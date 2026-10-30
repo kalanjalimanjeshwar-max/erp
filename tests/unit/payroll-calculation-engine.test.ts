@@ -1,10 +1,18 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../../src/server/app.js';
 import { Decimal, AccountingMath } from '../../src/server/accounting/decimal-math.js';
 import { PayrollCalculationService } from '../../src/server/services/payroll-calculation.service.js';
 import { PermissionService } from '../../src/server/services/permission.service.js';
 import { AuthUser } from '../../src/shared/types.ts';
+
+vi.mock('../../src/server/db/client.js', () => ({
+  prisma: {
+    rolePermission: {
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
+  },
+}));
 
 describe('Phase 7.3: Payroll Backend & Calculation Engine Unit & Validation Tests', () => {
   const app = createApp();

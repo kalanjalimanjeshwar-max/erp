@@ -1,7 +1,16 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { PermissionService } from '../../src/server/services/permission.service.js';
 import { UserService } from '../../src/server/services/user.service.js';
 import { AuthUser, Role } from '../../src/shared/types.ts';
+
+vi.mock('../../src/server/db/client.js', () => ({
+  prisma: {
+    rolePermission: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      findMany: vi.fn().mockResolvedValue([]),
+    },
+  },
+}));
 
 describe('Phase 3 Permission Matrix & RBAC Hierarchy Tests', () => {
   const dummyCompanyId = 'company-test-uuid-1';

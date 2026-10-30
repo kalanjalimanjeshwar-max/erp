@@ -7,6 +7,14 @@ import { LeaveService } from '../../src/server/services/leave.service.js';
 import { PermissionService } from '../../src/server/services/permission.service.js';
 import { AuthUser } from '../../src/shared/types.ts';
 
+vi.mock('../../src/server/db/client.js', () => ({
+  prisma: {
+    rolePermission: {
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
+  },
+}));
+
 describe('Phase 7.2: Attendance, Shift, and Leave Backend Unit & Validation Tests', () => {
   const app = createApp();
 
