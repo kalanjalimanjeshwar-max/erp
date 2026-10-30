@@ -1,0 +1,6 @@
+{
+  "name": "CoreERP Platform",
+  "description": "Production-oriented Enterprise Resource Planning (ERP) platform with PostgreSQL persistence, company isolation, and robust architectural foundation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

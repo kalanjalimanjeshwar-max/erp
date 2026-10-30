@@ -1,0 +1,86 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # Sole Operational Database: PostgreSQL 16
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: coreerp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-erp_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-erp_secure_password_123}
+      POSTGRES_DB: ${POSTGRES_DB:-core_erp}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-erp_user} -d ${POSTGRES_DB:-core_erp}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - coreerp-network
+
+  # ============================================================================
+  # One-Shot Database Migration Runner (Prisma Migrate Deploy)
+  # Applies pending migrations in order and exits with code 0.
+  # Migrations do NOT run inside application replicas.
+  # Can also be run manually during deployment: docker compose run --rm migration
+  # ============================================================================
+  migration:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coreerp-migration
+    restart: "no"
+    command: ["npx", "prisma", "migrate", "deploy"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:-erp_secure_password_123}@postgres:5432/${POSTGRES_DB:-core_erp}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - coreerp-network
+
+  # ============================================================================
+  # CoreERP Application Server (Express API + React Frontend)
+  # Multi-stage container running as non-root user 'erpuser'.
+  # Depends on the migration step completing successfully before booting.
+  # ============================================================================
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: coreerp-app
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:-erp_secure_password_123}@postgres:5432/${POSTGRES_DB:-core_erp}?schema=public
+      # Production secret safety: SESSION_SECRET must be explicitly provided in environment.
+      # Insecure/default fallback has been removed. Generate via: openssl rand -hex 32
+      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be explicitly set with a high-entropy string in production (generate via: openssl rand -hex 32)}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    networks:
+      - coreerp-network
+
+networks:
+  coreerp-network:
+    driver: bridge
+
+volumes:
+  # Persistent database volume ensures data survives restarts
+  postgres_data:
+    driver: local

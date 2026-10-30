@@ -1,0 +1,196 @@
+import { describe, it, expect } from 'vitest';
+import fs from 'fs';
+import path from 'path';
+
+describe('Database Migration History & Integrity Tests', () => {
+  const migrationsDir = path.resolve(import.meta.dirname, '../../prisma/migrations');
+
+  it('should maintain migration_lock.toml targeting postgresql', () => {
+    const lockPath = path.join(migrationsDir, 'migration_lock.toml');
+    expect(fs.existsSync(lockPath)).toBe(true);
+
+    const lockContent = fs.readFileSync(lockPath, 'utf-8');
+    expect(lockContent).toContain('provider = "postgresql"');
+  });
+
+  it('should preserve existing initial migration (20261011000000_init)', () => {
+    const initMigrationSql = path.join(migrationsDir, '20261011000000_init', 'migration.sql');
+    expect(fs.existsSync(initMigrationSql)).toBe(true);
+
+    const content = fs.readFileSync(initMigrationSql, 'utf-8');
+    expect(content).toContain('CREATE TABLE "Company"');
+    expect(content).toContain('CREATE TABLE "User"');
+  });
+
+  it('should include version-controlled Phase 2 migration (20261011120000_core_tenant_foundation)', () => {
+    const phase2MigrationSql = path.join(
+      migrationsDir,
+      '20261011120000_core_tenant_foundation',
+      'migration.sql'
+    );
+    expect(fs.existsSync(phase2MigrationSql)).toBe(true);
+
+    const content = fs.readFileSync(phase2MigrationSql, 'utf-8');
+    // Verifies non-destructive DDL
+    expect(content).toContain('ALTER TYPE "Role" ADD VALUE IF NOT EXISTS \'VICE_ADMIN\'');
+    expect(content).toContain('ALTER TYPE "Role" ADD VALUE IF NOT EXISTS \'EMPLOYEE\'');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "CurrencyConfig"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "FiscalPeriod"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "CompanySetting"');
+    expect(content).toContain('ALTER TABLE "AuditLog" ADD COLUMN IF NOT EXISTS "correlationId"');
+  });
+
+  it('should include version-controlled Phase 3 migration (20261011180000_auth_rbac_company_admin)', () => {
+    const phase3MigrationSql = path.join(
+      migrationsDir,
+      '20261011180000_auth_rbac_company_admin',
+      'migration.sql'
+    );
+    expect(fs.existsSync(phase3MigrationSql)).toBe(true);
+
+    const content = fs.readFileSync(phase3MigrationSql, 'utf-8');
+    expect(content).toContain('ALTER TABLE "Company" ADD COLUMN IF NOT EXISTS "address"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "RolePermission"');
+    expect(content).toContain('RolePermission_companyId_role_module_action_key');
+  });
+
+  it('should include version-controlled Phase 4 migration (20261012000000_core_accounting_engine)', () => {
+    const phase4MigrationSql = path.join(
+      migrationsDir,
+      '20261012000000_core_accounting_engine',
+      'migration.sql'
+    );
+    expect(fs.existsSync(phase4MigrationSql)).toBe(true);
+
+    const content = fs.readFileSync(phase4MigrationSql, 'utf-8');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "AccountGroup"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "AccountLedger"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "JournalEntry"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "JournalLine"');
+    expect(content).toContain('AccountGroup_companyId_code_key');
+    expect(content).toContain('AccountLedger_companyId_name_key');
+  });
+
+  it('should include version-controlled Phase 5 migration (20261012120000_quotations_billing_receipts)', () => {
+    const phase5MigrationSql = path.join(
+      migrationsDir,
+      '20261012120000_quotations_billing_receipts',
+      'migration.sql'
+    );
+    expect(fs.existsSync(phase5MigrationSql)).toBe(true);
+
+    const content = fs.readFileSync(phase5MigrationSql, 'utf-8');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "Customer"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "Quotation"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "Invoice"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "CustomerReceipt"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "ReceiptAllocation"');
+    expect(content).toContain('Invoice_companyId_invoiceNumber_key');
+    expect(content).toContain('CustomerReceipt_companyId_receiptNumber_key');
+  });
+
+  it('should include version-controlled Phase 6 migration (20261012180000_employee_management_salary)', () => {
+    const phase6MigrationSql = path.join(
+      migrationsDir,
+      '20261012180000_employee_management_salary',
+      'migration.sql'
+    );
+    expect(fs.existsSync(phase6MigrationSql)).toBe(true);
+
+    const content = fs.readFileSync(phase6MigrationSql, 'utf-8');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "Department"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "Designation"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "Employee"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "SalaryRevision"');
+    expect(content).toContain('Employee_companyId_employeeCode_key');
+    expect(content).toContain('Employee_userId_key');
+    expect(content).toContain('Employee_ledgerId_key');
+  });
+
+  it('should include version-controlled Phase 7.1 migration (20261013000000_attendance_shift_leave_payroll)', () => {
+    const phase7MigrationSql = path.join(
+      migrationsDir,
+      '20261013000000_attendance_shift_leave_payroll',
+      'migration.sql'
+    );
+    expect(fs.existsSync(phase7MigrationSql)).toBe(true);
+
+    const content = fs.readFileSync(phase7MigrationSql, 'utf-8');
+    expect(content).toContain('CREATE TYPE "AttendanceStatus"');
+    expect(content).toContain('CREATE TYPE "AttendanceSource"');
+    expect(content).toContain('CREATE TYPE "LeaveStatus"');
+    expect(content).toContain('CREATE TYPE "PayrollStatus"');
+    expect(content).toContain('CREATE TYPE "PayslipStatus"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "Shift"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "Attendance"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "LeaveType"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "LeaveRequest"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "PayrollPeriod"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "Payslip"');
+    expect(content).toContain('Shift_companyId_code_key');
+    expect(content).toContain('Attendance_companyId_employeeId_workDate_key');
+    expect(content).toContain('LeaveType_companyId_code_key');
+    expect(content).toContain('PayrollPeriod_companyId_year_month_key');
+    expect(content).toContain('Payslip_payrollPeriodId_employeeId_key');
+  });
+
+  it('should include version-controlled Phase 8.1 migration (20261019000000_biometric_terminals_and_raw_punches)', () => {
+    const phase8MigrationSql = path.join(
+      migrationsDir,
+      '20261019000000_biometric_terminals_and_raw_punches',
+      'migration.sql'
+    );
+    expect(fs.existsSync(phase8MigrationSql)).toBe(true);
+
+    const content = fs.readFileSync(phase8MigrationSql, 'utf-8');
+    expect(content).toContain('CREATE TYPE "BiometricTerminalStatus"');
+    expect(content).toContain('CREATE TYPE "BiometricVerifyType"');
+    expect(content).toContain('CREATE TYPE "PunchInOutMode"');
+    expect(content).toContain('CREATE TYPE "PunchSyncStatus"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "BiometricTerminal"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "RawPunchLog"');
+    expect(content).toContain('BiometricTerminal_companyId_deviceSerialNumber_key');
+    expect(content).toContain('BiometricTerminal_apiKeyHash_key');
+    expect(content).toContain('RawPunchLog_companyId_idempotencyKey_key');
+  });
+
+  it('should include version-controlled Stage 2.1 migration (20261030000000_persistent_admin_notifications)', () => {
+    const stage21MigrationSql = path.join(
+      migrationsDir,
+      '20261030000000_persistent_admin_notifications',
+      'migration.sql'
+    );
+    expect(fs.existsSync(stage21MigrationSql)).toBe(true);
+
+    const content = fs.readFileSync(stage21MigrationSql, 'utf-8');
+    expect(content).toContain('CREATE TYPE "NotificationSeverity"');
+    expect(content).toContain('CREATE TYPE "NotificationEventStatus"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "Notification"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "NotificationUserState"');
+    expect(content).toContain('Notification_companyId_dedupeKey_key');
+    expect(content).toContain('Notification_id_companyId_key');
+    expect(content).toContain('User_id_companyId_key');
+    expect(content).toContain('NotificationUserState_notificationId_companyId_fkey');
+    expect(content).toContain('NotificationUserState_userId_companyId_fkey');
+  });
+
+  it('should verify migrations order sequentially', () => {
+    const subdirs = fs
+      .readdirSync(migrationsDir)
+      .filter((file) => fs.statSync(path.join(migrationsDir, file)).isDirectory())
+      .sort();
+
+    expect(subdirs).toEqual([
+      '20261011000000_init',
+      '20261011120000_core_tenant_foundation',
+      '20261011180000_auth_rbac_company_admin',
+      '20261012000000_core_accounting_engine',
+      '20261012120000_quotations_billing_receipts',
+      '20261012180000_employee_management_salary',
+      '20261013000000_attendance_shift_leave_payroll',
+      '20261019000000_biometric_terminals_and_raw_punches',
+      '20261030000000_persistent_admin_notifications',
+    ]);
+  });
+});
+

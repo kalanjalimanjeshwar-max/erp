@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  # Primary Development PostgreSQL database
+  postgres:
+    image: postgres:16-alpine
+    container_name: coreerp-postgres-dev
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: erp_user
+      POSTGRES_PASSWORD: erp_password_dev
+      POSTGRES_DB: core_erp
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erp_user -d core_erp"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Dedicated Isolated Test Database for Vitest integration tests
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: coreerp-postgres-test
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: erp_test_user
+      POSTGRES_PASSWORD: erp_test_password
+      POSTGRES_DB: core_erp_test
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U erp_test_user -d core_erp_test"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_dev_data:
+  postgres_test_data:

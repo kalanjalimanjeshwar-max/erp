@@ -1,0 +1,1172 @@
+// CoreERP Database Schema - Phase 4 Core Accounting Engine and Chart of Accounts
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+/// Enterprise Role-Based Access Control (RBAC)
+enum Role {
+  SUPER_ADMIN
+  ADMIN
+  VICE_ADMIN
+  EMPLOYEE
+}
+
+/// Severity categorization for system and security audit entries
+enum AuditSeverity {
+  INFO
+  WARN
+  CRITICAL
+}
+
+/// Operational alert severities for persistent admin notifications
+enum NotificationSeverity {
+  INFO
+  WARN
+  ERROR
+}
+
+/// Lifecycle status for company-wide operational notification events
+enum NotificationEventStatus {
+  ACTIVE
+  RESOLVED
+  CANCELLED
+}
+
+/// Lifecycle status for fiscal financial periods
+enum FiscalPeriodStatus {
+  OPEN
+  CLOSED
+  LOCKED
+}
+
+/// Standard accounting root account classifications
+enum AccountRootType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  EXPENSE
+}
+
+/// Debit or Credit balance nature
+enum BalanceType {
+  DEBIT
+  CREDIT
+}
+
+/// Lifecycle status of double-entry journal entries
+enum JournalStatus {
+  DRAFT
+  POSTED
+  REVERSED
+}
+
+/// Primary Company entity for strict multi-tenant isolation
+model Company {
+  id             String   @id @default(uuid()) @db.Uuid
+  code           String   @unique @db.VarChar(32)
+  name           String   @db.VarChar(128)
+  legalName      String?  @db.VarChar(255)
+  taxId          String?  @db.VarChar(64)
+  currency       String   @default("USD") @db.VarChar(3)
+  timezone       String   @default("UTC") @db.VarChar(64)
+  logoUrl        String?  @db.VarChar(512)
+  address        String?  @db.VarChar(255)
+  phone          String?  @db.VarChar(32)
+  email          String?  @db.VarChar(255)
+  website        String?  @db.VarChar(255)
+  appHeaderTitle String?  @db.VarChar(128)
+  isConfigured   Boolean  @default(true)
+  createdAt      DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime @updatedAt @db.Timestamptz(6)
+
+  // Company-scoped child relations with ON DELETE RESTRICT for enterprise data safety
+  users           User[]
+  currencies      CurrencyConfig[]
+  fiscalPeriods   FiscalPeriod[]
+  companySettings CompanySetting[]
+  rolePermissions RolePermission[]
+  auditLogs       AuditLog[]
+
+  // Accounting Core Relations
+  accountGroups   AccountGroup[]
+  accountLedgers  AccountLedger[]
+  journalEntries  JournalEntry[]
+  journalLines    JournalLine[]
+
+  // Phase 5: Billing, Quotations & Receipts Relations
+  customers          Customer[]
+  quotations         Quotation[]
+  invoices           Invoice[]
+  customerReceipts   CustomerReceipt[]
+  receiptAllocations ReceiptAllocation[]
+
+  // Phase 6: Employee Management, Departments, Designations & Salary Relations
+  departments        Department[]
+  designations       Designation[]
+  employees          Employee[]
+  salaryRevisions    SalaryRevision[]
+
+  // Phase 7: Attendance, Shift, Leave and Payroll Relations
+  shifts             Shift[]
+  attendances        Attendance[]
+  leaveTypes         LeaveType[]
+  leaveRequests      LeaveRequest[]
+  payrollPeriods     PayrollPeriod[]
+  payslips           Payslip[]
+
+  // Phase 8: Biometric Hardware LAN Bridge Relations
+  biometricTerminals BiometricTerminal[]
+  rawPunchLogs       RawPunchLog[]
+
+  // Stage 2.1: Persistent Admin Notifications Relations
+  notifications      Notification[]
+  notificationStates NotificationUserState[]
+
+  @@index([code])
+}
+
+/// User entity with strict company scoping, RBAC, and secure session management fields
+model User {
+  id                  String    @id @default(uuid()) @db.Uuid
+  companyId           String    @db.Uuid
+  company             Company   @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  email               String    @db.VarChar(255)
+  fullName            String    @db.VarChar(128)
+  passwordHash        String    @db.VarChar(255)
+  role                Role      @default(EMPLOYEE)
+  isActive            Boolean   @default(true)
+  tokenVersion        Int       @default(1)
+  lastLoginAt         DateTime? @db.Timestamptz(6)
+  lastLoginIp         String?   @db.VarChar(45)
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime? @db.Timestamptz(6)
+  passwordChangedAt   DateTime? @db.Timestamptz(6)
+  createdAt           DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime  @updatedAt @db.Timestamptz(6)
+
+  auditLogs           AuditLog[]
+  closedFiscalPeriods FiscalPeriod[] @relation("FiscalPeriodClosedByUser")
+
+  // Accounting relations
+  journalsCreated     JournalEntry[] @relation("JournalCreatedByUser")
+  journalsPosted      JournalEntry[] @relation("JournalPostedByUser")
+  journalsReversed    JournalEntry[] @relation("JournalReversedByUser")
+
+  // Phase 5 Billing & Quotations relations
+  quotationsCreated   Quotation[]       @relation("QuotationCreatedByUser")
+  invoicesCreated     Invoice[]         @relation("InvoiceCreatedByUser")
+  invoicesIssued      Invoice[]         @relation("InvoiceIssuedByUser")
+  invoicesVoided      Invoice[]         @relation("InvoiceVoidedByUser")
+  receiptsCreated     CustomerReceipt[] @relation("ReceiptCreatedByUser")
+  receiptsVoided      CustomerReceipt[] @relation("ReceiptVoidedByUser")
+
+  // Phase 6 Employee & Salary relations
+  employee               Employee?        @relation("EmployeeUser")
+  salaryRevisionsCreated SalaryRevision[] @relation("SalaryRevisionCreatedByUser")
+
+  // Phase 7 Attendance, Leave & Payroll relations
+  leaveRequestsReviewed LeaveRequest[]  @relation("LeaveReviewedByUser")
+  payrollPeriodsCreated PayrollPeriod[] @relation("PayrollCreatedByUser")
+
+  // Phase 8 Biometric relations
+  terminalsRegistered   BiometricTerminal[] @relation("TerminalRegisteredByUser")
+
+  // Stage 2.1: Persistent Admin Notifications Relations
+  notificationStates    NotificationUserState[]
+
+  @@unique([companyId, email])
+  @@unique([id, companyId])
+  @@index([companyId])
+  @@index([email])
+  @@index([role])
+}
+
+/// Company-scoped customized role permissions and module access overrides
+model RolePermission {
+  id        String   @id @default(uuid()) @db.Uuid
+  companyId String   @db.Uuid
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  role      Role
+  module    String   @db.VarChar(64)
+  action    String   @db.VarChar(32)
+  isGranted Boolean  @default(true)
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, role, module, action])
+  @@index([companyId, role])
+  @@index([companyId, module])
+}
+
+/// Company-scoped Currency Configuration with exact Decimal(18, 6) rates
+model CurrencyConfig {
+  id                String   @id @default(uuid()) @db.Uuid
+  companyId         String   @db.Uuid
+  company           Company  @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  currencyCode      String   @db.VarChar(3)
+  exchangeRate      Decimal  @default(1.000000) @db.Decimal(18, 6)
+  roundingPrecision Int      @default(2)
+  isBaseCurrency    Boolean  @default(false)
+  createdAt         DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, currencyCode])
+  @@index([companyId])
+  @@index([currencyCode])
+}
+
+/// Company-scoped Fiscal Periods with explicit calendar dates (Date) and status control
+model FiscalPeriod {
+  id             String             @id @default(uuid()) @db.Uuid
+  companyId      String             @db.Uuid
+  company        Company            @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  periodName     String             @db.VarChar(64)
+  fiscalYear     Int
+  periodNumber   Int
+  startDate      DateTime           @db.Date
+  endDate        DateTime           @db.Date
+  status         FiscalPeriodStatus @default(OPEN)
+  isLocked       Boolean            @default(false)
+  closedAt       DateTime?          @db.Timestamptz(6)
+  closedByUserId String?            @db.Uuid
+  closedByUser   User?              @relation("FiscalPeriodClosedByUser", fields: [closedByUserId], references: [id], onDelete: SetNull)
+  createdAt      DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime           @updatedAt @db.Timestamptz(6)
+
+  journals       JournalEntry[]
+
+  @@unique([companyId, fiscalYear, periodNumber])
+  @@index([companyId])
+  @@index([fiscalYear])
+  @@index([status])
+}
+
+/// Company-scoped Chart of Accounts Groups supporting hierarchical trees
+model AccountGroup {
+  id            String          @id @default(uuid()) @db.Uuid
+  companyId     String          @db.Uuid
+  company       Company         @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  code          String          @db.VarChar(32)
+  name          String          @db.VarChar(128)
+  rootType      AccountRootType
+  parentGroupId String?         @db.Uuid
+  parentGroup   AccountGroup?   @relation("GroupHierarchy", fields: [parentGroupId], references: [id], onDelete: Restrict)
+  subGroups     AccountGroup[]  @relation("GroupHierarchy")
+  isSystem      Boolean         @default(false)
+  createdAt     DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime        @updatedAt @db.Timestamptz(6)
+
+  ledgers       AccountLedger[]
+
+  @@unique([companyId, code])
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([rootType])
+  @@index([parentGroupId])
+}
+
+/// Company-scoped Individual General Ledgers under an AccountGroup
+model AccountLedger {
+  id                 String          @id @default(uuid()) @db.Uuid
+  companyId          String          @db.Uuid
+  company            Company         @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  groupId            String          @db.Uuid
+  group              AccountGroup    @relation(fields: [groupId], references: [id], onDelete: Restrict)
+  code               String?         @db.VarChar(32)
+  name               String          @db.VarChar(128)
+  description        String?         @db.Text
+  currency           String          @default("USD") @db.VarChar(3)
+  isActive           Boolean         @default(true)
+  openingBalance     Decimal         @default(0.0000) @db.Decimal(18, 4)
+  openingBalanceType BalanceType     @default(DEBIT)
+  employeeId         String?         @db.Uuid // Future employee linkage safeguard
+  createdAt          DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime        @updatedAt @db.Timestamptz(6)
+
+  journalLines       JournalLine[]
+
+  // Phase 5 Billing & Receipts relations
+  customerReceivables Customer[]        @relation("CustomerReceivableLedger")
+  receiptsReceived    CustomerReceipt[] @relation("ReceiptReceivingLedger")
+  receiptsReceivable  CustomerReceipt[] @relation("ReceiptReceivableLedger")
+  invoiceLines        InvoiceLine[]
+
+  // Phase 6 Employee relation
+  employee            Employee?         @relation("EmployeeLedger")
+
+  // Phase 7 Payroll relations
+  payslips            Payslip[]         @relation("PayslipLedger")
+
+  @@unique([companyId, name])
+  @@unique([companyId, code])
+  @@unique([companyId, employeeId])
+  @@index([companyId])
+  @@index([groupId])
+  @@index([isActive])
+}
+
+/// Double-Entry Journal Entry with transaction header and balance validation
+model JournalEntry {
+  id                  String        @id @default(uuid()) @db.Uuid
+  companyId           String        @db.Uuid
+  company             Company       @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  voucherNumber       String        @db.VarChar(64)
+  idempotencyKey      String?       @db.VarChar(64)
+  entryDate           DateTime      @db.Date
+  fiscalPeriodId      String?       @db.Uuid
+  fiscalPeriod        FiscalPeriod? @relation(fields: [fiscalPeriodId], references: [id], onDelete: Restrict)
+  narration           String        @db.Text
+  reference           String?       @db.VarChar(128)
+  status              JournalStatus @default(DRAFT)
+  totalDebit          Decimal       @default(0.0000) @db.Decimal(18, 4)
+  totalCredit         Decimal       @default(0.0000) @db.Decimal(18, 4)
+  postedAt            DateTime?     @db.Timestamptz(6)
+  postedByUserId      String?       @db.Uuid
+  postedByUser        User?         @relation("JournalPostedByUser", fields: [postedByUserId], references: [id], onDelete: SetNull)
+  reversedAt          DateTime?     @db.Timestamptz(6)
+  reversedByUserId    String?       @db.Uuid
+  reversedByUser      User?         @relation("JournalReversedByUser", fields: [reversedByUserId], references: [id], onDelete: SetNull)
+  reversalOfId        String?       @db.Uuid
+  createdByUserId     String        @db.Uuid
+  createdByUser       User          @relation("JournalCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  createdAt           DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime      @updatedAt @db.Timestamptz(6)
+
+  lines               JournalLine[]
+
+  // Phase 5 Billing & Receipts relations
+  invoices            Invoice[]         @relation("InvoiceJournalEntry")
+  receipts            CustomerReceipt[] @relation("ReceiptJournalEntry")
+
+  // Phase 7 Payroll relations
+  payslips            Payslip[]         @relation("PayslipJournalEntry")
+
+  @@unique([companyId, voucherNumber])
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId])
+  @@index([entryDate])
+  @@index([status])
+  @@index([fiscalPeriodId])
+}
+
+/// Individual posting line within a double-entry journal voucher
+model JournalLine {
+  id          String        @id @default(uuid()) @db.Uuid
+  journalId   String        @db.Uuid
+  journal     JournalEntry  @relation(fields: [journalId], references: [id], onDelete: Cascade)
+  companyId   String        @db.Uuid
+  company     Company       @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  ledgerId    String        @db.Uuid
+  ledger      AccountLedger @relation(fields: [ledgerId], references: [id], onDelete: Restrict)
+  lineNumber  Int
+  debit       Decimal       @default(0.0000) @db.Decimal(18, 4)
+  credit      Decimal       @default(0.0000) @db.Decimal(18, 4)
+  description String?       @db.Text
+  createdAt   DateTime      @default(now()) @db.Timestamptz(6)
+
+  @@unique([journalId, lineNumber])
+  @@index([journalId])
+  @@index([companyId])
+  @@index([ledgerId])
+}
+
+/// Company-scoped settings (e.g., custom prefixes, approval thresholds, local parameters)
+model CompanySetting {
+  id        String   @id @default(uuid()) @db.Uuid
+  companyId String   @db.Uuid
+  company   Company  @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  key       String   @db.VarChar(64)
+  value     String   @db.Text
+  createdAt DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, key])
+  @@index([companyId])
+  @@index([key])
+}
+
+/// Platform-wide system settings (global maintenance, platform metadata)
+model SystemSetting {
+  id        String   @id @default(uuid()) @db.Uuid
+  key       String   @unique @db.VarChar(64)
+  value     String   @db.Text
+  isSecret  Boolean  @default(false)
+  updatedAt DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([key])
+}
+
+/// Audit log for tamper-evident tracking with tenant isolation and request correlation
+model AuditLog {
+  id            String        @id @default(uuid()) @db.Uuid
+  companyId     String?       @db.Uuid
+  company       Company?      @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  userId        String?       @db.Uuid
+  user          User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action        String        @db.VarChar(64)
+  entity        String        @db.VarChar(64)
+  entityId      String?       @db.VarChar(64)
+  severity      AuditSeverity @default(INFO)
+  correlationId String?       @db.VarChar(64)
+  ipAddress     String?       @db.VarChar(45)
+  userAgent     String?       @db.VarChar(255)
+  details       String?       @db.Text
+  createdAt     DateTime      @default(now()) @db.Timestamptz(6)
+
+  @@index([companyId])
+  @@index([createdAt])
+  @@index([action])
+  @@index([correlationId])
+  @@index([entity, entityId])
+}
+
+/// ========================================================
+/// Phase 5: Quotations, Billing & Customer Receipts
+/// ========================================================
+
+enum QuotationStatus {
+  DRAFT
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CANCELLED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  VOID
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  CHEQUE
+  CREDIT_CARD
+  OTHER
+}
+
+enum ReceiptStatus {
+  POSTED
+  VOID
+}
+
+/// Company-scoped Customer entity
+model Customer {
+  id                 String          @id @default(uuid()) @db.Uuid
+  companyId          String          @db.Uuid
+  company            Company         @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  code               String          @db.VarChar(32)
+  name               String          @db.VarChar(128)
+  email              String?         @db.VarChar(255)
+  phone              String?         @db.VarChar(32)
+  address            String?         @db.Text
+  taxId              String?         @db.VarChar(64)
+  currency           String          @default("USD") @db.VarChar(3)
+  paymentTermsDays   Int             @default(30)
+  receivableLedgerId String?         @db.Uuid
+  receivableLedger   AccountLedger?  @relation("CustomerReceivableLedger", fields: [receivableLedgerId], references: [id], onDelete: Restrict)
+  isActive           Boolean         @default(true)
+  createdAt          DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime        @updatedAt @db.Timestamptz(6)
+
+  quotations         Quotation[]
+  invoices           Invoice[]
+  receipts           CustomerReceipt[]
+
+  @@unique([companyId, code])
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+/// Company-scoped Sales Quotation (Accounting-Neutral)
+model Quotation {
+  id                  String          @id @default(uuid()) @db.Uuid
+  companyId           String          @db.Uuid
+  company             Company         @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  quotationNumber     String          @db.VarChar(64)
+  customerId          String?         @db.Uuid
+  customer            Customer?       @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  customerName        String          @db.VarChar(128)
+  customerEmail       String?         @db.VarChar(255)
+  customerPhone       String?         @db.VarChar(32)
+  customerAddress     String?         @db.Text
+  quotationDate       DateTime        @db.Date
+  validUntilDate      DateTime        @db.Date
+  status              QuotationStatus @default(DRAFT)
+  currency            String          @default("USD") @db.VarChar(3)
+  subtotal            Decimal         @default(0.0000) @db.Decimal(18, 4)
+  discountTotal       Decimal         @default(0.0000) @db.Decimal(18, 4)
+  taxTotal            Decimal         @default(0.0000) @db.Decimal(18, 4)
+  total               Decimal         @default(0.0000) @db.Decimal(18, 4)
+  notes               String?         @db.Text
+  terms               String?         @db.Text
+  documentTitle       String?         @db.VarChar(64)
+  convertedToInvoiceId String?        @db.Uuid
+  createdByUserId     String          @db.Uuid
+  createdByUser       User            @relation("QuotationCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  createdAt           DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime        @updatedAt @db.Timestamptz(6)
+
+  lines               QuotationLine[]
+  invoices            Invoice[]
+
+  @@unique([companyId, quotationNumber])
+  @@index([companyId])
+  @@index([status])
+  @@index([quotationDate])
+  @@index([customerId])
+}
+
+/// Line items of a Sales Quotation
+model QuotationLine {
+  id              String    @id @default(uuid()) @db.Uuid
+  quotationId     String    @db.Uuid
+  quotation       Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  lineNumber      Int
+  itemDescription String    @db.Text
+  quantity        Decimal   @default(1.0000) @db.Decimal(18, 4)
+  unitPrice       Decimal   @default(0.0000) @db.Decimal(18, 4)
+  discountAmount  Decimal   @default(0.0000) @db.Decimal(18, 4)
+  taxRate         Decimal   @default(0.0000) @db.Decimal(18, 4)
+  taxAmount       Decimal   @default(0.0000) @db.Decimal(18, 4)
+  lineTotal       Decimal   @default(0.0000) @db.Decimal(18, 4)
+  createdAt       DateTime  @default(now()) @db.Timestamptz(6)
+
+  @@unique([quotationId, lineNumber])
+  @@index([quotationId])
+}
+
+/// Company-scoped Sales Invoice / Bill
+model Invoice {
+  id              String        @id @default(uuid()) @db.Uuid
+  companyId       String        @db.Uuid
+  company         Company       @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  invoiceNumber   String        @db.VarChar(64)
+  quotationId     String?       @db.Uuid
+  quotation       Quotation?    @relation(fields: [quotationId], references: [id], onDelete: SetNull)
+  customerId      String?       @db.Uuid
+  customer        Customer?     @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  customerName    String        @db.VarChar(128)
+  customerEmail   String?       @db.VarChar(255)
+  customerPhone   String?       @db.VarChar(32)
+  customerAddress String?       @db.Text
+  customerTaxId   String?       @db.VarChar(64)
+  invoiceDate     DateTime      @db.Date
+  dueDate         DateTime      @db.Date
+  status          InvoiceStatus @default(DRAFT)
+  currency        String        @default("USD") @db.VarChar(3)
+  subtotal        Decimal       @default(0.0000) @db.Decimal(18, 4)
+  discountTotal   Decimal       @default(0.0000) @db.Decimal(18, 4)
+  taxTotal        Decimal       @default(0.0000) @db.Decimal(18, 4)
+  total           Decimal       @default(0.0000) @db.Decimal(18, 4)
+  amountPaid      Decimal       @default(0.0000) @db.Decimal(18, 4)
+  balanceDue      Decimal       @default(0.0000) @db.Decimal(18, 4)
+  notes           String?       @db.Text
+  terms           String?       @db.Text
+  documentTitle   String?       @db.VarChar(64)
+  journalEntryId  String?       @db.Uuid
+  journalEntry    JournalEntry? @relation("InvoiceJournalEntry", fields: [journalEntryId], references: [id], onDelete: SetNull)
+  issuedAt        DateTime?     @db.Timestamptz(6)
+  issuedByUserId  String?       @db.Uuid
+  issuedByUser    User?         @relation("InvoiceIssuedByUser", fields: [issuedByUserId], references: [id], onDelete: SetNull)
+  voidedAt        DateTime?     @db.Timestamptz(6)
+  voidedByUserId  String?       @db.Uuid
+  voidedByUser    User?         @relation("InvoiceVoidedByUser", fields: [voidedByUserId], references: [id], onDelete: SetNull)
+  voidReason      String?       @db.Text
+  createdByUserId String        @db.Uuid
+  createdByUser   User          @relation("InvoiceCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  createdAt       DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime      @updatedAt @db.Timestamptz(6)
+
+  lines           InvoiceLine[]
+  allocations     ReceiptAllocation[]
+
+  @@unique([companyId, invoiceNumber])
+  @@index([companyId])
+  @@index([status])
+  @@index([invoiceDate])
+  @@index([dueDate])
+  @@index([customerId])
+  @@index([quotationId])
+}
+
+/// Line items of a Sales Invoice
+model InvoiceLine {
+  id              String        @id @default(uuid()) @db.Uuid
+  invoiceId       String        @db.Uuid
+  invoice         Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  lineNumber      Int
+  itemDescription String        @db.Text
+  quantity        Decimal       @default(1.0000) @db.Decimal(18, 4)
+  unitPrice       Decimal       @default(0.0000) @db.Decimal(18, 4)
+  discountAmount  Decimal       @default(0.0000) @db.Decimal(18, 4)
+  taxRate         Decimal       @default(0.0000) @db.Decimal(18, 4)
+  taxAmount       Decimal       @default(0.0000) @db.Decimal(18, 4)
+  lineTotal       Decimal       @default(0.0000) @db.Decimal(18, 4)
+  revenueLedgerId String?       @db.Uuid
+  revenueLedger   AccountLedger? @relation(fields: [revenueLedgerId], references: [id], onDelete: Restrict)
+  createdAt       DateTime      @default(now()) @db.Timestamptz(6)
+
+  @@unique([invoiceId, lineNumber])
+  @@index([invoiceId])
+  @@index([revenueLedgerId])
+}
+
+/// Customer Payment Receipt with Accounting Integration
+model CustomerReceipt {
+  id                 String          @id @default(uuid()) @db.Uuid
+  companyId          String          @db.Uuid
+  company            Company         @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  receiptNumber      String          @db.VarChar(64)
+  receiptDate        DateTime        @db.Date
+  customerId         String          @db.Uuid
+  customer           Customer        @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  amount             Decimal         @db.Decimal(18, 4)
+  allocatedTotal     Decimal         @default(0.0000) @db.Decimal(18, 4)
+  unallocatedAmount  Decimal         @default(0.0000) @db.Decimal(18, 4)
+  paymentMethod      PaymentMethod   @default(BANK_TRANSFER)
+  referenceNumber    String?         @db.VarChar(128)
+  receivingLedgerId  String          @db.Uuid
+  receivingLedger    AccountLedger   @relation("ReceiptReceivingLedger", fields: [receivingLedgerId], references: [id], onDelete: Restrict)
+  receivableLedgerId String          @db.Uuid
+  receivableLedger   AccountLedger   @relation("ReceiptReceivableLedger", fields: [receivableLedgerId], references: [id], onDelete: Restrict)
+  journalEntryId     String?         @db.Uuid
+  journalEntry       JournalEntry?   @relation("ReceiptJournalEntry", fields: [journalEntryId], references: [id], onDelete: SetNull)
+  status             ReceiptStatus   @default(POSTED)
+  notes              String?         @db.Text
+  voidedAt           DateTime?       @db.Timestamptz(6)
+  voidedByUserId     String?         @db.Uuid
+  voidedByUser       User?           @relation("ReceiptVoidedByUser", fields: [voidedByUserId], references: [id], onDelete: SetNull)
+  voidReason         String?         @db.Text
+  createdByUserId    String          @db.Uuid
+  createdByUser      User            @relation("ReceiptCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  createdAt          DateTime        @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime        @updatedAt @db.Timestamptz(6)
+
+  allocations        ReceiptAllocation[]
+
+  @@unique([companyId, receiptNumber])
+  @@index([companyId])
+  @@index([customerId])
+  @@index([receiptDate])
+  @@index([status])
+}
+
+/// Allocation of Customer Receipt towards specific Invoice
+model ReceiptAllocation {
+  id              String          @id @default(uuid()) @db.Uuid
+  companyId       String          @db.Uuid
+  company         Company         @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  receiptId       String          @db.Uuid
+  receipt         CustomerReceipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  invoiceId       String          @db.Uuid
+  invoice         Invoice         @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  allocatedAmount Decimal         @db.Decimal(18, 4)
+  createdAt       DateTime        @default(now()) @db.Timestamptz(6)
+
+  @@unique([receiptId, invoiceId])
+  @@index([receiptId])
+  @@index([invoiceId])
+  @@index([companyId])
+}
+
+// ============================================================================
+// PHASE 6: EMPLOYEE MANAGEMENT, DEPARTMENTS, DESIGNATIONS & SALARY STRUCTURE
+// ============================================================================
+
+/// Lifecycle status of company employees
+enum EmployeeStatus {
+  ACTIVE
+  INACTIVE
+  EXITED
+}
+
+/// Category of employment contract
+enum EmploymentType {
+  FULL_TIME
+  PART_TIME
+  CONTRACT
+  INTERN
+}
+
+/// Department master entity scoped to company
+model Department {
+  id          String     @id @default(uuid()) @db.Uuid
+  companyId   String     @db.Uuid
+  company     Company    @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  code        String     @db.VarChar(32)
+  name        String     @db.VarChar(128)
+  description String?    @db.Text
+  isActive    Boolean    @default(true)
+  createdAt   DateTime   @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime   @updatedAt @db.Timestamptz(6)
+
+  employees   Employee[]
+
+  @@unique([companyId, code])
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+/// Designation / Job Title master entity scoped to company
+model Designation {
+  id          String     @id @default(uuid()) @db.Uuid
+  companyId   String     @db.Uuid
+  company     Company    @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  code        String     @db.VarChar(32)
+  name        String     @db.VarChar(128)
+  description String?    @db.Text
+  isActive    Boolean    @default(true)
+  createdAt   DateTime   @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime   @updatedAt @db.Timestamptz(6)
+
+  employees   Employee[]
+
+  @@unique([companyId, code])
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+/// Company-scoped Employee Record
+model Employee {
+  id                String           @id @default(uuid()) @db.Uuid
+  companyId         String           @db.Uuid
+  company           Company          @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  employeeCode      String           @db.VarChar(32)
+  fullName          String           @db.VarChar(128)
+  email             String?          @db.VarChar(255)
+  phone             String?          @db.VarChar(32)
+  address           String?          @db.VarChar(255)
+  photoUrl          String?          @db.VarChar(512)
+  dateOfBirth       DateTime?        @db.Date
+  dateOfJoining     DateTime         @db.Date
+  departmentId      String?          @db.Uuid
+  department        Department?      @relation(fields: [departmentId], references: [id], onDelete: Restrict)
+  designationId     String?          @db.Uuid
+  designation       Designation?     @relation(fields: [designationId], references: [id], onDelete: Restrict)
+  employmentType    EmploymentType   @default(FULL_TIME)
+  status            EmployeeStatus   @default(ACTIVE)
+  notes             String?          @db.Text
+  biometricDeviceId String?          @db.VarChar(64) // Kept separate from ERP employee ID
+  userId            String?          @unique @db.Uuid // 1-to-1 link to User login
+  user              User?            @relation("EmployeeUser", fields: [userId], references: [id], onDelete: SetNull)
+  ledgerId          String?          @unique @db.Uuid // 1-to-1 link to AccountLedger
+  ledger            AccountLedger?   @relation("EmployeeLedger", fields: [ledgerId], references: [id], onDelete: Restrict)
+  createdAt         DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime         @updatedAt @db.Timestamptz(6)
+
+  salaryRevisions   SalaryRevision[]
+
+  // Phase 7: Shift, Attendance, Leave and Payroll relations
+  shiftId           String?          @db.Uuid
+  shift             Shift?           @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  attendances       Attendance[]
+  leaveRequests     LeaveRequest[]
+  payslips          Payslip[]
+
+  // Phase 8: Biometric raw punch logs
+  rawPunchLogs      RawPunchLog[]    @relation("EmployeeRawPunches")
+
+  // Stage 2.1: Persistent Admin Notifications Relations
+  notifications     Notification[]
+
+  @@unique([companyId, employeeCode])
+  @@index([companyId])
+  @@index([departmentId])
+  @@index([designationId])
+  @@index([status])
+  @@index([dateOfJoining])
+}
+
+/// Employee Fixed Salary Structure and Revision History
+model SalaryRevision {
+  id              String    @id @default(uuid()) @db.Uuid
+  companyId       String    @db.Uuid
+  company         Company   @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  employeeId      String    @db.Uuid
+  employee        Employee  @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  fixedSalary     Decimal   @default(0.0000) @db.Decimal(18, 4)
+  effectiveFrom   DateTime  @db.Date
+  effectiveTo     DateTime? @db.Date
+  revisionReason  String?   @db.VarChar(255)
+  notes           String?   @db.Text
+  createdByUserId String    @db.Uuid
+  createdByUser   User      @relation("SalaryRevisionCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  createdAt       DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @db.Timestamptz(6)
+
+  @@index([companyId])
+  @@index([employeeId])
+  @@index([effectiveFrom])
+}
+
+// ============================================================================
+// PHASE 7: ATTENDANCE, SHIFT, LEAVE AND PAYROLL DATABASE FOUNDATION
+// ============================================================================
+
+/// Daily attendance presence and punctuality status
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  HALF_DAY
+  LATE
+  ON_LEAVE
+}
+
+/// Source of attendance record capture
+enum AttendanceSource {
+  MANUAL
+  BIOMETRIC
+}
+
+/// Leave workflow approval lifecycle status
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+/// Monthly payroll period processing and general ledger posting status
+enum PayrollStatus {
+  DRAFT
+  PROCESSED
+  POSTED
+  CANCELLED
+}
+
+/// Individual employee monthly payslip status
+enum PayslipStatus {
+  DRAFT
+  APPROVED
+  PAID
+  CANCELLED
+}
+
+/// Work Shift Definition scoped to company
+model Shift {
+  id              String       @id @default(uuid()) @db.Uuid
+  companyId       String       @db.Uuid
+  company         Company      @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  code            String       @db.VarChar(32)
+  name            String       @db.VarChar(128)
+  startTime       String       @db.VarChar(8) // Format "HH:mm" (e.g., "09:00" or "22:00")
+  endTime         String       @db.VarChar(8) // Format "HH:mm" (e.g., "18:00" or "06:00")
+  isOvernight     Boolean      @default(false) // Supports overnight shifts across midnight boundary
+  graceMinutes    Int          @default(15)
+  halfDayMinutes  Int          @default(240)
+  isActive        Boolean      @default(true)
+  description     String?      @db.Text
+  createdAt       DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime     @updatedAt @db.Timestamptz(6)
+
+  employees       Employee[]
+  attendances     Attendance[]
+
+  @@unique([companyId, code])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+/// Company-scoped Employee Attendance Log
+model Attendance {
+  id              String           @id @default(uuid()) @db.Uuid
+  companyId       String           @db.Uuid
+  company         Company          @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  employeeId      String           @db.Uuid
+  employee        Employee         @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  shiftId         String?          @db.Uuid
+  shift           Shift?           @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  workDate        DateTime         @db.Date
+  checkIn         DateTime?        @db.Timestamptz(6)
+  checkOut        DateTime?        @db.Timestamptz(6)
+  status          AttendanceStatus @default(PRESENT)
+  lateMinutes     Int              @default(0)
+  overtimeMinutes Int              @default(0)
+  source          AttendanceSource @default(MANUAL)
+  notes           String?          @db.Text
+  createdAt       DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime         @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, employeeId, workDate])
+  @@index([companyId])
+  @@index([employeeId])
+  @@index([workDate])
+  @@index([status])
+}
+
+/// Company-scoped Leave Type Configuration
+model LeaveType {
+  id               String         @id @default(uuid()) @db.Uuid
+  companyId        String         @db.Uuid
+  company          Company        @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  code             String         @db.VarChar(32)
+  name             String         @db.VarChar(128)
+  description      String?        @db.Text
+  isPaid           Boolean        @default(true)
+  defaultAllowance Int            @default(12)
+  isActive         Boolean        @default(true)
+  createdAt        DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime       @updatedAt @db.Timestamptz(6)
+
+  leaveRequests    LeaveRequest[]
+
+  @@unique([companyId, code])
+  @@unique([companyId, name])
+  @@index([companyId])
+  @@index([isActive])
+}
+
+/// Employee Leave Application and Approval Record
+model LeaveRequest {
+  id               String      @id @default(uuid()) @db.Uuid
+  companyId        String      @db.Uuid
+  company          Company     @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  employeeId       String      @db.Uuid
+  employee         Employee    @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  leaveTypeId      String      @db.Uuid
+  leaveType        LeaveType   @relation(fields: [leaveTypeId], references: [id], onDelete: Restrict)
+  startDate        DateTime    @db.Date
+  endDate          DateTime    @db.Date
+  totalDays        Decimal     @default(1.0) @db.Decimal(5, 2)
+  reason           String?     @db.Text
+  status           LeaveStatus @default(PENDING)
+  reviewedByUserId String?     @db.Uuid
+  reviewedByUser   User?       @relation("LeaveReviewedByUser", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+  reviewedAt       DateTime?   @db.Timestamptz(6)
+  rejectionReason  String?     @db.Text
+  createdAt        DateTime    @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime    @updatedAt @db.Timestamptz(6)
+
+  @@index([companyId])
+  @@index([employeeId])
+  @@index([leaveTypeId])
+  @@index([status])
+  @@index([startDate])
+}
+
+/// Monthly Payroll Period scoped to company
+model PayrollPeriod {
+  id              String        @id @default(uuid()) @db.Uuid
+  companyId       String        @db.Uuid
+  company         Company       @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  month           Int
+  year            Int
+  name            String?       @db.VarChar(64)
+  startDate       DateTime      @db.Date
+  endDate         DateTime      @db.Date
+  status          PayrollStatus @default(DRAFT)
+  processedAt     DateTime?     @db.Timestamptz(6)
+  postedAt        DateTime?     @db.Timestamptz(6)
+  createdByUserId String        @db.Uuid
+  createdByUser   User          @relation("PayrollCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  createdAt       DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime      @updatedAt @db.Timestamptz(6)
+
+  payslips        Payslip[]
+
+  @@unique([companyId, year, month])
+  @@index([companyId])
+  @@index([status])
+  @@index([year, month])
+}
+
+/// Individual Employee Monthly Payslip
+model Payslip {
+  id                 String         @id @default(uuid()) @db.Uuid
+  companyId          String         @db.Uuid
+  company            Company        @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  payrollPeriodId    String         @db.Uuid
+  payrollPeriod      PayrollPeriod  @relation(fields: [payrollPeriodId], references: [id], onDelete: Cascade)
+  employeeId         String         @db.Uuid
+  employee           Employee       @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  basicSalary        Decimal        @default(0.0000) @db.Decimal(18, 4)
+  allowances         Decimal        @default(0.0000) @db.Decimal(18, 4)
+  overtimePay        Decimal        @default(0.0000) @db.Decimal(18, 4)
+  grossSalary        Decimal        @default(0.0000) @db.Decimal(18, 4)
+  deductions         Decimal        @default(0.0000) @db.Decimal(18, 4)
+  lossOfPayDeduction Decimal        @default(0.0000) @db.Decimal(18, 4)
+  netSalary          Decimal        @default(0.0000) @db.Decimal(18, 4)
+  status             PayslipStatus  @default(DRAFT)
+  paymentMethod      String?        @db.VarChar(32)
+  paymentDate        DateTime?      @db.Date
+  ledgerId           String?        @db.Uuid // Optional link to employee payable ledger
+  ledger             AccountLedger? @relation("PayslipLedger", fields: [ledgerId], references: [id], onDelete: SetNull)
+  journalEntryId     String?        @db.Uuid // Optional link to double-entry general ledger voucher
+  journalEntry       JournalEntry?  @relation("PayslipJournalEntry", fields: [journalEntryId], references: [id], onDelete: SetNull)
+  notes              String?        @db.Text
+  createdAt          DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime       @updatedAt @db.Timestamptz(6)
+
+  @@unique([payrollPeriodId, employeeId])
+  @@index([companyId])
+  @@index([payrollPeriodId])
+  @@index([employeeId])
+  @@index([status])
+}
+
+// ============================================================================
+// PHASE 8: BIOMETRIC HARDWARE LAN BRIDGE & AUDITABLE PUNCH INGESTION
+// ============================================================================
+
+/// Operational online/offline status of registered physical biometric device
+enum BiometricTerminalStatus {
+  ONLINE
+  OFFLINE
+  ERROR
+  DEACTIVATED
+}
+
+/// Authentication/verification modality of physical biometric punch
+enum BiometricVerifyType {
+  FINGERPRINT
+  CARD
+  PASSWORD
+  FACE
+}
+
+/// Direction mode of biometric timeclock punch
+enum PunchInOutMode {
+  CHECK_IN
+  CHECK_OUT
+  BREAK_OUT
+  BREAK_IN
+}
+
+/// Ingestion and downstream synchronization status of raw punch event
+enum PunchSyncStatus {
+  PENDING
+  PROCESSED
+  IGNORED
+  ERROR
+}
+
+/// Registered Physical Biometric Hardware Terminal scoped to company
+model BiometricTerminal {
+  id                 String                  @id @default(uuid()) @db.Uuid
+  companyId          String                  @db.Uuid
+  company            Company                 @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  deviceSerialNumber String                  @db.VarChar(64)
+  name               String                  @db.VarChar(128)
+  terminalModel      String                  @default("ZKTeco-F22") @db.VarChar(64)
+  ipAddress          String?                 @db.VarChar(45)
+  port               Int                     @default(4370)
+  location           String?                 @db.VarChar(128)
+  apiKeyHash         String                  @unique @db.VarChar(128)
+  apiKeyPrefix       String                  @db.VarChar(16)
+  status             BiometricTerminalStatus @default(OFFLINE)
+  lastHeartbeatAt    DateTime?               @db.Timestamptz(6)
+  lastSyncAt         DateTime?               @db.Timestamptz(6)
+  firmwareVersion    String?                 @db.VarChar(64)
+  registeredByUserId String                  @db.Uuid
+  registeredByUser   User                    @relation("TerminalRegisteredByUser", fields: [registeredByUserId], references: [id], onDelete: Restrict)
+  isActive           Boolean                 @default(true)
+  notes              String?                 @db.Text
+  createdAt          DateTime                @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime                @updatedAt @db.Timestamptz(6)
+
+  rawPunchLogs       RawPunchLog[]
+
+  @@unique([companyId, deviceSerialNumber])
+  @@index([companyId])
+  @@index([apiKeyHash])
+  @@index([status])
+  @@index([isActive])
+}
+
+/// Immutable incoming raw biometric punch event from physical hardware
+model RawPunchLog {
+  id                 String              @id @default(uuid()) @db.Uuid
+  companyId          String              @db.Uuid
+  company            Company             @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  terminalId         String              @db.Uuid
+  terminal           BiometricTerminal   @relation(fields: [terminalId], references: [id], onDelete: Restrict)
+  devicePunchId      String?             @db.VarChar(64)
+  userEnrollmentId   String              @db.VarChar(64)
+  punchTime          DateTime            @db.Timestamptz(6)
+  verifyType         BiometricVerifyType @default(FINGERPRINT)
+  inOutMode          PunchInOutMode      @default(CHECK_IN)
+  syncStatus         PunchSyncStatus     @default(PENDING)
+  errorMessage       String?             @db.Text
+  rawPayload         String?             @db.Text
+  idempotencyKey     String              @db.VarChar(128)
+  matchedEmployeeId  String?             @db.Uuid
+  matchedEmployee    Employee?           @relation("EmployeeRawPunches", fields: [matchedEmployeeId], references: [id], onDelete: SetNull)
+  createdAt          DateTime            @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime            @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, idempotencyKey])
+  @@index([companyId])
+  @@index([terminalId])
+  @@index([userEnrollmentId])
+  @@index([punchTime])
+  @@index([syncStatus])
+  @@index([matchedEmployeeId])
+}
+
+// ============================================================================
+// STAGE 2.1: PERSISTENT ADMIN NOTIFICATIONS DATABASE FOUNDATION
+// ============================================================================
+
+/// Company-scoped operational event alert (1 row per system event)
+model Notification {
+  id          String                  @id @default(uuid()) @db.Uuid
+  companyId   String                  @db.Uuid
+  company     Company                 @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  dedupeKey   String                  @db.VarChar(128)
+  type        String                  @db.VarChar(64)
+  severity    NotificationSeverity    @default(WARN)
+  title       String                  @db.VarChar(128)
+  message     String                  @db.Text
+  actionUrl   String                  @db.VarChar(255)
+  status      NotificationEventStatus @default(ACTIVE)
+  employeeId  String?                 @db.Uuid
+  employee    Employee?               @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  workDate    DateTime?               @db.Date
+  metadata    Json?
+  resolvedAt  DateTime?               @db.Timestamptz(6)
+  createdAt   DateTime                @default(now()) @db.Timestamptz(6)
+  updatedAt   DateTime                @updatedAt @db.Timestamptz(6)
+
+  userStates  NotificationUserState[]
+
+  @@unique([companyId, dedupeKey])
+  @@unique([id, companyId])
+  @@index([companyId, status])
+  @@index([companyId, createdAt])
+  @@index([employeeId])
+}
+
+/// Independent per-admin read and dismissal state
+model NotificationUserState {
+  id             String       @id @default(uuid()) @db.Uuid
+  companyId      String       @db.Uuid
+  company        Company      @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  notificationId String       @db.Uuid
+  notification   Notification @relation(fields: [notificationId, companyId], references: [id, companyId], onDelete: Cascade)
+  userId         String       @db.Uuid
+  user           User         @relation(fields: [userId, companyId], references: [id, companyId], onDelete: Cascade)
+  isRead         Boolean      @default(false)
+  readAt         DateTime?    @db.Timestamptz(6)
+  isDismissed    Boolean      @default(false)
+  dismissedAt    DateTime?    @db.Timestamptz(6)
+  createdAt      DateTime     @default(now()) @db.Timestamptz(6)
+  updatedAt      DateTime     @updatedAt @db.Timestamptz(6)
+
+  @@unique([notificationId, userId])
+  @@index([userId, companyId, isDismissed, isRead])
+  @@index([companyId])
+}
