@@ -175,6 +175,40 @@ describe('Database Migration History & Integrity Tests', () => {
     expect(content).toContain('NotificationUserState_userId_companyId_fkey');
   });
 
+  it('should include version-controlled Migration 10 (20261031120000_role_enum_cleanup)', () => {
+    const migration10Sql = path.join(
+      migrationsDir,
+      '20261031120000_role_enum_cleanup',
+      'migration.sql'
+    );
+    expect(fs.existsSync(migration10Sql)).toBe(true);
+
+    const content = fs.readFileSync(migration10Sql, 'utf-8');
+
+    // 1. Both legacy-role safety checks exist
+    expect(content).toMatch(/IF EXISTS \(\s*SELECT 1 FROM "User"\s*WHERE "role"::text IN \('MANAGER', 'USER'\)\s*\) THEN\s*RAISE EXCEPTION/);
+    expect(content).toMatch(/IF EXISTS \(\s*SELECT 1 FROM "RolePermission"\s*WHERE "role"::text IN \('MANAGER', 'USER'\)\s*\) THEN\s*RAISE EXCEPTION/);
+
+    // 2. The replacement enum contains exactly the four active roles
+    expect(content).toContain('ALTER TYPE "Role" RENAME TO "Role_old";');
+    expect(content).toContain("CREATE TYPE \"Role\" AS ENUM ('SUPER_ADMIN', 'ADMIN', 'VICE_ADMIN', 'EMPLOYEE');");
+
+    // 3. Both User.role and RolePermission.role conversions exist using text intermediate cast
+    expect(content).toContain('ALTER TABLE "User" ALTER COLUMN "role" DROP DEFAULT;');
+    expect(content).toMatch(/ALTER TABLE "User"[\s\S]*?ALTER COLUMN "role" TYPE "Role"[\s\S]*?USING \("role"::text::"Role"\);/);
+    expect(content).toMatch(/ALTER TABLE "RolePermission"[\s\S]*?ALTER COLUMN "role" TYPE "Role"[\s\S]*?USING \("role"::text::"Role"\);/);
+
+    // 4. User.role default is restored to EMPLOYEE
+    expect(content).toContain("ALTER TABLE \"User\" ALTER COLUMN \"role\" SET DEFAULT 'EMPLOYEE';");
+
+    // 5. DROP TYPE is used without CASCADE
+    expect(content).toContain('DROP TYPE "Role_old";');
+    expect(content).not.toMatch(/DROP\s+TYPE\s+.*CASCADE/i);
+
+    // 6. No explicit BEGIN or COMMIT statements exist
+    expect(content).not.toMatch(/^\s*(BEGIN|COMMIT)\s*;/m);
+  });
+
   it('should verify migrations order sequentially', () => {
     const subdirs = fs
       .readdirSync(migrationsDir)
@@ -191,7 +225,9 @@ describe('Database Migration History & Integrity Tests', () => {
       '20261013000000_attendance_shift_leave_payroll',
       '20261019000000_biometric_terminals_and_raw_punches',
       '20261030000000_persistent_admin_notifications',
+      '20261031120000_role_enum_cleanup',
     ]);
   });
 });
+
 
