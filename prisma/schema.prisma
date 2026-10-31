@@ -787,6 +787,7 @@ model Employee {
   @@index([companyId])
   @@index([departmentId])
   @@index([designationId])
+  @@index([shiftId])
   @@index([status])
   @@index([dateOfJoining])
 }
@@ -1082,7 +1083,6 @@ model BiometricTerminal {
 
   @@unique([companyId, deviceSerialNumber])
   @@index([companyId])
-  @@index([apiKeyHash])
   @@index([status])
   @@index([isActive])
 }

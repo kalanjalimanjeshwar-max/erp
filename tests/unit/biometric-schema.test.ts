@@ -60,7 +60,8 @@ describe('Phase 8.1 Biometric Hardware LAN Bridge Database Schema Tests', () => 
     // Constraints & Indexes
     expect(body).toMatch(/@@unique\(\[companyId,\s*deviceSerialNumber\]\)/);
     expect(body).toMatch(/@@index\(\[companyId\]\)/);
-    expect(body).toMatch(/@@index\(\[apiKeyHash\]\)/);
+    expect(body).toMatch(/apiKeyHash\s+String\s+@unique/);
+    expect(body).not.toMatch(/@@index\(\[apiKeyHash\]\)/);
     expect(body).toMatch(/@@index\(\[status\]\)/);
     expect(body).toMatch(/@@index\(\[isActive\]\)/);
   });
