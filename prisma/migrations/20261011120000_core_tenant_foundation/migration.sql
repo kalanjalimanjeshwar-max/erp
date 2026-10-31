@@ -6,12 +6,7 @@ ALTER TYPE "Role" ADD VALUE IF NOT EXISTS 'VICE_ADMIN';
 ALTER TYPE "Role" ADD VALUE IF NOT EXISTS 'EMPLOYEE';
 
 -- 2. Create FiscalPeriodStatus Enum
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_type WHERE typname = 'FiscalPeriodStatus') THEN
-        CREATE TYPE "FiscalPeriodStatus" AS ENUM ('OPEN', 'CLOSED', 'LOCKED');
-    END IF;
-END $$;
+CREATE TYPE "FiscalPeriodStatus" AS ENUM ('OPEN', 'CLOSED', 'LOCKED');
 
 -- 3. Enhance User Model with secure session controls & role defaults
 ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "tokenVersion" INTEGER NOT NULL DEFAULT 1;
