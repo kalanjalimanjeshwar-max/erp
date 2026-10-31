@@ -49,6 +49,7 @@ describe('Database Migration History & Integrity Tests', () => {
     expect(fs.existsSync(phase3MigrationSql)).toBe(true);
 
     const content = fs.readFileSync(phase3MigrationSql, 'utf-8');
+    expect(content).toContain('ALTER TABLE "User" ALTER COLUMN "role" SET DEFAULT \'EMPLOYEE\'');
     expect(content).toContain('ALTER TABLE "Company" ADD COLUMN IF NOT EXISTS "address"');
     expect(content).toContain('CREATE TABLE IF NOT EXISTS "RolePermission"');
     expect(content).toContain('RolePermission_companyId_role_module_action_key');
