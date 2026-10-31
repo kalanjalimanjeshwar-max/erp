@@ -1,6 +1,18 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import bcrypt from 'bcryptjs';
 import { AuthService, SessionPayload } from '../../src/server/services/auth.service.js';
+
+// Mock only the Prisma methods required by the failed-login rate-limit test
+vi.mock('../../src/server/db/client.js', () => ({
+  prisma: {
+    user: {
+      findFirst: vi.fn().mockResolvedValue(null),
+    },
+    auditLog: {
+      create: vi.fn().mockResolvedValue({ id: 'mock-audit-id' }),
+    },
+  },
+}));
 
 describe('Phase 3 Authentication, Passwords & Session Security Tests', () => {
   it('should securely hash passwords with bcrypt and reject plaintext comparisons', async () => {

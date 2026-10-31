@@ -1,8 +1,17 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import bcrypt from 'bcryptjs';
 import { AccountingMath, Decimal } from '../../src/server/accounting/decimal-math.js';
 import { PermissionService } from '../../src/server/services/permission.service.js';
 import { Role } from '../../src/shared/types.ts';
+
+// Mock only the Prisma permission lookup needed by the private-record tests
+vi.mock('../../src/server/db/client.js', () => ({
+  prisma: {
+    rolePermission: {
+      findUnique: vi.fn().mockResolvedValue(null),
+    },
+  },
+}));
 
 describe('Phase 6: Employee Management, Departments, Designations & Salary Structure', () => {
   const testCompanyId = 'company-test-uuid-phase6';
