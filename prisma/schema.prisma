@@ -173,6 +173,8 @@ model User {
   // Phase 7 Attendance, Leave & Payroll relations
   leaveRequestsReviewed LeaveRequest[]  @relation("LeaveReviewedByUser")
   payrollPeriodsCreated PayrollPeriod[] @relation("PayrollCreatedByUser")
+  payrollAccountsApproved PayrollPeriod[] @relation("PayrollAccountsApprovedByUser")
+  payrollAdminApproved    PayrollPeriod[] @relation("PayrollAdminApprovedByUser")
 
   // Phase 8 Biometric relations
   terminalsRegistered   BiometricTerminal[] @relation("TerminalRegisteredByUser")
@@ -845,6 +847,7 @@ enum LeaveStatus {
 enum PayrollStatus {
   DRAFT
   PROCESSED
+  ACCOUNTS_APPROVED
   POSTED
   CANCELLED
 }
@@ -969,20 +972,29 @@ model PayrollPeriod {
   name            String?       @db.VarChar(64)
   startDate       DateTime      @db.Date
   endDate         DateTime      @db.Date
-  status          PayrollStatus @default(DRAFT)
-  processedAt     DateTime?     @db.Timestamptz(6)
-  postedAt        DateTime?     @db.Timestamptz(6)
-  createdByUserId String        @db.Uuid
-  createdByUser   User          @relation("PayrollCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
-  createdAt       DateTime      @default(now()) @db.Timestamptz(6)
-  updatedAt       DateTime      @updatedAt @db.Timestamptz(6)
+  status                   PayrollStatus @default(DRAFT)
+  processedAt              DateTime?     @db.Timestamptz(6)
+  accountsApprovedAt       DateTime?     @db.Timestamptz(6)
+  accountsApprovedByUserId String?       @db.Uuid
+  accountsApprovedByUser   User?         @relation("PayrollAccountsApprovedByUser", fields: [accountsApprovedByUserId], references: [id], onDelete: Restrict)
+  accountsApprovalNotes    String?       @db.Text
+  adminApprovedAt          DateTime?     @db.Timestamptz(6)
+  adminApprovedByUserId    String?       @db.Uuid
+  adminApprovedByUser      User?         @relation("PayrollAdminApprovedByUser", fields: [adminApprovedByUserId], references: [id], onDelete: Restrict)
+  postedAt                 DateTime?     @db.Timestamptz(6)
+  createdByUserId          String        @db.Uuid
+  createdByUser            User          @relation("PayrollCreatedByUser", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  createdAt                DateTime      @default(now()) @db.Timestamptz(6)
+  updatedAt                DateTime      @updatedAt @db.Timestamptz(6)
 
-  payslips        Payslip[]
+  payslips                 Payslip[]
 
   @@unique([companyId, year, month])
   @@index([companyId])
   @@index([status])
   @@index([year, month])
+  @@index([accountsApprovedByUserId])
+  @@index([adminApprovedByUserId])
 }
 
 /// Individual Employee Monthly Payslip

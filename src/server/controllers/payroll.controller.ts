@@ -73,6 +73,33 @@ export class PayrollController {
     }
   }
 
+  static async approveAccounts(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const { notes } = req.body || {};
+      const approved = await PayrollService.approveAccounts(
+        actor,
+        req.params.id,
+        notes,
+        req.correlationId
+      );
+      res.json(approved);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code:
+            status === 403
+              ? 'FORBIDDEN'
+              : status === 404
+              ? 'PAYROLL_PERIOD_NOT_FOUND'
+              : 'PAYROLL_ACCOUNTS_APPROVAL_FAILED',
+          message: (err as Error).message,
+        },
+      });
+    }
+  }
+
   static async postPeriod(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;

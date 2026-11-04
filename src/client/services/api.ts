@@ -85,6 +85,7 @@ import {
   PayslipItem,
   PayslipStatus,
   PostPayrollRequest,
+  ApprovePayrollAccountsRequest,
   BiometricTerminalItem,
   BiometricTerminalStatus,
   CreateBiometricTerminalRequest,
@@ -796,6 +797,11 @@ export const api = {
   processPayrollPeriod: (id: string) =>
     request<PayrollPeriodItem>(`/api/payroll/periods/${id}/process`, {
       method: 'POST',
+    }),
+  approvePayrollAccounts: (id: string, data?: ApprovePayrollAccountsRequest) =>
+    request<PayrollPeriodItem>(`/api/payroll/periods/${id}/approve-accounts`, {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
     }),
   postPayrollPeriod: (id: string, data?: PostPayrollRequest) =>
     request<PayrollPeriodItem>(`/api/payroll/periods/${id}/post`, {

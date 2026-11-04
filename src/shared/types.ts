@@ -1106,7 +1106,7 @@ export interface LinkEmployeeLedgerRequest {
 export type AttendanceStatus = 'PRESENT' | 'ABSENT' | 'HALF_DAY' | 'LATE' | 'ON_LEAVE';
 export type AttendanceSource = 'MANUAL' | 'BIOMETRIC';
 export type LeaveStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'CANCELLED';
-export type PayrollStatus = 'DRAFT' | 'PROCESSED' | 'POSTED' | 'CANCELLED';
+export type PayrollStatus = 'DRAFT' | 'PROCESSED' | 'ACCOUNTS_APPROVED' | 'POSTED' | 'CANCELLED';
 export type PayslipStatus = 'DRAFT' | 'APPROVED' | 'PAID' | 'CANCELLED';
 
 // Shift Types
@@ -1319,6 +1319,13 @@ export interface PayrollPeriodItem {
   endDate: string; // YYYY-MM-DD
   status: PayrollStatus;
   processedAt: string | null;
+  accountsApprovedAt?: string | null;
+  accountsApprovedByUserId?: string | null;
+  accountsApprovedByUserName?: string | null;
+  accountsApprovalNotes?: string | null;
+  adminApprovedAt?: string | null;
+  adminApprovedByUserId?: string | null;
+  adminApprovedByUserName?: string | null;
   postedAt: string | null;
   createdByUserId: string;
   createdByUserName?: string | null;
@@ -1328,6 +1335,10 @@ export interface PayrollPeriodItem {
   payslipsCount?: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface ApprovePayrollAccountsRequest {
+  notes?: string | null;
 }
 
 export interface CreatePayrollPeriodRequest {

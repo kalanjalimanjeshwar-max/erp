@@ -11,7 +11,15 @@ const __dirname = path.dirname(__filename);
 async function startServer() {
   console.log('\n[CoreERP] Initializing CoreERP Platform (Phase 1)...');
 
-  // 1. Environment validation
+  // 1. Resolve port: check CLI args (--port 3000) or default to 3000 for AI Studio dev server
+  const portArgIndex = process.argv.findIndex((arg) => arg === '--port' || arg === '-p');
+  if (portArgIndex !== -1 && process.argv[portArgIndex + 1]) {
+    process.env.PORT = process.argv[portArgIndex + 1];
+  } else if (!process.env.PORT || process.env.NODE_ENV !== 'production') {
+    process.env.PORT = '3000';
+  }
+
+  // Environment validation
   const config = validateEnv();
   console.log(`[CoreERP] Environment: ${config.NODE_ENV}`);
   console.log(`[CoreERP] Port: ${config.PORT}`);
@@ -39,7 +47,7 @@ async function startServer() {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       configFile: path.resolve(__dirname, 'vite.config.ts'),
-      server: { middlewareMode: true },
+      server: { middlewareMode: true, hmr: false },
       appType: 'spa',
     });
     app.use(vite.middlewares);
@@ -55,6 +63,14 @@ async function startServer() {
   const port = config.PORT || 3000;
   const server = app.listen(port, '0.0.0.0', () => {
     console.log(`[CoreERP] Server running at http://0.0.0.0:${port}`);
+  });
+
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[CoreERP] Port ${port} is already in use.`);
+    } else {
+      console.error('[CoreERP] Server error:', err);
+    }
   });
 
   // Graceful shutdown handling

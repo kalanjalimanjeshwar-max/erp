@@ -105,8 +105,9 @@ export class PermissionService {
     }
 
     // Check company-specific database override if available
+    let override: { isGranted: boolean } | null = null;
     try {
-      const override = await prisma.rolePermission.findUnique({
+      override = await prisma.rolePermission.findUnique({
         where: {
           companyId_role_module_action: {
             companyId,
@@ -116,15 +117,23 @@ export class PermissionService {
           },
         },
       });
-
-      if (override !== null) {
-        return override.isGranted;
-      }
-    } catch {
-      // Fallback to static matrix if database is unreachable or table uninitialized
+    } catch (error) {
+      // SEC-11-01 FAIL-CLOSED SECURITY FIX:
+      // An infrastructure error (connection failure, timeout, pool exhaustion, or database unavailable)
+      // must securely fail closed and deny access. Falling back to static defaults after a DB error
+      // would bypass explicit company DENY overrides (isGranted: false).
+      const safeErrorMessage = error instanceof Error ? error.message : 'Unknown database error';
+      console.error(
+        `[SECURITY ERROR] Database error evaluating permission for companyId=${companyId}, role=${role}, module=${module}, action=${action}: ${safeErrorMessage}. Failing closed (DENY).`
+      );
+      return false;
     }
 
-    // Default permission lookup
+    if (override !== null) {
+      return override.isGranted;
+    }
+
+    // Default permission lookup when no override exists and database query succeeded
     const roleModuleActions = DEFAULT_ROLE_PERMISSIONS[role]?.[module] || [];
     return roleModuleActions.includes(action);
   }
@@ -160,6 +169,13 @@ export class PermissionService {
       'FISCAL_PERIOD',
       'CURRENCY',
       'ACCOUNTING',
+      'QUOTATION',
+      'CUSTOMER',
+      'INVOICE',
+      'RECEIPT',
+      'EMPLOYEE',
+      'DEPARTMENT',
+      'DESIGNATION',
       'PAYROLL',
       'ATTENDANCE',
       'BIOMETRIC',

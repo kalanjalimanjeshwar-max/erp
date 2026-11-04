@@ -209,6 +209,33 @@ describe('Database Migration History & Integrity Tests', () => {
     expect(content).not.toMatch(/^\s*(BEGIN|COMMIT)\s*;/m);
   });
 
+  it('should include version-controlled Phase 1.3 migration (20261103000000_four_eyes_payroll_approval)', () => {
+    const migration11Sql = path.join(
+      migrationsDir,
+      '20261103000000_four_eyes_payroll_approval',
+      'migration.sql'
+    );
+    expect(fs.existsSync(migration11Sql)).toBe(true);
+
+    const content = fs.readFileSync(migration11Sql, 'utf-8');
+
+    // 1. Alter PayrollStatus enum to include ACCOUNTS_APPROVED
+    expect(content).toContain("ALTER TYPE \"PayrollStatus\" ADD VALUE IF NOT EXISTS 'ACCOUNTS_APPROVED';");
+
+    // 2. Adds accounts approval tracking columns
+    expect(content).toContain('"accountsApprovedAt"');
+    expect(content).toContain('"accountsApprovedByUserId"');
+    expect(content).toContain('"accountsApprovalNotes"');
+
+    // 3. Adds admin approval tracking columns
+    expect(content).toContain('"adminApprovedAt"');
+    expect(content).toContain('"adminApprovedByUserId"');
+
+    // 4. Foreign key constraints to User table
+    expect(content).toContain('FOREIGN KEY ("accountsApprovedByUserId")');
+    expect(content).toContain('FOREIGN KEY ("adminApprovedByUserId")');
+  });
+
   it('should verify migrations order sequentially', () => {
     const subdirs = fs
       .readdirSync(migrationsDir)
@@ -226,6 +253,7 @@ describe('Database Migration History & Integrity Tests', () => {
       '20261019000000_biometric_terminals_and_raw_punches',
       '20261030000000_persistent_admin_notifications',
       '20261031120000_role_enum_cleanup',
+      '20261103000000_four_eyes_payroll_approval',
     ]);
   });
 });

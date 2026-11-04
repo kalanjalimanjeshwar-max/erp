@@ -82,6 +82,11 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
   const [isPosting, setIsPosting] = useState<boolean>(false);
   const [isCancelling, setIsCancelling] = useState<boolean>(false);
 
+  // Accounts Approval Action State
+  const [isAccountsApproveModalOpen, setIsAccountsApproveModalOpen] = useState<boolean>(false);
+  const [accountsApprovalNotes, setAccountsApprovalNotes] = useState<string>('');
+  const [isApprovingAccounts, setIsApprovingAccounts] = useState<boolean>(false);
+
   // Post Period Modal
   const [isPostModalOpen, setIsPostModalOpen] = useState<boolean>(false);
   const [ledgers, setLedgers] = useState<AccountLedgerItem[]>([]);
@@ -266,11 +271,11 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
       setActionError('Processing payroll is unavailable in Preview Mode: PostgreSQL is offline in sandbox.');
       return;
     }
-    if (
-      !confirm(
-        `Calculate and process payslips for ${selectedPeriod.name || `${selectedPeriod.year}-${selectedPeriod.month}`}? This evaluates active employees, salary revisions, and deduplicated unpaid absences.`
-      )
-    ) {
+    const isAccountsApproved = selectedPeriod.status === 'ACCOUNTS_APPROVED';
+    const promptMsg = isAccountsApproved
+      ? `Recalculate payslips for ${selectedPeriod.name || `${selectedPeriod.year}-${selectedPeriod.month}`}? WARNING: This period is currently ACCOUNTS_APPROVED. Recalculation will invalidate previous Accounts approval and return status to PROCESSED.`
+      : `Calculate and process payslips for ${selectedPeriod.name || `${selectedPeriod.year}-${selectedPeriod.month}`}? This evaluates active employees, salary revisions, and deduplicated unpaid absences.`;
+    if (!confirm(promptMsg)) {
       return;
     }
 
@@ -285,6 +290,39 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
       setActionError((err as Error).message || 'Failed to process payroll period.');
     } finally {
       setIsProcessing(false);
+    }
+  };
+
+  // Open Accounts Approval Modal
+  const handleOpenAccountsApproveModal = () => {
+    setAccountsApprovalNotes('');
+    setActionError(null);
+    setIsAccountsApproveModalOpen(true);
+  };
+
+  // Confirm Accounts Approval
+  const handleConfirmAccountsApprove = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedPeriod) return;
+    if (currentUser?.isPreview) {
+      setActionError('Accounts approval is unavailable in Preview Mode: PostgreSQL is offline in sandbox.');
+      return;
+    }
+
+    setIsApprovingAccounts(true);
+    setActionError(null);
+    try {
+      const updated = await api.approvePayrollAccounts(selectedPeriod.id, {
+        notes: accountsApprovalNotes.trim() || undefined,
+      });
+      setSelectedPeriod(updated);
+      setIsAccountsApproveModalOpen(false);
+      loadPeriods();
+      loadPeriodPayslips(updated.id);
+    } catch (err: unknown) {
+      setActionError((err as Error).message || 'Failed to grant Accounts approval.');
+    } finally {
+      setIsApprovingAccounts(false);
     }
   };
 
@@ -353,6 +391,8 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
       case 'PAID':
       case 'APPROVED':
         return 'text-emerald-400';
+      case 'ACCOUNTS_APPROVED':
+        return 'text-cyan-400';
       case 'PROCESSED':
         return 'text-sky-400';
       case 'DRAFT':
@@ -598,6 +638,7 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                     <option value="">All Statuses</option>
                     <option value="DRAFT">Draft</option>
                     <option value="PROCESSED">Processed</option>
+                    <option value="ACCOUNTS_APPROVED">Accounts Approved</option>
                     <option value="POSTED">Posted to GL</option>
                     <option value="CANCELLED">Cancelled</option>
                   </select>
@@ -730,54 +771,241 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                 </div>
 
                 {/* Status-Driven Lifecycle Actions */}
-                <div className="flex flex-wrap items-center gap-2.5">
-                  {/* Recalculate / Process button (Only if DRAFT or PROCESSED) */}
-                  {selectedPeriod.status !== 'POSTED' && selectedPeriod.status !== 'CANCELLED' && (
-                    <button
-                      onClick={handleProcessPeriod}
-                      disabled={isProcessing}
-                      className="px-3 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-50"
-                      title="Run calculation engine against employee revisions and attendance records"
-                    >
-                      <Play className={`w-3.5 h-3.5 ${isProcessing ? 'animate-spin' : ''}`} />
-                      <span>{selectedPeriod.status === 'PROCESSED' ? 'Recalculate Period' : 'Process Payroll'}</span>
-                    </button>
-                  )}
+                {(() => {
+                  const currentUserId = currentUser.id || (currentUser as unknown as { userId?: string }).userId;
+                  const isAccountsApprover = Boolean(
+                    selectedPeriod.accountsApprovedByUserId &&
+                      selectedPeriod.accountsApprovedByUserId === currentUserId
+                  );
 
-                  {/* Post to GL (Only if PROCESSED) */}
-                  {selectedPeriod.status === 'PROCESSED' && (
-                    <button
-                      onClick={handleOpenPostModal}
-                      disabled={isPosting}
-                      className="px-3.5 py-1.5 text-xs font-medium text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-50"
-                      title="Generate and post balanced double-entry journal entry to GL"
-                    >
-                      <BookOpen className="w-3.5 h-3.5" />
-                      <span>Post to General Ledger</span>
-                    </button>
-                  )}
+                  return (
+                    <div className="flex flex-col items-end gap-2.5">
+                      <div className="flex flex-wrap items-center gap-2.5">
+                        {/* Recalculate / Process button (Only if DRAFT, PROCESSED, or ACCOUNTS_APPROVED) */}
+                        {selectedPeriod.status !== 'POSTED' && selectedPeriod.status !== 'CANCELLED' && (
+                          <button
+                            onClick={handleProcessPeriod}
+                            disabled={isProcessing}
+                            className="px-3 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-50"
+                            title="Run calculation engine against employee revisions and attendance records"
+                          >
+                            <Play className={`w-3.5 h-3.5 ${isProcessing ? 'animate-spin' : ''}`} />
+                            <span>
+                              {selectedPeriod.status === 'DRAFT'
+                                ? 'Process Payroll'
+                                : 'Recalculate Period'}
+                            </span>
+                          </button>
+                        )}
 
-                  {/* Cancel button (Only if DRAFT or PROCESSED) */}
-                  {selectedPeriod.status !== 'POSTED' && selectedPeriod.status !== 'CANCELLED' && (
-                    <button
-                      onClick={handleCancelPeriod}
-                      disabled={isCancelling}
-                      className="px-3 py-1.5 text-xs font-medium text-rose-300 bg-rose-950/60 border border-rose-800 hover:bg-rose-900/80 rounded-lg transition-colors disabled:opacity-50"
-                    >
-                      Cancel Period
-                    </button>
-                  )}
+                        {/* Stage 1: Accounts Approval (Available when PROCESSED) */}
+                        {selectedPeriod.status === 'PROCESSED' && (
+                          <button
+                            onClick={handleOpenAccountsApproveModal}
+                            className="px-3.5 py-1.5 text-xs font-medium text-white bg-cyan-600 hover:bg-cyan-500 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm"
+                            title="Review and grant Accounts approval (requires ACCOUNTING:APPROVE)"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            <span>Approve Accounts</span>
+                          </button>
+                        )}
 
-                  {/* If Posted, Link to Journals */}
-                  {selectedPeriod.status === 'POSTED' && onNavigateToJournals && (
-                    <button
-                      onClick={onNavigateToJournals}
-                      className="px-3.5 py-1.5 text-xs font-medium text-indigo-300 bg-indigo-950 border border-indigo-800 rounded-lg hover:bg-indigo-900 transition flex items-center gap-1.5"
-                    >
-                      <BookOpen className="w-3.5 h-3.5" />
-                      <span>View GL Journal Postings</span>
-                    </button>
-                  )}
+                        {/* Stage 2: Post to GL (Available when ACCOUNTS_APPROVED) */}
+                        {selectedPeriod.status === 'ACCOUNTS_APPROVED' && (
+                          <button
+                            onClick={handleOpenPostModal}
+                            disabled={isPosting || isAccountsApprover}
+                            className={`px-3.5 py-1.5 text-xs font-medium rounded-lg transition-colors flex items-center gap-1.5 shadow-sm ${
+                              isAccountsApprover
+                                ? 'bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed opacity-75'
+                                : 'text-white bg-emerald-600 hover:bg-emerald-500'
+                            }`}
+                            title={
+                              isAccountsApprover
+                                ? 'Four-Eyes Dual Approval: You approved this period in Accounts stage. A distinct administrator must authorize final posting.'
+                                : 'Post to General Ledger and lock period (requires PAYROLL:APPROVE)'
+                            }
+                          >
+                            {isAccountsApprover ? (
+                              <Lock className="w-3.5 h-3.5" />
+                            ) : (
+                              <BookOpen className="w-3.5 h-3.5" />
+                            )}
+                            <span>Post to General Ledger</span>
+                          </button>
+                        )}
+
+                        {/* Cancel button (Only if DRAFT, PROCESSED, or ACCOUNTS_APPROVED) */}
+                        {selectedPeriod.status !== 'POSTED' && selectedPeriod.status !== 'CANCELLED' && (
+                          <button
+                            onClick={handleCancelPeriod}
+                            disabled={isCancelling}
+                            className="px-3 py-1.5 text-xs font-medium text-rose-300 bg-rose-950/60 border border-rose-800 hover:bg-rose-900/80 rounded-lg transition-colors disabled:opacity-50"
+                          >
+                            Cancel Period
+                          </button>
+                        )}
+
+                        {/* If Posted, Link to Journals */}
+                        {selectedPeriod.status === 'POSTED' && onNavigateToJournals && (
+                          <button
+                            onClick={onNavigateToJournals}
+                            className="px-3.5 py-1.5 text-xs font-medium text-indigo-300 bg-indigo-950 border border-indigo-800 rounded-lg hover:bg-indigo-900 transition flex items-center gap-1.5"
+                          >
+                            <BookOpen className="w-3.5 h-3.5" />
+                            <span>View GL Journal Postings</span>
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Four-Eyes Warning Banner when user is the Accounts Approver */}
+                      {selectedPeriod.status === 'ACCOUNTS_APPROVED' && isAccountsApprover && (
+                        <div className="w-full bg-amber-950/40 border border-amber-800/80 rounded-lg p-2.5 text-xs text-amber-200 flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4 text-amber-400 shrink-0" />
+                          <span>
+                            <strong>Four-Eyes Security Policy:</strong> You provided Accounts approval for this period. In accordance with dual-control governance, a distinct administrator with PAYROLL:APPROVE must authorize final posting.
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </div>
+
+              {/* Four-Eyes Dual Approval Governance Timeline */}
+              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
+                <div className="flex items-center justify-between border-b border-slate-800/80 pb-2">
+                  <span className="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-2">
+                    <CheckCircle2 className="w-4 h-4 text-indigo-400" />
+                    <span>Four-Eyes Dual Approval Governance</span>
+                  </span>
+                  <span className="text-[11px] text-slate-500 font-mono">
+                    Enforced: Accounts &amp; Admin Approvals by Distinct Users
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-xs">
+                  {/* Stage 1: Accounts Approval */}
+                  <div
+                    className={`p-3 rounded-lg border ${
+                      selectedPeriod.accountsApprovedAt
+                        ? 'bg-cyan-950/20 border-cyan-800/60'
+                        : selectedPeriod.status === 'PROCESSED'
+                        ? 'bg-slate-900 border-amber-800/60'
+                        : 'bg-slate-900/40 border-slate-800/60'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-slate-200 flex items-center gap-1.5">
+                        <span className="w-5 h-5 rounded-full bg-cyan-900/60 border border-cyan-700 text-cyan-300 flex items-center justify-center text-[10px] font-bold">
+                          1
+                        </span>
+                        <span>Stage 1: Accounts Approval</span>
+                      </span>
+                      <span
+                        className={`px-2 py-0.5 rounded text-[10px] font-semibold font-mono ${
+                          selectedPeriod.accountsApprovedAt
+                            ? 'bg-cyan-950 text-cyan-300 border border-cyan-800'
+                            : 'bg-slate-800 text-slate-400'
+                        }`}
+                      >
+                        {selectedPeriod.accountsApprovedAt ? 'APPROVED' : 'PENDING'}
+                      </span>
+                    </div>
+                    <div className="mt-2 text-[11px] text-slate-400 space-y-0.5">
+                      <div>
+                        Required Permission:{' '}
+                        <span className="font-mono text-slate-300">ACCOUNTING:APPROVE</span>
+                      </div>
+                      {selectedPeriod.accountsApprovedAt ? (
+                        <>
+                          <div>
+                            Approver:{' '}
+                            <strong className="text-slate-200">
+                              {selectedPeriod.accountsApprovedByUserName ||
+                                selectedPeriod.accountsApprovedByUserId}
+                            </strong>
+                          </div>
+                          <div>
+                            Timestamp:{' '}
+                            <span className="font-mono tabular-nums text-slate-300">
+                              {new Date(selectedPeriod.accountsApprovedAt).toLocaleString()}
+                            </span>
+                          </div>
+                          {selectedPeriod.accountsApprovalNotes && (
+                            <div className="italic text-slate-400 mt-1">
+                              Notes: &quot;{selectedPeriod.accountsApprovalNotes}&quot;
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        <div className="text-slate-500 mt-1">
+                          {selectedPeriod.status === 'PROCESSED'
+                            ? 'Awaiting review and approval by Accounting.'
+                            : 'Requires period to be in PROCESSED status.'}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Stage 2: Admin Posting Approval */}
+                  <div
+                    className={`p-3 rounded-lg border ${
+                      selectedPeriod.adminApprovedAt || selectedPeriod.status === 'POSTED'
+                        ? 'bg-emerald-950/20 border-emerald-800/60'
+                        : selectedPeriod.status === 'ACCOUNTS_APPROVED'
+                        ? 'bg-slate-900 border-indigo-800/60'
+                        : 'bg-slate-900/40 border-slate-800/60'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-slate-200 flex items-center gap-1.5">
+                        <span className="w-5 h-5 rounded-full bg-emerald-900/60 border border-emerald-700 text-emerald-300 flex items-center justify-center text-[10px] font-bold">
+                          2
+                        </span>
+                        <span>Stage 2: Admin GL Posting</span>
+                      </span>
+                      <span
+                        className={`px-2 py-0.5 rounded text-[10px] font-semibold font-mono ${
+                          selectedPeriod.adminApprovedAt || selectedPeriod.status === 'POSTED'
+                            ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
+                            : 'bg-slate-800 text-slate-400'
+                        }`}
+                      >
+                        {selectedPeriod.status === 'POSTED' ? 'POSTED & LOCKED' : 'PENDING'}
+                      </span>
+                    </div>
+                    <div className="mt-2 text-[11px] text-slate-400 space-y-0.5">
+                      <div>
+                        Required Permission:{' '}
+                        <span className="font-mono text-slate-300">PAYROLL:APPROVE</span>
+                      </div>
+                      {selectedPeriod.adminApprovedAt || selectedPeriod.status === 'POSTED' ? (
+                        <>
+                          <div>
+                            Approver:{' '}
+                            <strong className="text-slate-200">
+                              {selectedPeriod.adminApprovedByUserName || 'Admin'}
+                            </strong>
+                          </div>
+                          <div>
+                            Timestamp:{' '}
+                            <span className="font-mono tabular-nums text-slate-300">
+                              {new Date(
+                                selectedPeriod.adminApprovedAt || selectedPeriod.postedAt || ''
+                              ).toLocaleString()}
+                            </span>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="text-slate-500 mt-1">
+                          {selectedPeriod.status === 'ACCOUNTS_APPROVED'
+                            ? 'Ready for final posting by distinct administrator.'
+                            : 'Locked until Stage 1 Accounts Approval completes.'}
+                        </div>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
 
@@ -1177,6 +1405,93 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                   className="px-4 py-2 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition disabled:opacity-50"
                 >
                   {isSubmittingPeriod ? 'Creating Period...' : 'Establish Period'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================================================= */}
+      {/* MODAL: ACCOUNTS APPROVAL CONFIRMATION                                     */}
+      {/* ========================================================================= */}
+      {isAccountsApproveModalOpen && selectedPeriod && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-lg w-full p-6 space-y-5 shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-sm font-bold text-cyan-400 flex items-center gap-2">
+                <CheckCircle2 className="w-4 h-4" />
+                <span>Stage 1: Grant Accounts Approval</span>
+              </h3>
+              <button
+                onClick={() => setIsAccountsApproveModalOpen(false)}
+                className="text-slate-400 hover:text-slate-200"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="text-xs text-slate-300 space-y-3">
+              <p>
+                Grant Accounts approval for period <strong className="text-white">{selectedPeriod.name}</strong>.
+                This certifies that earnings, attendance deductions, and net disbursements have been verified by accounting.
+              </p>
+              <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg space-y-1.5 font-mono text-[11px]">
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Total Gross Pay:</span>
+                  <span className="text-slate-200">${selectedPeriod.totalGross}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Total Deductions:</span>
+                  <span className="text-rose-400">${selectedPeriod.totalDeductions}</span>
+                </div>
+                <div className="flex justify-between font-bold">
+                  <span className="text-slate-300">Total Net Payable:</span>
+                  <span className="text-emerald-400">${selectedPeriod.totalNet}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span className="text-slate-400">Employee Payslips:</span>
+                  <span className="text-slate-200">{selectedPeriod.payslipsCount || 0}</span>
+                </div>
+              </div>
+
+              <div className="p-2.5 bg-amber-950/40 border border-amber-800/80 rounded-lg text-amber-200 text-[11px] flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <span>
+                  <strong>Four-Eyes Policy Notice:</strong> Once you grant Accounts approval, you will be recorded as the Stage 1 Approver. Under corporate governance rules, you cannot authorize the Stage 2 General Ledger posting for this period. A distinct administrator must post.
+                </span>
+              </div>
+            </div>
+
+            <form onSubmit={handleConfirmAccountsApprove} className="space-y-4 pt-2 border-t border-slate-800">
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1">
+                  Approval Notes / Audit Reference (Optional)
+                </label>
+                <textarea
+                  value={accountsApprovalNotes}
+                  onChange={(e) => setAccountsApprovalNotes(e.target.value)}
+                  placeholder="e.g., Verified timesheets and absence reconciliations for all engineering and operations staff."
+                  rows={3}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-cyan-500 placeholder:text-slate-600"
+                />
+              </div>
+
+              <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => setIsAccountsApproveModalOpen(false)}
+                  className="px-3.5 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 rounded-lg transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isApprovingAccounts}
+                  className="px-4 py-2 text-xs font-medium text-white bg-cyan-600 hover:bg-cyan-500 rounded-lg transition disabled:opacity-50 flex items-center gap-1.5"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>{isApprovingAccounts ? 'Recording Approval...' : 'Confirm Accounts Approval'}</span>
                 </button>
               </div>
             </form>

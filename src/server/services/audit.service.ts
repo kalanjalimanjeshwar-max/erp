@@ -69,9 +69,11 @@ export interface CreateAuditEntryInput {
 
 export class AuditService {
   /**
-   * Persists an audit log entry after strictly sanitizing all metadata to prevent secret leakage
+   * Persists an audit log entry after strictly sanitizing all metadata to prevent secret leakage.
+   * Supports an optional Prisma transaction client (txClient) to enable atomic audit logging
+   * within database business transactions. If omitted, uses the default global prisma client.
    */
-  static async log(input: CreateAuditEntryInput) {
+  static async log(input: CreateAuditEntryInput, txClient?: any) {
     let sanitizedDetails: string | undefined = undefined;
     const rawData = input.metadata ?? input.details;
 
@@ -88,7 +90,8 @@ export class AuditService {
       }
     }
 
-    return prisma.auditLog.create({
+    const client = (txClient || prisma) as typeof prisma;
+    return client.auditLog.create({
       data: {
         companyId: input.companyId || null,
         userId: input.userId || null,

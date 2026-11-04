@@ -14,6 +14,7 @@ import { UnpaidAbsenceService } from './unpaid-absence.service.js';
 import { LeaveService } from './leave.service.js';
 import { JournalService } from './journal.service.js';
 import { AuditService } from './audit.service.js';
+import { PermissionService } from './permission.service.js';
 
 export class PayrollService {
   /**
@@ -62,6 +63,8 @@ export class PayrollService {
       orderBy: [{ year: 'desc' }, { month: 'desc' }],
       include: {
         createdByUser: { select: { fullName: true } },
+        accountsApprovedByUser: { select: { fullName: true } },
+        adminApprovedByUser: { select: { fullName: true } },
         payslips: {
           select: { grossSalary: true, deductions: true, netSalary: true },
         },
@@ -89,6 +92,13 @@ export class PayrollService {
         endDate: p.endDate.toISOString().split('T')[0],
         status: p.status as PayrollStatus,
         processedAt: p.processedAt ? p.processedAt.toISOString() : null,
+        accountsApprovedAt: (p as any).accountsApprovedAt ? (p as any).accountsApprovedAt.toISOString() : null,
+        accountsApprovedByUserId: (p as any).accountsApprovedByUserId || null,
+        accountsApprovedByUserName: (p as any).accountsApprovedByUser?.fullName || null,
+        accountsApprovalNotes: (p as any).accountsApprovalNotes || null,
+        adminApprovedAt: (p as any).adminApprovedAt ? (p as any).adminApprovedAt.toISOString() : null,
+        adminApprovedByUserId: (p as any).adminApprovedByUserId || null,
+        adminApprovedByUserName: (p as any).adminApprovedByUser?.fullName || null,
         postedAt: p.postedAt ? p.postedAt.toISOString() : null,
         createdByUserId: p.createdByUserId,
         createdByUserName: p.createdByUser?.fullName || null,
@@ -117,6 +127,8 @@ export class PayrollService {
       where: { id },
       include: {
         createdByUser: { select: { fullName: true } },
+        accountsApprovedByUser: { select: { fullName: true } },
+        adminApprovedByUser: { select: { fullName: true } },
         payslips: {
           select: { grossSalary: true, deductions: true, netSalary: true },
         },
@@ -149,6 +161,13 @@ export class PayrollService {
       endDate: p.endDate.toISOString().split('T')[0],
       status: p.status as PayrollStatus,
       processedAt: p.processedAt ? p.processedAt.toISOString() : null,
+      accountsApprovedAt: (p as any).accountsApprovedAt ? (p as any).accountsApprovedAt.toISOString() : null,
+      accountsApprovedByUserId: (p as any).accountsApprovedByUserId || null,
+      accountsApprovedByUserName: (p as any).accountsApprovedByUser?.fullName || null,
+      accountsApprovalNotes: (p as any).accountsApprovalNotes || null,
+      adminApprovedAt: (p as any).adminApprovedAt ? (p as any).adminApprovedAt.toISOString() : null,
+      adminApprovedByUserId: (p as any).adminApprovedByUserId || null,
+      adminApprovedByUserName: (p as any).adminApprovedByUser?.fullName || null,
       postedAt: p.postedAt ? p.postedAt.toISOString() : null,
       createdByUserId: p.createdByUserId,
       createdByUserName: p.createdByUser?.fullName || null,
@@ -396,6 +415,47 @@ export class PayrollService {
 
     // Atomically recalculate and replace payslips
     await prisma.$transaction(async (tx) => {
+      // Concurrency lock & atomic state revalidation inside the interactive transaction
+      if (typeof (tx as any).$queryRaw === 'function') {
+        await (tx as any).$queryRaw`SELECT id FROM "PayrollPeriod" WHERE id = ${period.id}::uuid FOR UPDATE`;
+      }
+
+      const currentInTx = typeof tx.payrollPeriod?.findUnique === 'function'
+        ? await tx.payrollPeriod.findUnique({ where: { id: period.id } })
+        : period;
+
+      if (!currentInTx || currentInTx.companyId !== actor.companyId) {
+        const err = new Error('Payroll period not found in this company.');
+        (err as { statusCode?: number }).statusCode = 404;
+        throw err;
+      }
+
+      // Explicit fail-safe: Once POSTED, a period is strictly immutable
+      if (currentInTx.status === 'POSTED') {
+        const err = new Error('Posted payroll period cannot be recalculated or modified.');
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+
+      if (currentInTx.status === 'CANCELLED') {
+        const err = new Error('Cancelled payroll period cannot be processed.');
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+
+      // Valid recalculation states: DRAFT, PROCESSED, or ACCOUNTS_APPROVED (which resets approval atomically)
+      if (
+        currentInTx.status !== 'DRAFT' &&
+        currentInTx.status !== 'PROCESSED' &&
+        currentInTx.status !== 'ACCOUNTS_APPROVED'
+      ) {
+        const err = new Error(
+          `Cannot recalculate payroll period: Current status is '${currentInTx.status}'.`
+        );
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+
       // 1. Delete existing draft payslips for this period to prevent duplication
       await tx.payslip.deleteMany({
         where: { payrollPeriodId: period.id },
@@ -534,12 +594,17 @@ export class PayrollService {
         });
       }
 
-      // 4. Transition period status to PROCESSED
+      // 4. Transition period status to PROCESSED and atomically invalidate previous approvals
       await tx.payrollPeriod.update({
         where: { id: period.id },
         data: {
           status: 'PROCESSED',
           processedAt: new Date(),
+          accountsApprovedAt: null,
+          accountsApprovedByUserId: null,
+          accountsApprovalNotes: null,
+          adminApprovedAt: null,
+          adminApprovedByUserId: null,
         },
       });
     });
@@ -796,6 +861,135 @@ export class PayrollService {
   }
 
   /**
+   * Stage 1 of Four-Eyes Dual Approval:
+   * Explicit Accounts Approval for a PROCESSED payroll period
+   * Requires ACCOUNTING:APPROVE permission.
+   */
+  static async approveAccounts(
+    actor: AuthUser,
+    id: string,
+    notes?: string | null,
+    correlationId?: string
+  ): Promise<PayrollPeriodItem> {
+    // Verify permission
+    const hasPerm = await PermissionService.hasPermission(
+      actor.companyId,
+      actor.role,
+      'ACCOUNTING',
+      'APPROVE'
+    );
+    if (!hasPerm) {
+      const err = new Error(
+        'Forbidden: Accounts approval requires ACCOUNTING:APPROVE permission.'
+      );
+      (err as { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
+    const period = await prisma.payrollPeriod.findUnique({
+      where: { id },
+      include: {
+        payslips: { select: { id: true } },
+      },
+    });
+
+    if (!period || period.companyId !== actor.companyId) {
+      const err = new Error('Payroll period not found in this company.');
+      (err as { statusCode?: number }).statusCode = 404;
+      throw err;
+    }
+
+    if (period.status === 'POSTED') {
+      const err = new Error('Posted payroll period is finalized and cannot be modified.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (period.status === 'CANCELLED') {
+      const err = new Error('Cancelled payroll period cannot be approved.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (period.status === 'ACCOUNTS_APPROVED') {
+      const err = new Error(
+        'Payroll period has already received Accounts approval. Duplicate approval is not permitted.'
+      );
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (period.status !== 'PROCESSED') {
+      const err = new Error(
+        `Payroll period must be processed before Accounts approval. Current status is '${period.status}'.`
+      );
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (!period.payslips || period.payslips.length === 0) {
+      const err = new Error('Cannot approve an empty payroll period with zero payslips.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    const approverId = actor.userId || actor.id;
+    const trimmedNotes = notes ? notes.trim().slice(0, 500) : null;
+
+    // Concurrency & state safety: update atomically inside transaction
+    await prisma.$transaction(async (tx) => {
+      // Row lock on PayrollPeriod (ordered lock acquisition)
+      if (typeof (tx as any).$queryRaw === 'function') {
+        await (tx as any).$queryRaw`SELECT id FROM "PayrollPeriod" WHERE id = ${period.id}::uuid FOR UPDATE`;
+      }
+
+      const current = typeof tx.payrollPeriod?.findUnique === 'function'
+        ? await tx.payrollPeriod.findUnique({
+            where: { id: period.id },
+            select: { status: true },
+          })
+        : period;
+
+      if (!current || current.status !== 'PROCESSED') {
+        const err = new Error(
+          `Concurrent conflict: Payroll period is no longer in PROCESSED status (current: '${current?.status}').`
+        );
+        (err as { statusCode?: number }).statusCode = 409;
+        throw err;
+      }
+
+      await tx.payrollPeriod.update({
+        where: { id: period.id },
+        data: {
+          status: 'ACCOUNTS_APPROVED',
+          accountsApprovedAt: new Date(),
+          accountsApprovedByUserId: approverId,
+          accountsApprovalNotes: trimmedNotes,
+        },
+      });
+
+      // Atomic audit log inside transaction: commits or rolls back together with approval
+      await AuditService.log({
+        companyId: actor.companyId,
+        userId: approverId,
+        action: 'PAYROLL_ACCOUNTS_APPROVED',
+        entity: 'PayrollPeriod',
+        entityId: period.id,
+        correlationId,
+        details: {
+          year: period.year,
+          month: period.month,
+          name: period.name,
+          accountsApprovedByUserId: approverId,
+          notes: trimmedNotes,
+        },
+      }, tx);
+    });
+
+    return this.getPeriodById(actor, period.id);
+  }
+
+  /**
    * Posts a processed payroll period into the double-entry accounting journal
    * Ensures idempotency and strict debit === credit balance
    */
@@ -827,11 +1021,49 @@ export class PayrollService {
       return this.getPeriodById(actor, period.id);
     }
 
-    if (period.status !== 'PROCESSED') {
+    if (period.status === 'CANCELLED') {
+      const err = new Error('Cancelled payroll period cannot be posted.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (period.status === 'DRAFT') {
+      const err = new Error('Cannot post payroll: Period must be processed and receive Accounts approval first.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (period.status === 'PROCESSED') {
       const err = new Error(
-        `Only PROCESSED payroll periods can be posted to accounting. Current status is '${period.status}'. Please process the period first.`
+        'Cannot post payroll: Period must receive Accounts approval (ACCOUNTING:APPROVE) prior to final Admin posting.'
       );
       (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (period.status !== 'ACCOUNTS_APPROVED') {
+      const err = new Error(
+        `Cannot post payroll: Period must be in ACCOUNTS_APPROVED status. Current status is '${period.status}'.`
+      );
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (!period.accountsApprovedByUserId) {
+      const err = new Error(
+        'Cannot post payroll: Missing Accounts approver record. Accounts approval must be completed before posting.'
+      );
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    // Four-Eyes Invariant: The same individual cannot provide both Accounts and Admin approvals
+    const currentUserId = actor.userId || actor.id;
+    if (period.accountsApprovedByUserId === currentUserId) {
+      const err = new Error(
+        'Four-Eyes Security Violation: The same individual cannot provide both Accounts and Admin approvals. A distinct administrator must authorize final posting.'
+      );
+      (err as { statusCode?: number }).statusCode = 403;
       throw err;
     }
 
@@ -947,8 +1179,55 @@ export class PayrollService {
     let createdVoucherNumber = '';
 
     // ATOMIC DATABASE TRANSACTION:
-    // Journal creation and period status transition execute in a SINGLE database transaction
+    // Row lock, journal creation, period status transition, and audit log execute in a SINGLE database transaction
     await prisma.$transaction(async (tx) => {
+      // Concurrency lock: acquire exclusive row lock on PayrollPeriod first (ordered lock acquisition)
+      if (typeof (tx as any).$queryRaw === 'function') {
+        await (tx as any).$queryRaw`SELECT id FROM "PayrollPeriod" WHERE id = ${period.id}::uuid FOR UPDATE`;
+      }
+
+      // Concurrency check inside transaction: re-verify status and approvers under lock
+      const currentInTx = typeof tx.payrollPeriod?.findUnique === 'function'
+        ? await tx.payrollPeriod.findUnique({
+            where: { id: period.id },
+          })
+        : period;
+
+      if (!currentInTx || currentInTx.companyId !== actor.companyId) {
+        const err = new Error('Payroll period not found in this company.');
+        (err as { statusCode?: number }).statusCode = 404;
+        throw err;
+      }
+
+      // Idempotency check under lock:
+      // If another concurrent request posted this period while waiting for the lock,
+      // exit gracefully without duplicate GL entries or status updates.
+      if (currentInTx.status === 'POSTED') {
+        return;
+      }
+
+      if (currentInTx.status !== 'ACCOUNTS_APPROVED') {
+        const err = new Error(
+          `Cannot post payroll: Period must be in ACCOUNTS_APPROVED status. Current status is '${currentInTx.status}'.`
+        );
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+      if (!currentInTx.accountsApprovedByUserId) {
+        const err = new Error(
+          'Cannot post payroll: Missing Accounts approver record. Accounts approval must be completed before posting.'
+        );
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+      if (currentInTx.accountsApprovedByUserId === currentUserId) {
+        const err = new Error(
+          'Four-Eyes Security Violation: The same individual cannot provide both Accounts and Admin approvals. A distinct administrator must authorize final posting.'
+        );
+        (err as { statusCode?: number }).statusCode = 403;
+        throw err;
+      }
+
       // 1. Create and post journal passing the active transaction client
       const journal = await JournalService.createJournal(
         actor,
@@ -978,6 +1257,8 @@ export class PayrollService {
         data: {
           status: 'POSTED',
           postedAt: new Date(),
+          adminApprovedAt: new Date(),
+          adminApprovedByUserId: currentUserId,
         },
       });
 
@@ -989,21 +1270,24 @@ export class PayrollService {
           paymentDate: period.endDate,
         },
       });
-    });
 
-    await AuditService.log({
-      companyId: actor.companyId,
-      userId: actor.userId || actor.id,
-      action: 'PAYROLL_PERIOD_POST',
-      entity: 'PayrollPeriod',
-      entityId: period.id,
-      correlationId,
-      details: {
-        journalEntryId: createdJournalId,
-        voucherNumber: createdVoucherNumber,
-        totalGross: AccountingMath.format(totalGross, 2),
-        totalNet: AccountingMath.format(totalNet, 2),
-      },
+      // 3. In-transaction atomic audit logging: commits or rolls back together with posting
+      await AuditService.log({
+        companyId: actor.companyId,
+        userId: actor.userId || actor.id,
+        action: 'PAYROLL_PERIOD_POST',
+        entity: 'PayrollPeriod',
+        entityId: period.id,
+        correlationId,
+        details: {
+          journalEntryId: createdJournalId,
+          voucherNumber: createdVoucherNumber,
+          totalGross: AccountingMath.format(totalGross, 2),
+          totalNet: AccountingMath.format(totalNet, 2),
+          accountsApprovedByUserId: currentInTx.accountsApprovedByUserId,
+          adminApprovedByUserId: currentUserId,
+        },
+      }, tx);
     });
 
     return this.getPeriodById(actor, period.id);

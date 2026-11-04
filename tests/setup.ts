@@ -77,3 +77,23 @@ if (!process.env.TEST_DATABASE_URL) {
 if (!process.env.SESSION_SECRET) {
   process.env.SESSION_SECRET = 'test_isolated_session_secret_not_for_production_min32chars';
 }
+
+// 5. Default stub for rolePermission in isolated non-connecting test runs
+// Prevents offline database connection failures from blocking permission resolution
+// in tests that do not connect to a live postgres database.
+import { beforeAll, vi } from 'vitest';
+
+beforeAll(async () => {
+  const { prisma } = await import('../src/server/db/client.js');
+  if (prisma?.rolePermission) {
+    if ('findUnique' in prisma.rolePermission) {
+      vi.spyOn(prisma.rolePermission, 'findUnique').mockResolvedValue(null);
+    }
+    if ('findMany' in prisma.rolePermission) {
+      vi.spyOn(prisma.rolePermission, 'findMany').mockResolvedValue([]);
+    }
+  }
+});
+
+
+

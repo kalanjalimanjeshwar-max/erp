@@ -188,6 +188,7 @@ apiRouter.get('/payroll/periods', requireAuth, requirePermission('PAYROLL', 'VIE
 apiRouter.get('/payroll/periods/:id', requireAuth, requirePermission('PAYROLL', 'VIEW'), PayrollController.getPeriodById);
 apiRouter.post('/payroll/periods', requireAuth, requirePermission('PAYROLL', 'CREATE'), PayrollController.createPeriod);
 apiRouter.post('/payroll/periods/:id/process', requireAuth, requirePermission('PAYROLL', 'EDIT'), PayrollController.processPeriod);
+apiRouter.post('/payroll/periods/:id/approve-accounts', requireAuth, requirePermission('ACCOUNTING', 'APPROVE'), PayrollController.approveAccounts);
 apiRouter.post('/payroll/periods/:id/post', requireAuth, requirePermission('PAYROLL', 'APPROVE'), PayrollController.postPeriod);
 apiRouter.post('/payroll/periods/:id/cancel', requireAuth, requirePermission('PAYROLL', 'EDIT'), PayrollController.cancelPeriod);
 apiRouter.get('/payroll/periods/:id/payslips', requireAuth, requirePermission('PAYROLL', 'VIEW'), PayrollController.listPayslips);

@@ -23,10 +23,17 @@ const MODULES: { id: AppModule; label: string; desc: string }[] = [
   { id: 'AUDIT_LOG', label: 'Audit Trail', desc: 'Tamper-evident system activity logs' },
   { id: 'FISCAL_PERIOD', label: 'Fiscal Periods', desc: 'Financial period locks and dates' },
   { id: 'CURRENCY', label: 'Currency Config', desc: 'Multi-currency rates and decimal precision' },
-  { id: 'ACCOUNTING', label: 'Accounting (Phase 4)', desc: 'General ledger and vouchers' },
-  { id: 'PAYROLL', label: 'Payroll (Future)', desc: 'Salary batches and payslips' },
-  { id: 'ATTENDANCE', label: 'Attendance (Future)', desc: 'Shifts, clock-ins, leave requests' },
-  { id: 'BIOMETRIC', label: 'Biometrics (Future)', desc: 'Hardware terminal daemon config' },
+  { id: 'ACCOUNTING', label: 'Accounting', desc: 'General ledger, charts of accounts, and vouchers' },
+  { id: 'QUOTATION', label: 'Quotations', desc: 'Sales quotes and customer estimates' },
+  { id: 'CUSTOMER', label: 'Customer Directory', desc: 'Customer accounts, tax details, and contacts' },
+  { id: 'INVOICE', label: 'Sales Invoices', desc: 'Customer billing, invoicing, and revenue posting' },
+  { id: 'RECEIPT', label: 'Customer Receipts', desc: 'Payment receipt allocation and settlement' },
+  { id: 'EMPLOYEE', label: 'Employee Master', desc: 'Staff records, salary revisions, and user linking' },
+  { id: 'DEPARTMENT', label: 'Departments', desc: 'Organizational departments and hierarchy' },
+  { id: 'DESIGNATION', label: 'Designations', desc: 'Job titles, ranks, and operational levels' },
+  { id: 'PAYROLL', label: 'Payroll', desc: 'Salary batches, calculation, and payslips' },
+  { id: 'ATTENDANCE', label: 'Attendance', desc: 'Shifts, daily logs, and leave requests' },
+  { id: 'BIOMETRIC', label: 'Biometrics', desc: 'Hardware terminal LAN bridge and sync' },
 ];
 
 const ACTIONS: AppAction[] = ['VIEW', 'CREATE', 'EDIT', 'APPROVE', 'DEACTIVATE', 'DELETE'];
