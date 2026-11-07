@@ -99,10 +99,32 @@ describe('Environment Validation Unit Tests', () => {
         NODE_ENV: 'production',
         DATABASE_URL: 'postgresql://erp_prod:prod_pass@db.internal:5432/core_erp',
         SESSION_SECRET: 'c8f49b1368a27e059f13e7168d8cb5164d781b0a5381fbc947e2a9b3c4d5e6f7',
+        BANK_ENCRYPTION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
       });
 
       expect(prodConfig.NODE_ENV).toBe('production');
       expect(prodConfig.SESSION_SECRET).toBe('c8f49b1368a27e059f13e7168d8cb5164d781b0a5381fbc947e2a9b3c4d5e6f7');
+      expect(prodConfig.BANK_ENCRYPTION_KEY).toBe('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef');
+    });
+
+    it('should fail closed in production when BANK_ENCRYPTION_KEY is missing or invalid', () => {
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'production',
+          DATABASE_URL: 'postgresql://erp_prod:prod_pass@db.internal:5432/core_erp',
+          SESSION_SECRET: 'c8f49b1368a27e059f13e7168d8cb5164d781b0a5381fbc947e2a9b3c4d5e6f7',
+          // BANK_ENCRYPTION_KEY omitted
+        });
+      }).toThrowError(/BANK_ENCRYPTION_KEY is strictly required/);
+
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'production',
+          DATABASE_URL: 'postgresql://erp_prod:prod_pass@db.internal:5432/core_erp',
+          SESSION_SECRET: 'c8f49b1368a27e059f13e7168d8cb5164d781b0a5381fbc947e2a9b3c4d5e6f7',
+          BANK_ENCRYPTION_KEY: 'invalid_short_key',
+        });
+      }).toThrowError(/BANK_ENCRYPTION_KEY must be exactly 64 hexadecimal characters/);
     });
 
     it('should strictly reject missing or omitted session secret in production mode', () => {
@@ -173,6 +195,58 @@ describe('Environment Validation Unit Tests', () => {
       // Verifies explicit stub and physical hardware limitation documentation
       expect(readmeContent).toContain('NOT YET a working physical ZKTeco socket driver');
       expect(readmeContent).toContain('Zero physical device or live hardware verification has been performed');
+    });
+
+    it('should accept valid BANK_ACTIVE_KEY_ID and valid BANK_HISTORICAL_KEYS JSON', () => {
+      const validConfig = validateEnv({
+        NODE_ENV: 'test',
+        DATABASE_URL: 'postgresql://erp_user:pass@localhost:5432/core_erp',
+        BANK_ENCRYPTION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+        BANK_ACTIVE_KEY_ID: 'k2',
+        BANK_HISTORICAL_KEYS: JSON.stringify({
+          k1: 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210',
+          k0: '1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff',
+        }),
+      });
+
+      expect(validConfig.BANK_ACTIVE_KEY_ID).toBe('k2');
+      expect(validConfig.BANK_HISTORICAL_KEYS).toBeDefined();
+    });
+
+    it('should reject malformed JSON in BANK_HISTORICAL_KEYS', () => {
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'test',
+          DATABASE_URL: 'postgresql://erp_user:pass@localhost:5432/core_erp',
+          BANK_HISTORICAL_KEYS: 'not-json-{{{',
+        });
+      }).toThrowError(/BANK_HISTORICAL_KEYS must be a valid JSON object/);
+    });
+
+    it('should reject invalid historical key hex material length or format', () => {
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'test',
+          DATABASE_URL: 'postgresql://erp_user:pass@localhost:5432/core_erp',
+          BANK_HISTORICAL_KEYS: JSON.stringify({
+            k1: 'too-short',
+          }),
+        });
+      }).toThrowError(/must be a 64-character hexadecimal string/);
+    });
+
+    it('should reject conflict when historical key ID matches active key ID with different key material', () => {
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'test',
+          DATABASE_URL: 'postgresql://erp_user:pass@localhost:5432/core_erp',
+          BANK_ENCRYPTION_KEY: '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+          BANK_ACTIVE_KEY_ID: 'k1',
+          BANK_HISTORICAL_KEYS: JSON.stringify({
+            k1: 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff',
+          }),
+        });
+      }).toThrowError(/conflicts with BANK_ACTIVE_KEY_ID but contains different key material/);
     });
   });
 });

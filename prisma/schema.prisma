@@ -82,6 +82,19 @@ model Company {
   website        String?  @db.VarChar(255)
   appHeaderTitle String?  @db.VarChar(128)
   isConfigured   Boolean  @default(true)
+
+  // Phase 2.1: Structured statutory, location, and regional foundations
+  registrationNumber      String?  @db.VarChar(64)
+  taxRegistrationNumber   String?  @db.VarChar(64)
+  country                 String   @default("US") @db.VarChar(64)
+  state                   String?  @db.VarChar(64)
+  city                    String?  @db.VarChar(64)
+  postalCode              String?  @db.VarChar(20)
+  addressLine1            String?  @db.VarChar(255)
+  addressLine2            String?  @db.VarChar(255)
+  fiscalYearStartMonth    Int      @default(1) @db.SmallInt
+  defaultDocumentLanguage String   @default("EN") @db.VarChar(10)
+
   createdAt      DateTime @default(now()) @db.Timestamptz(6)
   updatedAt      DateTime @updatedAt @db.Timestamptz(6)
 
@@ -92,6 +105,11 @@ model Company {
   companySettings CompanySetting[]
   rolePermissions RolePermission[]
   auditLogs       AuditLog[]
+
+  // Phase 2.1: Company Settings Foundations Relations
+  bankAccounts           CompanyBankAccount[]
+  settingsChangeRequests CompanySettingsChangeRequest[]
+  documentNumberSequences DocumentNumberSequence[]
 
   // Accounting Core Relations
   accountGroups   AccountGroup[]
@@ -181,6 +199,10 @@ model User {
 
   // Stage 2.1: Persistent Admin Notifications Relations
   notificationStates    NotificationUserState[]
+
+  // Phase 2.1: Settings Change Request Relations (Maker-Checker)
+  settingsChangeRequestsCreated  CompanySettingsChangeRequest[] @relation("SettingsChangeRequestCreatedByUser")
+  settingsChangeRequestsReviewed CompanySettingsChangeRequest[] @relation("SettingsChangeRequestReviewedByUser")
 
   @@unique([companyId, email])
   @@unique([id, companyId])
@@ -402,6 +424,89 @@ model SystemSetting {
   updatedAt DateTime @updatedAt @db.Timestamptz(6)
 
   @@index([key])
+}
+
+/// Phase 2.1: Lifecycle status for maker-checker settings change requests
+enum SettingsChangeRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+/// Phase 2.1: Supported configurable document numbering series
+enum DocumentNumberType {
+  INVOICE
+  QUOTATION
+  RECEIPT
+  JOURNAL_VOUCHER
+}
+
+/// Phase 2.1: Multiple company bank accounts foundation with active default account designation
+model CompanyBankAccount {
+  id                String   @id @default(uuid()) @db.Uuid
+  companyId         String   @db.Uuid
+  company           Company  @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  bankName          String   @db.VarChar(128)
+  accountHolderName String   @db.VarChar(128)
+  accountNumber     String   @db.VarChar(255)
+  routingCode       String?  @db.VarChar(255) // Country-dependent (e.g. IFSC, Routing Transit, Sort Code)
+  branchName        String?  @db.VarChar(255)
+  swiftBic          String?  @db.VarChar(255)
+  iban              String?  @db.VarChar(255)
+  upiId             String?  @db.VarChar(255)
+  accountType       String?  @db.VarChar(32) // e.g. CURRENT, SAVINGS
+  currency          String   @default("USD") @db.VarChar(3)
+  isDefault         Boolean  @default(false)
+  isActive          Boolean  @default(true)
+  showOnInvoices    Boolean  @default(true)
+  showOnQuotations  Boolean  @default(false)
+  createdAt         DateTime @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime @updatedAt @db.Timestamptz(6)
+
+  @@index([companyId])
+  @@index([companyId, isActive])
+}
+
+/// Phase 2.1: Maker-checker company settings change requests and approval audit trail
+model CompanySettingsChangeRequest {
+  id              String                      @id @default(uuid()) @db.Uuid
+  companyId       String                      @db.Uuid
+  company         Company                     @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  requestedById   String                      @db.Uuid
+  requestedBy     User                        @relation("SettingsChangeRequestCreatedByUser", fields: [requestedById], references: [id], onDelete: Restrict)
+  payload         Json                        // Proposed diff: company fields and company settings key-value pairs
+  status          SettingsChangeRequestStatus @default(PENDING)
+  rejectionReason String?                     @db.Text
+  reviewedById    String?                     @db.Uuid
+  reviewedBy      User?                       @relation("SettingsChangeRequestReviewedByUser", fields: [reviewedById], references: [id], onDelete: SetNull)
+  reviewedAt      DateTime?                   @db.Timestamptz(6)
+  appliedAt       DateTime?                   @db.Timestamptz(6)
+  createdAt       DateTime                    @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime                    @updatedAt @db.Timestamptz(6)
+
+  @@index([companyId])
+  @@index([companyId, status])
+  @@index([requestedById])
+  @@index([reviewedById])
+}
+
+/// Phase 2.1 & Phase 2.2: Concurrency-safe document numbering sequences with configurable prefixes & FY format
+model DocumentNumberSequence {
+  id            String             @id @default(uuid()) @db.Uuid
+  companyId     String             @db.Uuid
+  company       Company            @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  documentType  DocumentNumberType
+  prefix        String             @db.VarChar(32)
+  fiscalYear    String             @db.VarChar(16) // e.g. "2026" or "2026-2027"
+  currentNumber Int                @default(0) @map("lastNumber")
+  paddingZeros  Int                @default(5) @db.SmallInt
+  createdAt     DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime           @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, documentType, prefix, fiscalYear])
+  @@index([companyId])
+  @@index([companyId, documentType])
 }
 
 /// Audit log for tamper-evident tracking with tenant isolation and request correlation

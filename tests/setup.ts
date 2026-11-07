@@ -9,9 +9,11 @@ process.env.NODE_ENV = 'test';
 // Approved local test endpoint configuration matching docker-compose.dev.yml test service
 const APPROVED_TEST_DB_HOSTS = new Set(['localhost', '127.0.0.1']);
 const APPROVED_TEST_DB_PORT = '5433';
-const APPROVED_TEST_DB_NAME = 'core_erp_test';
+const APPROVED_TEST_DB_NAMES = new Set(['core_erp_test', 'core_erp_integration_test']);
 const APPROVED_TEST_DB_URL =
   'postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public';
+const APPROVED_INTEGRATION_TEST_DB_URL =
+  'postgresql://erp_integration_user:replace_with_test_password@localhost:5433/core_erp_integration_test?schema=public';
 
 /**
  * Validates that a connection URL strictly points to the approved local test database.
@@ -28,7 +30,7 @@ function enforceTestDatabaseUrlSafety(varName: string, urlValue: string | undefi
     parsed = new URL(urlValue);
   } catch {
     throw new Error(
-      `[DATABASE SAFETY VIOLATION] Invalid or unparseable ${varName} in test environment. Expected approved local test endpoint (localhost:5433/core_erp_test). Refusing to proceed.`
+      `[DATABASE SAFETY VIOLATION] Invalid or unparseable ${varName} in test environment. Expected approved local test endpoint (localhost:5433/core_erp_test or core_erp_integration_test). Refusing to proceed.`
     );
   }
 
@@ -54,9 +56,9 @@ function enforceTestDatabaseUrlSafety(varName: string, urlValue: string | undefi
   }
 
   const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
-  if (dbName !== APPROVED_TEST_DB_NAME) {
+  if (!APPROVED_TEST_DB_NAMES.has(dbName)) {
     throw new Error(
-      `[DATABASE SAFETY VIOLATION] Unapproved database name "${dbName}" in ${varName}. Primary and staging databases are strictly forbidden in tests. Expected "${APPROVED_TEST_DB_NAME}". Refusing to proceed.`
+      `[DATABASE SAFETY VIOLATION] Unapproved database name "${dbName}" in ${varName}. Primary and staging databases are strictly forbidden in tests. Expected one of: ${Array.from(APPROVED_TEST_DB_NAMES).join(', ')}. Refusing to proceed.`
     );
   }
 }
@@ -70,7 +72,7 @@ if (!process.env.DATABASE_URL) {
   process.env.DATABASE_URL = APPROVED_TEST_DB_URL;
 }
 if (!process.env.TEST_DATABASE_URL) {
-  process.env.TEST_DATABASE_URL = APPROVED_TEST_DB_URL;
+  process.env.TEST_DATABASE_URL = APPROVED_INTEGRATION_TEST_DB_URL;
 }
 
 // 4. Provide non-secret, test-only SESSION_SECRET satisfying environment schema

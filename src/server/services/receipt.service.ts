@@ -8,22 +8,18 @@ import {
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
 import { JournalService } from './journal.service.js';
 import { AuditService } from './audit.service.js';
+import { DocumentSequenceService } from './document-sequence.service.js';
 
 export class ReceiptService {
   /**
-   * Generates sequential receipt number scoped to company and year (e.g. RCT-2026-0001)
+   * Generates sequential receipt number scoped to company and year using DocumentSequenceService
    */
-  private static async generateReceiptNumber(companyId: string, year: number): Promise<string> {
-    const prefix = `RCT-${year}-`;
-    const count = await prisma.customerReceipt.count({
-      where: {
-        companyId,
-        receiptNumber: { startsWith: prefix },
-      },
+  private static async generateReceiptNumber(companyId: string, year: number, tx?: any): Promise<string> {
+    const seq = await DocumentSequenceService.allocateNextNumber(companyId, 'RECEIPT', {
+      fiscalYear: year,
+      tx,
     });
-
-    const nextSeq = (count + 1).toString().padStart(4, '0');
-    return `${prefix}${nextSeq}`;
+    return seq.formattedNumber;
   }
 
   /**
@@ -338,10 +334,15 @@ export class ReceiptService {
     }
 
     const unallocatedAmount = totalAmount.minus(allocatedTotal);
-    const receiptNumber = await this.generateReceiptNumber(actor.companyId, rDate.getFullYear());
 
     // 5. Execute atomic transaction
     const createdReceipt = await prisma.$transaction(async (tx) => {
+      const seq = await DocumentSequenceService.allocateNextNumber(actor.companyId, 'RECEIPT', {
+        date: rDate,
+        tx,
+      });
+      const receiptNumber = seq.formattedNumber;
+
       // Create and post double-entry Journal Voucher
       // Debit: Receiving Cash/Bank ledger (amount)
       // Credit: Accounts Receivable ledger (amount)
@@ -427,7 +428,7 @@ export class ReceiptService {
       entityId: createdReceipt.id,
       correlationId,
       details: {
-        receiptNumber,
+        receiptNumber: createdReceipt.receiptNumber,
         amount: AccountingMath.format(totalAmount),
         allocatedTotal: AccountingMath.format(allocatedTotal),
         journalEntryId: createdReceipt.journalEntryId,

@@ -14,7 +14,9 @@
     "db:migrate:dev": "prisma migrate dev",
     "db:migrate:prod": "prisma migrate deploy",
     "db:migrate:status": "prisma migrate status",
-    "db:verify:staging": "tsx scripts/verify-staging-db.ts"
+    "db:verify:staging": "tsx scripts/verify-staging-db.ts",
+    "maintenance:backfill-bank-accounts": "tsx scripts/backfill-bank-accounts.ts",
+    "test:integration:concurrency": "vitest run tests/integration/concurrent-bank-account-default.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

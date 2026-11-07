@@ -9,22 +9,18 @@ import {
 } from '../../shared/types.js';
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
 import { AuditService } from './audit.service.js';
+import { DocumentSequenceService } from './document-sequence.service.js';
 
 export class QuotationService {
   /**
-   * Generates sequential quotation number scoped to company and year (e.g. QT-2026-0001)
+   * Generates sequential quotation number scoped to company and year using DocumentSequenceService
    */
-  private static async generateQuotationNumber(companyId: string, year: number): Promise<string> {
-    const prefix = `QT-${year}-`;
-    const count = await prisma.quotation.count({
-      where: {
-        companyId,
-        quotationNumber: { startsWith: prefix },
-      },
+  private static async generateQuotationNumber(companyId: string, year: number, tx?: any): Promise<string> {
+    const seq = await DocumentSequenceService.allocateNextNumber(companyId, 'QUOTATION', {
+      fiscalYear: year,
+      tx,
     });
-
-    const nextSeq = (count + 1).toString().padStart(4, '0');
-    return `${prefix}${nextSeq}`;
+    return seq.formattedNumber;
   }
 
   /**
@@ -280,9 +276,14 @@ export class QuotationService {
     }
 
     const total = subtotal.minus(discountTotal).plus(taxTotal);
-    const quotationNumber = await this.generateQuotationNumber(actor.companyId, qDate.getFullYear());
 
     const created = await prisma.$transaction(async (tx) => {
+      const seq = await DocumentSequenceService.allocateNextNumber(actor.companyId, 'QUOTATION', {
+        date: qDate,
+        tx,
+      });
+      const quotationNumber = seq.formattedNumber;
+
       const q = await tx.quotation.create({
         data: {
           companyId: actor.companyId,
@@ -332,7 +333,7 @@ export class QuotationService {
       entity: 'Quotation',
       entityId: created.id,
       correlationId,
-      details: { quotationNumber, total: AccountingMath.format(total) },
+      details: { quotationNumber: created.quotationNumber, total: AccountingMath.format(total) },
     });
 
     return this.getQuotationById(actor.companyId, created.id);

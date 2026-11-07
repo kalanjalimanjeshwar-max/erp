@@ -254,7 +254,69 @@ describe('Database Migration History & Integrity Tests', () => {
       '20261030000000_persistent_admin_notifications',
       '20261031120000_role_enum_cleanup',
       '20261103000000_four_eyes_payroll_approval',
+      '20261105000000_phase2_1_company_settings_foundations',
+      '20261105120000_phase2_2_document_sequence_padding',
+      '20261106000000_phase2_3_bank_account_encryption_capacity',
     ]);
+  });
+
+  it('should include version-controlled Phase 2.1 migration (20261105000000_phase2_1_company_settings_foundations)', () => {
+    const migration12Dir = path.join(migrationsDir, '20261105000000_phase2_1_company_settings_foundations');
+    expect(fs.existsSync(migration12Dir)).toBe(true);
+
+    const migration12Sql = path.join(migration12Dir, 'migration.sql');
+    expect(fs.existsSync(migration12Sql)).toBe(true);
+
+    const content = fs.readFileSync(migration12Sql, 'utf-8');
+
+    // 1. Create enums
+    expect(content).toContain('"SettingsChangeRequestStatus"');
+    expect(content).toContain('"DocumentNumberType"');
+
+    // 2. Additive columns to Company
+    expect(content).toContain('"registrationNumber"');
+    expect(content).toContain('"taxRegistrationNumber"');
+    expect(content).toContain('"country"');
+    expect(content).toContain('"addressLine1"');
+    expect(content).toContain('"fiscalYearStartMonth"');
+
+    // 3. New foundation tables
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "CompanyBankAccount"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "CompanySettingsChangeRequest"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "DocumentNumberSequence"');
+
+    // 4. Default bank account uniqueness
+    expect(content).toContain('"CompanyBankAccount_companyId_default_unique"');
+  });
+
+  it('should include version-controlled Phase 2.2 migration (20261105120000_phase2_2_document_sequence_padding)', () => {
+    const migration13Dir = path.join(migrationsDir, '20261105120000_phase2_2_document_sequence_padding');
+    expect(fs.existsSync(migration13Dir)).toBe(true);
+
+    const migration13Sql = path.join(migration13Dir, 'migration.sql');
+    expect(fs.existsSync(migration13Sql)).toBe(true);
+
+    const content = fs.readFileSync(migration13Sql, 'utf-8');
+    expect(content).toContain('ALTER TABLE "DocumentNumberSequence"');
+    expect(content).toContain('ADD COLUMN IF NOT EXISTS "paddingZeros"');
+    expect(content).toContain('DEFAULT 5');
+  });
+
+  it('should include version-controlled Phase 2.3 migration (20261106000000_phase2_3_bank_account_encryption_capacity)', () => {
+    const migration14Dir = path.join(migrationsDir, '20261106000000_phase2_3_bank_account_encryption_capacity');
+    expect(fs.existsSync(migration14Dir)).toBe(true);
+
+    const migration14Sql = path.join(migration14Dir, 'migration.sql');
+    expect(fs.existsSync(migration14Sql)).toBe(true);
+
+    const content = fs.readFileSync(migration14Sql, 'utf-8');
+    expect(content).toContain('SET LOCAL lock_timeout = \'3s\'');
+    expect(content).toContain('ALTER TABLE "CompanyBankAccount"');
+    expect(content).toContain('ALTER COLUMN "accountNumber" TYPE VARCHAR(255)');
+    expect(content).toContain('ALTER COLUMN "routingCode" TYPE VARCHAR(255)');
+    expect(content).toContain('ALTER COLUMN "swiftBic" TYPE VARCHAR(255)');
+    expect(content).toContain('ALTER COLUMN "iban" TYPE VARCHAR(255)');
+    expect(content).toContain('ALTER COLUMN "upiId" TYPE VARCHAR(255)');
   });
 });
 

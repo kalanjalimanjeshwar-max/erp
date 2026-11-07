@@ -46,13 +46,13 @@ const KNOWN_DEV_SECRETS = new Set([
   '12345678901234567890123456789012',
 ]);
 
-const envSchema = z
+export const envSchema = z
   .object({
     NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
     PORT: z
-      .string()
+      .union([z.string(), z.number()])
       .default('3000')
-      .transform((val) => parseInt(val, 10))
+      .transform((val) => (typeof val === 'number' ? val : parseInt(val, 10)))
       .refine((val) => !isNaN(val) && val > 0 && val <= 65535, {
         message: 'PORT must be a valid integer between 1 and 65535',
       }),
@@ -79,10 +79,80 @@ const envSchema = z
     BOOTSTRAP_COMPANY_NAME: z.string().min(2).optional(),
     BOOTSTRAP_COMPANY_CODE: z.string().min(2).max(10).optional(),
     BIOMETRIC_BRIDGE_TOKEN: z.string().optional(),
+    BANK_ENCRYPTION_KEY: z.string().optional(),
+    BANK_ACTIVE_KEY_ID: z
+      .string()
+      .trim()
+      .regex(
+        /^[a-zA-Z0-9_-]{1,32}$/,
+        'BANK_ACTIVE_KEY_ID must be 1-32 alphanumeric, dash, or underscore characters'
+      )
+      .default('k1'),
+    BANK_HISTORICAL_KEYS: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    // 1. Validation for BANK_HISTORICAL_KEYS (all environments)
+    if (data.BANK_HISTORICAL_KEYS && data.BANK_HISTORICAL_KEYS.trim() !== '') {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(data.BANK_HISTORICAL_KEYS.trim());
+      } catch {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BANK_HISTORICAL_KEYS'],
+          message: 'BANK_HISTORICAL_KEYS must be a valid JSON object mapping key IDs to 64-hexadecimal key strings.',
+        });
+        parsed = null;
+      }
+
+      if (parsed !== null) {
+        if (typeof parsed !== 'object' || Array.isArray(parsed) || parsed === null) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['BANK_HISTORICAL_KEYS'],
+            message: 'BANK_HISTORICAL_KEYS must be a JSON object (dictionary) of { [keyId: string]: string }.',
+          });
+        } else {
+          const activeId = data.BANK_ACTIVE_KEY_ID || 'k1';
+          const entries = Object.entries(parsed as Record<string, unknown>);
+
+          for (const [keyId, keyMaterial] of entries) {
+            // Validate keyId syntax
+            if (!keyId || typeof keyId !== 'string' || !/^[a-zA-Z0-9_-]{1,32}$/.test(keyId)) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['BANK_HISTORICAL_KEYS', keyId],
+                message: `Historical key ID "${keyId}" is invalid. Must be 1-32 characters of [a-zA-Z0-9_-].`,
+              });
+            }
+
+            // Key material must be a string and 64 hex characters
+            if (typeof keyMaterial !== 'string' || !/^[0-9a-fA-F]{64}$/.test(keyMaterial.trim())) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: ['BANK_HISTORICAL_KEYS', keyId],
+                message: `Historical key "${keyId}" material must be a 64-character hexadecimal string representing a 256-bit key.`,
+              });
+            }
+
+            // Conflict check: Active key ID cannot conflict with historical keys unless identical
+            if (keyId === activeId) {
+              const activeKeyHex = data.BANK_ENCRYPTION_KEY?.trim();
+              if (activeKeyHex && typeof keyMaterial === 'string' && keyMaterial.trim().toLowerCase() !== activeKeyHex.toLowerCase()) {
+                ctx.addIssue({
+                  code: z.ZodIssueCode.custom,
+                  path: ['BANK_HISTORICAL_KEYS', keyId],
+                  message: `Historical key ID "${keyId}" conflicts with BANK_ACTIVE_KEY_ID but contains different key material.`,
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+
     if (data.NODE_ENV === 'production') {
-      // 1. Explicitly check if secret was omitted or defaulted to insecure development fallback
+      // 2. Explicitly check if session secret was omitted or defaulted to insecure development fallback
       if (
         !data.SESSION_SECRET ||
         data.SESSION_SECRET.trim() === '' ||
@@ -97,7 +167,7 @@ const envSchema = z
         return;
       }
 
-      // 2. Minimum length check (at least 32 characters)
+      // 3. Minimum length check (at least 32 characters)
       if (data.SESSION_SECRET.length < 32) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -108,7 +178,7 @@ const envSchema = z
         return;
       }
 
-      // 3. Known placeholder / template string check
+      // 4. Known placeholder / template string check
       const lowerSecret = data.SESSION_SECRET.toLowerCase();
       if (
         KNOWN_DEV_SECRETS.has(data.SESSION_SECRET) ||
@@ -128,8 +198,44 @@ const envSchema = z
             'In production mode (NODE_ENV=production), SESSION_SECRET cannot use a known development placeholder or template string. Generate a high-entropy secret.',
         });
       }
+
+      // 5. Production fail-closed check for BANK_ENCRYPTION_KEY (Phase 2.3)
+      if (!data.BANK_ENCRYPTION_KEY || data.BANK_ENCRYPTION_KEY.trim() === '') {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BANK_ENCRYPTION_KEY'],
+          message:
+            'In production mode (NODE_ENV=production), BANK_ENCRYPTION_KEY is strictly required and must be provided (64 hex characters / 256 bits). It does NOT fall back to SESSION_SECRET.',
+        });
+      } else if (!/^[0-9a-fA-F]{64}$/.test(data.BANK_ENCRYPTION_KEY.trim())) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['BANK_ENCRYPTION_KEY'],
+          message:
+            'In production mode (NODE_ENV=production), BANK_ENCRYPTION_KEY must be exactly 64 hexadecimal characters representing a 256-bit key.',
+        });
+      }
     }
   });
+
+export function parseBankHistoricalKeys(rawJson?: string): Record<string, string> {
+  if (!rawJson || rawJson.trim() === '') return {};
+  try {
+    const parsed = JSON.parse(rawJson.trim());
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+      const clean: Record<string, string> = {};
+      for (const [k, v] of Object.entries(parsed)) {
+        if (typeof v === 'string' && /^[0-9a-fA-F]{64}$/.test(v.trim())) {
+          clean[k] = v.trim();
+        }
+      }
+      return clean;
+    }
+    return {};
+  } catch {
+    return {};
+  }
+}
 
 export type AppConfig = z.infer<typeof envSchema>;
 

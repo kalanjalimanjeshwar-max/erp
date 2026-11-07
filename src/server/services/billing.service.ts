@@ -11,22 +11,18 @@ import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
 import { JournalService } from './journal.service.js';
 import { AuditService } from './audit.service.js';
 import { CompanyService } from './company.service.js';
+import { DocumentSequenceService } from './document-sequence.service.js';
 
 export class BillingService {
   /**
-   * Generates sequential invoice number scoped to company and year (e.g. INV-2026-0001)
+   * Generates sequential invoice number scoped to company and year using DocumentSequenceService
    */
-  private static async generateInvoiceNumber(companyId: string, year: number): Promise<string> {
-    const prefix = `INV-${year}-`;
-    const count = await prisma.invoice.count({
-      where: {
-        companyId,
-        invoiceNumber: { startsWith: prefix },
-      },
+  private static async generateInvoiceNumber(companyId: string, year: number, tx?: any): Promise<string> {
+    const seq = await DocumentSequenceService.allocateNextNumber(companyId, 'INVOICE', {
+      fiscalYear: year,
+      tx,
     });
-
-    const nextSeq = (count + 1).toString().padStart(4, '0');
-    return `${prefix}${nextSeq}`;
+    return seq.formattedNumber;
   }
 
   /**
@@ -349,9 +345,14 @@ export class BillingService {
     }
 
     const total = subtotal.minus(discountTotal).plus(taxTotal);
-    const invoiceNumber = await this.generateInvoiceNumber(actor.companyId, invDate.getFullYear());
 
     const created = await prisma.$transaction(async (tx) => {
+      const seq = await DocumentSequenceService.allocateNextNumber(actor.companyId, 'INVOICE', {
+        date: invDate,
+        tx,
+      });
+      const invoiceNumber = seq.formattedNumber;
+
       const inv = await tx.invoice.create({
         data: {
           companyId: actor.companyId,
@@ -406,7 +407,7 @@ export class BillingService {
       entity: 'Invoice',
       entityId: created.id,
       correlationId,
-      details: { invoiceNumber, total: AccountingMath.format(total) },
+      details: { invoiceNumber: created.invoiceNumber, total: AccountingMath.format(total) },
     });
 
     return this.getInvoiceById(actor.companyId, created.id);

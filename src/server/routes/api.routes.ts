@@ -5,6 +5,7 @@ import { AuthController } from '../controllers/auth.controller.js';
 import { PreviewAuthController } from '../controllers/preview-auth.controller.js';
 import { UserController } from '../controllers/user.controller.js';
 import { CompanyController } from '../controllers/company.controller.js';
+import { CompanyBankAccountController } from '../controllers/company-bank-account.controller.js';
 import { PermissionController } from '../controllers/permission.controller.js';
 import { AuditController } from '../controllers/audit.controller.js';
 import { AccountingController } from '../controllers/accounting.controller.js';
@@ -51,6 +52,14 @@ apiRouter.post('/users/:id/reset-password', requireAuth, requirePermission('USER
 // 5. Company Administration Endpoints
 apiRouter.get('/company/profile', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyController.getProfile);
 apiRouter.patch('/company/profile', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyController.updateProfile);
+apiRouter.get('/company/sequences', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyController.getSequences);
+apiRouter.get('/company/bank-accounts', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyBankAccountController.list);
+apiRouter.get('/company/bank-accounts/:id', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyBankAccountController.getById);
+apiRouter.post('/company/bank-accounts', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyBankAccountController.create);
+apiRouter.patch('/company/bank-accounts/:id', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyBankAccountController.update);
+apiRouter.post('/company/bank-accounts/:id/default', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyBankAccountController.setDefault);
+apiRouter.patch('/company/bank-accounts/:id/status', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyBankAccountController.updateStatus);
+apiRouter.delete('/company/bank-accounts/:id', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyBankAccountController.delete);
 
 // 6. Permission Matrix Endpoints
 apiRouter.get('/permissions/matrix', requireAuth, requirePermission('ROLE_PERMISSION', 'VIEW'), PermissionController.getMatrix);

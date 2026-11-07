@@ -1595,3 +1595,60 @@ export interface AdminNotificationItem {
   createdAt: string;
 }
 
+// ============================================================================
+// Phase 2.3: Company Bank Accounts (Masked at API Boundary)
+// ============================================================================
+
+export interface CompanyBankAccountItem {
+  id: string;
+  companyId: string;
+  bankName: string;
+  accountHolderName: string;
+  accountNumber: string; // Masked e.g. "•••• •••• 1234"
+  routingCode: string | null; // Masked e.g. "•••••5678"
+  branchName: string | null;
+  swiftBic: string | null;
+  iban: string | null; // Masked e.g. "GB•• •••• •••• 1234"
+  upiId: string | null; // Masked e.g. "ac•••@icici"
+  accountType: string | null;
+  currency: string;
+  isDefault: boolean;
+  isActive: boolean;
+  showOnInvoices: boolean;
+  showOnQuotations: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateCompanyBankAccountRequest {
+  bankName: string;
+  accountHolderName: string;
+  accountNumber: string;
+  routingCode?: string | null;
+  branchName?: string | null;
+  swiftBic?: string | null;
+  iban?: string | null;
+  upiId?: string | null;
+  accountType?: string | null;
+  currency?: string;
+  isDefault?: boolean;
+  showOnInvoices?: boolean;
+  showOnQuotations?: boolean;
+}
+
+export interface UpdateCompanyBankAccountRequest {
+  bankName?: string;
+  accountHolderName?: string;
+  accountNumber?: string;
+  routingCode?: string | null;
+  branchName?: string | null;
+  swiftBic?: string | null;
+  iban?: string | null;
+  upiId?: string | null;
+  accountType?: string | null;
+  currency?: string;
+  isDefault?: boolean;
+  showOnInvoices?: boolean;
+  showOnQuotations?: boolean;
+}
+

@@ -7,23 +7,18 @@ import {
 } from '../../shared/types.js';
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
 import { AuditService } from './audit.service.js';
+import { DocumentSequenceService } from './document-sequence.service.js';
 
 export class JournalService {
   /**
-   * Generates a sequential voucher number (e.g., JV-2026-0001) scoped to the company
+   * Generates a sequential voucher number (e.g., JV-2026-00001) scoped to the company using DocumentSequenceService
    */
   private static async generateVoucherNumber(companyId: string, year: number, tx?: any): Promise<string> {
-    const client = tx || prisma;
-    const prefix = `JV-${year}-`;
-    const count = await client.journalEntry.count({
-      where: {
-        companyId,
-        voucherNumber: { startsWith: prefix },
-      },
+    const seq = await DocumentSequenceService.allocateNextNumber(companyId, 'JOURNAL_VOUCHER', {
+      fiscalYear: year,
+      tx,
     });
-
-    const nextSeq = (count + 1).toString().padStart(4, '0');
-    return `${prefix}${nextSeq}`;
+    return seq.formattedNumber;
   }
 
   /**
@@ -474,7 +469,7 @@ export class JournalService {
 
     const result = await prisma.$transaction(async (tx) => {
       // 1. Generate voucher for reversal entry
-      const reversalVoucher = await this.generateVoucherNumber(actor.companyId, year);
+      const reversalVoucher = await this.generateVoucherNumber(actor.companyId, year, tx);
 
       // 2. Create the inverse posting lines (swapping debits and credits)
       const reversalJournal = await tx.journalEntry.create({
