@@ -6,14 +6,16 @@
 // 1. Enforce test environment
 process.env.NODE_ENV = 'test';
 
-// Approved local test endpoint configuration matching docker-compose.dev.yml test service
+// Approved local unit test database endpoint matching docker-compose.dev.yml test service
 const APPROVED_TEST_DB_HOSTS = new Set(['localhost', '127.0.0.1']);
-const APPROVED_TEST_DB_PORT = '5433';
-const APPROVED_TEST_DB_NAMES = new Set(['core_erp_test', 'core_erp_integration_test']);
+const APPROVED_UNIT_TEST_DB_PORT = '5433';
+const APPROVED_UNIT_TEST_DB_NAME = 'core_erp_test';
 const APPROVED_TEST_DB_URL =
   'postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public';
-const APPROVED_INTEGRATION_TEST_DB_URL =
-  'postgresql://erp_integration_user:replace_with_test_password@localhost:5433/core_erp_integration_test?schema=public';
+
+// Approved isolated integration test database endpoint matching docker-compose.integration-test.yml
+const APPROVED_INTEGRATION_TEST_DB_PORT = '5434';
+const APPROVED_INTEGRATION_TEST_DB_NAME = 'core_erp_integration_test';
 
 /**
  * Validates that a connection URL strictly points to the approved local test database.
@@ -30,7 +32,7 @@ function enforceTestDatabaseUrlSafety(varName: string, urlValue: string | undefi
     parsed = new URL(urlValue);
   } catch {
     throw new Error(
-      `[DATABASE SAFETY VIOLATION] Invalid or unparseable ${varName} in test environment. Expected approved local test endpoint (localhost:5433/core_erp_test or core_erp_integration_test). Refusing to proceed.`
+      `[DATABASE SAFETY VIOLATION] Invalid or unparseable ${varName} in test environment. Expected approved local test endpoint. Refusing to proceed.`
     );
   }
 
@@ -44,22 +46,35 @@ function enforceTestDatabaseUrlSafety(varName: string, urlValue: string | undefi
   const hostname = parsed.hostname;
   if (!APPROVED_TEST_DB_HOSTS.has(hostname)) {
     throw new Error(
-      `[DATABASE SAFETY VIOLATION] Unapproved database host in ${varName}. Remote and production hosts are strictly forbidden in tests. Expected localhost. Refusing to proceed.`
+      `[DATABASE SAFETY VIOLATION] Unapproved database host in ${varName}. Remote and production hosts are strictly forbidden in tests. Expected localhost or 127.0.0.1. Refusing to proceed.`
     );
   }
 
   const port = parsed.port;
-  if (port !== APPROVED_TEST_DB_PORT) {
-    throw new Error(
-      `[DATABASE SAFETY VIOLATION] Unapproved database port in ${varName}. Primary port 5432 and non-test ports are strictly forbidden in tests. Expected port 5433. Refusing to proceed.`
-    );
-  }
-
   const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
-  if (!APPROVED_TEST_DB_NAMES.has(dbName)) {
-    throw new Error(
-      `[DATABASE SAFETY VIOLATION] Unapproved database name "${dbName}" in ${varName}. Primary and staging databases are strictly forbidden in tests. Expected one of: ${Array.from(APPROVED_TEST_DB_NAMES).join(', ')}. Refusing to proceed.`
-    );
+
+  if (varName === 'DATABASE_URL') {
+    if (port !== APPROVED_UNIT_TEST_DB_PORT) {
+      throw new Error(
+        `[DATABASE SAFETY VIOLATION] Unapproved database port in ${varName}. Primary port 5432 and non-test ports are strictly forbidden in tests. Expected port ${APPROVED_UNIT_TEST_DB_PORT}. Refusing to proceed.`
+      );
+    }
+    if (dbName !== APPROVED_UNIT_TEST_DB_NAME) {
+      throw new Error(
+        `[DATABASE SAFETY VIOLATION] Unapproved database name "${dbName}" in ${varName}. Expected database "${APPROVED_UNIT_TEST_DB_NAME}". Refusing to proceed.`
+      );
+    }
+  } else if (varName === 'TEST_DATABASE_URL') {
+    if (port !== APPROVED_INTEGRATION_TEST_DB_PORT) {
+      throw new Error(
+        `[DATABASE SAFETY VIOLATION] Unapproved database port in ${varName}. Expected dedicated integration test port ${APPROVED_INTEGRATION_TEST_DB_PORT}. Refusing to proceed.`
+      );
+    }
+    if (dbName !== APPROVED_INTEGRATION_TEST_DB_NAME) {
+      throw new Error(
+        `[DATABASE SAFETY VIOLATION] Unapproved database name "${dbName}" in ${varName}. Expected dedicated database "${APPROVED_INTEGRATION_TEST_DB_NAME}". Refusing to proceed.`
+      );
+    }
   }
 }
 
@@ -67,13 +82,12 @@ function enforceTestDatabaseUrlSafety(varName: string, urlValue: string | undefi
 enforceTestDatabaseUrlSafety('DATABASE_URL', process.env.DATABASE_URL);
 enforceTestDatabaseUrlSafety('TEST_DATABASE_URL', process.env.TEST_DATABASE_URL);
 
-// 3. Populate approved local test database URLs if absent
+// 3. Populate approved local test database URL for standard unit tests if absent
 if (!process.env.DATABASE_URL) {
   process.env.DATABASE_URL = APPROVED_TEST_DB_URL;
 }
-if (!process.env.TEST_DATABASE_URL) {
-  process.env.TEST_DATABASE_URL = APPROVED_INTEGRATION_TEST_DB_URL;
-}
+// Note: TEST_DATABASE_URL is intentionally NOT populated with placeholder credentials.
+// Integration tests require explicitly configured TEST_DATABASE_URL from .env.integration-test.
 
 // 4. Provide non-secret, test-only SESSION_SECRET satisfying environment schema
 if (!process.env.SESSION_SECRET) {

@@ -20,7 +20,7 @@ import net from 'net';
  */
 
 describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switching', () => {
-  const testDbUrl = process.env.TEST_DATABASE_URL || 'postgresql://erp_integration_user:replace_with_test_password@localhost:5433/core_erp_integration_test?schema=public';
+  const testDbUrl = process.env.TEST_DATABASE_URL;
   let isDbReachable = false;
   let testPrisma1: PrismaClient | null = null;
   let testPrisma2: PrismaClient | null = null;
@@ -58,6 +58,19 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
   };
 
   beforeAll(async () => {
+    // If TEST_DATABASE_URL is unset, gracefully mark as BLOCKED / NOT RUN without failing suite
+    if (!testDbUrl || testDbUrl.trim() === '') {
+      console.warn(
+        '\n[INTEGRATION TEST BLOCKED / NOT RUN]: Dedicated TEST_DATABASE_URL is not configured.' +
+        '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
+        '\n  1. Start container: docker compose -f docker-compose.integration-test.yml up -d' +
+        '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
+        '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm test -- tests/integration/concurrent-bank-account-default.test.ts --run\n'
+      );
+      isDbReachable = false;
+      return;
+    }
+
     // Safety Guard 1: Never silently fall back to or collide with primary DATABASE_URL
     if (process.env.DATABASE_URL && testDbUrl === process.env.DATABASE_URL) {
       throw new Error(
@@ -65,21 +78,42 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       );
     }
 
-    // Safety Guard 2: Parse URL and strictly enforce dedicated database name
+    // Safety Guard 2: Parse URL and strictly enforce dedicated database endpoint
     let parsed: URL;
     try {
       parsed = new URL(testDbUrl);
-    } catch (err: any) {
-      throw new Error(`[SECURITY FATAL] Invalid database URL format for TEST_DATABASE_URL: ${err.message}`);
+    } catch {
+      throw new Error('[SECURITY FATAL] Invalid database URL format for TEST_DATABASE_URL.');
+    }
+
+    const protocol = parsed.protocol;
+    if (protocol !== 'postgresql:' && protocol !== 'postgres:') {
+      throw new Error(
+        `[SECURITY FATAL] Forbidden database protocol "${protocol}" in TEST_DATABASE_URL. PostgreSQL is required.`
+      );
+    }
+
+    const host = parsed.hostname || 'localhost';
+    if (host !== 'localhost' && host !== '127.0.0.1') {
+      throw new Error(
+        '[SECURITY FATAL] Integration test refused: Unapproved host in TEST_DATABASE_URL. Remote and production hosts are strictly forbidden. Expected localhost or 127.0.0.1.'
+      );
+    }
+
+    const port = parseInt(parsed.port, 10);
+    if (port !== 5434) {
+      throw new Error(
+        `[SECURITY FATAL] Integration test refused: Dedicated integration test must run on port 5434. Received: ${parsed.port || 'default'}`
+      );
     }
 
     const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
 
-    // Reject protected, development, and production database names
-    const forbiddenNames = ['core_erp', 'core_erp_dev', 'core_erp_prod', 'postgres', 'production', 'development'];
+    // Reject protected, development, test, and production database names
+    const forbiddenNames = ['core_erp', 'core_erp_dev', 'core_erp_prod', 'core_erp_test', 'postgres', 'production', 'development'];
     if (forbiddenNames.includes(dbName.toLowerCase())) {
       throw new Error(
-        `[SECURITY FATAL] Integration test refused: Target database name '${dbName}' matches a protected production or development database.`
+        `[SECURITY FATAL] Integration test refused: Target database name '${dbName}' matches a protected development, test, or production database.`
       );
     }
 
@@ -90,18 +124,14 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       );
     }
 
-    // Check if database host/port is available
-    const host = parsed.hostname || 'localhost';
-    const port = parseInt(parsed.port, 10) || 5433;
-
     const reachable = await checkPortReachable(host, port);
     if (!reachable) {
       console.warn(
         `\n[INTEGRATION TEST BLOCKED / NOT RUN]: Real PostgreSQL 16 server is not reachable at ${host}:${port}.` +
-        `\nTo run live concurrency tests against PostgreSQL 16:` +
-        `\n  1. Start PostgreSQL 16 test container on port ${port} with database 'core_erp_integration_test'.` +
-        `\n  2. Deploy migrations: DATABASE_URL="${testDbUrl}" npx prisma migrate deploy` +
-        `\n  3. Run: TEST_DATABASE_URL="${testDbUrl}" npm test -- tests/integration/concurrent-bank-account-default.test.ts --run\n`
+        `\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:` +
+        `\n  1. Start container: docker compose -f docker-compose.integration-test.yml up -d` +
+        `\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy` +
+        `\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm test -- tests/integration/concurrent-bank-account-default.test.ts --run\n`
       );
       isDbReachable = false;
       return;
@@ -128,7 +158,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       if (err.message && err.message.includes('[SECURITY FATAL]')) {
         throw err;
       }
-      console.warn(`[INTEGRATION TEST BLOCKED]: Database connection failed: ${err.message}`);
+      console.warn('[INTEGRATION TEST BLOCKED]: Database connection failed.');
       isDbReachable = false;
     }
   });
@@ -155,7 +185,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
   it('should enforce exactly one active default bank account under real concurrent switching', async () => {
     if (!isDbReachable || !testPrisma1 || !testPrisma2) {
       // Mark as blocked without failing Vitest suite
-      console.warn('Skipping execution: PostgreSQL 16 test instance offline (Status: BLOCKED / NOT RUN).');
+      console.warn('Skipping execution: PostgreSQL 16 test instance offline or TEST_DATABASE_URL not configured (Status: BLOCKED / NOT RUN).');
       expect(true).toBe(true);
       return;
     }

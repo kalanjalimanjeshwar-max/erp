@@ -15,6 +15,8 @@ dist-ssr/
 .env.development.local
 .env.test.local
 .env.production.local
+.env.integration-test
+.env.integration-test.local
 !.env.example
 
 # Database dumps, migrations locks and SQLite/local databases

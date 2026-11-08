@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # Dedicated Isolated PostgreSQL 16 Database for CoreERP Concurrency Integration Tests
   postgres-integration-test:
@@ -8,12 +6,12 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: erp_integration_user
-      POSTGRES_PASSWORD: replace_with_test_password
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env.integration-test}
       POSTGRES_DB: core_erp_integration_test
       TZ: UTC
       PGTZ: UTC
     ports:
-      - "5433:5432"
+      - "5434:5432"
     volumes:
       - postgres_integration_test_data:/var/lib/postgresql/data
     healthcheck:
