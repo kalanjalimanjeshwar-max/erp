@@ -62,6 +62,7 @@
     "qs": "6.16.2"
   },
   "optionalDependencies": {
-    "@rolldown/binding-win32-x64-msvc": "1.2.13"
+    "@rolldown/binding-win32-x64-msvc": "1.2.13",
+    "lightningcss-win32-x64-msvc": "1.32.0"
   }
 }
