@@ -37,6 +37,7 @@ interface CliArgs {
   mode: BackfillMode;
   batchSize: number;
   companyId?: string;
+  accountId?: string;
 }
 
 function parseCliArgs(args: string[]): CliArgs {
@@ -68,7 +69,13 @@ function parseCliArgs(args: string[]): CliArgs {
     companyId = args[companyIdx + 1].trim();
   }
 
-  return { isInventory, isDryRun, isConfirmed, mode, batchSize, companyId };
+  let accountId: string | undefined = undefined;
+  const accountIdx = args.indexOf('--account-id');
+  if (accountIdx !== -1 && args[accountIdx + 1]) {
+    accountId = args[accountIdx + 1].trim();
+  }
+
+  return { isInventory, isDryRun, isConfirmed, mode, batchSize, companyId, accountId };
 }
 
 async function main(): Promise<void> {
@@ -90,6 +97,9 @@ async function main(): Promise<void> {
     if (options.companyId) {
       console.log(`Tenant Filter:            ${options.companyId}`);
     }
+    if (options.accountId) {
+      console.log(`Fixture Filter:           ${options.accountId}`);
+    }
     console.log('----------------------------------------------------------------');
 
     // 2. Read-only Key Inventory mode
@@ -97,7 +107,7 @@ async function main(): Promise<void> {
       console.log('Mode: READ-ONLY KEY INVENTORY REPORT');
       console.log('Scanning database bank account records...\n');
 
-      const inventory = await BankAccountBackfillService.getKeyInventory(options.companyId);
+      const inventory = await BankAccountBackfillService.getKeyInventory(options.companyId, options.accountId);
 
       console.log('================================================================');
       console.log('  Database Key Inventory Summary');
@@ -136,6 +146,7 @@ async function main(): Promise<void> {
       console.error('Optional arguments:');
       console.error('  --mode <all|plaintext-only|rotation-only>');
       console.error('  --company-id <UUID>');
+      console.error('  --account-id <UUID>');
       console.error('  --batch-size <1-100>\n');
       process.exit(1);
     }
@@ -151,6 +162,7 @@ async function main(): Promise<void> {
       batchSize: options.batchSize,
       dryRun: options.isDryRun,
       companyId: options.companyId,
+      accountId: options.accountId,
       mode: options.mode,
     });
 

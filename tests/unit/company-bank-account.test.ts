@@ -1327,5 +1327,83 @@ describe('Phase 2.3: Company Bank Accounts, AES-256-GCM Encryption & Security', 
       expect(inventory.unknownKeyCount).toBe(1);
       expect(inventory.unsupportedVersionCount).toBe(1);
     });
+
+    it('15. runBackfill respects fixture-level accountId scoping', async () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Cipher = EncryptionService.encrypt('FIXTURE_ACC_NUM')!;
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+
+      let capturedWhere: any = null;
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        return cb({
+          companyBankAccount: {
+            findMany: vi.fn().mockImplementation((args: any) => {
+              capturedWhere = args.where;
+              return [
+                {
+                  id: 'specific-fixture-uuid',
+                  companyId: 'specific-company-uuid',
+                  accountNumber: k1Cipher,
+                  routingCode: null,
+                  branchName: null,
+                  swiftBic: null,
+                  iban: null,
+                  upiId: null,
+                },
+              ];
+            }),
+            update: vi.fn(),
+          },
+        });
+      });
+
+      const res = await BankAccountBackfillService.runBackfill({
+        companyId: 'specific-company-uuid',
+        accountId: 'specific-fixture-uuid',
+        dryRun: true,
+        mode: 'rotation-only',
+      });
+
+      expect(res.totalInspected).toBe(1);
+      expect(res.totalUpdated).toBe(1);
+      expect(capturedWhere).toEqual({
+        companyId: 'specific-company-uuid',
+        id: 'specific-fixture-uuid',
+      });
+    });
+
+    it('16. getKeyInventory respects fixture-level accountId scoping', async () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Cipher = EncryptionService.encrypt('INV_FIXTURE_NUM')!;
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+
+      let capturedWhere: any = null;
+      (vi.spyOn(prisma.companyBankAccount, 'findMany') as any).mockImplementation((args: any) => {
+        capturedWhere = args.where;
+        return Promise.resolve([
+          {
+            id: 'specific-fixture-uuid-2',
+            accountNumber: k1Cipher,
+            routingCode: null,
+            swiftBic: null,
+            iban: null,
+            upiId: null,
+          },
+        ]);
+      });
+
+      const inv = await BankAccountBackfillService.getKeyInventory(
+        'specific-company-uuid',
+        'specific-fixture-uuid-2'
+      );
+
+      expect(inv.totalRecords).toBe(1);
+      expect(inv.companyIdFilter).toBe('specific-company-uuid');
+      expect(inv.accountIdFilter).toBe('specific-fixture-uuid-2');
+      expect(capturedWhere).toEqual({
+        companyId: 'specific-company-uuid',
+        id: 'specific-fixture-uuid-2',
+      });
+    });
   });
 });

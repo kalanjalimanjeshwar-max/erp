@@ -18,6 +18,7 @@
  */
 
 import { prisma } from '../db/client.js';
+import { Prisma } from '@prisma/client';
 import { EncryptionService } from './encryption.service.js';
 
 export type BackfillMode = 'all' | 'plaintext-only' | 'rotation-only';
@@ -26,6 +27,7 @@ export interface BackfillOptions {
   batchSize?: number;
   dryRun?: boolean;
   companyId?: string; // Optional filter to scope to a single tenant
+  accountId?: string; // Optional filter to scope to a single fixture
   mode?: BackfillMode;
 }
 
@@ -55,6 +57,7 @@ export interface KeyInventoryReport {
   fullyActiveCount: number;
   needsRotationCount: number;
   companyIdFilter?: string;
+  accountIdFilter?: string;
   retirementSafetyNotice: string;
 }
 
@@ -146,118 +149,77 @@ export class BankAccountBackfillService {
     batchSize: number,
     companyId?: string,
     mode: BackfillMode = 'all',
-    activeKeyId: string = EncryptionService.getActiveKeyId()
+    activeKeyId: string = EncryptionService.getActiveKeyId(),
+    accountId?: string
   ): Promise<any[]> {
     const activePrefix = `enc:v1:${activeKeyId}:%`;
 
     if (typeof tx.$queryRaw === 'function') {
       try {
+        const companyFilter = companyId ? Prisma.sql`AND "companyId" = ${companyId}::uuid` : Prisma.empty;
+        const accountFilter = accountId ? Prisma.sql`AND id = ${accountId}::uuid` : Prisma.empty;
+
         if (mode === 'plaintext-only') {
-          if (companyId) {
-            return await tx.$queryRaw`
-              SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
-              FROM "CompanyBankAccount"
-              WHERE "companyId" = ${companyId}::uuid
-                AND (
-                  "accountNumber" NOT LIKE 'enc:%'
-                  OR ("routingCode" IS NOT NULL AND "routingCode" NOT LIKE 'enc:%')
-                  OR ("swiftBic" IS NOT NULL AND "swiftBic" NOT LIKE 'enc:%')
-                  OR ("iban" IS NOT NULL AND "iban" NOT LIKE 'enc:%')
-                  OR ("upiId" IS NOT NULL AND "upiId" NOT LIKE 'enc:%')
-                )
-              ORDER BY id ASC
-              LIMIT ${batchSize}
-              FOR UPDATE SKIP LOCKED
-            `;
-          } else {
-            return await tx.$queryRaw`
-              SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
-              FROM "CompanyBankAccount"
-              WHERE (
-                "accountNumber" NOT LIKE 'enc:%'
-                OR ("routingCode" IS NOT NULL AND "routingCode" NOT LIKE 'enc:%')
-                OR ("swiftBic" IS NOT NULL AND "swiftBic" NOT LIKE 'enc:%')
-                OR ("iban" IS NOT NULL AND "iban" NOT LIKE 'enc:%')
-                OR ("upiId" IS NOT NULL AND "upiId" NOT LIKE 'enc:%')
-              )
-              ORDER BY id ASC
-              LIMIT ${batchSize}
-              FOR UPDATE SKIP LOCKED
-            `;
-          }
+          return await tx.$queryRaw`
+            SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
+            FROM "CompanyBankAccount"
+            WHERE (
+              "accountNumber" NOT LIKE 'enc:%'
+              OR ("routingCode" IS NOT NULL AND "routingCode" NOT LIKE 'enc:%')
+              OR ("swiftBic" IS NOT NULL AND "swiftBic" NOT LIKE 'enc:%')
+              OR ("iban" IS NOT NULL AND "iban" NOT LIKE 'enc:%')
+              OR ("upiId" IS NOT NULL AND "upiId" NOT LIKE 'enc:%')
+            )
+            ${companyFilter}
+            ${accountFilter}
+            ORDER BY id ASC
+            LIMIT ${batchSize}
+            FOR UPDATE SKIP LOCKED
+          `;
         } else if (mode === 'rotation-only') {
-          if (companyId) {
-            return await tx.$queryRaw`
-              SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
-              FROM "CompanyBankAccount"
-              WHERE "companyId" = ${companyId}::uuid
-                AND (
-                  ("accountNumber" LIKE 'enc:v1:%' AND "accountNumber" NOT LIKE ${activePrefix})
-                  OR ("routingCode" IS NOT NULL AND "routingCode" LIKE 'enc:v1:%' AND "routingCode" NOT LIKE ${activePrefix})
-                  OR ("swiftBic" IS NOT NULL AND "swiftBic" LIKE 'enc:v1:%' AND "swiftBic" NOT LIKE ${activePrefix})
-                  OR ("iban" IS NOT NULL AND "iban" LIKE 'enc:v1:%' AND "iban" NOT LIKE ${activePrefix})
-                  OR ("upiId" IS NOT NULL AND "upiId" LIKE 'enc:v1:%' AND "upiId" NOT LIKE ${activePrefix})
-                )
-              ORDER BY id ASC
-              LIMIT ${batchSize}
-              FOR UPDATE SKIP LOCKED
-            `;
-          } else {
-            return await tx.$queryRaw`
-              SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
-              FROM "CompanyBankAccount"
-              WHERE (
-                ("accountNumber" LIKE 'enc:v1:%' AND "accountNumber" NOT LIKE ${activePrefix})
-                OR ("routingCode" IS NOT NULL AND "routingCode" LIKE 'enc:v1:%' AND "routingCode" NOT LIKE ${activePrefix})
-                OR ("swiftBic" IS NOT NULL AND "swiftBic" LIKE 'enc:v1:%' AND "swiftBic" NOT LIKE ${activePrefix})
-                OR ("iban" IS NOT NULL AND "iban" LIKE 'enc:v1:%' AND "iban" NOT LIKE ${activePrefix})
-                OR ("upiId" IS NOT NULL AND "upiId" LIKE 'enc:v1:%' AND "upiId" NOT LIKE ${activePrefix})
-              )
-              ORDER BY id ASC
-              LIMIT ${batchSize}
-              FOR UPDATE SKIP LOCKED
-            `;
-          }
+          return await tx.$queryRaw`
+            SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
+            FROM "CompanyBankAccount"
+            WHERE (
+              ("accountNumber" LIKE 'enc:v1:%' AND "accountNumber" NOT LIKE ${activePrefix})
+              OR ("routingCode" IS NOT NULL AND "routingCode" LIKE 'enc:v1:%' AND "routingCode" NOT LIKE ${activePrefix})
+              OR ("swiftBic" IS NOT NULL AND "swiftBic" LIKE 'enc:v1:%' AND "swiftBic" NOT LIKE ${activePrefix})
+              OR ("iban" IS NOT NULL AND "iban" LIKE 'enc:v1:%' AND "iban" NOT LIKE ${activePrefix})
+              OR ("upiId" IS NOT NULL AND "upiId" LIKE 'enc:v1:%' AND "upiId" NOT LIKE ${activePrefix})
+            )
+            ${companyFilter}
+            ${accountFilter}
+            ORDER BY id ASC
+            LIMIT ${batchSize}
+            FOR UPDATE SKIP LOCKED
+          `;
         } else {
           // Default: 'all' mode (selects any record not encrypted with the active key)
-          if (companyId) {
-            return await tx.$queryRaw`
-              SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
-              FROM "CompanyBankAccount"
-              WHERE "companyId" = ${companyId}::uuid
-                AND (
-                  "accountNumber" NOT LIKE ${activePrefix}
-                  OR ("routingCode" IS NOT NULL AND "routingCode" NOT LIKE ${activePrefix})
-                  OR ("swiftBic" IS NOT NULL AND "swiftBic" NOT LIKE ${activePrefix})
-                  OR ("iban" IS NOT NULL AND "iban" NOT LIKE ${activePrefix})
-                  OR ("upiId" IS NOT NULL AND "upiId" NOT LIKE ${activePrefix})
-                )
-              ORDER BY id ASC
-              LIMIT ${batchSize}
-              FOR UPDATE SKIP LOCKED
-            `;
-          } else {
-            return await tx.$queryRaw`
-              SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
-              FROM "CompanyBankAccount"
-              WHERE (
-                "accountNumber" NOT LIKE ${activePrefix}
-                OR ("routingCode" IS NOT NULL AND "routingCode" NOT LIKE ${activePrefix})
-                OR ("swiftBic" IS NOT NULL AND "swiftBic" NOT LIKE ${activePrefix})
-                OR ("iban" IS NOT NULL AND "iban" NOT LIKE ${activePrefix})
-                OR ("upiId" IS NOT NULL AND "upiId" NOT LIKE ${activePrefix})
-              )
-              ORDER BY id ASC
-              LIMIT ${batchSize}
-              FOR UPDATE SKIP LOCKED
-            `;
-          }
+          return await tx.$queryRaw`
+            SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
+            FROM "CompanyBankAccount"
+            WHERE (
+              "accountNumber" NOT LIKE ${activePrefix}
+              OR ("routingCode" IS NOT NULL AND "routingCode" NOT LIKE ${activePrefix})
+              OR ("swiftBic" IS NOT NULL AND "swiftBic" NOT LIKE ${activePrefix})
+              OR ("iban" IS NOT NULL AND "iban" NOT LIKE ${activePrefix})
+              OR ("upiId" IS NOT NULL AND "upiId" NOT LIKE ${activePrefix})
+            )
+            ${companyFilter}
+            ${accountFilter}
+            ORDER BY id ASC
+            LIMIT ${batchSize}
+            FOR UPDATE SKIP LOCKED
+          `;
         }
       } catch (err: any) {
         // Fallback for unit tests if $queryRaw is mocked or not implemented
         if (tx.companyBankAccount?.findMany) {
+          const where: any = {};
+          if (companyId) where.companyId = companyId;
+          if (accountId) where.id = accountId;
           return await tx.companyBankAccount.findMany({
-            where: companyId ? { companyId } : {},
+            where,
             take: batchSize,
             orderBy: { id: 'asc' },
           });
@@ -267,8 +229,11 @@ export class BankAccountBackfillService {
     }
 
     if (tx.companyBankAccount?.findMany) {
+      const where: any = {};
+      if (companyId) where.companyId = companyId;
+      if (accountId) where.id = accountId;
       return await tx.companyBankAccount.findMany({
-        where: companyId ? { companyId } : {},
+        where,
         take: batchSize,
         orderBy: { id: 'asc' },
       });
@@ -316,7 +281,8 @@ export class BankAccountBackfillService {
             batchSize,
             options.companyId,
             mode,
-            activeKeyId
+            activeKeyId,
+            options.accountId
           );
 
           if (!candidates || candidates.length === 0) {
@@ -491,7 +457,7 @@ export class BankAccountBackfillService {
    * plaintext status, and unrecoverable envelope errors.
    * Never mutates records or prints sensitive secrets.
    */
-  public static async getKeyInventory(companyId?: string): Promise<KeyInventoryReport> {
+  public static async getKeyInventory(companyId?: string, accountId?: string): Promise<KeyInventoryReport> {
     const activeKeyId = EncryptionService.getActiveKeyId();
     const registeredKeys = EncryptionService.getRegisteredKeyIds();
 
@@ -514,8 +480,12 @@ export class BankAccountBackfillService {
     let hasMore = true;
 
     while (hasMore) {
+      const where: any = {};
+      if (companyId) where.companyId = companyId;
+      if (accountId) where.id = accountId;
+
       const records: any[] = await prisma.companyBankAccount.findMany({
-        where: companyId ? { companyId } : {},
+        where,
         take: BATCH,
         ...(lastId ? { skip: 1, cursor: { id: lastId } } : {}),
         orderBy: { id: 'asc' },
@@ -592,6 +562,7 @@ export class BankAccountBackfillService {
       fullyActiveCount,
       needsRotationCount,
       companyIdFilter: companyId,
+      accountIdFilter: accountId,
       retirementSafetyNotice:
         'A historical key must NEVER be retired or removed from BANK_HISTORICAL_KEYS until all records across all tenants and storage scopes have been fully re-encrypted to the active key, verified via read-only inventory across all database environments and backups, and a full operational backup has been taken.',
     };
