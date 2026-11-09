@@ -6,23 +6,24 @@
 // 1. Enforce test environment
 process.env.NODE_ENV = 'test';
 
-// Approved local unit test database endpoint matching docker-compose.dev.yml test service
+// Approved endpoints configuration
 const APPROVED_TEST_DB_HOSTS = new Set(['localhost', '127.0.0.1']);
-const APPROVED_UNIT_TEST_DB_PORT = '5433';
-const APPROVED_UNIT_TEST_DB_NAME = 'core_erp_test';
-const APPROVED_TEST_DB_URL =
+
+// Standard Unit Test Database (Port 5433 from docker-compose.dev.yml)
+const STANDARD_TEST_DB_PORT = '5433';
+const STANDARD_TEST_DB_NAME = 'core_erp_test';
+const APPROVED_STANDARD_TEST_DB_URL =
   'postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public';
 
-// Approved isolated integration test database endpoint matching docker-compose.integration-test.yml
-const APPROVED_INTEGRATION_TEST_DB_PORT = '5434';
-const APPROVED_INTEGRATION_TEST_DB_NAME = 'core_erp_integration_test';
+// Dedicated Concurrency Integration Test Database (Port 5434 from docker-compose.integration-test.yml)
+const INTEGRATION_TEST_DB_PORT = '5434';
+const INTEGRATION_TEST_DB_NAME = 'core_erp_integration_test';
 
 /**
- * Validates that a connection URL strictly points to the approved local test database.
- * Throws a fatal safety error if an unapproved, primary (5432), staging, or production
- * database is detected. Credentials are never logged in error messages.
+ * Validates that DATABASE_URL strictly points to the approved standard unit test database.
+ * Credentials and raw connection strings are NEVER logged in error messages.
  */
-function enforceTestDatabaseUrlSafety(varName: string, urlValue: string | undefined): void {
+function validateStandardDatabaseUrl(urlValue: string | undefined): void {
   if (!urlValue || urlValue.trim() === '') {
     return;
   }
@@ -32,62 +33,96 @@ function enforceTestDatabaseUrlSafety(varName: string, urlValue: string | undefi
     parsed = new URL(urlValue);
   } catch {
     throw new Error(
-      `[DATABASE SAFETY VIOLATION] Invalid or unparseable ${varName} in test environment. Expected approved local test endpoint. Refusing to proceed.`
+      '[DATABASE SAFETY VIOLATION] Invalid or unparseable DATABASE_URL in test environment. Expected approved local test endpoint. Refusing to proceed.'
     );
   }
 
   const protocol = parsed.protocol;
   if (protocol !== 'postgresql:' && protocol !== 'postgres:') {
     throw new Error(
-      `[DATABASE SAFETY VIOLATION] Forbidden database protocol "${protocol}" in ${varName}. PostgreSQL is required. Refusing to proceed.`
+      '[DATABASE SAFETY VIOLATION] Forbidden database protocol in DATABASE_URL. PostgreSQL is required. Refusing to proceed.'
     );
   }
 
   const hostname = parsed.hostname;
   if (!APPROVED_TEST_DB_HOSTS.has(hostname)) {
     throw new Error(
-      `[DATABASE SAFETY VIOLATION] Unapproved database host in ${varName}. Remote and production hosts are strictly forbidden in tests. Expected localhost or 127.0.0.1. Refusing to proceed.`
+      '[DATABASE SAFETY VIOLATION] Unapproved database host in DATABASE_URL. Remote and production hosts are strictly forbidden in tests. Expected localhost or 127.0.0.1. Refusing to proceed.'
     );
   }
 
   const port = parsed.port;
-  const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
+  if (port !== STANDARD_TEST_DB_PORT) {
+    throw new Error(
+      `[DATABASE SAFETY VIOLATION] Unapproved database port in DATABASE_URL. Primary port 5432 and non-test ports are strictly forbidden in tests. Expected port ${STANDARD_TEST_DB_PORT}. Refusing to proceed.`
+    );
+  }
 
-  if (varName === 'DATABASE_URL') {
-    if (port !== APPROVED_UNIT_TEST_DB_PORT) {
-      throw new Error(
-        `[DATABASE SAFETY VIOLATION] Unapproved database port in ${varName}. Primary port 5432 and non-test ports are strictly forbidden in tests. Expected port ${APPROVED_UNIT_TEST_DB_PORT}. Refusing to proceed.`
-      );
-    }
-    if (dbName !== APPROVED_UNIT_TEST_DB_NAME) {
-      throw new Error(
-        `[DATABASE SAFETY VIOLATION] Unapproved database name "${dbName}" in ${varName}. Expected database "${APPROVED_UNIT_TEST_DB_NAME}". Refusing to proceed.`
-      );
-    }
-  } else if (varName === 'TEST_DATABASE_URL') {
-    if (port !== APPROVED_INTEGRATION_TEST_DB_PORT) {
-      throw new Error(
-        `[DATABASE SAFETY VIOLATION] Unapproved database port in ${varName}. Expected dedicated integration test port ${APPROVED_INTEGRATION_TEST_DB_PORT}. Refusing to proceed.`
-      );
-    }
-    if (dbName !== APPROVED_INTEGRATION_TEST_DB_NAME) {
-      throw new Error(
-        `[DATABASE SAFETY VIOLATION] Unapproved database name "${dbName}" in ${varName}. Expected dedicated database "${APPROVED_INTEGRATION_TEST_DB_NAME}". Refusing to proceed.`
-      );
-    }
+  const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
+  if (dbName !== STANDARD_TEST_DB_NAME) {
+    throw new Error(
+      `[DATABASE SAFETY VIOLATION] Unapproved database name in DATABASE_URL. Expected database "${STANDARD_TEST_DB_NAME}". Refusing to proceed.`
+    );
   }
 }
 
-// 2. Validate any pre-existing database URLs for safety before proceeding
-enforceTestDatabaseUrlSafety('DATABASE_URL', process.env.DATABASE_URL);
-enforceTestDatabaseUrlSafety('TEST_DATABASE_URL', process.env.TEST_DATABASE_URL);
+/**
+ * Validates that TEST_DATABASE_URL strictly points to the dedicated concurrency integration test database.
+ * Credentials and raw connection strings are NEVER logged in error messages.
+ */
+function validateIntegrationDatabaseUrl(urlValue: string | undefined): void {
+  if (!urlValue || urlValue.trim() === '') {
+    return;
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(urlValue);
+  } catch {
+    throw new Error(
+      '[DATABASE SAFETY VIOLATION] Invalid or unparseable TEST_DATABASE_URL in test environment. Expected approved local test endpoint. Refusing to proceed.'
+    );
+  }
+
+  const protocol = parsed.protocol;
+  if (protocol !== 'postgresql:' && protocol !== 'postgres:') {
+    throw new Error(
+      '[DATABASE SAFETY VIOLATION] Forbidden database protocol in TEST_DATABASE_URL. PostgreSQL is required. Refusing to proceed.'
+    );
+  }
+
+  const hostname = parsed.hostname;
+  if (!APPROVED_TEST_DB_HOSTS.has(hostname)) {
+    throw new Error(
+      '[DATABASE SAFETY VIOLATION] Unapproved database host in TEST_DATABASE_URL. Remote and production hosts are strictly forbidden in tests. Expected localhost or 127.0.0.1. Refusing to proceed.'
+    );
+  }
+
+  const port = parsed.port;
+  if (port !== INTEGRATION_TEST_DB_PORT) {
+    throw new Error(
+      `[DATABASE SAFETY VIOLATION] Unapproved database port in TEST_DATABASE_URL. Dedicated integration test must run on port ${INTEGRATION_TEST_DB_PORT}. Refusing to proceed.`
+    );
+  }
+
+  const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
+  if (dbName !== INTEGRATION_TEST_DB_NAME) {
+    throw new Error(
+      `[DATABASE SAFETY VIOLATION] Unapproved database name in TEST_DATABASE_URL. Expected dedicated database "${INTEGRATION_TEST_DB_NAME}". Refusing to proceed.`
+    );
+  }
+}
+
+// 2. Validate environment database URLs independently for safety
+validateStandardDatabaseUrl(process.env.DATABASE_URL);
+validateIntegrationDatabaseUrl(process.env.TEST_DATABASE_URL);
 
 // 3. Populate approved local test database URL for standard unit tests if absent
 if (!process.env.DATABASE_URL) {
-  process.env.DATABASE_URL = APPROVED_TEST_DB_URL;
+  process.env.DATABASE_URL = APPROVED_STANDARD_TEST_DB_URL;
 }
-// Note: TEST_DATABASE_URL is intentionally NOT populated with placeholder credentials.
-// Integration tests require explicitly configured TEST_DATABASE_URL from .env.integration-test.
+// Note: TEST_DATABASE_URL is NEVER automatically populated with default or placeholder credentials.
+// Missing TEST_DATABASE_URL remains missing so dedicated integration tests report BLOCKED / NOT RUN safely.
 
 // 4. Provide non-secret, test-only SESSION_SECRET satisfying environment schema
 if (!process.env.SESSION_SECRET) {

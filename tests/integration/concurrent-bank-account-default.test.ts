@@ -9,9 +9,9 @@ import net from 'net';
  * Concurrent Default-Account Switching & Partial Unique Index Verification
  *
  * Scope & Safety:
- * 1. Dedicated Test Database: Strictly requires TEST_DATABASE_URL containing '_test' or '_staging'.
- * 2. Never connects to production or standard development databases.
- * 3. If PostgreSQL 16 is not reachable on localhost:5433 or configured test port, marks
+ * 1. Dedicated Test Database: Strictly requires TEST_DATABASE_URL pointing to isolated 'core_erp_integration_test' on port 5434.
+ * 2. Never connects to production, development, or standard unit-test databases.
+ * 3. If TEST_DATABASE_URL is not set or PostgreSQL 16 is not reachable on localhost:5434, marks
  *    execution status as BLOCKED / NOT RUN without falsifying real concurrency through mocks.
  * 4. Executes independent concurrent transactions against PostgreSQL 16 to prove:
  *    - "CompanyBankAccount_companyId_default_unique" index prevents duplicate active defaults.
@@ -58,27 +58,27 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
   };
 
   beforeAll(async () => {
-    // If TEST_DATABASE_URL is unset, gracefully mark as BLOCKED / NOT RUN without failing suite
+    // 1. Require an explicitly provided TEST_DATABASE_URL
     if (!testDbUrl || testDbUrl.trim() === '') {
       console.warn(
-        '\n[INTEGRATION TEST BLOCKED / NOT RUN]: Dedicated TEST_DATABASE_URL is not configured.' +
+        '\n[INTEGRATION TEST BLOCKED / NOT RUN]: TEST_DATABASE_URL is not configured.' +
         '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
         '\n  1. Start container: docker compose -f docker-compose.integration-test.yml up -d' +
         '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
-        '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm test -- tests/integration/concurrent-bank-account-default.test.ts --run\n'
+        '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency\n'
       );
       isDbReachable = false;
       return;
     }
 
-    // Safety Guard 1: Never silently fall back to or collide with primary DATABASE_URL
+    // 2. Reject collision with standard test or primary DATABASE_URL
     if (process.env.DATABASE_URL && testDbUrl === process.env.DATABASE_URL) {
       throw new Error(
         '[SECURITY FATAL] Integration test refused: TEST_DATABASE_URL matches primary DATABASE_URL. Test execution requires an isolated dedicated database.'
       );
     }
 
-    // Safety Guard 2: Parse URL and strictly enforce dedicated database endpoint
+    // 3. Parse URL and strictly enforce dedicated database endpoint
     let parsed: URL;
     try {
       parsed = new URL(testDbUrl);
@@ -89,11 +89,11 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
     const protocol = parsed.protocol;
     if (protocol !== 'postgresql:' && protocol !== 'postgres:') {
       throw new Error(
-        `[SECURITY FATAL] Forbidden database protocol "${protocol}" in TEST_DATABASE_URL. PostgreSQL is required.`
+        '[SECURITY FATAL] Forbidden database protocol in TEST_DATABASE_URL. PostgreSQL is required.'
       );
     }
 
-    const host = parsed.hostname || 'localhost';
+    const host = parsed.hostname;
     if (host !== 'localhost' && host !== '127.0.0.1') {
       throw new Error(
         '[SECURITY FATAL] Integration test refused: Unapproved host in TEST_DATABASE_URL. Remote and production hosts are strictly forbidden. Expected localhost or 127.0.0.1.'
@@ -103,35 +103,43 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
     const port = parseInt(parsed.port, 10);
     if (port !== 5434) {
       throw new Error(
-        `[SECURITY FATAL] Integration test refused: Dedicated integration test must run on port 5434. Received: ${parsed.port || 'default'}`
+        '[SECURITY FATAL] Integration test refused: Dedicated integration test must run on port 5434.'
       );
     }
 
     const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
 
     // Reject protected, development, test, and production database names
-    const forbiddenNames = ['core_erp', 'core_erp_dev', 'core_erp_prod', 'core_erp_test', 'postgres', 'production', 'development'];
+    const forbiddenNames = [
+      'core_erp',
+      'core_erp_dev',
+      'core_erp_prod',
+      'core_erp_test',
+      'postgres',
+      'production',
+      'development',
+    ];
     if (forbiddenNames.includes(dbName.toLowerCase())) {
       throw new Error(
-        `[SECURITY FATAL] Integration test refused: Target database name '${dbName}' matches a protected development, test, or production database.`
+        '[SECURITY FATAL] Integration test refused: Target database matches a protected development, test, or production database.'
       );
     }
 
     // Strictly enforce dedicated database name: core_erp_integration_test
     if (dbName !== 'core_erp_integration_test') {
       throw new Error(
-        `[SECURITY FATAL] Integration test refused: Dedicated database name must strictly be 'core_erp_integration_test'. Received: '${dbName}'`
+        '[SECURITY FATAL] Integration test refused: Dedicated database name must strictly be "core_erp_integration_test".'
       );
     }
 
     const reachable = await checkPortReachable(host, port);
     if (!reachable) {
       console.warn(
-        `\n[INTEGRATION TEST BLOCKED / NOT RUN]: Real PostgreSQL 16 server is not reachable at ${host}:${port}.` +
-        `\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:` +
-        `\n  1. Start container: docker compose -f docker-compose.integration-test.yml up -d` +
-        `\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy` +
-        `\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm test -- tests/integration/concurrent-bank-account-default.test.ts --run\n`
+        '\n[INTEGRATION TEST BLOCKED / NOT RUN]: PostgreSQL 16 integration database is unreachable at localhost:5434.' +
+        '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
+        '\n  1. Start container: docker compose -f docker-compose.integration-test.yml up -d' +
+        '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
+        '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency\n'
       );
       isDbReachable = false;
       return;
@@ -143,13 +151,13 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       await testPrisma1.$connect();
       await testPrisma2.$connect();
 
-      // Safety Guard 3: Query server version and assert PostgreSQL major version 16
+      // Verify PostgreSQL major version 16
       const versionResult = await testPrisma1.$queryRawUnsafe<Array<{ version: string }>>('SELECT version();');
       const versionString = versionResult[0]?.version || '';
       const isPg16 = /PostgreSQL\s+16\b/i.test(versionString);
       if (!isPg16) {
         throw new Error(
-          `[SECURITY FATAL] Integration test requires PostgreSQL major version 16. Detected version string: "${versionString}"`
+          '[SECURITY FATAL] Integration test requires PostgreSQL major version 16.'
         );
       }
 
@@ -158,7 +166,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       if (err.message && err.message.includes('[SECURITY FATAL]')) {
         throw err;
       }
-      console.warn('[INTEGRATION TEST BLOCKED]: Database connection failed.');
+      console.warn('[INTEGRATION TEST BLOCKED]: Database connection failed. Details have been withheld to protect credentials.');
       isDbReachable = false;
     }
   });
