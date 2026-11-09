@@ -165,6 +165,66 @@ export class EncryptionService {
   }
 
   /**
+   * Extracts the key ID from a versioned encryption envelope if valid.
+   * Returns null if not encrypted or malformed.
+   */
+  public static extractEnvelopeKeyId(value: string | null | undefined): string | null {
+    if (!value || typeof value !== 'string') return null;
+    if (!value.startsWith('enc:v1:')) return null;
+    const parts = value.split(':');
+    if (parts.length !== 4 || parts[0] !== 'enc' || parts[1] !== 'v1') return null;
+    return parts[2] || null;
+  }
+
+  /**
+   * Checks if value is already encrypted with the currently active key
+   */
+  public static isEncryptedWithActiveKey(value: string | null | undefined): boolean {
+    if (!value || typeof value !== 'string') return false;
+    this.ensureInitialized();
+    return value.startsWith(`enc:v1:${this.activeKeyId}:`);
+  }
+
+  /**
+   * Inspects envelope classification for safe key inventory and migration status.
+   */
+  public static getEnvelopeStatus(value: string | null | undefined): {
+    category:
+      | 'EMPTY'
+      | 'PLAINTEXT'
+      | 'ACTIVE_KEY'
+      | 'HISTORICAL_KEY'
+      | 'UNKNOWN_KEY'
+      | 'UNSUPPORTED_VERSION'
+      | 'MALFORMED';
+    keyId: string | null;
+  } {
+    if (value === null || value === undefined || value === '') {
+      return { category: 'EMPTY', keyId: null };
+    }
+    const str = String(value);
+    if (!str.startsWith('enc:')) {
+      return { category: 'PLAINTEXT', keyId: null };
+    }
+    if (!str.startsWith('enc:v1:')) {
+      return { category: 'UNSUPPORTED_VERSION', keyId: null };
+    }
+    const parts = str.split(':');
+    if (parts.length !== 4 || parts[0] !== 'enc' || parts[1] !== 'v1' || !parts[2] || !parts[3]) {
+      return { category: 'MALFORMED', keyId: null };
+    }
+    const keyId = parts[2];
+    this.ensureInitialized();
+    if (keyId === this.activeKeyId) {
+      return { category: 'ACTIVE_KEY', keyId };
+    }
+    if (this.keyRing.has(keyId)) {
+      return { category: 'HISTORICAL_KEY', keyId };
+    }
+    return { category: 'UNKNOWN_KEY', keyId };
+  }
+
+  /**
    * Encrypts plaintext using AES-256-GCM with fresh 12-byte IV
    * Returns: enc:v1:<keyId>:<base64(iv + tag + ciphertext)>
    */

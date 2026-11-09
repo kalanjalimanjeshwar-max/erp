@@ -963,4 +963,369 @@ describe('Phase 2.3: Company Bank Accounts, AES-256-GCM Encryption & Security', 
       expect(err.message).toContain('Field "isActive" must be a boolean');
     });
   });
+
+  // --------------------------------------------------------------------------
+  // Phase 2.3: Historical-Key to Active-Key Re-encryption & Key Inventory Tests
+  // --------------------------------------------------------------------------
+  describe('Phase 2.3: Historical-Key to Active-Key Re-encryption & Key Inventory', () => {
+    const k1Hex = '1111111111111111111111111111111111111111111111111111111111111111';
+    const k2Hex = '2222222222222222222222222222222222222222222222222222222222222222';
+
+    beforeEach(() => {
+      EncryptionService.resetKeyRingForTesting();
+      // Setup key ring: k1 is historical, k2 is active
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), false);
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+    });
+
+    it('1. Plaintext record is recognized for initial encryption', () => {
+      const inspection = BankAccountBackfillService.inspectField('PLAIN_ACC_123', 'all', 'k2');
+      expect(inspection.needsUpdate).toBe(true);
+      expect(inspection.isPlaintext).toBe(true);
+      expect(inspection.isHistorical).toBe(false);
+      expect(inspection.isAlreadyActive).toBe(false);
+    });
+
+    it('2. Record encrypted with k1 is recognized for re-encryption when active key is k2', () => {
+      // Create envelope with k1
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Envelope = EncryptionService.encrypt('SECRET_CREDENTIAL')!;
+      expect(k1Envelope.startsWith('enc:v1:k1:')).toBe(true);
+
+      // Switch active to k2
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+
+      const inspection = BankAccountBackfillService.inspectField(k1Envelope, 'rotation-only', 'k2');
+      expect(inspection.needsUpdate).toBe(true);
+      expect(inspection.isHistorical).toBe(true);
+      expect(inspection.isPlaintext).toBe(false);
+      expect(inspection.sourceKeyId).toBe('k1');
+    });
+
+    it('3. Historical k1 data decrypts correctly while k1 remains in the historical key ring', () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Cipher = EncryptionService.encrypt('HISTORICAL_ACCOUNT_DATA')!;
+
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+      // k1 is still in key ring as historical
+      expect(EncryptionService.decrypt(k1Cipher)).toBe('HISTORICAL_ACCOUNT_DATA');
+    });
+
+    it('4. Re-encryption produces a valid k2 envelope', () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Cipher = EncryptionService.encrypt('ACC_987654321')!;
+
+      // Active is now k2
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+
+      const plain = EncryptionService.decrypt(k1Cipher);
+      const k2Cipher = EncryptionService.encrypt(plain)!;
+
+      expect(k2Cipher.startsWith('enc:v1:k2:')).toBe(true);
+      expect(EncryptionService.extractEnvelopeKeyId(k2Cipher)).toBe('k2');
+    });
+
+    it('5. The resulting k2 envelope decrypts to the original plaintext', () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const original = 'ORIGINAL_IBAN_GB123456';
+      const k1Cipher = EncryptionService.encrypt(original)!;
+
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+      const plain = EncryptionService.decrypt(k1Cipher);
+      const k2Cipher = EncryptionService.encrypt(plain)!;
+
+      expect(EncryptionService.decrypt(k2Cipher)).toBe(original);
+    });
+
+    it('6. Record already encrypted with k2 is skipped', () => {
+      const k2Cipher = EncryptionService.encrypt('ACTIVE_KEY_DATA')!;
+      expect(k2Cipher.startsWith('enc:v1:k2:')).toBe(true);
+
+      const inspection = BankAccountBackfillService.inspectField(k2Cipher, 'all', 'k2');
+      expect(inspection.needsUpdate).toBe(false);
+      expect(inspection.isAlreadyActive).toBe(true);
+      expect(inspection.sourceKeyId).toBe('k2');
+    });
+
+    it('7. Unknown historical key ID fails safely', () => {
+      const unknownKeyCipher = 'enc:v1:k999:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==';
+      const inspection = BankAccountBackfillService.inspectField(unknownKeyCipher, 'all', 'k2');
+
+      expect(inspection.needsUpdate).toBe(false);
+      expect(inspection.isUnrecoverable).toBe(true);
+      expect(inspection.error).toContain('UNKNOWN_KEY');
+    });
+
+    it('8. Unsupported envelope version fails safely', () => {
+      const badVersionCipher = 'enc:v2:k2:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==';
+      const inspection = BankAccountBackfillService.inspectField(badVersionCipher, 'all', 'k2');
+
+      expect(inspection.needsUpdate).toBe(false);
+      expect(inspection.isUnrecoverable).toBe(true);
+      expect(inspection.error).toContain('UNSUPPORTED_VERSION');
+    });
+
+    it('9. Tampered ciphertext fails authentication and is not overwritten', async () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const validCipher = EncryptionService.encrypt('TEST_TAMPER')!;
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+
+      // Corrupt payload
+      const parts = validCipher.split(':');
+      const buf = Buffer.from(parts[3], 'base64');
+      buf[buf.length - 1] ^= 0xff;
+      const tamperedCipher = `enc:v1:k1:${buf.toString('base64')}`;
+
+      const mockRecord = [
+        {
+          id: 'acc-tampered',
+          companyId: mockActor.companyId,
+          bankName: 'Tamper Bank',
+          accountHolderName: 'Holder',
+          accountNumber: tamperedCipher,
+          routingCode: null,
+          branchName: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+      ];
+
+      const updateSpy = vi.fn().mockResolvedValue({});
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        return cb({
+          companyBankAccount: {
+            findMany: vi.fn().mockResolvedValue(mockRecord),
+            update: updateSpy,
+          },
+        });
+      });
+
+      const result = await BankAccountBackfillService.runBackfill({ dryRun: false });
+
+      expect(result.totalErrors).toBe(1);
+      expect(result.totalUpdated).toBe(0);
+      expect(updateSpy).not.toHaveBeenCalled();
+      expect(result.errors[0].error).toContain('Decryption authentication failed');
+    });
+
+    it('10. Dry-run does not call any database update operation', async () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Cipher = EncryptionService.encrypt('ROTATION_CANDIDATE')!;
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+
+      const mockRecord = [
+        {
+          id: 'acc-dry-run-rot',
+          companyId: mockActor.companyId,
+          bankName: 'Dry Run Bank',
+          accountHolderName: 'Holder',
+          accountNumber: k1Cipher,
+          routingCode: null,
+          branchName: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+      ];
+
+      const updateSpy = vi.fn().mockResolvedValue({});
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        return cb({
+          companyBankAccount: {
+            findMany: vi.fn().mockResolvedValue(mockRecord),
+            update: updateSpy,
+          },
+        });
+      });
+
+      const result = await BankAccountBackfillService.runBackfill({ dryRun: true, mode: 'rotation-only' });
+
+      expect(result.dryRun).toBe(true);
+      expect(result.totalInspected).toBe(1);
+      expect(result.totalUpdated).toBe(1); // Simulated update count
+      expect(result.totalHistoricalReencrypted).toBe(1);
+      expect(updateSpy).not.toHaveBeenCalled(); // Non-mutating invariant
+    });
+
+    it('11. Dry-run reports the correct counts for plaintext vs historical vs active', async () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Cipher = EncryptionService.encrypt('HISTORICAL_1')!;
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+      const k2Cipher = EncryptionService.encrypt('ACTIVE_1')!;
+
+      const mockRecords = [
+        {
+          id: 'acc-plain',
+          accountNumber: 'RAW_PLAINTEXT_1',
+          routingCode: null,
+          branchName: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+        {
+          id: 'acc-historical',
+          accountNumber: k1Cipher,
+          routingCode: null,
+          branchName: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+        {
+          id: 'acc-active',
+          accountNumber: k2Cipher,
+          routingCode: null,
+          branchName: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+      ];
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        return cb({
+          companyBankAccount: {
+            findMany: vi.fn().mockResolvedValue(mockRecords),
+            update: vi.fn(),
+          },
+        });
+      });
+
+      const result = await BankAccountBackfillService.runBackfill({ dryRun: true, mode: 'all' });
+
+      expect(result.totalInspected).toBe(3);
+      expect(result.totalPlaintextEncrypted).toBe(1);
+      expect(result.totalHistoricalReencrypted).toBe(1);
+      expect(result.totalAlreadyActiveKey).toBe(1);
+      expect(result.totalUpdated).toBe(2);
+      expect(result.totalErrors).toBe(0);
+    });
+
+    it('12. Repeated dry-run remains consistent and idempotent', async () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Cipher = EncryptionService.encrypt('IDEMPOTENT_TEST')!;
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+
+      const mockRecords = [
+        {
+          id: 'acc-rep',
+          accountNumber: k1Cipher,
+          routingCode: null,
+          branchName: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+      ];
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        return cb({
+          companyBankAccount: {
+            findMany: vi.fn().mockResolvedValue(mockRecords),
+            update: vi.fn(),
+          },
+        });
+      });
+
+      const run1 = await BankAccountBackfillService.runBackfill({ dryRun: true });
+      const run2 = await BankAccountBackfillService.runBackfill({ dryRun: true });
+
+      expect(run1.totalUpdated).toBe(run2.totalUpdated);
+      expect(run1.totalHistoricalReencrypted).toBe(run2.totalHistoricalReencrypted);
+      expect(run1.totalErrors).toBe(run2.totalErrors);
+    });
+
+    it('13. Key inventory reports counts without revealing sensitive data', async () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Cipher = EncryptionService.encrypt('INV_SECRET_1')!;
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+      const k2Cipher = EncryptionService.encrypt('INV_SECRET_2')!;
+
+      const mockDbRecords = [
+        {
+          id: 'acc-inv-1',
+          accountNumber: k1Cipher,
+          routingCode: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+        {
+          id: 'acc-inv-2',
+          accountNumber: k2Cipher,
+          routingCode: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+        {
+          id: 'acc-inv-3',
+          accountNumber: 'PLAINTEXT_INV_3',
+          routingCode: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+      ];
+
+      vi.spyOn(prisma.companyBankAccount, 'findMany').mockResolvedValue(mockDbRecords as any);
+
+      const inventory = await BankAccountBackfillService.getKeyInventory();
+
+      expect(inventory.totalRecords).toBe(3);
+      expect(inventory.activeKeyId).toBe('k2');
+      expect(inventory.countsByKeyId['k1']).toBe(1);
+      expect(inventory.countsByKeyId['k2']).toBe(1);
+      expect(inventory.plaintextCount).toBe(1);
+      expect(inventory.needsRotationCount).toBe(1);
+      expect(inventory.retirementSafetyNotice).toContain('A historical key must NEVER be retired');
+
+      // Verify no plaintext or ciphertext in inventory report stringification
+      const serialized = JSON.stringify(inventory);
+      expect(serialized).not.toContain('INV_SECRET');
+      expect(serialized).not.toContain('PLAINTEXT_INV_3');
+      expect(serialized).not.toContain(k1Hex);
+      expect(serialized).not.toContain(k2Hex);
+    });
+
+    it('14. Malformed records are reported safely in inventory', async () => {
+      const mockDbRecords = [
+        {
+          id: 'acc-mal-1',
+          accountNumber: 'enc:v1:malformed-without-enough-colons',
+          routingCode: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+        {
+          id: 'acc-unk-2',
+          accountNumber: 'enc:v1:kUnknownKey:AAAAAAAAAAAAAAAAAAAAAAAAAAAA==',
+          routingCode: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+        {
+          id: 'acc-ver-3',
+          accountNumber: 'enc:v9:k2:AAAAAAAAAAAAAAAAAAAAAAAAAAAA==',
+          routingCode: null,
+          swiftBic: null,
+          iban: null,
+          upiId: null,
+        },
+      ];
+
+      vi.spyOn(prisma.companyBankAccount, 'findMany').mockResolvedValue(mockDbRecords as any);
+
+      const inventory = await BankAccountBackfillService.getKeyInventory();
+
+      expect(inventory.totalRecords).toBe(3);
+      expect(inventory.malformedCount).toBe(1);
+      expect(inventory.unknownKeyCount).toBe(1);
+      expect(inventory.unsupportedVersionCount).toBe(1);
+    });
+  });
 });

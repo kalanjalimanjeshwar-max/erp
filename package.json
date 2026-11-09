@@ -16,6 +16,7 @@
     "db:migrate:status": "prisma migrate status",
     "db:verify:staging": "tsx scripts/verify-staging-db.ts",
     "maintenance:backfill-bank-accounts": "tsx scripts/backfill-bank-accounts.ts",
+    "maintenance:key-inventory": "tsx scripts/backfill-bank-accounts.ts --inventory",
     "test:integration:concurrency": "node -e \"process.env.COREERP_INTEGRATION_TEST_MODE='true'; delete process.env.DATABASE_URL; const { spawnSync } = require('child_process'); const cmd = process.platform === 'win32' ? 'npx.cmd' : 'npx'; const res = spawnSync(cmd, ['vitest', 'run', 'tests/integration/concurrent-bank-account-default.test.ts'], { stdio: 'inherit', env: process.env }); process.exit(res.status ?? 1);\""
   },
   "dependencies": {
