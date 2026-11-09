@@ -19,6 +19,17 @@ const APPROVED_STANDARD_TEST_DB_URL =
 const INTEGRATION_TEST_DB_PORT = '5434';
 const INTEGRATION_TEST_DB_NAME = 'core_erp_integration_test';
 
+export {
+  APPROVED_TEST_DB_HOSTS,
+  STANDARD_TEST_DB_PORT,
+  STANDARD_TEST_DB_NAME,
+  APPROVED_STANDARD_TEST_DB_URL,
+  INTEGRATION_TEST_DB_PORT,
+  INTEGRATION_TEST_DB_NAME,
+  validateStandardDatabaseUrl,
+  validateIntegrationDatabaseUrl,
+};
+
 /**
  * Validates that DATABASE_URL strictly points to the approved standard unit test database.
  * Credentials and raw connection strings are NEVER logged in error messages.
@@ -114,15 +125,47 @@ function validateIntegrationDatabaseUrl(urlValue: string | undefined): void {
 }
 
 // 2. Validate environment database URLs independently for safety
-validateStandardDatabaseUrl(process.env.DATABASE_URL);
-validateIntegrationDatabaseUrl(process.env.TEST_DATABASE_URL);
+import dotenv from 'dotenv';
 
-// 3. Populate approved local test database URL for standard unit tests if absent
-if (!process.env.DATABASE_URL) {
-  process.env.DATABASE_URL = APPROVED_STANDARD_TEST_DB_URL;
+const isIntegrationMode = process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
+
+if (isIntegrationMode) {
+  if (process.env.NODE_ENV !== 'test') {
+    throw new Error(
+      '[DATABASE SAFETY VIOLATION] COREERP_INTEGRATION_TEST_MODE requires NODE_ENV=test. Refusing to proceed.'
+    );
+  }
+  // Wrap dotenv.config so subsequent calls do not inject DATABASE_URL from .env
+  const origDotenvConfig = dotenv.config;
+  dotenv.config = (options?: any) => {
+    const res = origDotenvConfig(options);
+    delete process.env.DATABASE_URL;
+    return res;
+  };
+
+  if (process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== '') {
+    throw new Error(
+      '[DATABASE SAFETY VIOLATION] Conflicting DATABASE_URL detected in integration test mode. Integration tests must exclusively use TEST_DATABASE_URL to prevent split-brain routing. Refusing to proceed.'
+    );
+  }
+  if (!process.env.TEST_DATABASE_URL || process.env.TEST_DATABASE_URL.trim() === '') {
+    throw new Error(
+      '[DATABASE SAFETY VIOLATION] TEST_DATABASE_URL is required in integration test mode. Refusing to proceed.'
+    );
+  }
+  validateIntegrationDatabaseUrl(process.env.TEST_DATABASE_URL);
+  // In integration mode, DATABASE_URL is deliberately not populated with the port 5433 fallback.
+} else {
+  validateStandardDatabaseUrl(process.env.DATABASE_URL);
+  validateIntegrationDatabaseUrl(process.env.TEST_DATABASE_URL);
+
+  // 3. Populate approved local test database URL for standard unit tests if absent
+  if (!process.env.DATABASE_URL) {
+    process.env.DATABASE_URL = APPROVED_STANDARD_TEST_DB_URL;
+  }
+  // Note: TEST_DATABASE_URL is NEVER automatically populated with default or placeholder credentials.
+  // Missing TEST_DATABASE_URL remains missing so dedicated integration tests report BLOCKED / NOT RUN safely.
 }
-// Note: TEST_DATABASE_URL is NEVER automatically populated with default or placeholder credentials.
-// Missing TEST_DATABASE_URL remains missing so dedicated integration tests report BLOCKED / NOT RUN safely.
 
 // 4. Provide non-secret, test-only SESSION_SECRET satisfying environment schema
 if (!process.env.SESSION_SECRET) {
@@ -135,6 +178,9 @@ if (!process.env.SESSION_SECRET) {
 import { beforeAll, vi } from 'vitest';
 
 beforeAll(async () => {
+  if (process.env.COREERP_INTEGRATION_TEST_MODE === 'true') {
+    return;
+  }
   const { prisma } = await import('../src/server/db/client.js');
   if (prisma?.rolePermission) {
     if ('findUnique' in prisma.rolePermission) {

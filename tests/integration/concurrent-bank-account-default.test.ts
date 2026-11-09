@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { PrismaClient } from '@prisma/client';
 import { CompanyBankAccountService } from '../../src/server/services/company-bank-account.service.js';
+import { EncryptionService } from '../../src/server/security/encryption.service.js';
 import { AuthUser } from '../../src/shared/types.js';
 import net from 'net';
 
@@ -26,15 +27,31 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
   let testPrisma2: PrismaClient | null = null;
 
   const testCompanyId = '00000000-0000-4000-a000-000000000099';
+  const testUserId = '00000000-0000-4000-a000-000000000001';
   const testActor: AuthUser = {
-    id: 'user-integ-test-1',
-    userId: 'user-integ-test-1',
+    id: testUserId,
+    userId: testUserId,
     companyId: testCompanyId,
-    email: 'integration-test@coreerp.local',
-    fullName: 'Integration Tester',
+    email: 'integration-test-user@coreerp.local',
+    fullName: 'Integration Test Admin',
     role: 'ADMIN',
     isActive: true,
     tokenVersion: 1,
+  };
+
+  const cleanupTestData = async (client: PrismaClient) => {
+    try {
+      await client.auditLog.deleteMany({ where: { companyId: testCompanyId } });
+    } catch {}
+    try {
+      await client.companyBankAccount.deleteMany({ where: { companyId: testCompanyId } });
+    } catch {}
+    try {
+      await client.user.deleteMany({ where: { companyId: testCompanyId } });
+    } catch {}
+    try {
+      await client.company.deleteMany({ where: { id: testCompanyId } });
+    } catch {}
   };
 
   // Helper to test if TCP port is reachable before attempting Prisma connection
@@ -173,16 +190,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
 
   afterAll(async () => {
     if (testPrisma1) {
-      try {
-        await testPrisma1.companyBankAccount.deleteMany({
-          where: { companyId: testCompanyId },
-        });
-        await testPrisma1.company.deleteMany({
-          where: { id: testCompanyId },
-        });
-      } catch {
-        // cleanup best effort
-      }
+      await cleanupTestData(testPrisma1);
       await testPrisma1.$disconnect();
     }
     if (testPrisma2) {
@@ -198,7 +206,13 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       return;
     }
 
-    // Setup: Create test company and two active accounts
+    // Initialize encryption service for test session
+    EncryptionService.init();
+
+    // Clean up any stale data from previous aborted test runs
+    await cleanupTestData(testPrisma1);
+
+    // Setup: Create test company, test user actor, and two active accounts
     await testPrisma1.company.upsert({
       where: { id: testCompanyId },
       update: {},
@@ -211,12 +225,29 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       },
     });
 
+    await testPrisma1.user.upsert({
+      where: { id: testUserId },
+      update: {},
+      create: {
+        id: testUserId,
+        companyId: testCompanyId,
+        email: 'integration-test-user@coreerp.local',
+        fullName: 'Integration Test Admin',
+        role: 'ADMIN',
+        isActive: true,
+        passwordHash: '$2a$10$abcdefghijklmnopqrstuuNOPASSWORDHASHFORTESTONLY123456',
+      },
+    });
+
+    const encAcc1 = EncryptionService.encrypt('1111222233334444')!;
+    const encAcc2 = EncryptionService.encrypt('5555666677778888')!;
+
     const acc1 = await testPrisma1.companyBankAccount.create({
       data: {
         companyId: testCompanyId,
         bankName: 'Concurrent Bank Alpha',
         accountHolderName: 'Concurrency Test Corp',
-        accountNumber: 'enc:v1:k1:TESTACC1',
+        accountNumber: encAcc1,
         isDefault: false,
         isActive: true,
       },
@@ -227,7 +258,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
         companyId: testCompanyId,
         bankName: 'Concurrent Bank Beta',
         accountHolderName: 'Concurrency Test Corp',
-        accountNumber: 'enc:v1:k1:TESTACC2',
+        accountNumber: encAcc2,
         isDefault: false,
         isActive: true,
       },
@@ -247,7 +278,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
 
     if (rejectedCount > 0) {
       const rejected = [res1, res2].find((r) => r.status === 'rejected') as PromiseRejectedResult;
-      expect((rejected.reason as { statusCode?: number }).statusCode).toBe(409);
+      expect((rejected.reason as { statusCode?: number })?.statusCode).toBe(409);
     }
 
     // Verify database invariant: Exactly ONE default account can be active in the real PostgreSQL table
