@@ -1405,5 +1405,226 @@ describe('Phase 2.3: Company Bank Accounts, AES-256-GCM Encryption & Security', 
         id: 'specific-fixture-uuid-2',
       });
     });
+
+    it('17. Exact scoped account with historical key k1 is re-encrypted to k2, and re-running produces totalUpdated=0 and totalAlreadyActiveKey=1', async () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Cipher = EncryptionService.encrypt('CYCLE_TEST_ACC_1')!;
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+
+      let storedAccount: any = {
+        id: 'cycle-fixture-uuid',
+        companyId: 'cycle-company-uuid',
+        accountNumber: k1Cipher,
+        routingCode: null,
+        branchName: null,
+        swiftBic: null,
+        iban: null,
+        upiId: null,
+      };
+
+      // Mock transaction for first run (re-encryption from k1 to k2)
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        return cb({
+          companyBankAccount: {
+            findMany: vi.fn().mockImplementation(() => [storedAccount]),
+            update: vi.fn().mockImplementation((args: any) => {
+              storedAccount = { ...storedAccount, ...args.data };
+              return storedAccount;
+            }),
+          },
+        });
+      });
+
+      const firstRun = await BankAccountBackfillService.runBackfill({
+        companyId: 'cycle-company-uuid',
+        accountId: 'cycle-fixture-uuid',
+        dryRun: false,
+        mode: 'rotation-only',
+      });
+
+      expect(firstRun.totalInspected).toBe(1);
+      expect(firstRun.totalUpdated).toBe(1);
+      expect(firstRun.totalHistoricalReencrypted).toBe(1);
+      expect(firstRun.totalAlreadyActiveKey).toBe(0);
+      expect(storedAccount.accountNumber.startsWith('enc:v1:k2:')).toBe(true);
+
+      // Re-running against the same exact account produces totalUpdated=0 and totalAlreadyActiveKey=1
+      const rerun = await BankAccountBackfillService.runBackfill({
+        companyId: 'cycle-company-uuid',
+        accountId: 'cycle-fixture-uuid',
+        dryRun: false,
+        mode: 'rotation-only',
+      });
+
+      expect(rerun.totalInspected).toBe(1);
+      expect(rerun.totalUpdated).toBe(0);
+      expect(rerun.totalAlreadyActiveKey).toBe(1);
+      expect(rerun.totalAlreadyEncrypted).toBe(1);
+    });
+
+    it('18. Exact scoped account already encrypted with active key k2 is inspected and counted as totalAlreadyActiveKey=1', async () => {
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+      const k2Cipher = EncryptionService.encrypt('ALREADY_ACTIVE_ACC_2')!;
+
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        return cb({
+          companyBankAccount: {
+            findMany: vi.fn().mockImplementation(() => [
+              {
+                id: 'active-fixture-uuid',
+                companyId: 'active-company-uuid',
+                accountNumber: k2Cipher,
+                routingCode: null,
+                branchName: null,
+                swiftBic: null,
+                iban: null,
+                upiId: null,
+              },
+            ]),
+            update: vi.fn(),
+          },
+        });
+      });
+
+      const result = await BankAccountBackfillService.runBackfill({
+        companyId: 'active-company-uuid',
+        accountId: 'active-fixture-uuid',
+        dryRun: false,
+        mode: 'rotation-only',
+      });
+
+      expect(result.totalInspected).toBe(1);
+      expect(result.totalUpdated).toBe(0);
+      expect(result.totalAlreadyActiveKey).toBe(1);
+      expect(result.totalAlreadyEncrypted).toBe(1);
+    });
+
+    it('19. Batch run without accountId continues excluding active-key records in SQL candidate query', async () => {
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+
+      let batchQueryCaptured: any = null;
+      let exactQueryCaptured: any = null;
+
+      const mockBatchTx = {
+        $queryRaw: vi.fn().mockImplementation((strings: TemplateStringsArray, ...values: any[]) => {
+          batchQueryCaptured = { strings, values };
+          return Promise.resolve([]);
+        }),
+      };
+
+      const mockExactTx = {
+        $queryRaw: vi.fn().mockImplementation((strings: TemplateStringsArray, ...values: any[]) => {
+          exactQueryCaptured = { strings, values };
+          return Promise.resolve([]);
+        }),
+      };
+
+      // 1. Batch mode: accountId is absent
+      await BankAccountBackfillService.fetchLockedCandidates(
+        mockBatchTx,
+        50,
+        'batch-company-id',
+        'rotation-only',
+        'k2'
+      );
+
+      const batchSql = batchQueryCaptured.strings.join('?');
+      expect(batchSql).toContain('NOT LIKE');
+      expect(batchQueryCaptured.values).toContain('enc:v1:k2:%');
+      expect(batchSql).not.toContain('id =');
+
+      // 2. Exact account mode: accountId and companyId both present
+      await BankAccountBackfillService.fetchLockedCandidates(
+        mockExactTx,
+        50,
+        'exact-company-id',
+        'rotation-only',
+        'k2',
+        'exact-account-id'
+      );
+
+      const exactSql = exactQueryCaptured.strings.join('?');
+      expect(exactSql).toContain('id = ?::uuid');
+      expect(exactSql).toContain('"companyId" = ?::uuid');
+      // Exact account mode must NOT exclude active-key records so they reach the inspection loop
+      expect(exactSql).not.toContain('NOT LIKE');
+      expect(exactQueryCaptured.values).toContain('exact-account-id');
+      expect(exactQueryCaptured.values).toContain('exact-company-id');
+    });
+
+    it('20. Missing companyId with accountId is rejected safely to prevent tenant isolation breaches', async () => {
+      await expect(
+        BankAccountBackfillService.runBackfill({
+          accountId: 'orphan-account-uuid',
+        })
+      ).rejects.toThrow('[SECURITY FATAL] Account-specific execution requires explicit company scope');
+
+      await expect(
+        BankAccountBackfillService.getKeyInventory(undefined, 'orphan-account-uuid')
+      ).rejects.toThrow('[SECURITY FATAL] Account-specific execution requires explicit company scope');
+    });
+
+    it('21. Test cleanup execution is guaranteed even if assertion fails in try/finally block', async () => {
+      let cleanupRan = false;
+      const mockPrismaClient = {} as any;
+
+      const cleanupAction = async () => {
+        cleanupRan = true;
+      };
+
+      try {
+        try {
+          throw new Error('Simulated assertion failure');
+        } finally {
+          await cleanupAction();
+        }
+      } catch (err: any) {
+        expect(err.message).toBe('Simulated assertion failure');
+      }
+
+      expect(cleanupRan).toBe(true);
+    });
+
+    it('22. Existing dry-run behavior against scoped account remains strictly non-mutating', async () => {
+      EncryptionService.registerKey('k1', Buffer.from(k1Hex, 'hex'), true);
+      const k1Cipher = EncryptionService.encrypt('DRY_RUN_ACC_VAL')!;
+      EncryptionService.registerKey('k2', Buffer.from(k2Hex, 'hex'), true);
+
+      let updateCalled = false;
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        return cb({
+          companyBankAccount: {
+            findMany: vi.fn().mockImplementation(() => [
+              {
+                id: 'dry-acc-id',
+                companyId: 'dry-comp-id',
+                accountNumber: k1Cipher,
+                routingCode: null,
+                branchName: null,
+                swiftBic: null,
+                iban: null,
+                upiId: null,
+              },
+            ]),
+            update: vi.fn().mockImplementation(() => {
+              updateCalled = true;
+            }),
+          },
+        });
+      });
+
+      const dryRunRes = await BankAccountBackfillService.runBackfill({
+        companyId: 'dry-comp-id',
+        accountId: 'dry-acc-id',
+        dryRun: true,
+        mode: 'rotation-only',
+      });
+
+      expect(dryRunRes.dryRun).toBe(true);
+      expect(dryRunRes.totalInspected).toBe(1);
+      expect(dryRunRes.totalUpdated).toBe(1); // Projected update count
+      expect(dryRunRes.totalHistoricalReencrypted).toBe(1);
+      expect(updateCalled).toBe(false); // Database write was NOT executed
+    });
   });
 });

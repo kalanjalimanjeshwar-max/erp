@@ -143,6 +143,14 @@ export class BankAccountBackfillService {
   /**
    * Fetches candidate records with row-level lock FOR UPDATE SKIP LOCKED
    * Uses strictly parameterized SQL query matching the requested mode.
+   *
+   * Scoping rules:
+   * - When BOTH companyId and accountId are provided, performs exact account inspection:
+   *   fetches that exact record (id = accountId AND companyId = companyId) without filtering by
+   *   active key, allowing the inspection loop to detect and tally already-active records.
+   * - When accountId is absent (batch mode), filters candidates using SQL WHERE clauses to
+   *   exclude records already encrypted under the active key.
+   * - AccountId without companyId is strictly rejected to preserve tenant isolation boundaries.
    */
   public static async fetchLockedCandidates(
     tx: any,
@@ -152,13 +160,51 @@ export class BankAccountBackfillService {
     activeKeyId: string = EncryptionService.getActiveKeyId(),
     accountId?: string
   ): Promise<any[]> {
+    if (accountId && !companyId) {
+      throw new Error(
+        '[SECURITY FATAL] Account-specific execution requires explicit company scope to prevent tenant boundary violations.'
+      );
+    }
+
+    // 1. Exact Account Inspection Mode (Both companyId and accountId provided)
+    if (companyId && accountId) {
+      if (typeof tx.$queryRaw === 'function') {
+        try {
+          return await tx.$queryRaw`
+            SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
+            FROM "CompanyBankAccount"
+            WHERE id = ${accountId}::uuid
+              AND "companyId" = ${companyId}::uuid
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+          `;
+        } catch (err: any) {
+          if (tx.companyBankAccount?.findMany) {
+            return await tx.companyBankAccount.findMany({
+              where: { id: accountId, companyId },
+              take: 1,
+            });
+          }
+          throw err;
+        }
+      }
+
+      if (tx.companyBankAccount?.findMany) {
+        return await tx.companyBankAccount.findMany({
+          where: { id: accountId, companyId },
+          take: 1,
+        });
+      }
+
+      return [];
+    }
+
+    // 2. Batch Mode (accountId is absent)
     const activePrefix = `enc:v1:${activeKeyId}:%`;
+    const companyFilter = companyId ? Prisma.sql`AND "companyId" = ${companyId}::uuid` : Prisma.empty;
 
     if (typeof tx.$queryRaw === 'function') {
       try {
-        const companyFilter = companyId ? Prisma.sql`AND "companyId" = ${companyId}::uuid` : Prisma.empty;
-        const accountFilter = accountId ? Prisma.sql`AND id = ${accountId}::uuid` : Prisma.empty;
-
         if (mode === 'plaintext-only') {
           return await tx.$queryRaw`
             SELECT id, "companyId", "bankName", "accountHolderName", "accountNumber", "routingCode", "branchName", "swiftBic", "iban", "upiId"
@@ -171,7 +217,6 @@ export class BankAccountBackfillService {
               OR ("upiId" IS NOT NULL AND "upiId" NOT LIKE 'enc:%')
             )
             ${companyFilter}
-            ${accountFilter}
             ORDER BY id ASC
             LIMIT ${batchSize}
             FOR UPDATE SKIP LOCKED
@@ -188,7 +233,6 @@ export class BankAccountBackfillService {
               OR ("upiId" IS NOT NULL AND "upiId" LIKE 'enc:v1:%' AND "upiId" NOT LIKE ${activePrefix})
             )
             ${companyFilter}
-            ${accountFilter}
             ORDER BY id ASC
             LIMIT ${batchSize}
             FOR UPDATE SKIP LOCKED
@@ -206,7 +250,6 @@ export class BankAccountBackfillService {
               OR ("upiId" IS NOT NULL AND "upiId" NOT LIKE ${activePrefix})
             )
             ${companyFilter}
-            ${accountFilter}
             ORDER BY id ASC
             LIMIT ${batchSize}
             FOR UPDATE SKIP LOCKED
@@ -217,7 +260,6 @@ export class BankAccountBackfillService {
         if (tx.companyBankAccount?.findMany) {
           const where: any = {};
           if (companyId) where.companyId = companyId;
-          if (accountId) where.id = accountId;
           return await tx.companyBankAccount.findMany({
             where,
             take: batchSize,
@@ -231,7 +273,6 @@ export class BankAccountBackfillService {
     if (tx.companyBankAccount?.findMany) {
       const where: any = {};
       if (companyId) where.companyId = companyId;
-      if (accountId) where.id = accountId;
       return await tx.companyBankAccount.findMany({
         where,
         take: batchSize,
@@ -246,6 +287,12 @@ export class BankAccountBackfillService {
    * Executes backfill or key re-encryption in bounded, transactional chunks with row-level locking
    */
   public static async runBackfill(options: BackfillOptions = {}): Promise<BackfillResult> {
+    if (options.accountId && !options.companyId) {
+      throw new Error(
+        '[SECURITY FATAL] Account-specific execution requires explicit company scope to prevent tenant boundary violations.'
+      );
+    }
+
     const batchSize = Math.max(1, Math.min(100, options.batchSize || this.DEFAULT_BATCH_SIZE));
     const isDryRun = options.dryRun ?? false;
     const mode = options.mode || 'all';
@@ -434,8 +481,9 @@ export class BankAccountBackfillService {
           }
         });
 
+        // When accountId is specified, single target inspection is complete; exit loop
         // In dry run, stop after checking candidate rows to avoid re-scanning the same uncommitted rows
-        if (isDryRun || batchCandidateCount < batchSize || iterationCount >= MAX_DRY_RUN_ITERATIONS) {
+        if (isDryRun || options.accountId || batchCandidateCount < batchSize || iterationCount >= MAX_DRY_RUN_ITERATIONS) {
           hasMore = false;
         }
       } catch (batchErr: any) {
@@ -458,6 +506,12 @@ export class BankAccountBackfillService {
    * Never mutates records or prints sensitive secrets.
    */
   public static async getKeyInventory(companyId?: string, accountId?: string): Promise<KeyInventoryReport> {
+    if (accountId && !companyId) {
+      throw new Error(
+        '[SECURITY FATAL] Account-specific execution requires explicit company scope to prevent tenant boundary violations.'
+      );
+    }
+
     const activeKeyId = EncryptionService.getActiveKeyId();
     const registeredKeys = EncryptionService.getRegisteredKeyIds();
 

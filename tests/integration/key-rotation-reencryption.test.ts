@@ -35,18 +35,33 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
   const testK2Hex = '2222222222222222222222222222222222222222222222222222222222222222';
 
   const cleanupTestData = async (client: PrismaClient) => {
+    const errors: string[] = [];
     try {
       await client.auditLog.deleteMany({ where: { companyId: testCompanyId } });
-    } catch {}
+    } catch (err: any) {
+      errors.push(`auditLog: ${err?.message || err}`);
+    }
     try {
       await client.companyBankAccount.deleteMany({ where: { companyId: testCompanyId } });
-    } catch {}
+    } catch (err: any) {
+      errors.push(`companyBankAccount: ${err?.message || err}`);
+    }
     try {
       await client.user.deleteMany({ where: { companyId: testCompanyId } });
-    } catch {}
+    } catch (err: any) {
+      errors.push(`user: ${err?.message || err}`);
+    }
     try {
       await client.company.deleteMany({ where: { id: testCompanyId } });
-    } catch {}
+    } catch (err: any) {
+      errors.push(`company: ${err?.message || err}`);
+    }
+
+    if (errors.length > 0) {
+      console.error(
+        `[TEST CLEANUP WARNING] Safe foreign-key cleanup encountered errors for company "${testCompanyId}":\n  ${errors.join('\n  ')}`
+      );
+    }
   };
 
   const checkPortReachable = (host: string, port: number, timeoutMs = 1000): Promise<boolean> => {
@@ -159,96 +174,98 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
     // Clean up any stale data from previous aborted runs
     await cleanupTestData(testPrisma);
 
-    // 1. Setup initial cryptographic state: k1 is active
-    EncryptionService.resetKeyRingForTesting();
-    EncryptionService.registerKey('k1', Buffer.from(testK1Hex, 'hex'), true);
+    try {
+      // 1. Setup initial cryptographic state: k1 is active
+      EncryptionService.resetKeyRingForTesting();
+      EncryptionService.registerKey('k1', Buffer.from(testK1Hex, 'hex'), true);
 
-    const testPlaintext = 'CONCURRENT_ROTATION_TEST_ACC_1001';
-    const originalK1Ciphertext = EncryptionService.encrypt(testPlaintext)!;
-    expect(originalK1Ciphertext.startsWith('enc:v1:k1:')).toBe(true);
+      const testPlaintext = 'CONCURRENT_ROTATION_TEST_ACC_1001';
+      const originalK1Ciphertext = EncryptionService.encrypt(testPlaintext)!;
+      expect(originalK1Ciphertext.startsWith('enc:v1:k1:')).toBe(true);
 
-    // 2. Insert test fixtures: Company, User, and BankAccount encrypted with k1
-    await testPrisma.company.upsert({
-      where: { id: testCompanyId },
-      update: {},
-      create: {
-        id: testCompanyId,
-        name: 'Rotation Verification Corp',
-        code: 'ROTC',
-        currency: 'USD',
-        timezone: 'UTC',
-      },
-    });
+      // 2. Insert test fixtures: Company, User, and BankAccount encrypted with k1
+      await testPrisma.company.upsert({
+        where: { id: testCompanyId },
+        update: {},
+        create: {
+          id: testCompanyId,
+          name: 'Rotation Verification Corp',
+          code: 'ROTC',
+          currency: 'USD',
+          timezone: 'UTC',
+        },
+      });
 
-    await testPrisma.user.upsert({
-      where: { id: testUserId },
-      update: {},
-      create: {
-        id: testUserId,
+      await testPrisma.user.upsert({
+        where: { id: testUserId },
+        update: {},
+        create: {
+          id: testUserId,
+          companyId: testCompanyId,
+          email: 'rotation-test-user@coreerp.local',
+          fullName: 'Rotation Test User',
+          role: 'ADMIN',
+          isActive: true,
+          passwordHash: '$2a$10$abcdefghijklmnopqrstuuNOPASSWORDHASHFORTESTONLY123456',
+        },
+      });
+
+      const testAccount = await testPrisma.companyBankAccount.create({
+        data: {
+          companyId: testCompanyId,
+          bankName: 'Historical Key Bank',
+          accountHolderName: 'Rotation Verification Corp',
+          accountNumber: originalK1Ciphertext,
+          isDefault: false,
+          isActive: true,
+        },
+      });
+
+      // 3. Promote k2 to active key, retaining k1 as historical
+      EncryptionService.registerKey('k2', Buffer.from(testK2Hex, 'hex'), true);
+      expect(EncryptionService.getActiveKeyId()).toBe('k2');
+      expect(EncryptionService.getRegisteredKeyIds()).toContain('k1');
+      expect(EncryptionService.getRegisteredKeyIds()).toContain('k2');
+
+      // 4. Execute Dry-Run Re-encryption
+      const dryRunResult = await BankAccountBackfillService.runBackfill({
+        dryRun: true,
         companyId: testCompanyId,
-        email: 'rotation-test-user@coreerp.local',
-        fullName: 'Rotation Test User',
-        role: 'ADMIN',
-        isActive: true,
-        passwordHash: '$2a$10$abcdefghijklmnopqrstuuNOPASSWORDHASHFORTESTONLY123456',
-      },
-    });
+        mode: 'rotation-only',
+      });
 
-    const testAccount = await testPrisma.companyBankAccount.create({
-      data: {
-        companyId: testCompanyId,
-        bankName: 'Historical Key Bank',
-        accountHolderName: 'Rotation Verification Corp',
-        accountNumber: originalK1Ciphertext,
-        isDefault: false,
-        isActive: true,
-      },
-    });
+      expect(dryRunResult.dryRun).toBe(true);
+      expect(dryRunResult.totalInspected).toBe(1);
+      expect(dryRunResult.totalUpdated).toBe(1); // Simulated update count
+      expect(dryRunResult.totalHistoricalReencrypted).toBe(1);
+      expect(dryRunResult.totalErrors).toBe(0);
 
-    // 3. Promote k2 to active key, retaining k1 as historical
-    EncryptionService.registerKey('k2', Buffer.from(testK2Hex, 'hex'), true);
-    expect(EncryptionService.getActiveKeyId()).toBe('k2');
-    expect(EncryptionService.getRegisteredKeyIds()).toContain('k1');
-    expect(EncryptionService.getRegisteredKeyIds()).toContain('k2');
+      // 5. Verify database record was NOT mutated (Strict non-mutating invariant)
+      const recordAfterDryRun = await testPrisma.companyBankAccount.findUnique({
+        where: { id: testAccount.id },
+      });
 
-    // 4. Execute Dry-Run Re-encryption
-    const dryRunResult = await BankAccountBackfillService.runBackfill({
-      dryRun: true,
-      companyId: testCompanyId,
-      mode: 'rotation-only',
-    });
+      expect(recordAfterDryRun).toBeDefined();
+      // Database record MUST still contain the exact original k1 ciphertext
+      expect(recordAfterDryRun!.accountNumber).toBe(originalK1Ciphertext);
+      expect(recordAfterDryRun!.accountNumber.startsWith('enc:v1:k1:')).toBe(true);
 
-    expect(dryRunResult.dryRun).toBe(true);
-    expect(dryRunResult.totalInspected).toBe(1);
-    expect(dryRunResult.totalUpdated).toBe(1); // Simulated update count
-    expect(dryRunResult.totalHistoricalReencrypted).toBe(1);
-    expect(dryRunResult.totalErrors).toBe(0);
+      // 6. Verify original k1 ciphertext still decrypts to expected plaintext
+      const decrypted = EncryptionService.decrypt(recordAfterDryRun!.accountNumber);
+      expect(decrypted).toBe(testPlaintext);
 
-    // 5. Verify database record was NOT mutated (Strict non-mutating invariant)
-    const recordAfterDryRun = await testPrisma.companyBankAccount.findUnique({
-      where: { id: testAccount.id },
-    });
-
-    expect(recordAfterDryRun).toBeDefined();
-    // Database record MUST still contain the exact original k1 ciphertext
-    expect(recordAfterDryRun!.accountNumber).toBe(originalK1Ciphertext);
-    expect(recordAfterDryRun!.accountNumber.startsWith('enc:v1:k1:')).toBe(true);
-
-    // 6. Verify original k1 ciphertext still decrypts to expected plaintext
-    const decrypted = EncryptionService.decrypt(recordAfterDryRun!.accountNumber);
-    expect(decrypted).toBe(testPlaintext);
-
-    // 7. Verify Key Inventory Report reflects exactly 1 record under k1 and 0 under k2
-    const inventory = await BankAccountBackfillService.getKeyInventory(testCompanyId);
-    expect(inventory.totalRecords).toBe(1);
-    expect(inventory.activeKeyId).toBe('k2');
-    expect(inventory.countsByKeyId['k1']).toBe(1);
-    expect(inventory.countsByKeyId['k2']).toBe(0);
-    expect(inventory.needsRotationCount).toBe(1);
-    expect(inventory.fullyActiveCount).toBe(0);
-
-    // 8. Clean up test data
-    await cleanupTestData(testPrisma);
+      // 7. Verify Key Inventory Report reflects exactly 1 record under k1 and 0 under k2
+      const inventory = await BankAccountBackfillService.getKeyInventory(testCompanyId);
+      expect(inventory.totalRecords).toBe(1);
+      expect(inventory.activeKeyId).toBe('k2');
+      expect(inventory.countsByKeyId['k1']).toBe(1);
+      expect(inventory.countsByKeyId['k2']).toBe(0);
+      expect(inventory.needsRotationCount).toBe(1);
+      expect(inventory.fullyActiveCount).toBe(0);
+    } finally {
+      // 8. Clean up test data in guaranteed finally block
+      await cleanupTestData(testPrisma);
+    }
   });
 
   it('should execute live controlled re-encryption on a single test fixture under active key k2, verify round-trip, and clean up safely', async () => {
@@ -261,133 +278,135 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
     // Clean up any stale data from previous runs
     await cleanupTestData(testPrisma);
 
-    // 1. Setup initial cryptographic state: k1 is active
-    EncryptionService.resetKeyRingForTesting();
-    EncryptionService.registerKey('k1', Buffer.from(testK1Hex, 'hex'), true);
+    try {
+      // 1. Setup initial cryptographic state: k1 is active
+      EncryptionService.resetKeyRingForTesting();
+      EncryptionService.registerKey('k1', Buffer.from(testK1Hex, 'hex'), true);
 
-    const testPlaintext = 'LIVE_ROTATION_AUTHORIZED_ACC_2002';
-    const originalK1Ciphertext = EncryptionService.encrypt(testPlaintext)!;
-    expect(originalK1Ciphertext.startsWith('enc:v1:k1:')).toBe(true);
-    expect(EncryptionService.decrypt(originalK1Ciphertext)).toBe(testPlaintext);
+      const testPlaintext = 'LIVE_ROTATION_AUTHORIZED_ACC_2002';
+      const originalK1Ciphertext = EncryptionService.encrypt(testPlaintext)!;
+      expect(originalK1Ciphertext.startsWith('enc:v1:k1:')).toBe(true);
+      expect(EncryptionService.decrypt(originalK1Ciphertext)).toBe(testPlaintext);
 
-    // 2. Insert test fixtures: Company, User, and BankAccount encrypted with k1
-    await testPrisma.company.upsert({
-      where: { id: testCompanyId },
-      update: {},
-      create: {
-        id: testCompanyId,
-        name: 'Live Rotation Corp',
-        code: 'LROTC',
-        currency: 'USD',
-        timezone: 'UTC',
-      },
-    });
+      // 2. Insert test fixtures: Company, User, and BankAccount encrypted with k1
+      await testPrisma.company.upsert({
+        where: { id: testCompanyId },
+        update: {},
+        create: {
+          id: testCompanyId,
+          name: 'Live Rotation Corp',
+          code: 'LROTC',
+          currency: 'USD',
+          timezone: 'UTC',
+        },
+      });
 
-    await testPrisma.user.upsert({
-      where: { id: testUserId },
-      update: {},
-      create: {
-        id: testUserId,
+      await testPrisma.user.upsert({
+        where: { id: testUserId },
+        update: {},
+        create: {
+          id: testUserId,
+          companyId: testCompanyId,
+          email: 'live-rotation-user@coreerp.local',
+          fullName: 'Live Rotation User',
+          role: 'ADMIN',
+          isActive: true,
+          passwordHash: '$2a$10$abcdefghijklmnopqrstuuNOPASSWORDHASHFORTESTONLY123456',
+        },
+      });
+
+      const testAccount = await testPrisma.companyBankAccount.create({
+        data: {
+          companyId: testCompanyId,
+          bankName: 'Live Historical Key Bank',
+          accountHolderName: 'Live Rotation Corp',
+          accountNumber: originalK1Ciphertext,
+          isDefault: false,
+          isActive: true,
+        },
+      });
+
+      // 3. Promote k2 to active key, retaining k1 as historical
+      EncryptionService.registerKey('k2', Buffer.from(testK2Hex, 'hex'), true);
+      expect(EncryptionService.getActiveKeyId()).toBe('k2');
+      expect(EncryptionService.getRegisteredKeyIds()).toContain('k1');
+      expect(EncryptionService.getRegisteredKeyIds()).toContain('k2');
+
+      // 4. Step 8 of pre-flight: Dry-Run scoped strictly to test fixture
+      const dryRunResult = await BankAccountBackfillService.runBackfill({
+        dryRun: true,
         companyId: testCompanyId,
-        email: 'live-rotation-user@coreerp.local',
-        fullName: 'Live Rotation User',
-        role: 'ADMIN',
-        isActive: true,
-        passwordHash: '$2a$10$abcdefghijklmnopqrstuuNOPASSWORDHASHFORTESTONLY123456',
-      },
-    });
+        accountId: testAccount.id,
+        mode: 'rotation-only',
+      });
 
-    const testAccount = await testPrisma.companyBankAccount.create({
-      data: {
+      expect(dryRunResult.dryRun).toBe(true);
+      expect(dryRunResult.totalInspected).toBe(1);
+      expect(dryRunResult.totalUpdated).toBe(1);
+      expect(dryRunResult.totalHistoricalReencrypted).toBe(1);
+      expect(dryRunResult.totalErrors).toBe(0);
+
+      // Verify record was NOT mutated during dry-run
+      const recordAfterDryRun = await testPrisma.companyBankAccount.findUnique({
+        where: { id: testAccount.id },
+      });
+      expect(recordAfterDryRun!.accountNumber).toBe(originalK1Ciphertext);
+
+      // 5. Authorized Live Re-encryption scoped strictly to test fixture
+      const liveResult = await BankAccountBackfillService.runBackfill({
+        dryRun: false,
         companyId: testCompanyId,
-        bankName: 'Live Historical Key Bank',
-        accountHolderName: 'Live Rotation Corp',
-        accountNumber: originalK1Ciphertext,
-        isDefault: false,
-        isActive: true,
-      },
-    });
+        accountId: testAccount.id,
+        mode: 'rotation-only',
+      });
 
-    // 3. Promote k2 to active key, retaining k1 as historical
-    EncryptionService.registerKey('k2', Buffer.from(testK2Hex, 'hex'), true);
-    expect(EncryptionService.getActiveKeyId()).toBe('k2');
-    expect(EncryptionService.getRegisteredKeyIds()).toContain('k1');
-    expect(EncryptionService.getRegisteredKeyIds()).toContain('k2');
+      expect(liveResult.dryRun).toBe(false);
+      expect(liveResult.totalInspected).toBe(1);
+      expect(liveResult.totalUpdated).toBe(1);
+      expect(liveResult.totalHistoricalReencrypted).toBe(1);
+      expect(liveResult.totalErrors).toBe(0);
 
-    // 4. Step 8 of pre-flight: Dry-Run scoped strictly to test fixture
-    const dryRunResult = await BankAccountBackfillService.runBackfill({
-      dryRun: true,
-      companyId: testCompanyId,
-      accountId: testAccount.id,
-      mode: 'rotation-only',
-    });
+      // 6. Post-operation verification
+      const recordAfterLive = await testPrisma.companyBankAccount.findUnique({
+        where: { id: testAccount.id },
+      });
+      expect(recordAfterLive).toBeDefined();
 
-    expect(dryRunResult.dryRun).toBe(true);
-    expect(dryRunResult.totalInspected).toBe(1);
-    expect(dryRunResult.totalUpdated).toBe(1);
-    expect(dryRunResult.totalHistoricalReencrypted).toBe(1);
-    expect(dryRunResult.totalErrors).toBe(0);
+      // 6.1. Fixture now uses active test key k2
+      expect(recordAfterLive!.accountNumber.startsWith('enc:v1:k2:')).toBe(true);
 
-    // Verify record was NOT mutated during dry-run
-    const recordAfterDryRun = await testPrisma.companyBankAccount.findUnique({
-      where: { id: testAccount.id },
-    });
-    expect(recordAfterDryRun!.accountNumber).toBe(originalK1Ciphertext);
+      // 6.2. Old k1 ciphertext is no longer stored
+      expect(recordAfterLive!.accountNumber).not.toBe(originalK1Ciphertext);
 
-    // 5. Authorized Live Re-encryption scoped strictly to test fixture
-    const liveResult = await BankAccountBackfillService.runBackfill({
-      dryRun: false,
-      companyId: testCompanyId,
-      accountId: testAccount.id,
-      mode: 'rotation-only',
-    });
+      // 6.3. New ciphertext decrypts successfully and matches original plaintext
+      const decryptedLive = EncryptionService.decrypt(recordAfterLive!.accountNumber);
+      expect(decryptedLive).toBe(testPlaintext);
 
-    expect(liveResult.dryRun).toBe(false);
-    expect(liveResult.totalInspected).toBe(1);
-    expect(liveResult.totalUpdated).toBe(1);
-    expect(liveResult.totalHistoricalReencrypted).toBe(1);
-    expect(liveResult.totalErrors).toBe(0);
+      // 6.4. Scoped key inventory reports expected counts (k1: 0, k2: 1)
+      const inventory = await BankAccountBackfillService.getKeyInventory(testCompanyId, testAccount.id);
+      expect(inventory.totalRecords).toBe(1);
+      expect(inventory.activeKeyId).toBe('k2');
+      expect(inventory.countsByKeyId['k1']).toBe(0);
+      expect(inventory.countsByKeyId['k2']).toBe(1);
+      expect(inventory.needsRotationCount).toBe(0);
+      expect(inventory.fullyActiveCount).toBe(1);
 
-    // 6. Post-operation verification
-    const recordAfterLive = await testPrisma.companyBankAccount.findUnique({
-      where: { id: testAccount.id },
-    });
-    expect(recordAfterLive).toBeDefined();
-
-    // 6.1. Fixture now uses active test key k2
-    expect(recordAfterLive!.accountNumber.startsWith('enc:v1:k2:')).toBe(true);
-
-    // 6.2. Old k1 ciphertext is no longer stored
-    expect(recordAfterLive!.accountNumber).not.toBe(originalK1Ciphertext);
-
-    // 6.3. New ciphertext decrypts successfully and matches original plaintext
-    const decryptedLive = EncryptionService.decrypt(recordAfterLive!.accountNumber);
-    expect(decryptedLive).toBe(testPlaintext);
-
-    // 6.4. Scoped key inventory reports expected counts (k1: 0, k2: 1)
-    const inventory = await BankAccountBackfillService.getKeyInventory(testCompanyId, testAccount.id);
-    expect(inventory.totalRecords).toBe(1);
-    expect(inventory.activeKeyId).toBe('k2');
-    expect(inventory.countsByKeyId['k1']).toBe(0);
-    expect(inventory.countsByKeyId['k2']).toBe(1);
-    expect(inventory.needsRotationCount).toBe(0);
-    expect(inventory.fullyActiveCount).toBe(1);
-
-    // 6.5. Idempotent re-run skips already active key record
-    const rerunResult = await BankAccountBackfillService.runBackfill({
-      dryRun: false,
-      companyId: testCompanyId,
-      accountId: testAccount.id,
-      mode: 'rotation-only',
-    });
-    expect(rerunResult.totalUpdated).toBe(0);
-    expect(rerunResult.totalAlreadyActiveKey).toBe(1);
-
-    // 7. Safe cleanup of test-owned records in foreign-key order
-    await cleanupTestData(testPrisma);
-    const countRemaining = await testPrisma.companyBankAccount.count({
-      where: { companyId: testCompanyId },
-    });
-    expect(countRemaining).toBe(0);
+      // 6.5. Idempotent re-run skips already active key record
+      const rerunResult = await BankAccountBackfillService.runBackfill({
+        dryRun: false,
+        companyId: testCompanyId,
+        accountId: testAccount.id,
+        mode: 'rotation-only',
+      });
+      expect(rerunResult.totalUpdated).toBe(0);
+      expect(rerunResult.totalAlreadyActiveKey).toBe(1);
+    } finally {
+      // 7. Safe cleanup of test-owned records in guaranteed finally block
+      await cleanupTestData(testPrisma);
+      const countRemaining = await testPrisma.companyBankAccount.count({
+        where: { companyId: testCompanyId },
+      });
+      expect(countRemaining).toBe(0);
+    }
   });
 });
