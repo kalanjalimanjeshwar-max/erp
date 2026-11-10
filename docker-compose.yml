@@ -41,7 +41,7 @@ services:
     restart: "no"
     command: ["npx", "prisma", "migrate", "deploy"]
     environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:-erp_secure_password_123}@postgres:5432/${POSTGRES_DB:-core_erp}?schema=public
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:-erp_secure_password_123}@postgres:5432/${POSTGRES_DB:-core_erp}?schema=public"
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,10 +64,14 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
-      DATABASE_URL: postgresql://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:-erp_secure_password_123}@postgres:5432/${POSTGRES_DB:-core_erp}?schema=public
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:-erp_secure_password_123}@postgres:5432/${POSTGRES_DB:-core_erp}?schema=public"
       # Production secret safety: SESSION_SECRET must be explicitly provided in environment.
       # Insecure/default fallback has been removed. Generate via: openssl rand -hex 32
-      SESSION_SECRET: ${SESSION_SECRET:?SESSION_SECRET must be explicitly set with a high-entropy string in production (generate via: openssl rand -hex 32)}
+      SESSION_SECRET: "${SESSION_SECRET:?SESSION_SECRET must be explicitly set with a high-entropy string in production (generate via: openssl rand -hex 32)}"
+      # Dedicated 256-bit AES-GCM encryption key for corporate bank credentials (Phase 2.3)
+      BANK_ENCRYPTION_KEY: "${BANK_ENCRYPTION_KEY:-}"
+      BANK_ACTIVE_KEY_ID: "${BANK_ACTIVE_KEY_ID:-k1}"
+      BANK_HISTORICAL_KEYS: "${BANK_HISTORICAL_KEYS:-{}}"
     depends_on:
       postgres:
         condition: service_healthy

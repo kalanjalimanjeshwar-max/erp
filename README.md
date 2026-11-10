@@ -116,12 +116,22 @@ Visit `http://localhost:3000` to access the CoreERP dashboard and run the Initia
 git clone <repo-url> /opt/coreerp
 cd /opt/coreerp
 
-# 2. Create production environment file and generate high-entropy secrets
+# 2. Create production environment file and configure mandatory secrets
 cp .env.example .env
 
-# Generate cryptographically secure 64-character hex secret:
-# openssl rand -hex 32
-# Update .env with your generated secret and strong POSTGRES_PASSWORD
+# Generate cryptographically secure 64-character hex secrets:
+# For SESSION_SECRET:
+openssl rand -hex 32
+# For BANK_ENCRYPTION_KEY (Phase 2.3 dedicated 256-bit AES-GCM key):
+openssl rand -hex 32
+
+# Configure .env with your generated secrets and a strong POSTGRES_PASSWORD:
+# Mandatory production variables:
+# - SESSION_SECRET: High-entropy string (min 32 chars, 64-hex recommended).
+# - BANK_ENCRYPTION_KEY: Exactly 64 hexadecimal characters (256 bits).
+# - POSTGRES_USER: PostgreSQL database username (e.g., erp_user).
+# - POSTGRES_PASSWORD: Strong unique database password.
+# - POSTGRES_DB: Database name (e.g., core_erp).
 nano .env
 
 # 3. Controlled Database Migration (Runs before application starts)

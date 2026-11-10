@@ -172,9 +172,9 @@ describe('Environment Validation Unit Tests', () => {
       const composePath = path.resolve(import.meta.dirname, '../../docker-compose.yml');
       const composeContent = fs.readFileSync(composePath, 'utf-8');
 
-      // Verifies no insecure fallback for SESSION_SECRET
+      // Verifies no insecure fallback for SESSION_SECRET and fail-closed syntax properly quoted
       expect(composeContent).not.toContain('SESSION_SECRET:-a_secure_random_production_secret_key_64_characters_min');
-      expect(composeContent).toContain('SESSION_SECRET: ${SESSION_SECRET:?');
+      expect(composeContent).toContain('SESSION_SECRET: "${SESSION_SECRET:?');
 
       // Verifies dedicated one-shot migration service and dependency ordering
       expect(composeContent).toContain('coreerp-migration');
