@@ -77,4 +77,49 @@ describe('Dependency & Lockfile Integrity Validation', () => {
     expect(bunLockRaw).toMatch(/"yaml":\s*"\^2\./);
     expect(bunLockRaw).toContain('"yaml": ["yaml@2.');
   });
+
+  describe('Prisma Client Lifecycle & Clean-Install Reliability', () => {
+    it('should define postinstall script running prisma generate in package.json', () => {
+      expect(packageJson.scripts).toBeDefined();
+      expect(packageJson.scripts.postinstall).toBe('prisma generate');
+      expect(packageJson.scripts['db:generate']).toBe('prisma generate');
+    });
+
+    it('should confirm Prisma Client is generated and initialized in the node runtime', async () => {
+      // Verify generated client schema/artifacts exist on filesystem
+      const prismaClientDir = path.resolve(rootDir, 'node_modules/.prisma/client');
+      const hasSchema = fs.existsSync(path.join(prismaClientDir, 'schema.prisma'));
+      const hasIndex = fs.existsSync(path.join(prismaClientDir, 'index.js'));
+      expect(hasSchema || hasIndex).toBe(true);
+
+      // Verify that PrismaClient can be instantiated without throwing initialization errors
+      const { PrismaClient } = await import('@prisma/client');
+      expect(PrismaClient).toBeDefined();
+
+      expect(() => {
+        const client = new PrismaClient({
+          datasources: {
+            db: {
+              url: 'postgresql://erp_test_user:test_pass@localhost:5433/core_erp_test?schema=public',
+            },
+          },
+        });
+        expect(client).toBeDefined();
+      }).not.toThrowError(/did not initialize yet/);
+    });
+
+    it('should verify tests/setup.ts safely exports isPrismaClientInitialized guard', async () => {
+      const { isPrismaClientInitialized } = await import('../setup.js');
+      expect(typeof isPrismaClientInitialized).toBe('function');
+      expect(isPrismaClientInitialized()).toBe(true);
+    });
+
+    it('should verify Dockerfile build lifecycle runs npm ci which triggers postinstall', () => {
+      const dockerfilePath = path.join(rootDir, 'Dockerfile');
+      expect(fs.existsSync(dockerfilePath)).toBe(true);
+      const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
+      expect(dockerfile).toContain('RUN npm ci');
+    });
+  });
 });
+

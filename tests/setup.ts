@@ -175,20 +175,48 @@ if (!process.env.SESSION_SECRET) {
 // 5. Default stub for rolePermission in isolated non-connecting test runs
 // Prevents offline database connection failures from blocking permission resolution
 // in tests that do not connect to a live postgres database.
+import fs from 'fs';
+import path from 'path';
 import { beforeAll, vi } from 'vitest';
+
+export function isPrismaClientInitialized(): boolean {
+  try {
+    const prismaClientDir = path.resolve(process.cwd(), 'node_modules/.prisma/client');
+    return (
+      fs.existsSync(path.join(prismaClientDir, 'schema.prisma')) ||
+      fs.existsSync(path.join(prismaClientDir, 'index.js'))
+    );
+  } catch {
+    return false;
+  }
+}
 
 beforeAll(async () => {
   if (process.env.COREERP_INTEGRATION_TEST_MODE === 'true') {
     return;
   }
-  const { prisma } = await import('../src/server/db/client.js');
-  if (prisma?.rolePermission) {
-    if ('findUnique' in prisma.rolePermission) {
-      vi.spyOn(prisma.rolePermission, 'findUnique').mockResolvedValue(null);
+
+  // Ensure Prisma Client is generated before attempting to import or stub database models.
+  // This prevents premature instantiation exceptions during test setup for non-database suites.
+  if (!isPrismaClientInitialized()) {
+    return;
+  }
+
+  try {
+    const { prisma } = await import('../src/server/db/client.js');
+    if (prisma?.rolePermission) {
+      if ('findUnique' in prisma.rolePermission) {
+        vi.spyOn(prisma.rolePermission, 'findUnique').mockResolvedValue(null);
+      }
+      if ('findMany' in prisma.rolePermission) {
+        vi.spyOn(prisma.rolePermission, 'findMany').mockResolvedValue([]);
+      }
     }
-    if ('findMany' in prisma.rolePermission) {
-      vi.spyOn(prisma.rolePermission, 'findMany').mockResolvedValue([]);
+  } catch (err: any) {
+    if (err?.message?.includes('did not initialize yet')) {
+      return;
     }
+    throw err;
   }
 });
 
