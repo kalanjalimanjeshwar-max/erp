@@ -62,6 +62,7 @@ export const envSchema = z
         1,
         'DATABASE_URL is required. PostgreSQL is the sole operational database. Please configure a valid PostgreSQL connection string.'
       )
+      .transform((val) => val.trim().replace(/^["']|["']$/g, ''))
       .refine(
         (url) => url.startsWith('postgresql://') || url.startsWith('postgres://'),
         {

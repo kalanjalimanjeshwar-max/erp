@@ -91,6 +91,10 @@ export function createPrismaClient(databaseUrl?: string): PrismaClient {
         : undefined);
   }
 
+  if (url) {
+    url = url.trim().replace(/^["']|["']$/g, '');
+  }
+
   if (!url) {
     throw new Error(
       '[PostgreSQL Configuration Error] DATABASE_URL is not set. PostgreSQL is the mandatory sole operational database.'
@@ -181,6 +185,13 @@ export function configureIntegrationPrismaClient(databaseUrl: string): PrismaCli
   return client;
 }
 
+export function setPrismaClient(client: PrismaClient): void {
+  cachedClient = client;
+  if (typeof global !== 'undefined') {
+    global.__prismaClient = client;
+  }
+}
+
 export function getPrismaClient(): PrismaClient {
   if (global.__prismaClient) {
     return global.__prismaClient;
@@ -192,6 +203,119 @@ export function getPrismaClient(): PrismaClient {
     }
   }
   return cachedClient;
+}
+
+export interface UrlConsistencyCheckResult {
+  consistent: boolean;
+  mismatches: string[];
+  protocolMatch: boolean;
+  hostMatch: boolean;
+  portMatch: boolean;
+  usernameMatch: boolean;
+  databaseMatch: boolean;
+  queryParamMatch: boolean;
+  credentialsMatch: boolean;
+  sanitizedConfigTarget: string;
+  sanitizedPrismaTarget: string;
+}
+
+/**
+ * Diagnostic utility to verify that validated config DATABASE_URL and the URL
+ * used by Prisma are identical across all components without logging secrets.
+ */
+export function verifyDatabaseUrlConsistency(
+  configUrl: string,
+  client?: PrismaClient
+): UrlConsistencyCheckResult {
+  const activeClient = client || getPrismaClient();
+  const prismaUrl =
+    (activeClient as any)._engineConfig?.overrideDatasources?.db?.url ||
+    process.env.DATABASE_URL ||
+    '';
+
+  const cleanConfigUrl = configUrl ? configUrl.trim().replace(/^["']|["']$/g, '') : '';
+  const cleanPrismaUrl = prismaUrl ? prismaUrl.trim().replace(/^["']|["']$/g, '') : '';
+
+  const sanitizedConfigTarget = sanitizeDatabaseUrl(cleanConfigUrl);
+  const sanitizedPrismaTarget = sanitizeDatabaseUrl(cleanPrismaUrl);
+
+  const mismatches: string[] = [];
+
+  let pConfig: URL | null = null;
+  let pPrisma: URL | null = null;
+
+  try {
+    pConfig = new URL(cleanConfigUrl);
+  } catch {
+    mismatches.push('config_url_invalid');
+  }
+
+  try {
+    pPrisma = new URL(cleanPrismaUrl);
+  } catch {
+    mismatches.push('prisma_url_invalid');
+  }
+
+  if (!pConfig || !pPrisma) {
+    return {
+      consistent: false,
+      mismatches,
+      protocolMatch: false,
+      hostMatch: false,
+      portMatch: false,
+      usernameMatch: false,
+      databaseMatch: false,
+      queryParamMatch: false,
+      credentialsMatch: false,
+      sanitizedConfigTarget,
+      sanitizedPrismaTarget,
+    };
+  }
+
+  const protocolMatch = pConfig.protocol === pPrisma.protocol;
+  if (!protocolMatch) mismatches.push('protocol');
+
+  const hostMatch = pConfig.hostname.toLowerCase() === pPrisma.hostname.toLowerCase();
+  if (!hostMatch) mismatches.push('host');
+
+  const port1 = pConfig.port || '5432';
+  const port2 = pPrisma.port || '5432';
+  const portMatch = port1 === port2;
+  if (!portMatch) mismatches.push('port');
+
+  const user1 = decodeURIComponent(pConfig.username || '');
+  const user2 = decodeURIComponent(pPrisma.username || '');
+  const usernameMatch = user1 === user2;
+  if (!usernameMatch) mismatches.push('username');
+
+  const db1 = pConfig.pathname.replace(/^\//, '').split('?')[0];
+  const db2 = pPrisma.pathname.replace(/^\//, '').split('?')[0];
+  const databaseMatch = db1 === db2;
+  if (!databaseMatch) mismatches.push('database');
+
+  const query1 = pConfig.searchParams.toString();
+  const query2 = pPrisma.searchParams.toString();
+  const queryParamMatch = query1 === query2;
+  if (!queryParamMatch) mismatches.push('query_parameters');
+
+  const pass1 = decodeURIComponent(pConfig.password || '');
+  const pass2 = decodeURIComponent(pPrisma.password || '');
+  const credentialsMatch = pass1 === pass2;
+  if (!credentialsMatch) mismatches.push('credentials');
+
+  return {
+    consistent: mismatches.length === 0,
+    mismatches,
+    protocolMatch,
+    hostMatch,
+    portMatch,
+    usernameMatch,
+    databaseMatch,
+    queryParamMatch,
+    credentialsMatch,
+    sanitizedConfigTarget,
+    sanitizedPrismaTarget,
+  };
 }
 
 export const prisma: PrismaClient = new Proxy({} as PrismaClient, {

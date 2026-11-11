@@ -48,6 +48,16 @@ export interface DatabaseReadiness {
   database: 'PostgreSQL';
   latencyMs?: number;
   error?: string;
+  category?:
+    | 'authentication'
+    | 'database_not_found'
+    | 'network'
+    | 'timeout'
+    | 'ssl'
+    | 'configuration'
+    | 'query_failure'
+    | 'unknown';
+  code?: string;
   ssl?: boolean;
 }
 

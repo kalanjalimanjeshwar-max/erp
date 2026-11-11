@@ -1,9 +1,11 @@
+// 1. Initialize and validate environment configuration first
+import { validateEnv, sanitizeDatabaseUrl } from './src/server/config/env.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import express from 'express';
 import { createApp } from './src/server/app.js';
-import { validateEnv, sanitizeDatabaseUrl } from './src/server/config/env.js';
 import { checkPostgresHealth } from './src/server/db/health.js';
+import { getPrismaClient, verifyDatabaseUrlConsistency } from './src/server/db/client.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -25,8 +27,20 @@ async function startServer() {
   console.log(`[CoreERP] Port: ${config.PORT}`);
   console.log(`[CoreERP] PostgreSQL Target: ${sanitizeDatabaseUrl(config.DATABASE_URL)}`);
 
-  // 2. Safe Diagnostics probe
-  const dbHealth = await checkPostgresHealth();
+  // Verify consistency between validated environment and application Prisma client
+  const appPrisma = getPrismaClient();
+  const consistency = verifyDatabaseUrlConsistency(config.DATABASE_URL, appPrisma);
+  if (!consistency.consistent) {
+    console.warn(
+      `[CoreERP] Notice: Target mismatch between validated environment and Prisma client (${consistency.mismatches.join(', ')}).`
+    );
+  }
+
+  // 2. Safe Diagnostics probe using application client
+  const dbHealth = await checkPostgresHealth({
+    client: appPrisma,
+    targetUrl: config.DATABASE_URL,
+  });
   if (dbHealth.status === 'connected') {
     console.log(`[CoreERP] PostgreSQL Connected successfully (${dbHealth.latencyMs}ms).`);
   } else {
