@@ -286,7 +286,10 @@ export class BankAccountBackfillService {
   /**
    * Executes backfill or key re-encryption in bounded, transactional chunks with row-level locking
    */
-  public static async runBackfill(options: BackfillOptions = {}): Promise<BackfillResult> {
+  public static async runBackfill(
+    options: BackfillOptions = {},
+    client: any = prisma
+  ): Promise<BackfillResult> {
     if (options.accountId && !options.companyId) {
       throw new Error(
         '[SECURITY FATAL] Account-specific execution requires explicit company scope to prevent tenant boundary violations.'
@@ -321,7 +324,7 @@ export class BankAccountBackfillService {
       try {
         let batchCandidateCount = 0;
 
-        await prisma.$transaction(async (tx) => {
+        await client.$transaction(async (tx: any) => {
           // 1. Fetch batch using row-level locking FOR UPDATE SKIP LOCKED
           const candidates: any[] = await this.fetchLockedCandidates(
             tx,
@@ -505,7 +508,11 @@ export class BankAccountBackfillService {
    * plaintext status, and unrecoverable envelope errors.
    * Never mutates records or prints sensitive secrets.
    */
-  public static async getKeyInventory(companyId?: string, accountId?: string): Promise<KeyInventoryReport> {
+  public static async getKeyInventory(
+    companyId?: string,
+    accountId?: string,
+    client: any = prisma
+  ): Promise<KeyInventoryReport> {
     if (accountId && !companyId) {
       throw new Error(
         '[SECURITY FATAL] Account-specific execution requires explicit company scope to prevent tenant boundary violations.'
@@ -538,7 +545,7 @@ export class BankAccountBackfillService {
       if (companyId) where.companyId = companyId;
       if (accountId) where.id = accountId;
 
-      const records: any[] = await prisma.companyBankAccount.findMany({
+      const records: any[] = await client.companyBankAccount.findMany({
         where,
         take: BATCH,
         ...(lastId ? { skip: 1, cursor: { id: lastId } } : {}),

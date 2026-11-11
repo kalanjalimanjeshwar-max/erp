@@ -127,9 +127,19 @@ function validateIntegrationDatabaseUrl(urlValue: string | undefined): void {
 // 2. Validate environment database URLs independently for safety
 import dotenv from 'dotenv';
 
-const isIntegrationMode = process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
+const hasIntegrationTarget = Boolean(
+  process.env.TEST_DATABASE_URL &&
+    (process.env.TEST_DATABASE_URL.includes(':5434') ||
+      process.env.TEST_DATABASE_URL.includes('core_erp_integration_test'))
+);
+
+const isIntegrationMode =
+  process.env.COREERP_INTEGRATION_TEST_MODE === 'true' || hasIntegrationTarget;
 
 if (isIntegrationMode) {
+  process.env.COREERP_INTEGRATION_TEST_MODE = 'true';
+  delete process.env.DATABASE_URL;
+
   if (process.env.NODE_ENV !== 'test') {
     throw new Error(
       '[DATABASE SAFETY VIOLATION] COREERP_INTEGRATION_TEST_MODE requires NODE_ENV=test. Refusing to proceed.'

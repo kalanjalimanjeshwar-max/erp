@@ -11,6 +11,7 @@
  */
 
 import { prisma } from '../db/client.js';
+import type { PrismaClient } from '@prisma/client';
 import {
   AuthUser,
   CompanyBankAccountItem,
@@ -340,9 +341,10 @@ export class CompanyBankAccountService {
   public static async setDefaultAccount(
     actor: AuthUser,
     id: string,
-    correlationId?: string
+    correlationId?: string,
+    client: PrismaClient = prisma
   ): Promise<CompanyBankAccountItem> {
-    const existing = await prisma.companyBankAccount.findUnique({
+    const existing = await client.companyBankAccount.findUnique({
       where: { id },
     });
 
@@ -359,7 +361,7 @@ export class CompanyBankAccountService {
     }
 
     try {
-      const updated = await prisma.$transaction(async (tx) => {
+      const updated = await client.$transaction(async (tx) => {
         // Unset previous default
         await tx.companyBankAccount.updateMany({
           where: {
@@ -391,7 +393,16 @@ export class CompanyBankAccountService {
 
       return this.mapToMaskedItem(updated);
     } catch (err: any) {
-      if (err?.code === 'P2002' || err?.message?.includes('23505') || err?.message?.includes('CompanyBankAccount_companyId_default_unique')) {
+      if (
+        err?.code === 'P2002' ||
+        err?.code === 'P2034' ||
+        err?.message?.includes('23505') ||
+        err?.message?.includes('40001') ||
+        err?.message?.includes('40P01') ||
+        err?.message?.includes('CompanyBankAccount_companyId_default_unique') ||
+        err?.message?.includes('could not serialize') ||
+        err?.message?.includes('deadlock')
+      ) {
         const conflictErr = new Error(
           'A concurrent update modified the default bank account. Please refresh and try again.'
         );

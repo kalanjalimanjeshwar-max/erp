@@ -120,10 +120,65 @@ export function createPrismaClient(databaseUrl?: string): PrismaClient {
 let cachedClient: PrismaClient | null = null;
 
 export function resetPrismaClientForTesting(): void {
+  if (cachedClient) {
+    try {
+      cachedClient.$disconnect().catch(() => {});
+    } catch {}
+  }
   cachedClient = null;
   if (typeof global !== 'undefined') {
     delete (global as any).__prismaClient;
   }
+}
+
+/**
+ * Test-only explicit integration client configuration (Phase 2.3).
+ *
+ * Configures and binds the global application Prisma singleton proxy directly
+ * to the dedicated PostgreSQL 16 integration test database at localhost:5434.
+ *
+ * Safety Invariants:
+ * 1. Strictly forbidden in production (NODE_ENV=production).
+ * 2. Enforces NODE_ENV=test and COREERP_INTEGRATION_TEST_MODE=true.
+ * 3. Removes conflicting DATABASE_URL to satisfy the split-brain routing guard.
+ * 4. Strictly validates endpoint against localhost:5434 / core_erp_integration_test.
+ * 5. Safely disconnects any stale cached client and binds the singleton proxy to the integration database.
+ */
+export function configureIntegrationPrismaClient(databaseUrl: string): PrismaClient {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      '[SECURITY FATAL] configureIntegrationPrismaClient cannot be used in production mode.'
+    );
+  }
+
+  // Enforce test environment and integration mode
+  process.env.NODE_ENV = 'test';
+  process.env.COREERP_INTEGRATION_TEST_MODE = 'true';
+  delete process.env.DATABASE_URL;
+  process.env.TEST_DATABASE_URL = databaseUrl;
+
+  validateIntegrationDatabaseEndpoint(databaseUrl);
+
+  // Safely disconnect previous client if exists
+  if (cachedClient) {
+    try {
+      cachedClient.$disconnect().catch(() => {});
+    } catch {}
+    cachedClient = null;
+  }
+  if (typeof global !== 'undefined') {
+    delete (global as any).__prismaClient;
+  }
+
+  const client = createPrismaClient(databaseUrl);
+  // Ensure DATABASE_URL is deleted even if Prisma's constructor triggered dotenv loading
+  delete process.env.DATABASE_URL;
+  cachedClient = client;
+  if (typeof global !== 'undefined') {
+    global.__prismaClient = client;
+  }
+
+  return client;
 }
 
 export function getPrismaClient(): PrismaClient {

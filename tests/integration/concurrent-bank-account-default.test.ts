@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { PrismaClient } from '@prisma/client';
+import {
+  configureIntegrationPrismaClient,
+  resetPrismaClientForTesting,
+} from '../../src/server/db/client.js';
 import { CompanyBankAccountService } from '../../src/server/services/company-bank-account.service.js';
 import { EncryptionService } from '../../src/server/security/encryption.service.js';
 import { AuthUser } from '../../src/shared/types.js';
@@ -163,7 +167,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
     }
 
     try {
-      testPrisma1 = new PrismaClient({ datasources: { db: { url: testDbUrl } } });
+      testPrisma1 = configureIntegrationPrismaClient(testDbUrl);
       testPrisma2 = new PrismaClient({ datasources: { db: { url: testDbUrl } } });
       await testPrisma1.$connect();
       await testPrisma2.$connect();
@@ -196,6 +200,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
     if (testPrisma2) {
       await testPrisma2.$disconnect();
     }
+    resetPrismaClientForTesting();
   });
 
   it('should enforce exactly one active default bank account under real concurrent switching', async () => {
@@ -273,6 +278,19 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
     // One must succeed, while the competing concurrent update encounters conflict (or handles gracefully)
     const successCount = [res1, res2].filter((r) => r.status === 'fulfilled').length;
     const rejectedCount = [res1, res2].filter((r) => r.status === 'rejected').length;
+
+    if (successCount === 0) {
+      const formatRejection = (res: PromiseSettledResult<any>, idx: number) => {
+        if (res.status === 'rejected') {
+          const reason = res.reason;
+          return `Op ${idx}: code=${reason?.code || 'N/A'}, status=${reason?.statusCode || 'N/A'}, message=${reason?.message || reason}`;
+        }
+        return `Op ${idx}: fulfilled`;
+      };
+      console.error(
+        `[CONCURRENCY TEST FAILURE] Both competing operations rejected:\n  ${formatRejection(res1, 1)}\n  ${formatRejection(res2, 2)}`
+      );
+    }
 
     expect(successCount).toBeGreaterThanOrEqual(1);
 

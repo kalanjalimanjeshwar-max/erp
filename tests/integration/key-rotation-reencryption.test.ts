@@ -1,5 +1,9 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { PrismaClient } from '@prisma/client';
+import {
+  configureIntegrationPrismaClient,
+  resetPrismaClientForTesting,
+} from '../../src/server/db/client.js';
 import { EncryptionService } from '../../src/server/security/encryption.service.js';
 import { BankAccountBackfillService } from '../../src/server/security/bank-account-backfill.service.js';
 import net from 'net';
@@ -136,7 +140,7 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
     }
 
     try {
-      testPrisma = new PrismaClient({ datasources: { db: { url: testDbUrl } } });
+      testPrisma = configureIntegrationPrismaClient(testDbUrl);
       await testPrisma.$connect();
 
       const versionResult = await testPrisma.$queryRawUnsafe<Array<{ version: string }>>('SELECT version();');
@@ -161,6 +165,7 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       await cleanupTestData(testPrisma);
       await testPrisma.$disconnect();
     }
+    resetPrismaClientForTesting();
     EncryptionService.resetKeyRingForTesting();
   });
 
