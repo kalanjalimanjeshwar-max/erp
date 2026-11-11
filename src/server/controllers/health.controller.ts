@@ -27,7 +27,15 @@ export class HealthController {
    * Returns 200 when ready, 503 Service Unavailable when PostgreSQL is unreachable
    */
   static async getReadiness(_req: Request, res: Response<ReadinessResponse>): Promise<void> {
-    const postgresCheck = await checkPostgresHealth();
+    return HealthController.executeReadiness(_req, res);
+  }
+
+  static async executeReadiness(
+    _req: Request,
+    res: Response<ReadinessResponse>,
+    options?: import('../db/health.js').PostgresHealthOptions
+  ): Promise<void> {
+    const postgresCheck = await checkPostgresHealth(options);
     const isReady = postgresCheck.status === 'connected';
 
     const response: ReadinessResponse = {

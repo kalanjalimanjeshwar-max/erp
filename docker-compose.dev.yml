@@ -7,9 +7,9 @@ services:
     container_name: coreerp-postgres-dev
     restart: unless-stopped
     environment:
-      POSTGRES_USER: erp_user
-      POSTGRES_PASSWORD: erp_password_dev
-      POSTGRES_DB: core_erp
+      POSTGRES_USER: ${POSTGRES_USER:-erp_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-erp_password_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-core_erp}
       TZ: UTC
       PGTZ: UTC
     ports:
@@ -17,7 +17,7 @@ services:
     volumes:
       - postgres_dev_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U erp_user -d core_erp"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-erp_user} -d ${POSTGRES_DB:-core_erp}"]
       interval: 5s
       timeout: 3s
       retries: 5

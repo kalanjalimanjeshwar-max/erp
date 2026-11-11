@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+import YAML from 'yaml';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { validateEnv, sanitizeDatabaseUrl } from '../../src/server/config/env.js';
 import {
@@ -13,6 +16,7 @@ import {
   parseHostAndPort,
 } from '../../src/server/db/health.js';
 import * as healthModule from '../../src/server/db/health.js';
+import { HealthController } from '../../src/server/controllers/health.controller.js';
 
 describe('Development PostgreSQL & Prisma Diagnostic and Readiness Verification', () => {
   const origEnv = { ...process.env };
@@ -316,6 +320,124 @@ describe('Development PostgreSQL & Prisma Diagnostic and Readiness Verification'
           BANK_ENCRYPTION_KEY: 'not_a_hex_key',
         })
       ).toThrow(/must be exactly 64 hexadecimal characters/);
+    });
+  });
+
+  // ==========================================================================
+  // 7. Development Credential Consistency & Compose Synchronization
+  // ==========================================================================
+  describe('7. Development Credential Consistency & Compose Synchronization', () => {
+    it('should verify docker-compose.dev.yml uses canonical fallback credentials matching env.ts', () => {
+      const devComposePath = path.join(process.cwd(), 'docker-compose.dev.yml');
+      const rawYaml = fs.readFileSync(devComposePath, 'utf8');
+      const doc = YAML.parse(rawYaml);
+      const pgEnv = doc.services.postgres.environment;
+
+      // Must support variable interpolation with fallback to canonical development credentials
+      expect(pgEnv.POSTGRES_USER).toBe('${POSTGRES_USER:-erp_user}');
+      expect(pgEnv.POSTGRES_PASSWORD).toBe('${POSTGRES_PASSWORD:-erp_password_dev}');
+      expect(pgEnv.POSTGRES_DB).toBe('${POSTGRES_DB:-core_erp}');
+    });
+
+    it('should reject development environment where POSTGRES_PASSWORD and DATABASE_URL password diverge', () => {
+      expect(() =>
+        validateEnv({
+          NODE_ENV: 'development',
+          POSTGRES_USER: 'erp_user',
+          POSTGRES_PASSWORD: 'erp_password_dev',
+          DATABASE_URL: 'postgresql://erp_user:different_dev_password@localhost:5432/core_erp?schema=public',
+          SESSION_SECRET: 'test_isolated_session_secret_not_for_production_min32chars',
+        })
+      ).toThrow(/DATABASE_URL password does not match POSTGRES_PASSWORD/);
+    });
+
+    it('should accept development environment when POSTGRES_PASSWORD matches DATABASE_URL password', () => {
+      const config = validateEnv({
+        NODE_ENV: 'development',
+        POSTGRES_USER: 'erp_user',
+        POSTGRES_PASSWORD: 'erp_password_dev',
+        DATABASE_URL: 'postgresql://erp_user:erp_password_dev@localhost:5432/core_erp?schema=public',
+        SESSION_SECRET: 'test_isolated_session_secret_not_for_production_min32chars',
+      });
+
+      expect(config.DATABASE_URL).toBe(
+        'postgresql://erp_user:erp_password_dev@localhost:5432/core_erp?schema=public'
+      );
+      expect(config.POSTGRES_PASSWORD).toBe('erp_password_dev');
+    });
+  });
+
+  // ==========================================================================
+  // 8. Health & Readiness Endpoint Behavior (/api/health & /api/ready)
+  // ==========================================================================
+  describe('8. Health & Readiness Endpoint Behavior', () => {
+    it('should return 200 OK from /api/health regardless of database connectivity', () => {
+      let status = 0;
+      let body: any = null;
+
+      const mockRes: any = {
+        status: (code: number) => {
+          status = code;
+          return mockRes;
+        },
+        json: (data: any) => {
+          body = data;
+          return mockRes;
+        },
+      };
+
+      HealthController.getHealth({} as any, mockRes);
+
+      expect(status).toBe(200);
+      expect(body.status).toBe('ok');
+      expect(body.uptimeSeconds).toBeGreaterThanOrEqual(0);
+      expect(body.version).toBeDefined();
+    });
+
+    it('should return 503 from /api/ready when database authentication fails, with zero password leakage', async () => {
+      const authError = new Error('password authentication failed for user "erp_user"');
+      (authError as any).code = '28P01';
+
+      const mockClient = {
+        $queryRawUnsafe: vi.fn().mockRejectedValue(authError),
+        _engineConfig: {
+          overrideDatasources: {
+            db: {
+              url: 'postgresql://erp_user:secret_auth_token_xyz@localhost:5432/core_erp?schema=public',
+            },
+          },
+        },
+      } as any;
+
+      setPrismaClient(mockClient);
+      vi.spyOn(healthModule, 'isPostgresPortReachable').mockResolvedValue(true);
+
+      let statusCode = 0;
+      let responseBody: any = null;
+
+      const mockRes: any = {
+        status: (code: number) => {
+          statusCode = code;
+          return mockRes;
+        },
+        json: (data: any) => {
+          responseBody = data;
+          return mockRes;
+        },
+      };
+
+      await HealthController.executeReadiness({} as any, mockRes, { skipPortCheck: true });
+
+      expect(statusCode).toBe(503);
+      expect(responseBody.status).toBe('not_ready');
+      expect(responseBody.checks.postgres.status).toBe('disconnected');
+      expect(responseBody.checks.postgres.category).toBe('authentication');
+      expect(responseBody.checks.postgres.code).toBe('28P01');
+
+      // Strict security: Zero credential leakage in response
+      const jsonStr = JSON.stringify(responseBody);
+      expect(jsonStr).not.toMatch(/secret_auth_token_xyz/);
+      expect(jsonStr).not.toMatch(/password/i);
     });
   });
 });

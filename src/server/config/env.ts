@@ -16,7 +16,10 @@ if (
       const defaultDevEnv = [
         'PORT=3000',
         'NODE_ENV=development',
-        'DATABASE_URL="postgresql://erp_user:dev_password@localhost:5432/core_erp?schema=public"',
+        'POSTGRES_USER=erp_user',
+        'POSTGRES_PASSWORD=erp_password_dev',
+        'POSTGRES_DB=core_erp',
+        'DATABASE_URL="postgresql://erp_user:erp_password_dev@localhost:5432/core_erp?schema=public"',
         'TEST_DATABASE_URL="postgresql://erp_test_user:dev_test_password@localhost:5433/core_erp_test?schema=public"',
         'STAGING_DATABASE_URL="postgresql://erp_test_user:dev_test_password@localhost:5433/core_erp_staging?schema=public"',
         'SESSION_SECRET="dev_insecure_fallback_session_secret_32_chars_long"',
@@ -90,8 +93,29 @@ export const envSchema = z
       )
       .default('k1'),
     BANK_HISTORICAL_KEYS: z.string().optional(),
+    POSTGRES_USER: z.string().optional(),
+    POSTGRES_PASSWORD: z.string().optional(),
+    POSTGRES_DB: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    // 0. Development Docker Compose / DATABASE_URL consistency check
+    if (data.NODE_ENV === 'development' && data.POSTGRES_PASSWORD && data.DATABASE_URL) {
+      try {
+        const parsedUrl = new URL(data.DATABASE_URL);
+        const urlPass = decodeURIComponent(parsedUrl.password || '');
+        if (urlPass && data.POSTGRES_PASSWORD && urlPass !== data.POSTGRES_PASSWORD) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['DATABASE_URL'],
+            message:
+              'DATABASE_URL password does not match POSTGRES_PASSWORD. In development, ensure Docker Compose and application DATABASE_URL use matching credentials.',
+          });
+        }
+      } catch {
+        // Base validation handles unparseable URLs
+      }
+    }
+
     // 1. Validation for BANK_HISTORICAL_KEYS (all environments)
     if (data.BANK_HISTORICAL_KEYS && data.BANK_HISTORICAL_KEYS.trim() !== '') {
       let parsed: unknown;
