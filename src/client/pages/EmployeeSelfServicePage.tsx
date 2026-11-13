@@ -19,6 +19,7 @@ import {
 import { api, ApiError } from '../services/api.ts';
 import { LoadingSpinner } from '../components/common/LoadingSpinner.tsx';
 import { EmptyState } from '../components/common/EmptyState.tsx';
+import { ExpenseModuleView } from '../components/expenses/ExpenseModuleView.tsx';
 import {
   AuthUser,
   LeaveRequestItem,
@@ -43,20 +44,6 @@ export interface DemoSalaryAdvance {
   monthlyDeduction: number;
   status: 'PENDING_APPROVAL' | 'DISBURSED' | 'REPAID' | 'REJECTED';
   remarks: string | null;
-  isSimulated: boolean;
-}
-
-export interface DemoExpenseClaim {
-  id: string;
-  claimNumber: string;
-  title: string;
-  category: 'TRAVEL' | 'MEALS' | 'OFFICE_SUPPLIES' | 'CLIENT_MEETING' | 'OTHER';
-  amount: number;
-  expenseDate: string;
-  merchant: string;
-  receiptName: string | null;
-  status: 'SUBMITTED' | 'APPROVED' | 'REIMBURSED' | 'REJECTED';
-  reimbursementDate: string | null;
   isSimulated: boolean;
 }
 
@@ -101,15 +88,6 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
   const [advanceAmount, setAdvanceAmount] = useState<string>('500.00');
   const [advanceReason, setAdvanceReason] = useState<string>('Emergency home repairs');
   const [advanceMonths, setAdvanceMonths] = useState<number>(2);
-
-  // Tab 4: Expense Claims (Demo / Preview State)
-  const [expenseClaims, setExpenseClaims] = useState<DemoExpenseClaim[]>([]);
-  const [isExpenseModalOpen, setIsExpenseModalOpen] = useState<boolean>(false);
-  const [expenseTitle, setExpenseTitle] = useState<string>('');
-  const [expenseCategory, setExpenseCategory] = useState<'TRAVEL' | 'MEALS' | 'OFFICE_SUPPLIES' | 'CLIENT_MEETING' | 'OTHER'>('TRAVEL');
-  const [expenseAmount, setExpenseAmount] = useState<string>('75.50');
-  const [expenseMerchant, setExpenseMerchant] = useState<string>('');
-  const [expenseReceiptName, setExpenseReceiptName] = useState<string>('receipt_scan.pdf');
 
   // Load Leave Data
   const loadLeaveData = useCallback(async () => {
@@ -341,7 +319,7 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
     }
   }, [activeTab, loadLeaveData, loadPayslips]);
 
-  // Seed Initial Demo Salary Advances & Expenses
+  // Seed Initial Demo Salary Advances
   useEffect(() => {
     setSalaryAdvances([
       {
@@ -370,35 +348,6 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
         monthlyDeduction: 350.0,
         status: 'PENDING_APPROVAL',
         remarks: null,
-        isSimulated: true,
-      },
-    ]);
-
-    setExpenseClaims([
-      {
-        id: 'EXP-2026-012',
-        claimNumber: 'CLM-0012',
-        title: 'Interstate Client Onboarding Travel',
-        category: 'TRAVEL',
-        amount: 142.5,
-        expenseDate: '2026-01-18',
-        merchant: 'National Highspeed Rail',
-        receiptName: 'rail_ticket_inv_9823.pdf',
-        status: 'REIMBURSED',
-        reimbursementDate: '2026-01-25',
-        isSimulated: true,
-      },
-      {
-        id: 'EXP-2026-015',
-        claimNumber: 'CLM-0015',
-        title: 'Quarterly Team Strategy Lunch',
-        category: 'MEALS',
-        amount: 86.2,
-        expenseDate: '2026-01-29',
-        merchant: 'Harbor Bistro',
-        receiptName: 'bistro_receipt_4421.png',
-        status: 'APPROVED',
-        reimbursementDate: null,
         isSimulated: true,
       },
     ]);
@@ -518,39 +467,6 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
     setIsAdvanceModalOpen(false);
   };
 
-  // Handle Expense Claim Simulation Submission
-  const handleApplyExpense = (e: React.FormEvent) => {
-    e.preventDefault();
-    const numAmount = parseFloat(expenseAmount);
-    if (isNaN(numAmount) || numAmount <= 0) {
-      alert('Please provide a valid expense amount.');
-      return;
-    }
-    if (!expenseTitle.trim()) {
-      alert('Please enter a brief claim title.');
-      return;
-    }
-
-    const newClaim: DemoExpenseClaim = {
-      id: `EXP-${new Date().getFullYear()}-${String(expenseClaims.length + 20).padStart(3, '0')}`,
-      claimNumber: `CLM-${String(expenseClaims.length + 20).padStart(4, '0')}`,
-      title: expenseTitle,
-      category: expenseCategory,
-      amount: numAmount,
-      expenseDate: new Date().toISOString().split('T')[0],
-      merchant: expenseMerchant || 'Standard Commercial Merchant',
-      receiptName: expenseReceiptName || 'receipt.pdf',
-      status: 'SUBMITTED',
-      reimbursementDate: null,
-      isSimulated: true,
-    };
-
-    setExpenseClaims((prev) => [newClaim, ...prev]);
-    setIsExpenseModalOpen(false);
-    setExpenseTitle('');
-    setExpenseMerchant('');
-  };
-
   const monthsList = [
     { value: 1, label: 'January' },
     { value: 2, label: 'February' },
@@ -654,9 +570,6 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
           >
             <Receipt className="w-4 h-4" />
             Expense Reimbursements
-            <span className="text-[10px] px-1.5 py-0.2 bg-emerald-500/20 text-emerald-300 rounded font-normal">
-              Stage 2 Design
-            </span>
           </button>
         </div>
       </div>
@@ -1323,111 +1236,10 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
       )}
 
       {/* ========================================================================= */}
-      {/* TAB 4: EXPENSE CLAIMS & REIMBURSEMENTS (STAGE 2 DESIGN & PREVIEW)         */}
+      {/* TAB 4: EXPENSE CLAIMS & REIMBURSEMENTS (PRODUCTION DATABASE-BACKED)       */}
       {/* ========================================================================= */}
       {activeTab === 'expenses' && (
-        <div className="space-y-6">
-          {/* Informational Banner */}
-          <div className="bg-emerald-950/40 border border-emerald-600/40 rounded-xl p-5 text-xs text-emerald-200 space-y-2">
-            <div className="flex items-center gap-2 font-bold text-emerald-100 text-sm">
-              <ShieldAlert className="w-4 h-4 text-emerald-400" />
-              Stage 2 Proposed Relational Architecture — Expense Claims & Reimbursements
-            </div>
-            <p className="text-emerald-300/90 leading-relaxed">
-              Company expense reimbursements are audited liabilities that must NOT be mingled into taxable gross salary.
-              A dedicated relational model (<code className="bg-emerald-900/60 px-1 py-0.5 rounded font-mono text-emerald-200">ExpenseClaim</code>)
-              has been architected for Stage 2 to ensure:
-            </p>
-            <ul className="list-disc list-inside space-y-1 text-emerald-300/80 ml-2">
-              <li>Receipt attachment metadata with cryptographic hash and MIME verification.</li>
-              <li>Multi-level approval state machine: <span className="font-mono text-emerald-200">SUBMITTED → APPROVED → REIMBURSED</span></li>
-              <li>Separate Accounts Payable disbursement (Cash/Bank) rather than payroll income, avoiding incorrect tax withholdings.</li>
-              <li>Double-entry posting: Debit specific Expense account (Travel, Meals), Credit Accounts Payable / Bank.</li>
-            </ul>
-          </div>
-
-          <div className="flex items-center justify-between bg-slate-900 border border-slate-800 p-4 rounded-xl">
-            <div>
-              <h2 className="text-sm font-bold text-white">Expense Reimbursement Claims</h2>
-              <p className="text-xs text-slate-400">
-                Interactive preview of employee out-of-pocket expenses and settlement tracking.
-              </p>
-            </div>
-            <button
-              onClick={() => setIsExpenseModalOpen(true)}
-              className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold px-4 py-2 rounded-lg shadow-sm transition-all shadow-emerald-600/30"
-            >
-              <Plus className="w-4 h-4" />
-              Submit Expense Claim (Demo)
-            </button>
-          </div>
-
-          {/* Claims Table */}
-          <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden shadow-sm">
-            <table className="w-full text-left border-collapse text-xs">
-              <thead>
-                <tr className="border-b border-slate-800 bg-slate-950/50 text-slate-400 uppercase tracking-wider text-[11px]">
-                  <th className="py-3 px-4">Claim #</th>
-                  <th className="py-3 px-4">Title / Merchant</th>
-                  <th className="py-3 px-4">Category</th>
-                  <th className="py-3 px-4">Amount</th>
-                  <th className="py-3 px-4">Receipt Metadata</th>
-                  <th className="py-3 px-4">Status</th>
-                  <th className="py-3 px-4">Reimbursement Date</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60 text-slate-300">
-                {expenseClaims.map((claim) => (
-                  <tr key={claim.id} className="hover:bg-slate-800/30 transition-colors">
-                    <td className="py-3 px-4 font-mono font-semibold text-slate-200">
-                      {claim.claimNumber}
-                    </td>
-                    <td className="py-3 px-4">
-                      <div className="font-semibold text-slate-200">{claim.title}</div>
-                      <div className="text-[11px] text-slate-500">{claim.merchant}</div>
-                    </td>
-                    <td className="py-3 px-4">
-                      <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-300 border border-slate-700">
-                        {claim.category}
-                      </span>
-                    </td>
-                    <td className="py-3 px-4 font-mono font-bold text-emerald-400 text-sm">
-                      ${claim.amount.toFixed(2)}
-                    </td>
-                    <td className="py-3 px-4 text-slate-400">
-                      <span className="flex items-center gap-1 text-[11px] text-indigo-400 font-mono">
-                        <FileText className="w-3 h-3" />
-                        {claim.receiptName || 'receipt.pdf'}
-                      </span>
-                    </td>
-                    <td className="py-3 px-4">
-                      {claim.status === 'REIMBURSED' && (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                          <CheckCircle2 className="w-3 h-3" />
-                          Reimbursed
-                        </span>
-                      )}
-                      {claim.status === 'APPROVED' && (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                          Approved (Pending Payout)
-                        </span>
-                      )}
-                      {claim.status === 'SUBMITTED' && (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                          <Clock className="w-3 h-3" />
-                          Submitted
-                        </span>
-                      )}
-                    </td>
-                    <td className="py-3 px-4 text-slate-400 font-mono text-[11px]">
-                      {claim.reimbursementDate || 'Pending finance disbursement'}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </div>
+        <ExpenseModuleView currentUser={currentUser} />
       )}
 
       {/* ========================================================================= */}
@@ -1758,122 +1570,7 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
         </div>
       )}
 
-      {/* ========================================================================= */}
-      {/* MODAL: SUBMIT EXPENSE CLAIM (DEMO SIMULATION)                             */}
-      {/* ========================================================================= */}
-      {isExpenseModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-in fade-in">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
-            <div className="flex items-center justify-between pb-3 border-b border-slate-800">
-              <div className="flex items-center gap-2">
-                <Receipt className="w-5 h-5 text-emerald-400" />
-                <h3 className="text-base font-bold text-white">Submit Expense Claim</h3>
-              </div>
-              <button
-                onClick={() => setIsExpenseModalOpen(false)}
-                className="text-slate-400 hover:text-white p-1 rounded-lg"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
 
-            <p className="text-xs text-emerald-300/80 bg-emerald-950/40 p-3 rounded-lg border border-emerald-800/40">
-              Note: This is an interactive preview demonstration for Stage 2. Submitted claims are in-memory and will not alter production financial books.
-            </p>
-
-            <form onSubmit={handleApplyExpense} className="space-y-4 text-xs">
-              <div>
-                <label className="block text-slate-300 font-medium mb-1">
-                  Claim Title / Purpose *
-                </label>
-                <input
-                  type="text"
-                  value={expenseTitle}
-                  onChange={(e) => setExpenseTitle(e.target.value)}
-                  placeholder="e.g. Travel taxi fare to client headquarters"
-                  className="w-full bg-slate-950 border border-slate-800 text-slate-200 rounded-lg p-2.5 focus:border-emerald-500 focus:outline-none"
-                  required
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-slate-300 font-medium mb-1">
-                    Expense Category *
-                  </label>
-                  <select
-                    value={expenseCategory}
-                    onChange={(e) => setExpenseCategory(e.target.value as any)}
-                    className="w-full bg-slate-950 border border-slate-800 text-slate-200 rounded-lg p-2.5 focus:border-emerald-500 focus:outline-none"
-                  >
-                    <option value="TRAVEL">Travel & Transport</option>
-                    <option value="MEALS">Meals & Sustenance</option>
-                    <option value="OFFICE_SUPPLIES">Office Supplies</option>
-                    <option value="CLIENT_MEETING">Client Hospitality</option>
-                    <option value="OTHER">Other Expense</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-slate-300 font-medium mb-1">
-                    Amount ($) *
-                  </label>
-                  <input
-                    type="number"
-                    step="0.01"
-                    min="1"
-                    value={expenseAmount}
-                    onChange={(e) => setExpenseAmount(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 text-slate-200 rounded-lg p-2.5 font-mono focus:border-emerald-500 focus:outline-none"
-                    required
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-slate-300 font-medium mb-1">
-                  Vendor / Merchant Name
-                </label>
-                <input
-                  type="text"
-                  value={expenseMerchant}
-                  onChange={(e) => setExpenseMerchant(e.target.value)}
-                  placeholder="e.g. Acme Transportation Corp"
-                  className="w-full bg-slate-950 border border-slate-800 text-slate-200 rounded-lg p-2.5 focus:border-emerald-500 focus:outline-none"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-300 font-medium mb-1">
-                  Receipt File Attachment (Simulated)
-                </label>
-                <input
-                  type="text"
-                  value={expenseReceiptName}
-                  onChange={(e) => setExpenseReceiptName(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 text-slate-200 rounded-lg p-2.5 font-mono text-[11px]"
-                />
-              </div>
-
-              <div className="flex justify-end gap-3 pt-3 border-t border-slate-800">
-                <button
-                  type="button"
-                  onClick={() => setIsExpenseModalOpen(false)}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  className="px-5 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-sm"
-                >
-                  Submit Demo Claim
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

@@ -99,6 +99,16 @@ import {
   PunchReconciliationOptions,
   PunchReconciliationResponse,
   PunchSyncSummaryResponse,
+  ExpenseClaimItem,
+  ExpenseClaimStatus,
+  ExpenseClaimAttachmentItem,
+  CreateExpenseClaimRequest,
+  UpdateExpenseClaimRequest,
+  ReviewExpenseClaimRequest,
+  PayExpenseClaimRequest,
+  ExpenseSummaryReport,
+  CompanyBankAccountItem,
+  ExpenseCapabilitiesResponse,
 } from '../../shared/types.ts';
 
 export class ApiError extends Error {
@@ -216,6 +226,10 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
+  getCompanyBankAccounts: (isActive?: boolean) =>
+    request<CompanyBankAccountItem[]>(
+      `/api/company/bank-accounts${isActive !== undefined ? `?isActive=${isActive}` : ''}`
+    ),
 
   // Permission Matrix
   getPermissionMatrix: () =>
@@ -897,5 +911,73 @@ export const api = {
     }),
   getBiometricSyncSummary: () =>
     request<PunchSyncSummaryResponse>('/api/biometric/sync/summary'),
+
+  // ==========================================
+  // Stage 2.2 Employee Expense Claims & Reimbursements
+  // ==========================================
+  getExpenseClaims: (params?: {
+    status?: ExpenseClaimStatus;
+    employeeId?: string;
+    departmentId?: string;
+    startDate?: string;
+    endDate?: string;
+    search?: string;
+    queue?: 'self' | 'manager' | 'accounts';
+  }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.status) searchParams.append('status', params.status);
+    if (params?.employeeId) searchParams.append('employeeId', params.employeeId);
+    if (params?.departmentId) searchParams.append('departmentId', params.departmentId);
+    if (params?.startDate) searchParams.append('startDate', params.startDate);
+    if (params?.endDate) searchParams.append('endDate', params.endDate);
+    if (params?.search) searchParams.append('search', params.search);
+    if (params?.queue) searchParams.append('queue', params.queue);
+    const qs = searchParams.toString();
+    return request<ExpenseClaimItem[]>(`/api/expenses/claims${qs ? `?${qs}` : ''}`);
+  },
+  getExpenseClaim: (id: string) => request<ExpenseClaimItem>(`/api/expenses/claims/${id}`),
+  createExpenseClaim: (data: CreateExpenseClaimRequest) =>
+    request<ExpenseClaimItem>('/api/expenses/claims', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateExpenseClaim: (id: string, data: UpdateExpenseClaimRequest) =>
+    request<ExpenseClaimItem>(`/api/expenses/claims/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+  submitExpenseClaim: (id: string) =>
+    request<ExpenseClaimItem>(`/api/expenses/claims/${id}/submit`, {
+      method: 'POST',
+    }),
+  cancelExpenseClaim: (id: string, reason?: string) =>
+    request<ExpenseClaimItem>(`/api/expenses/claims/${id}/cancel`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
+    }),
+  reviewExpenseClaimAsManager: (id: string, data: ReviewExpenseClaimRequest) =>
+    request<ExpenseClaimItem>(`/api/expenses/claims/${id}/manager-review`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  reviewExpenseClaimAsAccounts: (id: string, data: ReviewExpenseClaimRequest) =>
+    request<ExpenseClaimItem>(`/api/expenses/claims/${id}/accounts-review`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  payExpenseClaim: (id: string, data: PayExpenseClaimRequest) =>
+    request<ExpenseClaimItem>(`/api/expenses/claims/${id}/pay`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  uploadExpenseAttachment: (data: { fileName: string; mimeType: string; dataBase64: string }, claimId?: string) =>
+    request<ExpenseClaimAttachmentItem>(`/api/expenses/attachments${claimId ? `?claimId=${claimId}` : ''}`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  getExpenseCapabilities: () =>
+    request<ExpenseCapabilitiesResponse>('/api/expenses/capabilities'),
+  getExpenseSummaryReport: () =>
+    request<ExpenseSummaryReport>('/api/expenses/reports/summary'),
 };
 

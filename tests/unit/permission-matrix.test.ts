@@ -125,6 +125,32 @@ describe('Phase 3 Permission Matrix & RBAC Hierarchy Tests', () => {
     expect(await PermissionService.hasPermission(dummyCompanyId, 'EMPLOYEE', 'BIOMETRIC', 'VIEW')).toBe(false);
     expect(await PermissionService.hasPermission(dummyCompanyId, 'EMPLOYEE', 'BIOMETRIC', 'CREATE')).toBe(false);
   });
+
+  it('should enforce EXPENSE module RBAC permissions across all roles', async () => {
+    // SUPER_ADMIN has full permissions
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'SUPER_ADMIN', 'EXPENSE', 'VIEW')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'SUPER_ADMIN', 'EXPENSE', 'APPROVE')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'SUPER_ADMIN', 'EXPENSE', 'DELETE')).toBe(true);
+
+    // ADMIN has operational review/approval
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'ADMIN', 'EXPENSE', 'VIEW')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'ADMIN', 'EXPENSE', 'CREATE')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'ADMIN', 'EXPENSE', 'EDIT')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'ADMIN', 'EXPENSE', 'APPROVE')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'ADMIN', 'EXPENSE', 'DELETE')).toBe(false);
+
+    // VICE_ADMIN has view only by default
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'VICE_ADMIN', 'EXPENSE', 'VIEW')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'VICE_ADMIN', 'EXPENSE', 'APPROVE')).toBe(false);
+
+    // EMPLOYEE can create/view/edit/delete own draft claims, but CANNOT approve claims or accounting
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'EMPLOYEE', 'EXPENSE', 'VIEW')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'EMPLOYEE', 'EXPENSE', 'CREATE')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'EMPLOYEE', 'EXPENSE', 'EDIT')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'EMPLOYEE', 'EXPENSE', 'DELETE')).toBe(true);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'EMPLOYEE', 'EXPENSE', 'APPROVE')).toBe(false);
+    expect(await PermissionService.hasPermission(dummyCompanyId, 'EMPLOYEE', 'ACCOUNTING', 'APPROVE')).toBe(false);
+  });
 });
 
 describe('SEC-11-01 Critical Fail-Closed RBAC & Override Precedence Tests', () => {
@@ -303,6 +329,7 @@ describe('SEC-11-02 Complete Permission Matrix Module Coverage Tests', () => {
     'PAYROLL',
     'ATTENDANCE',
     'BIOMETRIC',
+    'EXPENSE',
   ] as const;
 
   const PREVIOUSLY_MISSING_7_MODULES = [
@@ -335,13 +362,13 @@ describe('SEC-11-02 Complete Permission Matrix Module Coverage Tests', () => {
     vi.mocked(prisma.rolePermission.findMany).mockResolvedValue([]);
   });
 
-  it('Requirement A & B: getCompanyPermissionMatrix returns all 17 registered modules including the 7 missing ones', async () => {
+  it('Requirement A & B: getCompanyPermissionMatrix returns all 18 registered modules including the 7 missing ones and EXPENSE', async () => {
     const matrix = await PermissionService.getCompanyPermissionMatrix(companyTestId);
 
     for (const role of ['SUPER_ADMIN', 'ADMIN', 'VICE_ADMIN', 'EMPLOYEE'] as const) {
       expect(matrix).toHaveProperty(role);
       const roleModules = Object.keys(matrix[role]);
-      expect(roleModules).toHaveLength(17);
+      expect(roleModules).toHaveLength(18);
 
       for (const mod of ALL_17_MODULES) {
         expect(matrix[role]).toHaveProperty(mod);

@@ -26,6 +26,8 @@ import { BiometricDevicesPage } from './client/pages/BiometricDevicesPage.tsx';
 import { LeavePage } from './client/pages/LeavePage.tsx';
 import { PayrollPage } from './client/pages/PayrollPage.tsx';
 import { EmployeeSelfServicePage } from './client/pages/EmployeeSelfServicePage.tsx';
+import { ExpenseModuleView } from './client/components/expenses/ExpenseModuleView.tsx';
+import { Receipt } from 'lucide-react';
 import { AccessDenied } from './client/components/common/AccessDenied.tsx';
 import { DatabaseDisconnectedNotice } from './client/components/common/DatabaseDisconnectedNotice.tsx';
 import { LoadingSpinner } from './client/components/common/LoadingSpinner.tsx';
@@ -509,6 +511,38 @@ export default function App() {
               currentUser={currentUser!}
               onNavigateToJournals={() => setCurrentTab('journals')}
             />
+          ))}
+
+        {currentTab === 'expenses' &&
+          (showOfflineNotice || !currentUser ? (
+            <DatabaseDisconnectedNotice
+              moduleName="Employee Expense Claims & Reimbursements"
+              phaseTag="AP Reimbursements"
+              readiness={dbReadiness}
+              isAuthenticated={!!currentUser}
+              onBackToDashboard={() => setCurrentTab('dashboard')}
+              onNavigateToDiagnostics={() => setCurrentTab('health')}
+              onNavigateToLogin={() => setCurrentTab('login')}
+            />
+          ) : (
+            <div className="space-y-6">
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="p-2.5 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-emerald-400">
+                    <Receipt className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <h1 className="text-xl font-bold text-white tracking-tight">
+                      Employee Expense Claims & Reimbursements
+                    </h1>
+                    <p className="text-sm text-slate-400">
+                      Submit itemized expense claims, verify original expense dates, manage two-stage approvals, and post Accounts Payable disbursements.
+                    </p>
+                  </div>
+                </div>
+              </div>
+              <ExpenseModuleView currentUser={currentUser!} />
+            </div>
           ))}
 
         {currentTab === 'coa' &&

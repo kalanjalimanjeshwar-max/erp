@@ -257,6 +257,7 @@ describe('Database Migration History & Integrity Tests', () => {
       '20261105000000_phase2_1_company_settings_foundations',
       '20261105120000_phase2_2_document_sequence_padding',
       '20261106000000_phase2_3_bank_account_encryption_capacity',
+      '20261112000000_employee_expense_claims_reimbursement',
     ]);
   });
 
@@ -317,6 +318,23 @@ describe('Database Migration History & Integrity Tests', () => {
     expect(content).toContain('ALTER COLUMN "swiftBic" TYPE VARCHAR(255)');
     expect(content).toContain('ALTER COLUMN "iban" TYPE VARCHAR(255)');
     expect(content).toContain('ALTER COLUMN "upiId" TYPE VARCHAR(255)');
+  });
+
+  it('should include version-controlled Employee Expense Claims migration (20261112000000_employee_expense_claims_reimbursement)', () => {
+    const migration15Dir = path.join(migrationsDir, '20261112000000_employee_expense_claims_reimbursement');
+    expect(fs.existsSync(migration15Dir)).toBe(true);
+
+    const migration15Sql = path.join(migration15Dir, 'migration.sql');
+    expect(fs.existsSync(migration15Sql)).toBe(true);
+
+    const content = fs.readFileSync(migration15Sql, 'utf-8');
+    expect(content).toContain("ALTER TYPE \"DocumentNumberType\" ADD VALUE 'EXPENSE_CLAIM';");
+    expect(content).toContain('CREATE TYPE "ExpenseClaimStatus"');
+    expect(content).toContain('CREATE TABLE "ExpenseClaim"');
+    expect(content).toContain('CREATE TABLE "ExpenseClaimLine"');
+    expect(content).toContain('CREATE TABLE "ExpenseClaimAttachment"');
+    expect(content).toContain('CREATE TABLE "ExpenseClaimEvent"');
+    expect(content).toContain('"ExpenseClaim_companyId_claimNumber_key"');
   });
 });
 

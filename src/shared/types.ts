@@ -26,7 +26,8 @@ export type AppModule =
   | 'DESIGNATION'
   | 'PAYROLL'
   | 'ATTENDANCE'
-  | 'BIOMETRIC';
+  | 'BIOMETRIC'
+  | 'EXPENSE';
 
 export type AppAction = 'VIEW' | 'CREATE' | 'EDIT' | 'APPROVE' | 'DEACTIVATE' | 'DELETE';
 
@@ -1661,4 +1662,182 @@ export interface UpdateCompanyBankAccountRequest {
   showOnInvoices?: boolean;
   showOnQuotations?: boolean;
 }
+
+// ============================================================================
+// EMPLOYEE EXPENSE CLAIMS & REIMBURSEMENTS TYPES
+// ============================================================================
+
+export type ExpenseClaimStatus =
+  | 'DRAFT'
+  | 'SUBMITTED'
+  | 'MANAGER_APPROVED'
+  | 'ACCOUNTS_APPROVED'
+  | 'PAID'
+  | 'REJECTED'
+  | 'CANCELLED';
+
+export type ExpenseCategory =
+  | 'TRAVEL'
+  | 'MEALS'
+  | 'LODGING'
+  | 'OFFICE_SUPPLIES'
+  | 'COMMUNICATION'
+  | 'SOFTWARE'
+  | 'TRAINING'
+  | 'OTHER';
+
+export type ExpensePaymentMethod = 'BANK_TRANSFER' | 'CHEQUE' | 'CASH';
+
+export interface ExpenseClaimAttachmentItem {
+  id: string;
+  claimId?: string | null;
+  companyId: string;
+  fileName: string;
+  mimeType: string;
+  fileSizeBytes: number;
+  sha256Hash: string;
+  uploadedByUserId: string;
+  createdAt: string;
+}
+
+export interface ExpenseClaimLineItem {
+  id: string;
+  claimId: string;
+  companyId: string;
+  category: ExpenseCategory;
+  description: string;
+  expenseDate: string;
+  amount: number;
+  merchant?: string | null;
+  expenseLedgerId?: string | null;
+  expenseLedgerName?: string | null;
+  attachmentId?: string | null;
+  attachment?: ExpenseClaimAttachmentItem | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ExpenseClaimEventItem {
+  id: string;
+  claimId: string;
+  companyId: string;
+  action: string;
+  fromStatus?: ExpenseClaimStatus | null;
+  toStatus: ExpenseClaimStatus;
+  actorUserId: string;
+  actorName?: string;
+  notes?: string | null;
+  createdAt: string;
+}
+
+export interface ExpenseClaimItem {
+  id: string;
+  companyId: string;
+  claimNumber: string;
+  employeeId: string;
+  employeeName?: string;
+  employeeCode?: string;
+  departmentName?: string;
+  title: string;
+  description?: string | null;
+  originalExpenseDate: string;
+  currency: string;
+  totalAmount: number;
+  status: ExpenseClaimStatus;
+  managerId?: string | null;
+  managerName?: string | null;
+  managerApprovedAt?: string | null;
+  managerApprovedById?: string | null;
+  managerApprovedByName?: string | null;
+  accountsApprovedAt?: string | null;
+  accountsApprovedById?: string | null;
+  accountsApprovedByName?: string | null;
+  payableLedgerId?: string | null;
+  payableLedgerName?: string | null;
+  journalEntryId?: string | null;
+  journalVoucherNumber?: string | null;
+  paidAt?: string | null;
+  paidById?: string | null;
+  paidByName?: string | null;
+  paymentJournalEntryId?: string | null;
+  paymentJournalVoucherNumber?: string | null;
+  paymentReference?: string | null;
+  paymentMethod?: ExpensePaymentMethod | null;
+  bankAccountId?: string | null;
+  rejectionReason?: string | null;
+  returnReason?: string | null;
+  lines: ExpenseClaimLineItem[];
+  attachments: ExpenseClaimAttachmentItem[];
+  events: ExpenseClaimEventItem[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateExpenseClaimLineInput {
+  category: ExpenseCategory;
+  description: string;
+  expenseDate: string;
+  amount: number;
+  merchant?: string | null;
+  expenseLedgerId?: string | null;
+  attachmentId?: string | null;
+}
+
+export interface CreateExpenseClaimRequest {
+  title: string;
+  description?: string | null;
+  originalExpenseDate: string;
+  currency?: string;
+  managerId?: string | null;
+  lines: CreateExpenseClaimLineInput[];
+  submitImmediately?: boolean;
+}
+
+export interface UpdateExpenseClaimRequest {
+  title?: string;
+  description?: string | null;
+  originalExpenseDate?: string;
+  managerId?: string | null;
+  lines?: CreateExpenseClaimLineInput[];
+}
+
+export interface ReviewExpenseClaimRequest {
+  decision: 'APPROVE' | 'REJECT' | 'RETURN';
+  reason?: string;
+  payableLedgerId?: string; // For accounts review
+  expenseLedgerId?: string; // Fallback default expense ledger if not per-line
+}
+
+export interface PayExpenseClaimRequest {
+  bankAccountId?: string;
+  bankLedgerId?: string;
+  paymentMethod: ExpensePaymentMethod;
+  paymentReference?: string;
+  paymentDate?: string;
+}
+
+export interface ExpenseSummaryReport {
+  totalClaimsCount: number;
+  draftCount: number;
+  submittedCount: number;
+  managerApprovedCount: number;
+  accountsApprovedCount: number;
+  paidCount: number;
+  rejectedCount: number;
+  totalPendingAmount: number;
+  totalApprovedUnpaidAmount: number;
+  totalReimbursedAmount: number;
+  byCategory: Array<{ category: ExpenseCategory; amount: number; count: number }>;
+  byDepartment: Array<{ departmentId: string; departmentName: string; amount: number; count: number }>;
+}
+
+export interface ExpenseCapabilitiesResponse {
+  canManagerApprove: boolean;
+  canAccountsApprove: boolean;
+  canViewAccounting: boolean;
+  canViewCompanyBankAccounts: boolean;
+  canViewEmployees: boolean;
+  currentEmployeeId: string | null;
+}
+
 

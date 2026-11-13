@@ -34,6 +34,7 @@ const MODULES: { id: AppModule; label: string; desc: string }[] = [
   { id: 'PAYROLL', label: 'Payroll', desc: 'Salary batches, calculation, and payslips' },
   { id: 'ATTENDANCE', label: 'Attendance', desc: 'Shifts, daily logs, and leave requests' },
   { id: 'BIOMETRIC', label: 'Biometrics', desc: 'Hardware terminal LAN bridge and sync' },
+  { id: 'EXPENSE', label: 'Expense Claims', desc: 'Employee claims, multi-level approvals, and reimbursements' },
 ];
 
 const ACTIONS: AppAction[] = ['VIEW', 'CREATE', 'EDIT', 'APPROVE', 'DEACTIVATE', 'DELETE'];

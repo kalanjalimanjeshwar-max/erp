@@ -27,6 +27,7 @@ export const DEFAULT_DOCUMENT_PREFIXES: Readonly<Record<DocumentNumberType, stri
   QUOTATION: 'QTN',
   RECEIPT: 'REC',
   JOURNAL_VOUCHER: 'JV',
+  EXPENSE_CLAIM: 'EXP',
 });
 
 export const DEFAULT_PADDING_ZEROS = 5;
@@ -183,7 +184,7 @@ export class DocumentSequenceService {
     }
 
     // 2. Document Type Validation
-    const validTypes: DocumentNumberType[] = ['INVOICE', 'QUOTATION', 'RECEIPT', 'JOURNAL_VOUCHER'];
+    const validTypes: DocumentNumberType[] = ['INVOICE', 'QUOTATION', 'RECEIPT', 'JOURNAL_VOUCHER', 'EXPENSE_CLAIM'];
     if (!validTypes.includes(documentType)) {
       throw new Error(
         `[INVALID_DOCUMENT_TYPE] Unsupported document type "${documentType}". Must be one of: ${validTypes.join(', ')}`

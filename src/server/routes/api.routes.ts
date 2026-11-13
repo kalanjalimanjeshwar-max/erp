@@ -22,6 +22,7 @@ import { AttendanceController } from '../controllers/attendance.controller.js';
 import { LeaveController } from '../controllers/leave.controller.js';
 import { PayrollController } from '../controllers/payroll.controller.js';
 import { BiometricController } from '../controllers/biometric.controller.js';
+import { ExpenseClaimController } from '../controllers/expense-claim.controller.js';
 import { requireAuth, requirePermission } from '../middleware/auth.middleware.js';
 import { requireDeviceAuth } from '../middleware/device-auth.middleware.js';
 
@@ -218,4 +219,22 @@ apiRouter.post('/biometric/punches', requireDeviceAuth, BiometricController.inge
 apiRouter.get('/biometric/punches', requireAuth, requirePermission('BIOMETRIC', 'VIEW'), BiometricController.listPunches);
 apiRouter.post('/biometric/sync', requireAuth, requirePermission('BIOMETRIC', 'EDIT'), BiometricController.triggerSync);
 apiRouter.get('/biometric/sync/summary', requireAuth, requirePermission('BIOMETRIC', 'VIEW'), BiometricController.getSummary);
+
+// 23. Employee Expense Claims & Reimbursements Endpoints (Stage 2.2)
+apiRouter.get('/expenses/capabilities', requireAuth, requirePermission('EXPENSE', 'VIEW'), ExpenseClaimController.getCapabilities);
+apiRouter.post('/expenses/attachments', requireAuth, requirePermission('EXPENSE', 'CREATE'), ExpenseClaimController.uploadAttachment);
+apiRouter.get('/expenses/attachments/:id', requireAuth, requirePermission('EXPENSE', 'VIEW'), ExpenseClaimController.getAttachmentFile);
+
+apiRouter.get('/expenses/claims', requireAuth, requirePermission('EXPENSE', 'VIEW'), ExpenseClaimController.listClaims);
+apiRouter.get('/expenses/claims/:id', requireAuth, requirePermission('EXPENSE', 'VIEW'), ExpenseClaimController.getClaimById);
+apiRouter.post('/expenses/claims', requireAuth, requirePermission('EXPENSE', 'CREATE'), ExpenseClaimController.createClaim);
+apiRouter.patch('/expenses/claims/:id', requireAuth, requirePermission('EXPENSE', 'EDIT'), ExpenseClaimController.updateClaim);
+apiRouter.post('/expenses/claims/:id/submit', requireAuth, requirePermission('EXPENSE', 'EDIT'), ExpenseClaimController.submitClaim);
+apiRouter.post('/expenses/claims/:id/cancel', requireAuth, requirePermission('EXPENSE', 'EDIT'), ExpenseClaimController.cancelClaim);
+
+apiRouter.post('/expenses/claims/:id/manager-review', requireAuth, requirePermission('EXPENSE', 'APPROVE'), ExpenseClaimController.managerReview);
+apiRouter.post('/expenses/claims/:id/accounts-review', requireAuth, requirePermission('ACCOUNTING', 'APPROVE'), ExpenseClaimController.accountsReview);
+apiRouter.post('/expenses/claims/:id/pay', requireAuth, requirePermission('ACCOUNTING', 'APPROVE'), ExpenseClaimController.recordPayment);
+
+apiRouter.get('/expenses/reports/summary', requireAuth, requirePermission('EXPENSE', 'VIEW'), ExpenseClaimController.getSummaryReport);
 

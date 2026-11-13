@@ -28,6 +28,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<Role, Record<AppModule, AppAction[]>> = {
     PAYROLL: ['VIEW', 'CREATE', 'EDIT', 'APPROVE', 'DEACTIVATE', 'DELETE'],
     ATTENDANCE: ['VIEW', 'CREATE', 'EDIT', 'APPROVE', 'DEACTIVATE', 'DELETE'],
     BIOMETRIC: ['VIEW', 'CREATE', 'EDIT', 'APPROVE', 'DEACTIVATE', 'DELETE'],
+    EXPENSE: ['VIEW', 'CREATE', 'EDIT', 'APPROVE', 'DEACTIVATE', 'DELETE'],
   },
   ADMIN: {
     COMPANY: ['VIEW', 'EDIT'],
@@ -47,6 +48,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<Role, Record<AppModule, AppAction[]>> = {
     PAYROLL: ['VIEW', 'CREATE', 'EDIT', 'APPROVE'],
     ATTENDANCE: ['VIEW', 'CREATE', 'EDIT', 'APPROVE', 'DEACTIVATE'],
     BIOMETRIC: ['VIEW', 'CREATE', 'EDIT', 'DEACTIVATE'],
+    EXPENSE: ['VIEW', 'CREATE', 'EDIT', 'APPROVE'],
   },
   VICE_ADMIN: {
     COMPANY: ['VIEW'],
@@ -66,6 +68,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<Role, Record<AppModule, AppAction[]>> = {
     PAYROLL: ['VIEW'],
     ATTENDANCE: ['VIEW'],
     BIOMETRIC: ['VIEW'],
+    EXPENSE: ['VIEW'],
   },
   EMPLOYEE: {
     COMPANY: ['VIEW'],
@@ -85,6 +88,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<Role, Record<AppModule, AppAction[]>> = {
     PAYROLL: ['VIEW'], // View own payslip (controlled at resource level)
     ATTENDANCE: ['VIEW', 'CREATE'], // View own attendance / clock in
     BIOMETRIC: [],
+    EXPENSE: ['VIEW', 'CREATE', 'EDIT', 'DELETE'], // Manage own draft claims, view own claims
   },
 };
 
@@ -179,6 +183,7 @@ export class PermissionService {
       'PAYROLL',
       'ATTENDANCE',
       'BIOMETRIC',
+      'EXPENSE',
     ];
     const actions: AppAction[] = ['VIEW', 'CREATE', 'EDIT', 'APPROVE', 'DEACTIVATE', 'DELETE'];
 

@@ -19,6 +19,7 @@ import {
   UserPlus,
   ArrowLeftRight,
   UserCheck,
+  Receipt,
 } from 'lucide-react';
 import { AuthUser, CompanyProfile } from '../../../shared/types.ts';
 
@@ -78,6 +79,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         { id: 'my-profile', label: 'My Profile & Salary', icon: Users },
         { id: 'attendance', label: 'My Attendance Logs', icon: CalendarCheck },
         { id: 'leave', label: 'Leave Applications', icon: FileText },
+        { id: 'expenses', label: 'Expense Claims', icon: Receipt },
         { id: 'payroll', label: 'My Payslips', icon: DollarSign },
       ]
     : [
@@ -87,6 +89,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         { id: 'attendance', label: 'Time & Attendance', icon: CalendarCheck },
         { id: 'biometric', label: 'Biometric Terminals', icon: Fingerprint },
         { id: 'leave', label: 'Leave Management', icon: FileText },
+        { id: 'expenses', label: 'Expense Claims', icon: Receipt },
         { id: 'payroll', label: 'Payroll & Compensation', icon: DollarSign },
       ];
 

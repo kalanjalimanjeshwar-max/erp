@@ -138,6 +138,12 @@ model Company {
   payrollPeriods     PayrollPeriod[]
   payslips           Payslip[]
 
+  // Employee Expense Claims Relations
+  expenseClaims           ExpenseClaim[]
+  expenseClaimLines       ExpenseClaimLine[]
+  expenseClaimAttachments ExpenseClaimAttachment[]
+  expenseClaimEvents      ExpenseClaimEvent[]
+
   // Phase 8: Biometric Hardware LAN Bridge Relations
   biometricTerminals BiometricTerminal[]
   rawPunchLogs       RawPunchLog[]
@@ -203,6 +209,13 @@ model User {
   // Phase 2.1: Settings Change Request Relations (Maker-Checker)
   settingsChangeRequestsCreated  CompanySettingsChangeRequest[] @relation("SettingsChangeRequestCreatedByUser")
   settingsChangeRequestsReviewed CompanySettingsChangeRequest[] @relation("SettingsChangeRequestReviewedByUser")
+
+  // Employee Expense Claims Relations
+  managerApprovedExpenseClaims  ExpenseClaim[]           @relation("ExpenseClaimManagerApprovedByUser")
+  accountsApprovedExpenseClaims ExpenseClaim[]           @relation("ExpenseClaimAccountsApprovedByUser")
+  paidExpenseClaims             ExpenseClaim[]           @relation("ExpenseClaimPaidByUser")
+  uploadedExpenseAttachments    ExpenseClaimAttachment[] @relation("ExpenseAttachmentUploadedByUser")
+  expenseEvents                 ExpenseClaimEvent[]      @relation("ExpenseEventActorUser")
 
   @@unique([companyId, email])
   @@unique([id, companyId])
@@ -327,6 +340,11 @@ model AccountLedger {
   // Phase 7 Payroll relations
   payslips            Payslip[]         @relation("PayslipLedger")
 
+  // Employee Expense Claims relations
+  payableExpenseClaims ExpenseClaim[]     @relation("ExpenseClaimPayableLedger")
+  bankExpenseClaims    ExpenseClaim[]     @relation("ExpenseClaimBankLedger")
+  expenseClaimLines    ExpenseClaimLine[] @relation("ExpenseLineLedger")
+
   @@unique([companyId, name])
   @@unique([companyId, code])
   @@unique([companyId, employeeId])
@@ -370,6 +388,10 @@ model JournalEntry {
 
   // Phase 7 Payroll relations
   payslips            Payslip[]         @relation("PayslipJournalEntry")
+
+  // Employee Expense Claims relations
+  expenseClaims        ExpenseClaim[]     @relation("ExpenseClaimJournalEntry")
+  expensePaymentClaims ExpenseClaim[]     @relation("ExpenseClaimPaymentJournalEntry")
 
   @@unique([companyId, voucherNumber])
   @@unique([companyId, idempotencyKey])
@@ -440,6 +462,7 @@ enum DocumentNumberType {
   QUOTATION
   RECEIPT
   JOURNAL_VOUCHER
+  EXPENSE_CLAIM
 }
 
 /// Phase 2.1: Multiple company bank accounts foundation with active default account designation
@@ -463,6 +486,8 @@ model CompanyBankAccount {
   showOnQuotations  Boolean  @default(false)
   createdAt         DateTime @default(now()) @db.Timestamptz(6)
   updatedAt         DateTime @updatedAt @db.Timestamptz(6)
+
+  expenseClaims     ExpenseClaim[]
 
   @@index([companyId])
   @@index([companyId, isActive])
@@ -890,6 +915,10 @@ model Employee {
   // Stage 2.1: Persistent Admin Notifications Relations
   notifications     Notification[]
 
+  // Employee Expense Claims Relations
+  expenseClaims        ExpenseClaim[]   @relation("EmployeeExpenseClaims")
+  managedExpenseClaims ExpenseClaim[]   @relation("ManagerExpenseClaims")
+
   @@unique([companyId, employeeCode])
   @@index([companyId])
   @@index([departmentId])
@@ -1286,4 +1315,157 @@ model NotificationUserState {
   @@unique([notificationId, userId])
   @@index([userId, companyId, isDismissed, isRead])
   @@index([companyId])
+}
+
+// ============================================================================
+// STAGE 2.2: EMPLOYEE EXPENSE CLAIMS & REIMBURSEMENTS ENGINE
+// ============================================================================
+
+enum ExpenseClaimStatus {
+  DRAFT
+  SUBMITTED
+  MANAGER_APPROVED
+  ACCOUNTS_APPROVED
+  PAID
+  REJECTED
+  CANCELLED
+}
+
+enum ExpenseCategory {
+  TRAVEL
+  MEALS
+  LODGING
+  OFFICE_SUPPLIES
+  COMMUNICATION
+  SOFTWARE
+  TRAINING
+  OTHER
+}
+
+enum ExpensePaymentMethod {
+  BANK_TRANSFER
+  CHEQUE
+  CASH
+}
+
+/// Central Employee Expense Reimbursement Claim
+model ExpenseClaim {
+  id                         String               @id @default(uuid()) @db.Uuid
+  companyId                  String               @db.Uuid
+  company                    Company              @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  claimNumber                String               @db.VarChar(64)
+  employeeId                 String               @db.Uuid
+  employee                   Employee             @relation("EmployeeExpenseClaims", fields: [employeeId], references: [id], onDelete: Restrict)
+  title                      String               @db.VarChar(255)
+  description                String?              @db.Text
+  originalExpenseDate        DateTime             @db.Date
+  currency                   String               @default("USD") @db.VarChar(3)
+  totalAmount                Decimal              @default(0.0000) @db.Decimal(18, 4)
+  status                     ExpenseClaimStatus   @default(DRAFT)
+  managerId                  String?              @db.Uuid
+  manager                    Employee?            @relation("ManagerExpenseClaims", fields: [managerId], references: [id], onDelete: SetNull)
+  managerApprovedAt          DateTime?            @db.Timestamptz(6)
+  managerApprovedById        String?              @db.Uuid
+  managerApprovedBy          User?                @relation("ExpenseClaimManagerApprovedByUser", fields: [managerApprovedById], references: [id], onDelete: SetNull)
+  accountsApprovedAt         DateTime?            @db.Timestamptz(6)
+  accountsApprovedById       String?              @db.Uuid
+  accountsApprovedBy         User?                @relation("ExpenseClaimAccountsApprovedByUser", fields: [accountsApprovedById], references: [id], onDelete: SetNull)
+  payableLedgerId            String?              @db.Uuid
+  payableLedger              AccountLedger?       @relation("ExpenseClaimPayableLedger", fields: [payableLedgerId], references: [id], onDelete: Restrict)
+  journalEntryId             String?              @db.Uuid
+  journalEntry               JournalEntry?        @relation("ExpenseClaimJournalEntry", fields: [journalEntryId], references: [id], onDelete: SetNull)
+  paidAt                     DateTime?            @db.Timestamptz(6)
+  paidById                   String?              @db.Uuid
+  paidBy                     User?                @relation("ExpenseClaimPaidByUser", fields: [paidById], references: [id], onDelete: SetNull)
+  paymentJournalEntryId      String?              @db.Uuid
+  paymentJournalEntry        JournalEntry?        @relation("ExpenseClaimPaymentJournalEntry", fields: [paymentJournalEntryId], references: [id], onDelete: SetNull)
+  paymentReference           String?              @db.VarChar(128)
+  paymentMethod              ExpensePaymentMethod?
+  bankAccountId              String?              @db.Uuid
+  bankAccount                CompanyBankAccount?  @relation(fields: [bankAccountId], references: [id], onDelete: SetNull)
+  bankLedgerId               String?              @db.Uuid
+  bankLedger                 AccountLedger?       @relation("ExpenseClaimBankLedger", fields: [bankLedgerId], references: [id], onDelete: SetNull)
+  rejectionReason            String?              @db.Text
+  returnReason               String?              @db.Text
+  createdAt                  DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt                  DateTime             @updatedAt @db.Timestamptz(6)
+
+  lines                      ExpenseClaimLine[]
+  attachments                ExpenseClaimAttachment[]
+  events                     ExpenseClaimEvent[]
+
+  @@unique([companyId, claimNumber])
+  @@index([companyId])
+  @@index([employeeId])
+  @@index([managerId])
+  @@index([status])
+  @@index([originalExpenseDate])
+}
+
+/// Itemized posting line within an expense claim
+model ExpenseClaimLine {
+  id               String                 @id @default(uuid()) @db.Uuid
+  claimId          String                 @db.Uuid
+  claim            ExpenseClaim           @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  companyId        String                 @db.Uuid
+  company          Company                @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  category         ExpenseCategory        @default(OTHER)
+  description      String                 @db.VarChar(255)
+  expenseDate      DateTime               @db.Date
+  amount           Decimal                @default(0.0000) @db.Decimal(18, 4)
+  merchant         String?                @db.VarChar(128)
+  expenseLedgerId  String?                @db.Uuid
+  expenseLedger    AccountLedger?         @relation("ExpenseLineLedger", fields: [expenseLedgerId], references: [id], onDelete: Restrict)
+  attachmentId     String?                @db.Uuid
+  attachment       ExpenseClaimAttachment? @relation(fields: [attachmentId], references: [id], onDelete: SetNull)
+  createdAt        DateTime               @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime               @updatedAt @db.Timestamptz(6)
+
+  @@index([claimId])
+  @@index([companyId])
+  @@index([expenseLedgerId])
+  @@index([category])
+}
+
+/// Secure cryptographic attachment metadata with MIME and hash verification
+model ExpenseClaimAttachment {
+  id               String             @id @default(uuid()) @db.Uuid
+  claimId          String?            @db.Uuid
+  claim            ExpenseClaim?      @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  companyId        String             @db.Uuid
+  company          Company            @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  fileName         String             @db.VarChar(255)
+  storageKey       String             @db.VarChar(255)
+  mimeType         String             @db.VarChar(128)
+  fileSizeBytes    Int
+  sha256Hash       String             @db.VarChar(64)
+  uploadedByUserId String             @db.Uuid
+  uploadedByUser   User               @relation("ExpenseAttachmentUploadedByUser", fields: [uploadedByUserId], references: [id], onDelete: Restrict)
+  createdAt        DateTime           @default(now()) @db.Timestamptz(6)
+
+  claimLines       ExpenseClaimLine[]
+
+  @@index([companyId])
+  @@index([claimId])
+  @@index([sha256Hash])
+}
+
+/// Tamper-evident workflow audit event trail
+model ExpenseClaimEvent {
+  id          String              @id @default(uuid()) @db.Uuid
+  claimId     String              @db.Uuid
+  claim       ExpenseClaim        @relation(fields: [claimId], references: [id], onDelete: Cascade)
+  companyId   String              @db.Uuid
+  company     Company             @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  action      String              @db.VarChar(64)
+  fromStatus  ExpenseClaimStatus?
+  toStatus    ExpenseClaimStatus
+  actorUserId String              @db.Uuid
+  actorUser   User                @relation("ExpenseEventActorUser", fields: [actorUserId], references: [id], onDelete: Restrict)
+  notes       String?             @db.Text
+  createdAt   DateTime            @default(now()) @db.Timestamptz(6)
+
+  @@index([claimId])
+  @@index([companyId])
+  @@index([actorUserId])
 }

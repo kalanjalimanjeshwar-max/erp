@@ -15,6 +15,7 @@ export function createApp(): Express {
     })
   );
   app.use(cookieParser());
+  app.use('/api/expenses/attachments', express.json({ limit: '15mb' }));
   app.use(express.json());
 
   // Mount API endpoints
