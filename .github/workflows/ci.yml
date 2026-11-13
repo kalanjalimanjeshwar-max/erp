@@ -1,0 +1,43 @@
+name: CoreERP CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    name: Clean Install, Prisma Generate, Typecheck, Test & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Clean install dependencies (triggers postinstall -> prisma generate)
+        run: npm ci
+
+      - name: Verify idempotent Prisma Client generation
+        run: npm run db:generate
+
+      - name: Validate Prisma schema
+        env:
+          # Syntax-only validation in CI; does not connect to any database or expose credentials
+          DATABASE_URL: postgresql://ci_validate:ci_validate@localhost:5432/core_erp_ci?schema=public
+        run: npx prisma validate
+
+      - name: Run TypeScript type check (prelint regenerates Prisma Client)
+        run: npm run lint
+
+      - name: Run unit test suite (pretest regenerates Prisma Client)
+        run: npm test
+
+      - name: Build production bundle (prebuild regenerates Prisma Client)
+        run: npm run build

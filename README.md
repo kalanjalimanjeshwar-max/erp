@@ -83,8 +83,8 @@ To connect CoreERP in AI Studio to an external PostgreSQL database:
 ### Steps (PowerShell / Command Prompt)
 
 ```powershell
-# 1. Clone repository and install dependencies
-npm install
+# 1. Clone repository and perform clean reproducible installation (triggers postinstall -> prisma generate)
+npm ci
 
 # 2. Copy environment configuration
 cp .env.example .env
@@ -101,9 +101,21 @@ npm run dev
 
 Visit `http://localhost:3000` to access the CoreERP dashboard and run the Initial Setup Wizard.
 
+### Clean Installation & Post-Pull Prisma Client Lifecycle
+
+- **Pinned Prisma Tooling**: Both `prisma` and `@prisma/client` are pinned to exact `6.19.3` across `package.json`, `package-lock.json`, and `bun.lock`.
+- **Clean Installs (`npm ci`)**: Running `npm ci` (or `npm install`) automatically invokes `"postinstall": "prisma generate"` so `@prisma/client` matches `prisma/schema.prisma` immediately after installation.
+- **After Pulling Schema Changes (`git pull`)**: Whenever `prisma/schema.prisma` changes without reinstalling `node_modules`, regenerate the Prisma Client before running standalone `npx tsc --noEmit`:
+  ```powershell
+  npm run db:generate
+  # or equivalently:
+  npx prisma generate
+  ```
+- **Automatic Pre-Hooks**: Running `npm run lint`, `npm test`, `npm run build`, or `npm run dev` automatically runs `prisma generate` beforehand (`prelint`, `pretest`, `prebuild`, `predev`) cross-platform on both Windows PowerShell and Linux CI.
+
 ---
 
-## 4. Production Deployment: Ubuntu Linux with Docker Compose
+## 5. Production Deployment: Ubuntu Linux with Docker Compose
 
 ### Prerequisites
 - Ubuntu 22.04 LTS or 24.04 LTS
@@ -147,24 +159,30 @@ curl -i http://localhost:3000/api/ready
 
 ---
 
-## 5. Automated Verification & Testing
+## 6. Automated Verification & Testing
 
-Run unit tests and integration tests via Vitest:
+Run Prisma generation/validation, TypeScript checks, Vitest tests, and the production build:
 
 ```bash
-# Run complete test suite
-npm run test
+# 1. Regenerate Prisma Client (idempotent; also triggered automatically by pre* hooks below)
+npm run db:generate
 
-# Run TypeScript compilation checks
+# 2. Validate Prisma schema
+npx prisma validate
+
+# 3. Run TypeScript compilation checks (runs prelint -> prisma generate)
 npm run lint
 
-# Build production bundle
+# 4. Run complete test suite (runs pretest -> prisma generate)
+npm test
+
+# 5. Build production bundle (runs prebuild -> prisma generate)
 npm run build
 ```
 
 ---
 
-## 6. Health & Diagnostic Endpoints
+## 7. Health & Diagnostic Endpoints
 
 - `GET /api/health`: Returns process status, uptime, environment, and version.
 - `GET /api/ready`: Returns 200 when PostgreSQL is connected; returns 503 with safe diagnostic error when unreachable (never leaks credentials).

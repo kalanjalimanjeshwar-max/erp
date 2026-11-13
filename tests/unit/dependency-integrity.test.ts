@@ -79,10 +79,35 @@ describe('Dependency & Lockfile Integrity Validation', () => {
   });
 
   describe('Prisma Client Lifecycle & Clean-Install Reliability', () => {
-    it('should define postinstall script running prisma generate in package.json', () => {
+    it('should define postinstall, db:generate, and pre* generation hooks in package.json', () => {
       expect(packageJson.scripts).toBeDefined();
       expect(packageJson.scripts.postinstall).toBe('prisma generate');
       expect(packageJson.scripts['db:generate']).toBe('prisma generate');
+      expect(packageJson.scripts.prelint).toBe('prisma generate');
+      expect(packageJson.scripts.pretest).toBe('prisma generate');
+      expect(packageJson.scripts.prebuild).toBe('prisma generate');
+      expect(packageJson.scripts.predev).toBe('prisma generate');
+    });
+
+    it('should pin prisma and @prisma/client to identical exact compatible versions across package.json and lockfiles', () => {
+      const clientVersion = packageJson.dependencies?.['@prisma/client'];
+      const cliVersion = packageJson.devDependencies?.prisma;
+
+      expect(clientVersion).toBe('6.19.3');
+      expect(cliVersion).toBe('6.19.3');
+      expect(clientVersion).toBe(cliVersion);
+
+      const packageLock = JSON.parse(fs.readFileSync(packageLockPath, 'utf8'));
+      expect(packageLock.packages?.['']?.dependencies?.['@prisma/client']).toBe('6.19.3');
+      expect(packageLock.packages?.['']?.devDependencies?.prisma).toBe('6.19.3');
+      expect(packageLock.packages?.['node_modules/@prisma/client']?.version).toBe('6.19.3');
+      expect(packageLock.packages?.['node_modules/prisma']?.version).toBe('6.19.3');
+
+      if (fs.existsSync(bunLockPath)) {
+        const bunLockRaw = fs.readFileSync(bunLockPath, 'utf8');
+        expect(bunLockRaw).toMatch(/"@prisma\/client":\s*"6\.19\.3"/);
+        expect(bunLockRaw).toMatch(/"prisma":\s*"6\.19\.3"/);
+      }
     });
 
     it('should confirm Prisma Client is generated and initialized in the node runtime', async () => {
@@ -114,11 +139,53 @@ describe('Dependency & Lockfile Integrity Validation', () => {
       expect(isPrismaClientInitialized()).toBe(true);
     });
 
-    it('should verify Dockerfile build lifecycle runs npm ci which triggers postinstall', () => {
+    it('should verify Dockerfile build lifecycle runs npm ci and explicit prisma generate', () => {
       const dockerfilePath = path.join(rootDir, 'Dockerfile');
       expect(fs.existsSync(dockerfilePath)).toBe(true);
       const dockerfile = fs.readFileSync(dockerfilePath, 'utf8');
       expect(dockerfile).toContain('RUN npm ci');
+      expect(dockerfile).toContain('RUN npx prisma generate');
+    });
+
+    it('should exclude dist and node_modules in tsconfig.json to avoid build output scan errors', () => {
+      const tsconfigPath = path.join(rootDir, 'tsconfig.json');
+      const tsconfig = JSON.parse(fs.readFileSync(tsconfigPath, 'utf8'));
+      expect(Array.isArray(tsconfig.exclude)).toBe(true);
+      expect(tsconfig.exclude).toContain('node_modules');
+      expect(tsconfig.exclude).toContain('dist');
+    });
+
+    it('should provide a GitHub Actions CI workflow that runs npm ci, prisma generate, tsc, tests, and build', async () => {
+      const yamlModule = await import('yaml');
+      const ciPath = path.join(rootDir, '.github/workflows/ci.yml');
+      expect(fs.existsSync(ciPath)).toBe(true);
+
+      const ciDoc = yamlModule.parse(fs.readFileSync(ciPath, 'utf8'));
+      expect(ciDoc?.jobs?.verify?.steps).toBeDefined();
+
+      const steps: Array<{ run?: string }> = ciDoc.jobs.verify.steps;
+      const runCommands = steps.map((s) => s.run || '').filter(Boolean);
+
+      const ciIdx = runCommands.findIndex((cmd) => cmd.includes('npm ci'));
+      const genIdx = runCommands.findIndex((cmd) => cmd.includes('npm run db:generate') || cmd.includes('prisma generate'));
+      const lintIdx = runCommands.findIndex((cmd) => cmd.includes('npm run lint'));
+      const testIdx = runCommands.findIndex((cmd) => cmd.includes('npm test'));
+      const buildIdx = runCommands.findIndex((cmd) => cmd.includes('npm run build'));
+
+      expect(ciIdx).toBeGreaterThanOrEqual(0);
+      expect(genIdx).toBeGreaterThan(ciIdx);
+      expect(lintIdx).toBeGreaterThan(genIdx);
+      expect(testIdx).toBeGreaterThan(genIdx);
+      expect(buildIdx).toBeGreaterThan(genIdx);
+    });
+
+    it('should document clean npm ci installation and post-pull Prisma Client regeneration in README.md', () => {
+      const readmePath = path.join(rootDir, 'README.md');
+      const readme = fs.readFileSync(readmePath, 'utf8');
+      expect(readme).toContain('npm ci');
+      expect(readme).toContain('npm run db:generate');
+      expect(readme).toContain('npx prisma generate');
+      expect(readme).toContain('prisma/schema.prisma');
     });
   });
 });
