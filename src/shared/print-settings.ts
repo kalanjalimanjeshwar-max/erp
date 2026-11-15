@@ -7,11 +7,19 @@
 import { CurrencyDisplayMode } from './currency.js';
 import { DocumentLanguage } from './print-translations.js';
 import {
+  ALL_VISUAL_ELEMENT_KEYS,
   clampVisualElementBounds,
   createDefaultVisualElements,
   DocumentVisualElements,
   getEffectivePaperDimensionsMm,
   isValidBrandingUrl,
+  MAX_TEXT_FONT_SIZE_PT,
+  MAX_TEXT_LETTER_SPACING,
+  MAX_TEXT_LINE_HEIGHT,
+  MIN_TEXT_FONT_SIZE_PT,
+  MIN_TEXT_LETTER_SPACING,
+  MIN_TEXT_LINE_HEIGHT,
+  normalizeDocumentVisualElements,
   PAPER_SIZE_DIMENSIONS_MM,
   sanitizeBrandingUrl,
   VisualElementConfig,
@@ -222,53 +230,21 @@ function mergeVisualElements(
   base: DocumentVisualElements,
   incoming: Partial<DocumentVisualElements> | undefined | null,
   paperSize: PaperSize,
-  orientation: PageOrientation
+  orientation: PageOrientation,
+  margins = DEFAULT_BASE_LAYOUT.margins
 ): DocumentVisualElements {
-  const { widthMm, heightMm } = getEffectivePaperDimensionsMm(paperSize, orientation);
-  const keys: VisualElementKey[] = [
-    'logo',
-    'seal',
-    'signature',
-    'companyHeader',
-    'documentTitle',
-    'footer',
-  ];
-
-  const merged = {} as DocumentVisualElements;
-  for (const key of keys) {
-    const baseEl = base[key];
-    const incEl = incoming?.[key] as Partial<VisualElementConfig> | undefined;
-    const raw: VisualElementConfig = {
-      visible: incEl?.visible ?? baseEl.visible,
-      xMm: typeof incEl?.xMm === 'number' && Number.isFinite(incEl.xMm) ? incEl.xMm : baseEl.xMm,
-      yMm: typeof incEl?.yMm === 'number' && Number.isFinite(incEl.yMm) ? incEl.yMm : baseEl.yMm,
-      widthMm:
-        typeof incEl?.widthMm === 'number' && Number.isFinite(incEl.widthMm)
-          ? incEl.widthMm
-          : baseEl.widthMm,
-      heightMm:
-        typeof incEl?.heightMm === 'number' && Number.isFinite(incEl.heightMm)
-          ? incEl.heightMm
-          : baseEl.heightMm,
-      aspectRatio:
-        typeof incEl?.aspectRatio === 'number' &&
-        Number.isFinite(incEl.aspectRatio) &&
-        incEl.aspectRatio > 0
-          ? incEl.aspectRatio
-          : baseEl.aspectRatio,
-      lockAspectRatio: incEl?.lockAspectRatio ?? baseEl.lockAspectRatio,
-      align:
-        incEl?.align === 'left' || incEl?.align === 'center' || incEl?.align === 'right'
-          ? incEl.align
-          : baseEl.align,
-      spacingMm:
-        typeof incEl?.spacingMm === 'number' && Number.isFinite(incEl.spacingMm)
-          ? incEl.spacingMm
-          : baseEl.spacingMm,
-    };
-    merged[key] = clampVisualElementBounds(raw, widthMm, heightMm);
+  const normalizedBase = normalizeDocumentVisualElements(base, paperSize, orientation, margins);
+  if (!incoming || typeof incoming !== 'object') {
+    return normalizedBase;
   }
-  return merged;
+  const combined: Partial<DocumentVisualElements> = {};
+  for (const key of ALL_VISUAL_ELEMENT_KEYS) {
+    combined[key] = {
+      ...normalizedBase[key],
+      ...(incoming[key] || {}),
+    };
+  }
+  return normalizeDocumentVisualElements(combined, paperSize, orientation, margins);
 }
 
 function mergeSingleLayout(
@@ -276,11 +252,16 @@ function mergeSingleLayout(
   incoming?: Partial<DocumentPrintLayoutConfig> | null
 ): DocumentPrintLayoutConfig {
   if (!incoming || typeof incoming !== 'object') {
-    const paperDims = getEffectivePaperDimensionsMm(base.paperSize, base.orientation);
     return {
       ...base,
       margins: { ...base.margins },
-      elements: mergeVisualElements(base.elements, undefined, base.paperSize, base.orientation),
+      elements: mergeVisualElements(
+        base.elements,
+        undefined,
+        base.paperSize,
+        base.orientation,
+        base.margins
+      ),
     };
   }
 
@@ -348,7 +329,8 @@ function mergeSingleLayout(
     incoming.elements ? base.elements : defaultElementsForPaper,
     incoming.elements,
     paperSize,
-    orientation
+    orientation,
+    margins
   );
 
   return {
@@ -483,15 +465,7 @@ export function validatePrintSettingsPayload(payload: unknown): {
       }
     }
     if (layout.elements && typeof layout.elements === 'object') {
-      const elKeys: VisualElementKey[] = [
-        'logo',
-        'seal',
-        'signature',
-        'companyHeader',
-        'documentTitle',
-        'footer',
-      ];
-      for (const k of elKeys) {
+      for (const k of ALL_VISUAL_ELEMENT_KEYS) {
         const el = layout.elements[k];
         if (!el) continue;
         for (const numField of [el.xMm, el.yMm, el.widthMm, el.heightMm]) {
@@ -501,6 +475,39 @@ export function validatePrintSettingsPayload(payload: unknown): {
               error: `Invalid visual coordinate or dimension on ${k} in ${docType}.`,
             };
           }
+        }
+        if (
+          el.fontSizePt !== undefined &&
+          (!Number.isFinite(Number(el.fontSizePt)) ||
+            Number(el.fontSizePt) < MIN_TEXT_FONT_SIZE_PT ||
+            Number(el.fontSizePt) > MAX_TEXT_FONT_SIZE_PT)
+        ) {
+          return {
+            valid: false,
+            error: `Font size for ${k} in ${docType} must be between ${MIN_TEXT_FONT_SIZE_PT} pt and ${MAX_TEXT_FONT_SIZE_PT} pt.`,
+          };
+        }
+        if (
+          el.lineHeight !== undefined &&
+          (!Number.isFinite(Number(el.lineHeight)) ||
+            Number(el.lineHeight) < MIN_TEXT_LINE_HEIGHT ||
+            Number(el.lineHeight) > MAX_TEXT_LINE_HEIGHT)
+        ) {
+          return {
+            valid: false,
+            error: `Line height for ${k} in ${docType} must be between ${MIN_TEXT_LINE_HEIGHT} and ${MAX_TEXT_LINE_HEIGHT}.`,
+          };
+        }
+        if (
+          el.letterSpacing !== undefined &&
+          (!Number.isFinite(Number(el.letterSpacing)) ||
+            Number(el.letterSpacing) < MIN_TEXT_LETTER_SPACING ||
+            Number(el.letterSpacing) > MAX_TEXT_LETTER_SPACING)
+        ) {
+          return {
+            valid: false,
+            error: `Letter spacing for ${k} in ${docType} must be between ${MIN_TEXT_LETTER_SPACING} pt and ${MAX_TEXT_LETTER_SPACING} pt.`,
+          };
         }
       }
     }

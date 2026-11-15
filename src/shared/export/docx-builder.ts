@@ -22,8 +22,14 @@ import {
   DocumentPrintType,
   InvoiceItem,
   QuotationItem,
+  VisualElementKey,
+  VisualTextFontFamily,
+  VisualTextFontWeight,
 } from '../types.ts';
-import { createDefaultVisualElements } from '../branding.ts';
+import {
+  getVisualElementTypography,
+  normalizeDocumentVisualElements,
+} from '../branding.ts';
 import { createDefaultPrintSettings, PAPER_DIMENSIONS_MM } from '../print-settings.ts';
 import { DocumentPrintLabelKey, getDocumentLabel } from '../print-translations.ts';
 import { formatMoney, normalizeCurrencyCode } from '../currency.ts';
@@ -66,6 +72,17 @@ function formatLabelText(key: DocumentPrintLabelKey, language: DocumentLanguage)
   return entry.secondary ? `${entry.primary} / ${entry.secondary}` : entry.primary;
 }
 
+function resolveDocxFontFamily(family?: VisualTextFontFamily): string {
+  if (family === 'serif') return 'Georgia';
+  if (family === 'mono') return 'Courier New';
+  if (family === 'noto-kannada') return FONT_KANNADA;
+  return FONT_LATIN;
+}
+
+function isBoldWeight(weight?: VisualTextFontWeight): boolean {
+  return weight === '600' || weight === '700';
+}
+
 function makeTextRuns(
   text: string,
   options?: {
@@ -73,21 +90,39 @@ function makeTextRuns(
     size?: number; // half-points (20 = 10pt)
     color?: string;
     italics?: boolean;
+    fontFamily?: VisualTextFontFamily;
+    letterSpacingPt?: number;
   }
 ): TextRun[] {
   const segments = text.split(/([\u0C80-\u0CFF\s]+)/).filter(Boolean);
+  const latinFont = resolveDocxFontFamily(options?.fontFamily);
+  const charSpacing =
+    typeof options?.letterSpacingPt === 'number' && options.letterSpacingPt !== 0
+      ? Math.round(options.letterSpacingPt * 20)
+      : undefined;
   if (segments.length === 0) {
-    return [new TextRun({ text: '', ...options })];
+    return [
+      new TextRun({
+        text: '',
+        font: latinFont,
+        bold: options?.bold,
+        size: options?.size ?? 20,
+        color: options?.color ?? '0F172A',
+        italics: options?.italics,
+        ...(charSpacing !== undefined ? { characterSpacing: charSpacing } : {}),
+      }),
+    ];
   }
   return segments.map((seg) => {
     const isKn = hasKannada(seg);
     return new TextRun({
       text: seg,
-      font: isKn ? FONT_KANNADA : FONT_LATIN,
+      font: isKn ? FONT_KANNADA : latinFont,
       bold: options?.bold,
       size: options?.size ?? 20,
       color: options?.color ?? '0F172A',
       italics: options?.italics,
+      ...(charSpacing !== undefined ? { characterSpacing: charSpacing } : {}),
     });
   });
 }
@@ -254,9 +289,23 @@ export function createWordDocument(context: DocumentExportContext): Document {
     layoutOverride,
     isDraftPreview
   );
-  const visualElements =
-    layout.elements ||
-    createDefaultVisualElements(layout.paperSize, layout.orientation, layout.margins);
+  const visualElements = normalizeDocumentVisualElements(
+    layout.elements,
+    layout.paperSize,
+    layout.orientation,
+    layout.margins
+  );
+  const useVisual = Boolean(layout.visualLayoutEnabled);
+  const typoFor = (key: VisualElementKey) => {
+    const typo = getVisualElementTypography(visualElements[key]);
+    return {
+      ...typo,
+      bold: isBoldWeight(typo.fontWeight),
+      halfPt: Math.round(typo.fontSizePt * 2),
+      lineTwips: Math.round(typo.lineHeight * 240),
+      docxAlign: toDocxAlignment(typo.align),
+    };
+  };
 
   const paperDims = PAPER_DIMENSIONS_MM[layout.paperSize] || PAPER_DIMENSIONS_MM.A4;
   const isLandscape = layout.orientation === 'landscape';
@@ -351,10 +400,17 @@ export function createWordDocument(context: DocumentExportContext): Document {
   // Header table: Company Details (left) + Document Title & Number (right)
   const companyLines: Paragraph[] = [];
   const logoVisual = visualElements.logo;
+  const companyNameVisual = visualElements.companyName;
   const headerVisual = visualElements.companyHeader;
   const titleVisual = visualElements.documentTitle;
+  const docNumVisual = visualElements.documentNumber;
 
-  const logoVisible = layout.showLogo && (!layout.visualLayoutEnabled || logoVisual.visible);
+  const nameTypo = typoFor('companyName');
+  const headerTypo = typoFor('companyHeader');
+  const titleTypo = typoFor('documentTitle');
+  const docNumTypo = typoFor('documentNumber');
+
+  const logoVisible = layout.showLogo && (!useVisual || logoVisual.visible);
   const logoImageRun = logoVisible
     ? createRasterImageRun(
         brandingImages?.logo,
@@ -373,35 +429,56 @@ export function createWordDocument(context: DocumentExportContext): Document {
     );
   }
 
-  const companyHeaderVisible = !layout.visualLayoutEnabled || headerVisual.visible;
-  const headerAlign = toDocxAlignment(headerVisual.align);
-
-  if (companyHeaderVisible) {
-    if (layout.showCompanyName) {
+  const companyNameVisible = layout.showCompanyName && (!useVisual || companyNameVisual.visible);
+  if (companyNameVisible) {
+    companyLines.push(
+      new Paragraph({
+        alignment: nameTypo.docxAlign,
+        spacing: {
+          after: Math.max(30, Math.round((companyNameVisual.spacingMm || 1.5) * 20)),
+          line: nameTypo.lineTwips,
+        },
+        children: makeTextRuns(companyName, {
+          bold: nameTypo.bold,
+          size: nameTypo.halfPt,
+          color: '0F172A',
+          fontFamily: nameTypo.fontFamily,
+          letterSpacingPt: nameTypo.letterSpacing,
+        }),
+      })
+    );
+    if (companyProfile?.legalName && companyProfile.legalName !== companyName) {
       companyLines.push(
         new Paragraph({
-          alignment: headerAlign,
-          spacing: { after: 40 },
-          children: makeTextRuns(companyName, { bold: true, size: 28, color: '0F172A' }),
+          alignment: nameTypo.docxAlign,
+          spacing: { after: 30, line: nameTypo.lineTwips },
+          children: makeTextRuns(companyProfile.legalName, {
+            size: Math.max(14, nameTypo.halfPt - 8),
+            color: '475569',
+            fontFamily: nameTypo.fontFamily,
+          }),
         })
       );
-      if (companyProfile?.legalName && companyProfile.legalName !== companyName) {
-        companyLines.push(
-          new Paragraph({
-            alignment: headerAlign,
-            spacing: { after: 30 },
-            children: makeTextRuns(companyProfile.legalName, { size: 18, color: '475569' }),
-          })
-        );
-      }
     }
+  }
+
+  const companyHeaderVisible = !useVisual || headerVisual.visible;
+  const headerAlign = headerTypo.docxAlign;
+
+  if (companyHeaderVisible) {
     if (layout.showCompanyContact) {
       if (companyProfile?.address) {
         companyLines.push(
           new Paragraph({
             alignment: headerAlign,
-            spacing: { after: 20 },
-            children: makeTextRuns(companyProfile.address, { size: 18, color: '475569' }),
+            spacing: { after: 20, line: headerTypo.lineTwips },
+            children: makeTextRuns(companyProfile.address, {
+              bold: headerTypo.bold,
+              size: headerTypo.halfPt,
+              color: '475569',
+              fontFamily: headerTypo.fontFamily,
+              letterSpacingPt: headerTypo.letterSpacing,
+            }),
           })
         );
       }
@@ -414,8 +491,14 @@ export function createWordDocument(context: DocumentExportContext): Document {
         companyLines.push(
           new Paragraph({
             alignment: headerAlign,
-            spacing: { after: 20 },
-            children: makeTextRuns(contactParts.join('  •  '), { size: 18, color: '475569' }),
+            spacing: { after: 20, line: headerTypo.lineTwips },
+            children: makeTextRuns(contactParts.join('  •  '), {
+              bold: headerTypo.bold,
+              size: headerTypo.halfPt,
+              color: '475569',
+              fontFamily: headerTypo.fontFamily,
+              letterSpacingPt: headerTypo.letterSpacing,
+            }),
           })
         );
       }
@@ -424,10 +507,16 @@ export function createWordDocument(context: DocumentExportContext): Document {
       companyLines.push(
         new Paragraph({
           alignment: headerAlign,
-          spacing: { after: 20 },
+          spacing: { after: 20, line: headerTypo.lineTwips },
           children: makeTextRuns(
             `${formatLabelText('taxId', layout.language)}: ${companyProfile.taxId}`,
-            { bold: true, size: 18, color: '334155' }
+            {
+              bold: true,
+              size: headerTypo.halfPt,
+              color: '334155',
+              fontFamily: headerTypo.fontFamily,
+              letterSpacingPt: headerTypo.letterSpacing,
+            }
           ),
         })
       );
@@ -438,35 +527,56 @@ export function createWordDocument(context: DocumentExportContext): Document {
   }
 
   const resolvedTitleAlign =
-    layout.visualLayoutEnabled && titleVisual.align
-      ? toDocxAlignment(titleVisual.align)
+    useVisual && titleVisual.align
+      ? titleTypo.docxAlign
       : layout.titlePlacement === 'left'
       ? AlignmentType.LEFT
       : layout.titlePlacement === 'center'
       ? AlignmentType.CENTER
       : AlignmentType.RIGHT;
 
-  const titleVisible = !layout.visualLayoutEnabled || titleVisual.visible;
-  const titleCellParagraphs: Paragraph[] = titleVisible
-    ? [
-        new Paragraph({
-          alignment: resolvedTitleAlign,
-          spacing: { after: 60 },
-          children: makeTextRuns(resolvedTitle.toUpperCase(), {
-            bold: true,
-            size: 30,
-            color: '0F172A',
-          }),
+  const titleVisible = !useVisual || titleVisual.visible;
+  const docNumVisible = !useVisual || docNumVisual.visible;
+  const titleCellParagraphs: Paragraph[] = [];
+  if (titleVisible) {
+    titleCellParagraphs.push(
+      new Paragraph({
+        alignment: resolvedTitleAlign,
+        spacing: {
+          after: Math.max(40, Math.round((titleVisual.spacingMm || 2) * 20)),
+          line: titleTypo.lineTwips,
+        },
+        children: makeTextRuns(resolvedTitle.toUpperCase(), {
+          bold: titleTypo.bold,
+          size: titleTypo.halfPt,
+          color: '0F172A',
+          fontFamily: titleTypo.fontFamily,
+          letterSpacingPt: titleTypo.letterSpacing,
         }),
-        new Paragraph({
-          alignment: resolvedTitleAlign,
-          children: makeTextRuns(
-            `${formatLabelText(docNumberLabelKey, layout.language)}: ${docNumber || 'DRAFT PREVIEW'}`,
-            { bold: true, size: 20, color: '1E293B' }
-          ),
-        }),
-      ]
-    : [new Paragraph({ children: [] })];
+      })
+    );
+  }
+  if (docNumVisible && layout.numberPlacement !== 'meta-grid') {
+    titleCellParagraphs.push(
+      new Paragraph({
+        alignment: useVisual ? docNumTypo.docxAlign : resolvedTitleAlign,
+        spacing: { line: docNumTypo.lineTwips },
+        children: makeTextRuns(
+          `${formatLabelText(docNumberLabelKey, layout.language)}: ${docNumber || 'DRAFT PREVIEW'}`,
+          {
+            bold: docNumTypo.bold,
+            size: docNumTypo.halfPt,
+            color: '1E293B',
+            fontFamily: docNumTypo.fontFamily,
+            letterSpacingPt: docNumTypo.letterSpacing,
+          }
+        ),
+      })
+    );
+  }
+  if (titleCellParagraphs.length === 0) {
+    titleCellParagraphs.push(new Paragraph({ children: [] }));
+  }
 
   children.push(
     new Table({
@@ -509,31 +619,50 @@ export function createWordDocument(context: DocumentExportContext): Document {
       ? 'billedTo'
       : 'receivedFrom';
 
-  const partyParagraphs: Paragraph[] = [
-    new Paragraph({
-      spacing: { after: 40 },
-      children: makeTextRuns(formatLabelText(partyLabelKey, layout.language).toUpperCase(), {
-        bold: true,
-        size: 16,
-        color: '64748B',
-      }),
-    }),
-    new Paragraph({
-      spacing: { after: 40 },
-      children: makeTextRuns(docPayload.data.customerName, {
-        bold: true,
-        size: 22,
-        color: '0F172A',
-      }),
-    }),
-  ];
+  const customerTypo = typoFor('customerDetails');
+  const datesTypo = typoFor('dates');
+  const customerVisible = !useVisual || visualElements.customerDetails.visible;
+  const datesVisible = !useVisual || visualElements.dates.visible;
 
-  if (docPayload.type !== 'RECEIPT') {
+  const partyParagraphs: Paragraph[] = customerVisible
+    ? [
+        new Paragraph({
+          alignment: customerTypo.docxAlign,
+          spacing: { after: 40, line: customerTypo.lineTwips },
+          children: makeTextRuns(formatLabelText(partyLabelKey, layout.language).toUpperCase(), {
+            bold: true,
+            size: Math.max(14, customerTypo.halfPt - 2),
+            color: '64748B',
+            fontFamily: customerTypo.fontFamily,
+          }),
+        }),
+        new Paragraph({
+          alignment: customerTypo.docxAlign,
+          spacing: { after: 40, line: customerTypo.lineTwips },
+          children: makeTextRuns(docPayload.data.customerName, {
+            bold: true,
+            size: Math.max(18, customerTypo.halfPt + 3),
+            color: '0F172A',
+            fontFamily: customerTypo.fontFamily,
+            letterSpacingPt: customerTypo.letterSpacing,
+          }),
+        }),
+      ]
+    : [new Paragraph({ children: [] })];
+
+  if (customerVisible && docPayload.type !== 'RECEIPT') {
     if (layout.showCustomerAddress && docPayload.data.customerAddress) {
       partyParagraphs.push(
         new Paragraph({
-          spacing: { after: 30 },
-          children: makeTextRuns(docPayload.data.customerAddress, { size: 18, color: '475569' }),
+          alignment: customerTypo.docxAlign,
+          spacing: { after: 30, line: customerTypo.lineTwips },
+          children: makeTextRuns(docPayload.data.customerAddress, {
+            bold: customerTypo.bold,
+            size: customerTypo.halfPt,
+            color: '475569',
+            fontFamily: customerTypo.fontFamily,
+            letterSpacingPt: customerTypo.letterSpacing,
+          }),
         })
       );
     }
@@ -543,12 +672,19 @@ export function createWordDocument(context: DocumentExportContext): Document {
     ) {
       partyParagraphs.push(
         new Paragraph({
-          spacing: { after: 30 },
+          alignment: customerTypo.docxAlign,
+          spacing: { after: 30, line: customerTypo.lineTwips },
           children: makeTextRuns(
             [docPayload.data.customerEmail, docPayload.data.customerPhone]
               .filter(Boolean)
               .join('  •  '),
-            { size: 18, color: '475569' }
+            {
+              bold: customerTypo.bold,
+              size: customerTypo.halfPt,
+              color: '475569',
+              fontFamily: customerTypo.fontFamily,
+              letterSpacingPt: customerTypo.letterSpacing,
+            }
           ),
         })
       );
@@ -556,10 +692,17 @@ export function createWordDocument(context: DocumentExportContext): Document {
     if (layout.showCustomerTaxId && docPayload.data.customerTaxId) {
       partyParagraphs.push(
         new Paragraph({
-          spacing: { after: 20 },
+          alignment: customerTypo.docxAlign,
+          spacing: { after: 20, line: customerTypo.lineTwips },
           children: makeTextRuns(
             `${formatLabelText('taxId', layout.language)}: ${docPayload.data.customerTaxId}`,
-            { size: 18, color: '334155' }
+            {
+              bold: customerTypo.bold,
+              size: customerTypo.halfPt,
+              color: '334155',
+              fontFamily: customerTypo.fontFamily,
+              letterSpacingPt: customerTypo.letterSpacing,
+            }
           ),
         })
       );
@@ -573,61 +716,117 @@ export function createWordDocument(context: DocumentExportContext): Document {
       : docPayload.type === 'INVOICE'
       ? docPayload.data.invoiceDate
       : docPayload.data.receiptDate;
-  metaParagraphs.push(
-    new Paragraph({
-      spacing: { after: 40 },
-      children: makeTextRuns(`${formatLabelText('date', layout.language)}: ${docDate}`, {
-        size: 18,
-      }),
-    })
-  );
 
-  if (docPayload.type === 'QUOTATION') {
+  if (datesVisible) {
+    if (layout.numberPlacement === 'meta-grid' && docNumVisible) {
+      metaParagraphs.push(
+        new Paragraph({
+          alignment: datesTypo.docxAlign,
+          spacing: { after: 40, line: docNumTypo.lineTwips },
+          children: makeTextRuns(
+            `${formatLabelText(docNumberLabelKey, layout.language)}: ${docNumber || 'DRAFT PREVIEW'}`,
+            {
+              bold: true,
+              size: docNumTypo.halfPt,
+              fontFamily: docNumTypo.fontFamily,
+              letterSpacingPt: docNumTypo.letterSpacing,
+            }
+          ),
+        })
+      );
+    }
+
     metaParagraphs.push(
       new Paragraph({
-        spacing: { after: 40 },
-        children: makeTextRuns(
-          `${formatLabelText('validUntil', layout.language)}: ${docPayload.data.validUntilDate}`,
-          { size: 18 }
-        ),
+        alignment: datesTypo.docxAlign,
+        spacing: { after: 40, line: datesTypo.lineTwips },
+        children: makeTextRuns(`${formatLabelText('date', layout.language)}: ${docDate}`, {
+          bold: datesTypo.bold,
+          size: datesTypo.halfPt,
+          fontFamily: datesTypo.fontFamily,
+          letterSpacingPt: datesTypo.letterSpacing,
+        }),
       })
     );
-  } else if (docPayload.type === 'INVOICE') {
+
+    if (docPayload.type === 'QUOTATION') {
+      metaParagraphs.push(
+        new Paragraph({
+          alignment: datesTypo.docxAlign,
+          spacing: { after: 40, line: datesTypo.lineTwips },
+          children: makeTextRuns(
+            `${formatLabelText('validUntil', layout.language)}: ${docPayload.data.validUntilDate}`,
+            {
+              bold: datesTypo.bold,
+              size: datesTypo.halfPt,
+              fontFamily: datesTypo.fontFamily,
+              letterSpacingPt: datesTypo.letterSpacing,
+            }
+          ),
+        })
+      );
+    } else if (docPayload.type === 'INVOICE') {
+      metaParagraphs.push(
+        new Paragraph({
+          alignment: datesTypo.docxAlign,
+          spacing: { after: 40, line: datesTypo.lineTwips },
+          children: makeTextRuns(
+            `${formatLabelText('dueDate', layout.language)}: ${docPayload.data.dueDate}`,
+            {
+              bold: datesTypo.bold,
+              size: datesTypo.halfPt,
+              fontFamily: datesTypo.fontFamily,
+              letterSpacingPt: datesTypo.letterSpacing,
+            }
+          ),
+        })
+      );
+    } else {
+      metaParagraphs.push(
+        new Paragraph({
+          alignment: datesTypo.docxAlign,
+          spacing: { after: 40, line: datesTypo.lineTwips },
+          children: makeTextRuns(
+            `${formatLabelText('paymentMethod', layout.language)}: ${docPayload.data.paymentMethod.replace(/_/g, ' ')}`,
+            {
+              bold: datesTypo.bold,
+              size: datesTypo.halfPt,
+              fontFamily: datesTypo.fontFamily,
+              letterSpacingPt: datesTypo.letterSpacing,
+            }
+          ),
+        })
+      );
+    }
+
     metaParagraphs.push(
       new Paragraph({
-        spacing: { after: 40 },
+        alignment: datesTypo.docxAlign,
+        spacing: { after: 40, line: datesTypo.lineTwips },
+        children: makeTextRuns(`${formatLabelText('currency', layout.language)}: ${documentCurrency}`, {
+          bold: datesTypo.bold,
+          size: datesTypo.halfPt,
+          fontFamily: datesTypo.fontFamily,
+          letterSpacingPt: datesTypo.letterSpacing,
+        }),
+      }),
+      new Paragraph({
+        alignment: datesTypo.docxAlign,
+        spacing: { line: datesTypo.lineTwips },
         children: makeTextRuns(
-          `${formatLabelText('dueDate', layout.language)}: ${docPayload.data.dueDate}`,
-          { size: 18 }
+          `${formatLabelText('status', layout.language)}: ${docPayload.data.status}`,
+          {
+            bold: true,
+            size: datesTypo.halfPt,
+            fontFamily: datesTypo.fontFamily,
+            letterSpacingPt: datesTypo.letterSpacing,
+          }
         ),
       })
     );
   } else {
-    metaParagraphs.push(
-      new Paragraph({
-        spacing: { after: 40 },
-        children: makeTextRuns(
-          `${formatLabelText('paymentMethod', layout.language)}: ${docPayload.data.paymentMethod.replace(/_/g, ' ')}`,
-          { size: 18 }
-        ),
-      })
-    );
+    metaParagraphs.push(new Paragraph({ children: [] }));
   }
-
-  metaParagraphs.push(
-    new Paragraph({
-      spacing: { after: 40 },
-      children: makeTextRuns(`${formatLabelText('currency', layout.language)}: ${documentCurrency}`, {
-        size: 18,
-      }),
-    }),
-    new Paragraph({
-      children: makeTextRuns(
-        `${formatLabelText('status', layout.language)}: ${docPayload.data.status}`,
-        { bold: true, size: 18 }
-      ),
-    })
-  );
 
   children.push(
     new Table({
@@ -656,6 +855,9 @@ export function createWordDocument(context: DocumentExportContext): Document {
   children.push(new Paragraph({ spacing: { after: 180 }, children: [] }));
 
   // Service Line Items Table (Quotation & Invoice)
+  const thTypo = typoFor('tableHeadings');
+  const tableHeadingsVisible = !useVisual || visualElements.tableHeadings.visible;
+
   if (docPayload.type !== 'RECEIPT') {
     const headerCells: TableCell[] = [
       new TableCell({
@@ -664,10 +866,13 @@ export function createWordDocument(context: DocumentExportContext): Document {
         margins: { top: 90, bottom: 90, left: 80, right: 80 },
         children: [
           new Paragraph({
+            spacing: { line: thTypo.lineTwips },
             children: makeTextRuns(formatLabelText('serialNo', layout.language), {
-              bold: true,
-              size: 17,
+              bold: thTypo.bold,
+              size: thTypo.halfPt,
               color: 'FFFFFF',
+              fontFamily: thTypo.fontFamily,
+              letterSpacingPt: thTypo.letterSpacing,
             }),
           }),
         ],
@@ -681,10 +886,13 @@ export function createWordDocument(context: DocumentExportContext): Document {
         margins: { top: 90, bottom: 90, left: 80, right: 80 },
         children: [
           new Paragraph({
+            spacing: { line: thTypo.lineTwips },
             children: makeTextRuns(formatLabelText('serviceDescription', layout.language), {
-              bold: true,
-              size: 17,
+              bold: thTypo.bold,
+              size: thTypo.halfPt,
               color: 'FFFFFF',
+              fontFamily: thTypo.fontFamily,
+              letterSpacingPt: thTypo.letterSpacing,
             }),
           }),
         ],
@@ -696,10 +904,13 @@ export function createWordDocument(context: DocumentExportContext): Document {
         children: [
           new Paragraph({
             alignment: AlignmentType.RIGHT,
+            spacing: { line: thTypo.lineTwips },
             children: makeTextRuns(formatLabelText('qtyHours', layout.language), {
-              bold: true,
-              size: 17,
+              bold: thTypo.bold,
+              size: thTypo.halfPt,
               color: 'FFFFFF',
+              fontFamily: thTypo.fontFamily,
+              letterSpacingPt: thTypo.letterSpacing,
             }),
           }),
         ],
@@ -711,10 +922,13 @@ export function createWordDocument(context: DocumentExportContext): Document {
         children: [
           new Paragraph({
             alignment: AlignmentType.RIGHT,
+            spacing: { line: thTypo.lineTwips },
             children: makeTextRuns(formatLabelText('rate', layout.language), {
-              bold: true,
-              size: 17,
+              bold: thTypo.bold,
+              size: thTypo.halfPt,
               color: 'FFFFFF',
+              fontFamily: thTypo.fontFamily,
+              letterSpacingPt: thTypo.letterSpacing,
             }),
           }),
         ],
@@ -730,10 +944,13 @@ export function createWordDocument(context: DocumentExportContext): Document {
           children: [
             new Paragraph({
               alignment: AlignmentType.RIGHT,
+              spacing: { line: thTypo.lineTwips },
               children: makeTextRuns(formatLabelText('discount', layout.language), {
-                bold: true,
-                size: 17,
+                bold: thTypo.bold,
+                size: thTypo.halfPt,
                 color: 'FFFFFF',
+                fontFamily: thTypo.fontFamily,
+                letterSpacingPt: thTypo.letterSpacing,
               }),
             }),
           ],
@@ -750,10 +967,13 @@ export function createWordDocument(context: DocumentExportContext): Document {
           children: [
             new Paragraph({
               alignment: AlignmentType.RIGHT,
+              spacing: { line: thTypo.lineTwips },
               children: makeTextRuns(formatLabelText('tax', layout.language), {
-                bold: true,
-                size: 17,
+                bold: thTypo.bold,
+                size: thTypo.halfPt,
                 color: 'FFFFFF',
+                fontFamily: thTypo.fontFamily,
+                letterSpacingPt: thTypo.letterSpacing,
               }),
             }),
           ],
@@ -769,10 +989,13 @@ export function createWordDocument(context: DocumentExportContext): Document {
         children: [
           new Paragraph({
             alignment: AlignmentType.RIGHT,
+            spacing: { line: thTypo.lineTwips },
             children: makeTextRuns(formatLabelText('amount', layout.language), {
-              bold: true,
-              size: 17,
+              bold: thTypo.bold,
+              size: thTypo.halfPt,
               color: 'FFFFFF',
+              fontFamily: thTypo.fontFamily,
+              letterSpacingPt: thTypo.letterSpacing,
             }),
           }),
         ],
@@ -872,14 +1095,19 @@ export function createWordDocument(context: DocumentExportContext): Document {
         })
       );
 
-      return new TableRow({ children: rowCells });
+      return new TableRow({ cantSplit: true, children: rowCells });
     });
 
     children.push(
       new Table({
         width: { size: 100, type: WidthType.PERCENTAGE },
         borders: cellBorders('CBD5E1'),
-        rows: [new TableRow({ children: headerCells }), ...dataRows],
+        rows: [
+          ...(tableHeadingsVisible
+            ? [new TableRow({ tableHeader: true, cantSplit: true, children: headerCells })]
+            : []),
+          ...dataRows,
+        ],
       })
     );
   } else {
@@ -958,64 +1186,101 @@ export function createWordDocument(context: DocumentExportContext): Document {
     bankParagraphs.push(new Paragraph({ children: [] }));
   }
 
+  const totalsTypo = typoFor('financialTotals');
+  const totalsVisible = layout.showTotalsSummary && (!useVisual || visualElements.financialTotals.visible);
+  const totalsAlign = useVisual ? totalsTypo.docxAlign : AlignmentType.RIGHT;
+
   const totalParagraphs: Paragraph[] = [];
-  if (layout.showTotalsSummary) {
+  if (totalsVisible) {
     if (docPayload.type !== 'RECEIPT') {
       totalParagraphs.push(
         new Paragraph({
-          alignment: AlignmentType.RIGHT,
-          spacing: { after: 40 },
+          alignment: totalsAlign,
+          spacing: { after: 40, line: totalsTypo.lineTwips },
           children: makeTextRuns(
             `${formatLabelText('subtotal', layout.language)}: ${fmt(docPayload.data.subtotal)}`,
-            { size: 19, color: '475569' }
+            {
+              size: totalsTypo.halfPt,
+              color: '475569',
+              fontFamily: totalsTypo.fontFamily,
+              letterSpacingPt: totalsTypo.letterSpacing,
+            }
           ),
         }),
         new Paragraph({
-          alignment: AlignmentType.RIGHT,
-          spacing: { after: 40 },
+          alignment: totalsAlign,
+          spacing: { after: 40, line: totalsTypo.lineTwips },
           children: makeTextRuns(
             `${formatLabelText('totalDiscount', layout.language)}: -${fmt(docPayload.data.discountTotal)}`,
-            { size: 19, color: '475569' }
+            {
+              size: totalsTypo.halfPt,
+              color: '475569',
+              fontFamily: totalsTypo.fontFamily,
+              letterSpacingPt: totalsTypo.letterSpacing,
+            }
           ),
         })
       );
       if (layout.showTaxBreakdown) {
         totalParagraphs.push(
           new Paragraph({
-            alignment: AlignmentType.RIGHT,
-            spacing: { after: 40 },
+            alignment: totalsAlign,
+            spacing: { after: 40, line: totalsTypo.lineTwips },
             children: makeTextRuns(
               `${formatLabelText('totalTax', layout.language)}: ${fmt(docPayload.data.taxTotal)}`,
-              { size: 19, color: '475569' }
+              {
+                size: totalsTypo.halfPt,
+                color: '475569',
+                fontFamily: totalsTypo.fontFamily,
+                letterSpacingPt: totalsTypo.letterSpacing,
+              }
             ),
           })
         );
       }
       totalParagraphs.push(
         new Paragraph({
-          alignment: AlignmentType.RIGHT,
-          spacing: { before: 40, after: 40 },
+          alignment: totalsAlign,
+          spacing: { before: 40, after: 40, line: totalsTypo.lineTwips },
           children: makeTextRuns(
             `${formatLabelText('grandTotal', layout.language)}: ${fmt(docPayload.data.total)}`,
-            { bold: true, size: 22, color: '0F172A' }
+            {
+              bold: true,
+              size: totalsTypo.halfPt + 3,
+              color: '0F172A',
+              fontFamily: totalsTypo.fontFamily,
+              letterSpacingPt: totalsTypo.letterSpacing,
+            }
           ),
         })
       );
       if (docPayload.type === 'INVOICE') {
         totalParagraphs.push(
           new Paragraph({
-            alignment: AlignmentType.RIGHT,
-            spacing: { after: 30 },
+            alignment: totalsAlign,
+            spacing: { after: 30, line: totalsTypo.lineTwips },
             children: makeTextRuns(
               `${formatLabelText('amountPaid', layout.language)}: ${fmt(docPayload.data.amountPaid)}`,
-              { size: 18, color: '475569' }
+              {
+                size: totalsTypo.halfPt,
+                color: '475569',
+                fontFamily: totalsTypo.fontFamily,
+                letterSpacingPt: totalsTypo.letterSpacing,
+              }
             ),
           }),
           new Paragraph({
-            alignment: AlignmentType.RIGHT,
+            alignment: totalsAlign,
+            spacing: { line: totalsTypo.lineTwips },
             children: makeTextRuns(
               `${formatLabelText('balanceDue', layout.language)}: ${fmt(docPayload.data.balanceDue)}`,
-              { bold: true, size: 20, color: '0F172A' }
+              {
+                bold: true,
+                size: totalsTypo.halfPt + 2,
+                color: '0F172A',
+                fontFamily: totalsTypo.fontFamily,
+                letterSpacingPt: totalsTypo.letterSpacing,
+              }
             ),
           })
         );
@@ -1023,26 +1288,40 @@ export function createWordDocument(context: DocumentExportContext): Document {
     } else {
       totalParagraphs.push(
         new Paragraph({
-          alignment: AlignmentType.RIGHT,
-          spacing: { after: 40 },
+          alignment: totalsAlign,
+          spacing: { after: 40, line: totalsTypo.lineTwips },
           children: makeTextRuns(
             `${formatLabelText('amountReceived', layout.language)}: ${fmt(docPayload.data.amount)}`,
-            { bold: true, size: 20 }
+            {
+              bold: true,
+              size: totalsTypo.halfPt + 2,
+              fontFamily: totalsTypo.fontFamily,
+              letterSpacingPt: totalsTypo.letterSpacing,
+            }
           ),
         }),
         new Paragraph({
-          alignment: AlignmentType.RIGHT,
-          spacing: { after: 40 },
+          alignment: totalsAlign,
+          spacing: { after: 40, line: totalsTypo.lineTwips },
           children: makeTextRuns(
             `${formatLabelText('allocatedTotal', layout.language)}: ${fmt(docPayload.data.allocatedTotal)}`,
-            { size: 18 }
+            {
+              size: totalsTypo.halfPt,
+              fontFamily: totalsTypo.fontFamily,
+              letterSpacingPt: totalsTypo.letterSpacing,
+            }
           ),
         }),
         new Paragraph({
-          alignment: AlignmentType.RIGHT,
+          alignment: totalsAlign,
+          spacing: { line: totalsTypo.lineTwips },
           children: makeTextRuns(
             `${formatLabelText('unallocatedCredit', layout.language)}: ${fmt(docPayload.data.unallocatedAmount)}`,
-            { size: 18 }
+            {
+              size: totalsTypo.halfPt,
+              fontFamily: totalsTypo.fontFamily,
+              letterSpacingPt: totalsTypo.letterSpacing,
+            }
           ),
         })
       );
@@ -1070,7 +1349,7 @@ export function createWordDocument(context: DocumentExportContext): Document {
             }),
             new TableCell({
               width: { size: 46, type: WidthType.PERCENTAGE },
-              borders: layout.showTotalsSummary ? cellBorders('CBD5E1') : noBorders(),
+              borders: totalsVisible ? cellBorders('CBD5E1') : noBorders(),
               margins: { top: 100, bottom: 100, left: 120, right: 120 },
               children: totalParagraphs,
             }),
@@ -1084,36 +1363,63 @@ export function createWordDocument(context: DocumentExportContext): Document {
   const notesText = docPayload.data.notes;
   const termsText =
     (docPayload.type !== 'RECEIPT' ? docPayload.data.terms : null) || layout.defaultTermsText;
+  const termsTypo = typoFor('termsAndConditions');
+  const termsVisible =
+    layout.showTermsAndConditions &&
+    Boolean(termsText) &&
+    (!useVisual || visualElements.termsAndConditions.visible);
 
   if (notesText) {
     children.push(
       new Paragraph({
-        spacing: { before: 180, after: 40 },
+        alignment: termsTypo.docxAlign,
+        spacing: { before: 160, after: 40, line: termsTypo.lineTwips },
         children: makeTextRuns(formatLabelText('notes', layout.language).toUpperCase(), {
           bold: true,
-          size: 17,
+          size: Math.max(14, termsTypo.halfPt - 1),
           color: '64748B',
+          fontFamily: termsTypo.fontFamily,
         }),
       }),
       new Paragraph({
-        spacing: { after: 100 },
-        children: makeTextRuns(notesText, { size: 18, color: '334155' }),
+        alignment: termsTypo.docxAlign,
+        spacing: { after: 80, line: termsTypo.lineTwips },
+        children: makeTextRuns(notesText, {
+          bold: termsTypo.bold,
+          size: termsTypo.halfPt,
+          color: '334155',
+          fontFamily: termsTypo.fontFamily,
+          letterSpacingPt: termsTypo.letterSpacing,
+        }),
       })
     );
   }
 
-  if (layout.showTermsAndConditions && termsText) {
+  if (termsVisible && termsText) {
     children.push(
       new Paragraph({
-        spacing: { before: 120, after: 40 },
+        alignment: termsTypo.docxAlign,
+        spacing: { before: 100, after: 40, line: termsTypo.lineTwips },
         children: makeTextRuns(
           formatLabelText('termsAndConditions', layout.language).toUpperCase(),
-          { bold: true, size: 17, color: '64748B' }
+          {
+            bold: true,
+            size: Math.max(14, termsTypo.halfPt - 1),
+            color: '64748B',
+            fontFamily: termsTypo.fontFamily,
+          }
         ),
       }),
       new Paragraph({
-        spacing: { after: 140 },
-        children: makeTextRuns(termsText, { size: 18, color: '334155' }),
+        alignment: termsTypo.docxAlign,
+        spacing: { after: 120, line: termsTypo.lineTwips },
+        children: makeTextRuns(termsText, {
+          bold: termsTypo.bold,
+          size: termsTypo.halfPt,
+          color: '334155',
+          fontFamily: termsTypo.fontFamily,
+          letterSpacingPt: termsTypo.letterSpacing,
+        }),
       })
     );
   }
@@ -1130,8 +1436,12 @@ export function createWordDocument(context: DocumentExportContext): Document {
 
     const sealVisual = visualElements.seal;
     const sigVisual = visualElements.signature;
-    const sealVisible = !layout.visualLayoutEnabled || sealVisual.visible;
-    const sigVisible = !layout.visualLayoutEnabled || sigVisual.visible;
+    const sigLabelsVisual = visualElements.signatoryLabels;
+    const sigLabelsTypo = typoFor('signatoryLabels');
+
+    const sealVisible = !useVisual || sealVisual.visible;
+    const sigVisible = !useVisual || sigVisual.visible;
+    const sigLabelsVisible = !useVisual || sigLabelsVisual.visible;
 
     const sealImgRun = sealVisible
       ? createRasterImageRun(
@@ -1151,6 +1461,7 @@ export function createWordDocument(context: DocumentExportContext): Document {
       : null;
 
     const sigAlign = toDocxAlignment(sigVisual.align || 'right');
+    const sigLabelAlign = useVisual ? sigLabelsTypo.docxAlign : sigAlign;
     const sealAlign = toDocxAlignment(sealVisual.align || 'center');
 
     if (sealImgRun || sigImgRun) {
@@ -1160,6 +1471,7 @@ export function createWordDocument(context: DocumentExportContext): Document {
           borders: noBorders(),
           rows: [
             new TableRow({
+              cantSplit: true,
               children: [
                 new TableCell({
                   width: { size: 50, type: WidthType.PERCENTAGE },
@@ -1169,7 +1481,7 @@ export function createWordDocument(context: DocumentExportContext): Document {
                 new TableCell({
                   width: { size: 22, type: WidthType.PERCENTAGE },
                   borders: noBorders(),
-                  margins: { top: 120, bottom: 40, right: 80 },
+                  margins: { top: 100, bottom: 40, right: 80 },
                   children: sealImgRun
                     ? [
                         new Paragraph({
@@ -1182,79 +1494,103 @@ export function createWordDocument(context: DocumentExportContext): Document {
                 new TableCell({
                   width: { size: 28, type: WidthType.PERCENTAGE },
                   borders: noBorders(),
-                  margins: { top: 120, bottom: 40 },
-                  children: sigVisible
-                    ? [
-                        ...(sigImgRun
-                          ? [
-                              new Paragraph({
-                                alignment: sigAlign,
-                                spacing: { after: 30 },
-                                children: [sigImgRun],
-                              }),
-                            ]
-                          : [
-                              new Paragraph({
-                                alignment: sigAlign,
-                                spacing: { before: 140, after: 30 },
-                                children: [],
-                              }),
-                            ]),
-                        new Paragraph({
-                          alignment: sigAlign,
-                          spacing: { after: 30 },
-                          children: makeTextRuns('__________________________', {
-                            size: 18,
-                            color: '64748B',
-                          }),
-                        }),
-                        new Paragraph({
-                          alignment: sigAlign,
-                          spacing: { after: 20 },
-                          children: makeTextRuns(signatoryName, {
-                            bold: true,
-                            size: 19,
-                            color: '0F172A',
-                          }),
-                        }),
-                        ...(signatoryTitle
-                          ? [
-                              new Paragraph({
-                                alignment: sigAlign,
-                                children: makeTextRuns(signatoryTitle, {
-                                  size: 17,
-                                  color: '64748B',
+                  margins: { top: 100, bottom: 40 },
+                  children:
+                    sigVisible || sigLabelsVisible
+                      ? [
+                          ...(sigImgRun
+                            ? [
+                                new Paragraph({
+                                  alignment: sigAlign,
+                                  spacing: { after: 30 },
+                                  children: [sigImgRun],
                                 }),
-                              }),
-                            ]
-                          : []),
-                      ]
-                    : [new Paragraph({ children: [] })],
+                              ]
+                            : [
+                                new Paragraph({
+                                  alignment: sigAlign,
+                                  spacing: { before: 120, after: 30 },
+                                  children: [],
+                                }),
+                              ]),
+                          ...(sigLabelsVisible
+                            ? [
+                                new Paragraph({
+                                  alignment: sigLabelAlign,
+                                  spacing: { after: 30, line: sigLabelsTypo.lineTwips },
+                                  children: makeTextRuns('__________________________', {
+                                    size: sigLabelsTypo.halfPt,
+                                    color: '64748B',
+                                    fontFamily: sigLabelsTypo.fontFamily,
+                                  }),
+                                }),
+                                new Paragraph({
+                                  alignment: sigLabelAlign,
+                                  spacing: { after: 20, line: sigLabelsTypo.lineTwips },
+                                  children: makeTextRuns(signatoryName, {
+                                    bold: sigLabelsTypo.bold,
+                                    size: sigLabelsTypo.halfPt,
+                                    color: '0F172A',
+                                    fontFamily: sigLabelsTypo.fontFamily,
+                                    letterSpacingPt: sigLabelsTypo.letterSpacing,
+                                  }),
+                                }),
+                                ...(signatoryTitle
+                                  ? [
+                                      new Paragraph({
+                                        alignment: sigLabelAlign,
+                                        spacing: { line: sigLabelsTypo.lineTwips },
+                                        children: makeTextRuns(signatoryTitle, {
+                                          size: Math.max(13, sigLabelsTypo.halfPt - 2),
+                                          color: '64748B',
+                                          fontFamily: sigLabelsTypo.fontFamily,
+                                        }),
+                                      }),
+                                    ]
+                                  : []),
+                              ]
+                            : []),
+                        ]
+                      : [new Paragraph({ children: [] })],
                 }),
               ],
             }),
           ],
         })
       );
-    } else if (sigVisible) {
+    } else if (sigLabelsVisible) {
       children.push(
         new Paragraph({
-          alignment: sigAlign,
-          spacing: { before: 280, after: 40 },
-          children: makeTextRuns(`__________________________`, { size: 18, color: '64748B' }),
+          alignment: sigLabelAlign,
+          spacing: { before: 240, after: 40, line: sigLabelsTypo.lineTwips },
+          children: makeTextRuns(`__________________________`, {
+            size: sigLabelsTypo.halfPt,
+            color: '64748B',
+            fontFamily: sigLabelsTypo.fontFamily,
+          }),
         }),
         new Paragraph({
-          alignment: sigAlign,
-          spacing: { after: 20 },
-          children: makeTextRuns(signatoryName, { bold: true, size: 19, color: '0F172A' }),
+          alignment: sigLabelAlign,
+          spacing: { after: 20, line: sigLabelsTypo.lineTwips },
+          children: makeTextRuns(signatoryName, {
+            bold: sigLabelsTypo.bold,
+            size: sigLabelsTypo.halfPt,
+            color: '0F172A',
+            fontFamily: sigLabelsTypo.fontFamily,
+            letterSpacingPt: sigLabelsTypo.letterSpacing,
+          }),
         })
       );
       if (signatoryTitle) {
         children.push(
           new Paragraph({
-            alignment: sigAlign,
-            spacing: { after: 80 },
-            children: makeTextRuns(signatoryTitle, { size: 17, color: '64748B' }),
+            alignment: sigLabelAlign,
+            spacing: { after: 80, line: sigLabelsTypo.lineTwips },
+            children: makeTextRuns(signatoryTitle, {
+              size: Math.max(13, sigLabelsTypo.halfPt - 2),
+              color: '64748B',
+              fontFamily: sigLabelsTypo.fontFamily,
+            }),
           })
         );
       }
@@ -1262,7 +1598,8 @@ export function createWordDocument(context: DocumentExportContext): Document {
   }
 
   // Footer & Timestamp
-  const footerVisible = !layout.visualLayoutEnabled || visualElements.footer.visible;
+  const footerTypo = typoFor('footer');
+  const footerVisible = !useVisual || visualElements.footer.visible;
   if (footerVisible && (layout.footerText || layout.showPrintedTimestamp)) {
     const footerParts = [
       layout.footerText || '',
@@ -1272,9 +1609,15 @@ export function createWordDocument(context: DocumentExportContext): Document {
     ].filter(Boolean);
     children.push(
       new Paragraph({
-        alignment: toDocxAlignment(visualElements.footer.align),
-        spacing: { before: 200 },
-        children: makeTextRuns(footerParts.join('  |  '), { size: 16, color: '64748B' }),
+        alignment: footerTypo.docxAlign,
+        spacing: { before: 180, line: footerTypo.lineTwips },
+        children: makeTextRuns(footerParts.join('  |  '), {
+          bold: footerTypo.bold,
+          size: footerTypo.halfPt,
+          color: '64748B',
+          fontFamily: footerTypo.fontFamily,
+          letterSpacingPt: footerTypo.letterSpacing,
+        }),
       })
     );
   }

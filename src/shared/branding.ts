@@ -8,11 +8,46 @@ export type BrandingAssetType = 'LOGO' | 'SEAL' | 'SIGNATURE';
 
 export type VisualElementKey =
   | 'logo'
-  | 'seal'
-  | 'signature'
+  | 'companyName'
   | 'companyHeader'
   | 'documentTitle'
+  | 'documentNumber'
+  | 'customerDetails'
+  | 'dates'
+  | 'tableHeadings'
+  | 'financialTotals'
+  | 'termsAndConditions'
+  | 'seal'
+  | 'signature'
+  | 'signatoryLabels'
   | 'footer';
+
+export const ALL_VISUAL_ELEMENT_KEYS: VisualElementKey[] = [
+  'logo',
+  'companyName',
+  'companyHeader',
+  'documentTitle',
+  'documentNumber',
+  'customerDetails',
+  'dates',
+  'tableHeadings',
+  'financialTotals',
+  'termsAndConditions',
+  'seal',
+  'signature',
+  'signatoryLabels',
+  'footer',
+];
+
+export type VisualTextFontWeight = '400' | '500' | '600' | '700';
+export type VisualTextFontFamily = 'sans' | 'serif' | 'mono' | 'noto-kannada';
+
+export const MIN_TEXT_FONT_SIZE_PT = 6;
+export const MAX_TEXT_FONT_SIZE_PT = 36;
+export const MIN_TEXT_LINE_HEIGHT = 1.0;
+export const MAX_TEXT_LINE_HEIGHT = 2.4;
+export const MIN_TEXT_LETTER_SPACING = -1;
+export const MAX_TEXT_LETTER_SPACING = 6;
 
 export type ResizeCornerHandle = 'nw' | 'ne' | 'sw' | 'se';
 
@@ -50,14 +85,27 @@ export interface VisualElementConfig {
   lockAspectRatio: boolean;
   align: 'left' | 'center' | 'right';
   spacingMm: number;
+  fontSizePt?: number;
+  fontWeight?: VisualTextFontWeight;
+  fontFamily?: VisualTextFontFamily;
+  lineHeight?: number;
+  letterSpacing?: number; // in pt
 }
 
 export interface DocumentVisualElements {
   logo: VisualElementConfig;
-  seal: VisualElementConfig;
-  signature: VisualElementConfig;
+  companyName: VisualElementConfig;
   companyHeader: VisualElementConfig;
   documentTitle: VisualElementConfig;
+  documentNumber: VisualElementConfig;
+  customerDetails: VisualElementConfig;
+  dates: VisualElementConfig;
+  tableHeadings: VisualElementConfig;
+  financialTotals: VisualElementConfig;
+  termsAndConditions: VisualElementConfig;
+  seal: VisualElementConfig;
+  signature: VisualElementConfig;
+  signatoryLabels: VisualElementConfig;
   footer: VisualElementConfig;
 }
 
@@ -97,6 +145,39 @@ export function roundMm(val: number): number {
   return Math.round(val * 10) / 10;
 }
 
+export function roundHalfPt(val: number): number {
+  if (!Number.isFinite(val)) return 9;
+  return Math.round(val * 2) / 2;
+}
+
+export function clampFontSizePt(val: unknown, fallback = 9): number {
+  const num = Number(val);
+  if (!Number.isFinite(num)) return fallback;
+  return roundHalfPt(Math.min(MAX_TEXT_FONT_SIZE_PT, Math.max(MIN_TEXT_FONT_SIZE_PT, num)));
+}
+
+export function clampLineHeight(val: unknown, fallback = 1.35): number {
+  const num = Number(val);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.round(Math.min(MAX_TEXT_LINE_HEIGHT, Math.max(MIN_TEXT_LINE_HEIGHT, num)) * 100) / 100;
+}
+
+export function clampLetterSpacing(val: unknown, fallback = 0): number {
+  const num = Number(val);
+  if (!Number.isFinite(num)) return fallback;
+  return Math.round(Math.min(MAX_TEXT_LETTER_SPACING, Math.max(MIN_TEXT_LETTER_SPACING, num)) * 10) / 10;
+}
+
+export function normalizeFontWeight(val: unknown, fallback: VisualTextFontWeight = '400'): VisualTextFontWeight {
+  if (val === '400' || val === '500' || val === '600' || val === '700') return val;
+  return fallback;
+}
+
+export function normalizeFontFamily(val: unknown, fallback: VisualTextFontFamily = 'sans'): VisualTextFontFamily {
+  if (val === 'sans' || val === 'serif' || val === 'mono' || val === 'noto-kannada') return val;
+  return fallback;
+}
+
 export function getEffectivePaperDimensionsMm(
   paperSize: BrandingPaperSize,
   orientation: BrandingPageOrientation
@@ -114,82 +195,262 @@ export function createDefaultVisualElements(
 ): DocumentVisualElements {
   const { widthMm, heightMm } = getEffectivePaperDimensionsMm(paperSize, orientation);
   const contentW = Math.max(80, widthMm - margins.leftMm - margins.rightMm);
+  const printableH = Math.max(100, heightMm - margins.topMm - margins.bottomMm);
   const headerTop = margins.topMm;
-  const sigTop = Math.max(headerTop + 90, heightMm - margins.bottomMm - 42);
-  const footerTop = Math.max(sigTop + 26, heightMm - margins.bottomMm - 10);
+  const compactScale = printableH < 180;
+
+  const logoH = compactScale ? 11 : 13;
+  const nameY = headerTop + logoH + 2;
+  const headerY = nameY + (compactScale ? 7 : 8);
+  const bodyTop = headerTop + (compactScale ? 33 : 38);
+  const partyH = compactScale ? 20 : 25;
+  const tableTop = bodyTop + partyH + 4;
+  const totalsTop = Math.min(heightMm - margins.bottomMm - 72, tableTop + (compactScale ? 26 : 38));
+  const termsTop = Math.min(heightMm - margins.bottomMm - 50, totalsTop + (compactScale ? 26 : 34));
+  const sigTop = Math.max(headerTop + 85, heightMm - margins.bottomMm - 36);
+  const footerTop = Math.max(sigTop + 26, heightMm - margins.bottomMm - 8);
+
+  const halfW = roundMm((contentW - 4) / 2);
 
   return {
     logo: {
       visible: true,
       xMm: roundMm(margins.leftMm),
       yMm: roundMm(headerTop),
-      widthMm: 36,
-      heightMm: 14,
-      aspectRatio: roundMm(36 / 14),
+      widthMm: compactScale ? 28 : 34,
+      heightMm: logoH,
+      aspectRatio: roundMm((compactScale ? 28 : 34) / logoH),
       lockAspectRatio: true,
       align: 'left',
-      spacingMm: 3,
+      spacingMm: 2.5,
+    },
+    companyName: {
+      visible: true,
+      xMm: roundMm(margins.leftMm),
+      yMm: roundMm(nameY),
+      widthMm: roundMm(contentW * 0.56),
+      heightMm: 7.5,
+      aspectRatio: roundMm((contentW * 0.56) / 7.5),
+      lockAspectRatio: false,
+      align: 'left',
+      spacingMm: 1.5,
+      fontSizePt: compactScale ? 12 : 14,
+      fontWeight: '700',
+      fontFamily: 'sans',
+      lineHeight: 1.2,
+      letterSpacing: 0,
     },
     companyHeader: {
       visible: true,
       xMm: roundMm(margins.leftMm),
-      yMm: roundMm(headerTop + 17),
+      yMm: roundMm(headerY),
       widthMm: roundMm(contentW * 0.56),
-      heightMm: 22,
-      aspectRatio: roundMm((contentW * 0.56) / 22),
+      heightMm: 14,
+      aspectRatio: roundMm((contentW * 0.56) / 14),
       lockAspectRatio: false,
       align: 'left',
-      spacingMm: 4,
+      spacingMm: 2.5,
+      fontSizePt: compactScale ? 7.5 : 8.5,
+      fontWeight: '400',
+      fontFamily: 'sans',
+      lineHeight: 1.35,
+      letterSpacing: 0,
     },
     documentTitle: {
       visible: true,
       xMm: roundMm(margins.leftMm + contentW * 0.58),
       yMm: roundMm(headerTop),
       widthMm: roundMm(contentW * 0.42),
-      heightMm: 24,
-      aspectRatio: roundMm((contentW * 0.42) / 24),
+      heightMm: 11,
+      aspectRatio: roundMm((contentW * 0.42) / 11),
       lockAspectRatio: false,
       align: 'right',
-      spacingMm: 4,
+      spacingMm: 2,
+      fontSizePt: compactScale ? 13 : 15,
+      fontWeight: '700',
+      fontFamily: 'sans',
+      lineHeight: 1.2,
+      letterSpacing: 0.3,
+    },
+    documentNumber: {
+      visible: true,
+      xMm: roundMm(margins.leftMm + contentW * 0.58),
+      yMm: roundMm(headerTop + 12),
+      widthMm: roundMm(contentW * 0.42),
+      heightMm: 11,
+      aspectRatio: roundMm((contentW * 0.42) / 11),
+      lockAspectRatio: false,
+      align: 'right',
+      spacingMm: 2,
+      fontSizePt: compactScale ? 8.5 : 9.5,
+      fontWeight: '700',
+      fontFamily: 'mono',
+      lineHeight: 1.25,
+      letterSpacing: 0,
+    },
+    customerDetails: {
+      visible: true,
+      xMm: roundMm(margins.leftMm),
+      yMm: roundMm(bodyTop),
+      widthMm: halfW,
+      heightMm: partyH,
+      aspectRatio: roundMm(halfW / partyH),
+      lockAspectRatio: false,
+      align: 'left',
+      spacingMm: 3,
+      fontSizePt: compactScale ? 8 : 8.5,
+      fontWeight: '400',
+      fontFamily: 'sans',
+      lineHeight: 1.35,
+      letterSpacing: 0,
+    },
+    dates: {
+      visible: true,
+      xMm: roundMm(margins.leftMm + halfW + 4),
+      yMm: roundMm(bodyTop),
+      widthMm: halfW,
+      heightMm: partyH,
+      aspectRatio: roundMm(halfW / partyH),
+      lockAspectRatio: false,
+      align: 'left',
+      spacingMm: 3,
+      fontSizePt: compactScale ? 8 : 8.5,
+      fontWeight: '400',
+      fontFamily: 'sans',
+      lineHeight: 1.35,
+      letterSpacing: 0,
+    },
+    tableHeadings: {
+      visible: true,
+      xMm: roundMm(margins.leftMm),
+      yMm: roundMm(tableTop),
+      widthMm: roundMm(contentW),
+      heightMm: 9,
+      aspectRatio: roundMm(contentW / 9),
+      lockAspectRatio: false,
+      align: 'left',
+      spacingMm: 2,
+      fontSizePt: compactScale ? 7 : 7.5,
+      fontWeight: '700',
+      fontFamily: 'sans',
+      lineHeight: 1.25,
+      letterSpacing: 0.2,
+    },
+    financialTotals: {
+      visible: true,
+      xMm: roundMm(margins.leftMm + contentW * 0.56),
+      yMm: roundMm(totalsTop),
+      widthMm: roundMm(contentW * 0.44),
+      heightMm: 31,
+      aspectRatio: roundMm((contentW * 0.44) / 31),
+      lockAspectRatio: false,
+      align: 'right',
+      spacingMm: 3,
+      fontSizePt: compactScale ? 8 : 8.5,
+      fontWeight: '600',
+      fontFamily: 'sans',
+      lineHeight: 1.35,
+      letterSpacing: 0,
+    },
+    termsAndConditions: {
+      visible: true,
+      xMm: roundMm(margins.leftMm),
+      yMm: roundMm(termsTop),
+      widthMm: roundMm(contentW),
+      heightMm: 16,
+      aspectRatio: roundMm(contentW / 16),
+      lockAspectRatio: false,
+      align: 'left',
+      spacingMm: 3,
+      fontSizePt: compactScale ? 7.5 : 8.5,
+      fontWeight: '400',
+      fontFamily: 'sans',
+      lineHeight: 1.35,
+      letterSpacing: 0,
     },
     seal: {
       visible: true,
-      xMm: roundMm(widthMm - margins.rightMm - 74),
+      xMm: roundMm(widthMm - margins.rightMm - 72),
       yMm: roundMm(sigTop),
-      widthMm: 22,
-      heightMm: 22,
+      widthMm: compactScale ? 16 : 20,
+      heightMm: compactScale ? 16 : 20,
       aspectRatio: 1,
       lockAspectRatio: true,
       align: 'center',
-      spacingMm: 4,
+      spacingMm: 3,
     },
     signature: {
       visible: true,
-      xMm: roundMm(widthMm - margins.rightMm - 48),
+      xMm: roundMm(widthMm - margins.rightMm - 46),
       yMm: roundMm(sigTop),
-      widthMm: 48,
-      heightMm: 22,
-      aspectRatio: roundMm(48 / 22),
+      widthMm: compactScale ? 38 : 46,
+      heightMm: compactScale ? 13 : 16,
+      aspectRatio: roundMm((compactScale ? 38 : 46) / (compactScale ? 13 : 16)),
       lockAspectRatio: true,
       align: 'center',
+      spacingMm: 1.5,
+    },
+    signatoryLabels: {
+      visible: true,
+      xMm: roundMm(widthMm - margins.rightMm - 46),
+      yMm: roundMm(sigTop + (compactScale ? 14 : 17)),
+      widthMm: compactScale ? 38 : 46,
+      heightMm: 9,
+      aspectRatio: roundMm((compactScale ? 38 : 46) / 9),
+      lockAspectRatio: false,
+      align: 'center',
       spacingMm: 2,
+      fontSizePt: compactScale ? 7.5 : 8.5,
+      fontWeight: '600',
+      fontFamily: 'sans',
+      lineHeight: 1.25,
+      letterSpacing: 0,
     },
     footer: {
       visible: true,
       xMm: roundMm(margins.leftMm),
       yMm: roundMm(footerTop),
       widthMm: roundMm(contentW),
-      heightMm: 9,
-      aspectRatio: roundMm(contentW / 9),
+      heightMm: 7.5,
+      aspectRatio: roundMm(contentW / 7.5),
       lockAspectRatio: false,
       align: 'left',
-      spacingMm: 3,
+      spacingMm: 2,
+      fontSizePt: compactScale ? 7 : 7.5,
+      fontWeight: '400',
+      fontFamily: 'sans',
+      lineHeight: 1.3,
+      letterSpacing: 0,
     },
   };
 }
 
 export function isImageVisualElement(key: VisualElementKey): boolean {
   return key === 'logo' || key === 'seal' || key === 'signature';
+}
+
+export function getVisualElementTypography(
+  el?: Partial<VisualElementConfig> | null,
+  defaults?: Partial<VisualElementConfig> | null
+): {
+  fontSizePt: number;
+  fontWeight: VisualTextFontWeight;
+  fontFamily: VisualTextFontFamily;
+  lineHeight: number;
+  letterSpacing: number;
+  align: 'left' | 'center' | 'right';
+} {
+  return {
+    fontSizePt: clampFontSizePt(el?.fontSizePt ?? defaults?.fontSizePt, 9),
+    fontWeight: normalizeFontWeight(el?.fontWeight ?? defaults?.fontWeight, '400'),
+    fontFamily: normalizeFontFamily(el?.fontFamily ?? defaults?.fontFamily, 'sans'),
+    lineHeight: clampLineHeight(el?.lineHeight ?? defaults?.lineHeight, 1.35),
+    letterSpacing: clampLetterSpacing(el?.letterSpacing ?? defaults?.letterSpacing, 0),
+    align:
+      el?.align === 'left' || el?.align === 'center' || el?.align === 'right'
+        ? el.align
+        : defaults?.align || 'left',
+  };
 }
 
 export function clampVisualElementBounds(
@@ -234,7 +495,72 @@ export function clampVisualElementBounds(
         ? el.aspectRatio
         : Math.max(0.1, widthMm / Math.max(1, heightMm)),
     spacingMm: Number.isFinite(el.spacingMm) ? Math.min(30, Math.max(0, roundMm(el.spacingMm))) : 3,
+    ...(el.fontSizePt !== undefined ? { fontSizePt: clampFontSizePt(el.fontSizePt) } : {}),
+    ...(el.fontWeight !== undefined ? { fontWeight: normalizeFontWeight(el.fontWeight) } : {}),
+    ...(el.fontFamily !== undefined ? { fontFamily: normalizeFontFamily(el.fontFamily) } : {}),
+    ...(el.lineHeight !== undefined ? { lineHeight: clampLineHeight(el.lineHeight) } : {}),
+    ...(el.letterSpacing !== undefined ? { letterSpacing: clampLetterSpacing(el.letterSpacing) } : {}),
   };
+}
+
+export function normalizeDocumentVisualElements(
+  incoming?: Partial<DocumentVisualElements> | null,
+  paperSize: BrandingPaperSize = 'A4',
+  orientation: BrandingPageOrientation = 'portrait',
+  margins: BrandingMarginsMm = { topMm: 14, rightMm: 14, bottomMm: 16, leftMm: 14 }
+): DocumentVisualElements {
+  const defaults = createDefaultVisualElements(paperSize, orientation, margins);
+  const { widthMm, heightMm } = getEffectivePaperDimensionsMm(paperSize, orientation);
+  const normalized = {} as DocumentVisualElements;
+
+  for (const key of ALL_VISUAL_ELEMENT_KEYS) {
+    const baseEl = defaults[key];
+    const incEl = incoming?.[key] as Partial<VisualElementConfig> | undefined;
+    const isText = !isImageVisualElement(key);
+    const mergedRaw: VisualElementConfig = {
+      visible: incEl?.visible ?? baseEl.visible,
+      xMm: typeof incEl?.xMm === 'number' && Number.isFinite(incEl.xMm) ? incEl.xMm : baseEl.xMm,
+      yMm: typeof incEl?.yMm === 'number' && Number.isFinite(incEl.yMm) ? incEl.yMm : baseEl.yMm,
+      widthMm:
+        typeof incEl?.widthMm === 'number' && Number.isFinite(incEl.widthMm)
+          ? incEl.widthMm
+          : baseEl.widthMm,
+      heightMm:
+        typeof incEl?.heightMm === 'number' && Number.isFinite(incEl.heightMm)
+          ? incEl.heightMm
+          : baseEl.heightMm,
+      aspectRatio:
+        typeof incEl?.aspectRatio === 'number' &&
+        Number.isFinite(incEl.aspectRatio) &&
+        incEl.aspectRatio > 0
+          ? incEl.aspectRatio
+          : baseEl.aspectRatio,
+      lockAspectRatio: incEl?.lockAspectRatio ?? baseEl.lockAspectRatio,
+      align:
+        incEl?.align === 'left' || incEl?.align === 'center' || incEl?.align === 'right'
+          ? incEl.align
+          : baseEl.align,
+      spacingMm:
+        typeof incEl?.spacingMm === 'number' && Number.isFinite(incEl.spacingMm)
+          ? incEl.spacingMm
+          : baseEl.spacingMm,
+      ...(isText
+        ? {
+            fontSizePt: clampFontSizePt(incEl?.fontSizePt ?? baseEl.fontSizePt, baseEl.fontSizePt ?? 9),
+            fontWeight: normalizeFontWeight(incEl?.fontWeight ?? baseEl.fontWeight, baseEl.fontWeight ?? '400'),
+            fontFamily: normalizeFontFamily(incEl?.fontFamily ?? baseEl.fontFamily, baseEl.fontFamily ?? 'sans'),
+            lineHeight: clampLineHeight(incEl?.lineHeight ?? baseEl.lineHeight, baseEl.lineHeight ?? 1.35),
+            letterSpacing: clampLetterSpacing(
+              incEl?.letterSpacing ?? baseEl.letterSpacing,
+              baseEl.letterSpacing ?? 0
+            ),
+          }
+        : {}),
+    };
+    normalized[key] = clampVisualElementBounds(mergedRaw, widthMm, heightMm);
+  }
+
+  return normalized;
 }
 
 export function moveVisualElement(
@@ -258,6 +584,7 @@ export function moveVisualElement(
 /**
  * Resizes an element from one of its four corners.
  * Preserves aspect ratio by default when `el.lockAspectRatio` is enabled.
+ * For text elements (`scaleFontWithResize = true`), proportionally scales `fontSizePt` within [6, 36] pt.
  */
 export function resizeVisualElementFromHandle(
   el: VisualElementConfig,
@@ -267,7 +594,8 @@ export function resizeVisualElementFromHandle(
   paperWidthMm: number,
   paperHeightMm: number,
   minWidthMm = 10,
-  minHeightMm = 6
+  minHeightMm = 6,
+  scaleFontWithResize = false
 ): VisualElementConfig {
   const ratio =
     el.aspectRatio && Number.isFinite(el.aspectRatio) && el.aspectRatio > 0
@@ -317,10 +645,19 @@ export function resizeVisualElementFromHandle(
     nextX = affectsWest ? right - nextWidth : el.xMm;
     nextY = affectsNorth ? bottom - nextHeight : el.yMm;
   } else {
-    nextWidth = Math.max(minWidthMm, rawWidth);
-    nextHeight = Math.max(minHeightMm, rawHeight);
+    nextWidth = Math.max(minWidthMm, Math.min(affectsWest ? right : paperWidthMm - el.xMm, rawWidth));
+    nextHeight = Math.max(minHeightMm, Math.min(affectsNorth ? bottom : paperHeightMm - el.yMm, rawHeight));
     nextX = affectsWest ? right - nextWidth : el.xMm;
     nextY = affectsNorth ? bottom - nextHeight : el.yMm;
+  }
+
+  let nextFontSizePt = el.fontSizePt;
+  if (scaleFontWithResize && el.fontSizePt !== undefined) {
+    const wScale = nextWidth / Math.max(1, el.widthMm);
+    const hScale = nextHeight / Math.max(1, el.heightMm);
+    // Geometric scale proportionally reflects both corner width & height changes
+    const geoScale = Math.sqrt(Math.max(0.1, wScale * hScale));
+    nextFontSizePt = clampFontSizePt(el.fontSizePt * geoScale, el.fontSizePt);
   }
 
   return clampVisualElementBounds(
@@ -330,6 +667,7 @@ export function resizeVisualElementFromHandle(
       yMm: nextY,
       widthMm: nextWidth,
       heightMm: nextHeight,
+      ...(nextFontSizePt !== undefined ? { fontSizePt: nextFontSizePt } : {}),
     },
     paperWidthMm,
     paperHeightMm,

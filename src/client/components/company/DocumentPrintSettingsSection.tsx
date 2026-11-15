@@ -40,9 +40,10 @@ import {
   mergeDocumentPrintSettings,
 } from '../../../shared/print-settings.ts';
 import {
+  ALL_VISUAL_ELEMENT_KEYS,
   clampVisualElementBounds,
-  createDefaultVisualElements,
   getEffectivePaperDimensionsMm,
+  normalizeDocumentVisualElements,
 } from '../../../shared/branding.ts';
 import { api, ApiError } from '../../services/api.ts';
 import { PrintableDocumentPayload, PrintableDocumentView } from '../print/PrintableDocumentView.tsx';
@@ -178,28 +179,19 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
           ...current,
           ...patch,
         };
-        if (patch.paperSize !== undefined || patch.orientation !== undefined) {
+        if (patch.paperSize !== undefined || patch.orientation !== undefined || patch.margins !== undefined) {
           const dims = getEffectivePaperDimensionsMm(
             nextLayout.paperSize,
             nextLayout.orientation
           );
-          const base =
-            nextLayout.elements ||
-            createDefaultVisualElements(
-              nextLayout.paperSize,
-              nextLayout.orientation,
-              nextLayout.margins
-            );
-          const keys: VisualElementKey[] = [
-            'logo',
-            'seal',
-            'signature',
-            'companyHeader',
-            'documentTitle',
-            'footer',
-          ];
+          const base = normalizeDocumentVisualElements(
+            nextLayout.elements,
+            nextLayout.paperSize,
+            nextLayout.orientation,
+            nextLayout.margins
+          );
           const clamped = { ...base };
-          for (const k of keys) {
+          for (const k of ALL_VISUAL_ELEMENT_KEYS) {
             clamped[k] = clampVisualElementBounds(base[k], dims.widthMm, dims.heightMm);
           }
           nextLayout.elements = clamped;
@@ -223,9 +215,12 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
   ) => {
     commitSettingsChange((prev) => {
       const target = prev.layouts[activeDocType];
-      const baseElements =
-        target.elements ||
-        createDefaultVisualElements(target.paperSize, target.orientation, target.margins);
+      const baseElements = normalizeDocumentVisualElements(
+        target.elements,
+        target.paperSize,
+        target.orientation,
+        target.margins
+      );
       return {
         ...prev,
         layouts: {
@@ -1194,9 +1189,21 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
               </button>
             </div>
 
-            <span className="font-mono text-[11px] text-slate-400 tabular-nums">
-              {activeDocType} · {currentLayout.paperSize} · {currentLayout.orientation} · {currentLayout.language}
-            </span>
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-[11px] text-slate-400 tabular-nums">
+                {activeDocType} · {currentLayout.paperSize} · {currentLayout.orientation} · {currentLayout.language}
+              </span>
+              {designerMode === 'SHEET' && (
+                <button
+                  type="button"
+                  onClick={() => window.print()}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-md text-[11px] font-semibold transition cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <Printer className="w-3 h-3" />
+                  <span>Print Sheet</span>
+                </button>
+              )}
+            </div>
           </div>
 
           {designerMode === 'CANVAS' ? (
@@ -1216,6 +1223,8 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
                 companyProfile={companyProfile}
                 layoutOverride={currentLayout}
                 bankAccount={defaultBank}
+                currentUser={currentUser}
+                isDraftPreview={hasUnsavedChanges}
                 embedded
               />
             </div>

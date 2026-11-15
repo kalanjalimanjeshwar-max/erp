@@ -12,19 +12,28 @@ import { CompanyBankAccountService } from '../../src/server/services/company-ban
 import { DocumentExportService } from '../../src/server/services/document-export.service.js';
 import { prisma } from '../../src/server/db/client.js';
 import {
+  ALL_VISUAL_ELEMENT_KEYS,
   clampVisualElementBounds,
   createDefaultVisualElements,
+  getVisualElementTypography,
+  isImageVisualElement,
   MAX_BRANDING_FILE_SIZE_BYTES,
+  MAX_TEXT_FONT_SIZE_PT,
+  MIN_TEXT_FONT_SIZE_PT,
   moveVisualElement,
+  normalizeDocumentVisualElements,
   resizeVisualElementFromHandle,
 } from '../../src/shared/branding.js';
 import {
   createDefaultPrintSettings,
+  mergeDocumentPrintSettings,
   validatePrintSettingsPayload,
 } from '../../src/shared/print-settings.js';
+import { generateDocxBuffer } from '../../src/shared/export/docx-builder.js';
 import {
   AuthUser,
   CompanyProfile,
+  DocumentPrintLayoutConfig,
   InvoiceItem,
 } from '../../src/shared/types.ts';
 
@@ -731,4 +740,561 @@ describe('CoreERP Company Branding Asset Manager & Visual Document Layout Design
       );
     });
   });
+
+  // =========================================================================
+  // 5. Visual Text Resize/Typography, PDF 1-Page & Multi-Page Pagination,
+  //    DOCX Consistency, and Browser Print Portal Regression Suite (13 Tests)
+  // =========================================================================
+  describe('Visual Text Typography, PDF Pagination & Browser Print Regression Suite', () => {
+    function buildNammaMediaProfile(
+      overrides?: Partial<CompanyProfile>,
+      layoutOverrides?: Partial<DocumentPrintLayoutConfig>
+    ): CompanyProfile {
+      const settings = createDefaultPrintSettings({
+        defaultDocumentLanguage: 'EN',
+        documentBranding: {
+          logoSize: 'md',
+          logoAlignment: 'left',
+          signatoryName: 'Ramesh Rao',
+          signatureTitle: 'Managing Director',
+        },
+      });
+      settings.layouts.INVOICE = {
+        ...settings.layouts.INVOICE,
+        visualLayoutEnabled: true,
+        showBankDetails: true,
+        showSignatureSection: true,
+        showTermsAndConditions: true,
+        showPrintedTimestamp: true,
+        footerText: 'Subject to Bengaluru Jurisdiction',
+        defaultTermsText: 'Payment due within 30 days. Late payments attract 1.5% monthly interest.',
+        signatoryName: 'Ramesh Rao',
+        signatoryTitle: 'Managing Director',
+        ...layoutOverrides,
+      };
+      return {
+        id: 'test-co-namma-print',
+        code: 'NAMMA',
+        name: 'NAMMA MEDIA',
+        legalName: 'Namma Media Pvt Ltd',
+        taxId: '29AABCN1234F1Z2',
+        address: '42 MG Road, Bengaluru 560001',
+        phone: '+91 80 4123 9988',
+        email: 'billing@nammamedia.in',
+        website: 'https://nammamedia.in',
+        currency: 'INR',
+        timezone: 'Asia/Kolkata',
+        roundingPrecision: 2,
+        logoUrl: '/api/branding/test/logo.png',
+        sealUrl: '/api/branding/test/seal.png',
+        signatureUrl: '/api/branding/test/sig.png',
+        documentBranding: {
+          logoSize: 'md',
+          logoAlignment: 'left',
+          sealUrl: '/api/branding/test/seal.png',
+          signatureUrl: '/api/branding/test/sig.png',
+          signatoryName: 'Ramesh Rao',
+          signatureTitle: 'Managing Director',
+        },
+        printSettings: settings,
+        ...overrides,
+      } as CompanyProfile;
+    }
+
+    function buildSampleTwoItemInvoice(
+      companyId = 'test-co-namma-print',
+      lineCount = 2
+    ): InvoiceItem {
+      const lines = Array.from({ length: lineCount }, (_, idx) => ({
+        lineNumber: idx + 1,
+        itemDescription:
+          idx === 0
+            ? 'Brand Campaign Creative Direction & Production Services'
+            : `Digital Media Buying & Analytics Retainer - Batch ${idx + 1}`,
+        quantity: '1',
+        unitPrice: '25000.0000',
+        discountAmount: '0.0000',
+        taxRate: '18.00',
+        taxAmount: '4500.0000',
+        lineTotal: '29500.0000',
+      }));
+      const sub = lineCount * 25000;
+      const tax = lineCount * 4500;
+      const tot = sub + tax;
+      return {
+        id: `inv-reg-${lineCount}`,
+        companyId,
+        invoiceNumber: 'INV-2026-0042',
+        quotationId: null,
+        customerId: 'cust-deccan-1',
+        customerName: 'Deccan Digital Productions Pvt Ltd',
+        customerEmail: 'accounts@deccandigital.in',
+        customerPhone: '+91 80 2233 4455',
+        customerAddress: '18 Indiranagar 100ft Road, Bengaluru 560038',
+        customerTaxId: '29AABCD5678G1Z9',
+        invoiceDate: '2026-11-15',
+        dueDate: '2026-12-15',
+        status: 'DRAFT',
+        currency: 'INR',
+        subtotal: sub.toFixed(4),
+        discountTotal: '0.0000',
+        taxTotal: tax.toFixed(4),
+        total: tot.toFixed(4),
+        amountPaid: '0.0000',
+        balanceDue: tot.toFixed(4),
+        notes: 'Thank you for partnering with NAMMA MEDIA.',
+        terms: 'Payment due within 30 days via NEFT/RTGS.',
+        documentTitle: 'TAX INVOICE',
+        journalEntryId: null,
+        issuedAt: null,
+        voidedAt: null,
+        voidedByUserName: null,
+        voidReason: null,
+        createdAt: '2026-11-15T05:00:00.000Z',
+        lines,
+      };
+    }
+
+    function countPdfPages(pdfBuffer: Buffer): number {
+      const latin = pdfBuffer.toString('latin1');
+      // PDFKit writes `/Type /Page` for every page object and `/Type /Pages` for the page tree root
+      const matches = latin.match(/\/Type\s*\/Page(?!s)\b/g);
+      return matches ? matches.length : 0;
+    }
+
+    function extractPdfMediaBoxes(pdfBuffer: Buffer): Array<[number, number, number, number]> {
+      const latin = pdfBuffer.toString('latin1');
+      const regex = /\/MediaBox\s*\[\s*([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s+([\d.-]+)\s*\]/g;
+      const boxes: Array<[number, number, number, number]> = [];
+      let m: RegExpExecArray | null;
+      while ((m = regex.exec(latin)) !== null) {
+        boxes.push([Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4])]);
+      }
+      return boxes;
+    }
+
+    function mockBrandingAndExportEnv(profile: CompanyProfile) {
+      const logoBuf = makeValidPngBuffer(220, 72, 0x22);
+      const sealBuf = makeValidPngBuffer(120, 120, 0x44);
+      const sigBuf = makeValidPngBuffer(200, 64, 0x66);
+      vi.spyOn(CompanyService, 'getProfile').mockResolvedValue(profile);
+      vi.spyOn(BrandingAssetService, 'getDocumentSnapshot').mockResolvedValue(null);
+      vi.spyOn(BrandingAssetService, 'resolveExportImageBuffer').mockImplementation(
+        async (_cid, url) => {
+          if (!url) return null;
+          if (url.includes('logo')) return logoBuf;
+          if (url.includes('seal')) return sealBuf;
+          if (url.includes('sig')) return sigBuf;
+          return null;
+        }
+      );
+      vi.spyOn(CompanyBankAccountService, 'listBankAccounts').mockResolvedValue([
+        {
+          id: 'bank-1',
+          companyId: profile.id,
+          bankName: 'HDFC Bank',
+          branchName: 'MG Road',
+          accountHolderName: 'Namma Media Pvt Ltd',
+          accountNumber: 'XXXX-XXXX-9012',
+          routingCode: 'HDFC0000123',
+          swiftBic: null,
+          iban: null,
+          upiId: 'nammamedia@hdfcbank',
+          accountType: 'CURRENT',
+          currency: 'INR',
+          isDefault: true,
+          isActive: true,
+          showOnInvoices: true,
+          showOnQuotations: true,
+          createdAt: '2026-01-01T00:00:00.000Z',
+          updatedAt: '2026-01-01T00:00:00.000Z',
+        },
+      ]);
+    }
+
+    it('1. 2-item NAMMA MEDIA A4 Invoice PDF renders strictly on 1 page', async () => {
+      const profile = buildNammaMediaProfile();
+      mockBrandingAndExportEnv(profile);
+      const invoice = buildSampleTwoItemInvoice(profile.id, 2);
+
+      const res = await DocumentExportService.exportDocument(
+        superAdminActor,
+        { document: { type: 'INVOICE', data: invoice }, isDraftPreview: true },
+        'pdf'
+      );
+
+      expect(res.buffer.subarray(0, 5).toString('ascii')).toBe('%PDF-');
+      expect(countPdfPages(res.buffer)).toBe(1);
+    });
+
+    it('2. Logo, Seal, and Signature XObject images all embed cleanly on Page 1', async () => {
+      const profile = buildNammaMediaProfile();
+      mockBrandingAndExportEnv(profile);
+      const invoice = buildSampleTwoItemInvoice(profile.id, 2);
+
+      const res = await DocumentExportService.exportDocument(
+        superAdminActor,
+        { document: { type: 'INVOICE', data: invoice }, isDraftPreview: true },
+        'pdf'
+      );
+
+      const latin = res.buffer.toString('latin1');
+      const imgCount = (latin.match(/\/Subtype\s*\/Image\b/g) || []).length;
+      expect(countPdfPages(res.buffer)).toBe(1);
+      expect(imgCount).toBeGreaterThanOrEqual(3);
+    });
+
+    it('3. Footer & Page 1 of 1 stamp cleanly within bounds without triggering a trailing blank page (EN & EN_KN)', async () => {
+      for (const language of ['EN', 'KN', 'EN_KN'] as const) {
+        const profile = buildNammaMediaProfile(undefined, {
+          language,
+          footerText:
+            language === 'EN'
+              ? 'Registered Office: Bengaluru | Thank you for your business.'
+              : 'ನಮ್ಮ ಮೀಡಿಯಾ | Registered Office: Bengaluru | Thank you.',
+          showPrintedTimestamp: true,
+        });
+        mockBrandingAndExportEnv(profile);
+        const invoice = buildSampleTwoItemInvoice(profile.id, 2);
+
+        const res = await DocumentExportService.exportDocument(
+          superAdminActor,
+          { document: { type: 'INVOICE', data: invoice }, isDraftPreview: true },
+          'pdf'
+        );
+
+        expect(countPdfPages(res.buffer)).toBe(1);
+      }
+    });
+
+    it('4. Browser Print portal renders outside #root and print CSS hides non-portal app shell without sheet double-padding', () => {
+      const indexCss = fs.readFileSync(path.resolve(process.cwd(), 'src/index.css'), 'utf8');
+      const printableViewSrc = fs.readFileSync(
+        path.resolve(process.cwd(), 'src/client/components/print/PrintableDocumentView.tsx'),
+        'utf8'
+      );
+
+      expect(indexCss).toContain('.coreerp-print-portal');
+      expect(indexCss).toContain('body.coreerp-has-print-portal > *:not(.coreerp-print-portal)');
+      expect(indexCss).toContain('body.coreerp-has-print-modal > .coreerp-print-portal--embedded');
+      expect(indexCss).toContain('.print-document-sheet');
+      expect(indexCss).toContain('min-height: 0 !important');
+      expect(indexCss).toContain('padding: 0 !important');
+
+      expect(printableViewSrc).toContain('createPortal(');
+      expect(printableViewSrc).toContain('window.document.body');
+      expect(printableViewSrc).toContain('coreerp-has-print-portal');
+      expect(printableViewSrc).toContain('coreerp-has-print-modal');
+    });
+
+    it('5. Browser Print @page directive adapts to A4, A5, Letter and Portrait/Landscape margins', () => {
+      const printableViewSrc = fs.readFileSync(
+        path.resolve(process.cwd(), 'src/client/components/print/PrintableDocumentView.tsx'),
+        'utf8'
+      );
+      expect(printableViewSrc).toContain('const pageSizeCss = `${layout.paperSize} ${layout.orientation}`;');
+      expect(printableViewSrc).toContain(
+        'const marginCss = `${layout.margins.topMm}mm ${layout.margins.rightMm}mm ${layout.margins.bottomMm}mm ${layout.margins.leftMm}mm`;'
+      );
+      expect(printableViewSrc).toMatch(
+        /@page\s*\{\s*size:\s*\$\{pageSizeCss\};\s*margin:\s*\$\{marginCss\};\s*\}/
+      );
+    });
+
+    it('6. Long multi-page invoice (35 line items) paginates intentionally across multiple pages cleanly', async () => {
+      const profile = buildNammaMediaProfile();
+      mockBrandingAndExportEnv(profile);
+      const longInvoice = buildSampleTwoItemInvoice(profile.id, 35);
+
+      const res = await DocumentExportService.exportDocument(
+        superAdminActor,
+        { document: { type: 'INVOICE', data: longInvoice }, isDraftPreview: true },
+        'pdf'
+      );
+
+      const pageCount = countPdfPages(res.buffer);
+      expect(pageCount).toBeGreaterThanOrEqual(2);
+      expect(pageCount).toBeLessThanOrEqual(4);
+    });
+
+    it('7. A4, A5, and Letter page sizes export with accurate PDF MediaBox and DOCX pgSz dimensions', async () => {
+      const expectedMediaBoxes = {
+        A4: { w: 595.28, h: 841.89 },
+        A5: { w: 419.53, h: 595.28 },
+        Letter: { w: 612, h: 792 },
+      } as const;
+
+      for (const paperSize of ['A4', 'A5', 'Letter'] as const) {
+        const profile = buildNammaMediaProfile(undefined, {
+          paperSize,
+          orientation: 'portrait',
+        });
+        mockBrandingAndExportEnv(profile);
+        const invoice = buildSampleTwoItemInvoice(profile.id, 2);
+
+        const pdfRes = await DocumentExportService.exportDocument(
+          superAdminActor,
+          { document: { type: 'INVOICE', data: invoice }, isDraftPreview: true },
+          'pdf'
+        );
+        const boxes = extractPdfMediaBoxes(pdfRes.buffer);
+        expect(boxes.length).toBeGreaterThanOrEqual(1);
+        expect(Math.abs(boxes[0][2] - expectedMediaBoxes[paperSize].w)).toBeLessThan(2);
+        expect(Math.abs(boxes[0][3] - expectedMediaBoxes[paperSize].h)).toBeLessThan(2);
+
+        const docxBuf = await generateDocxBuffer({
+          document: { type: 'INVOICE', data: invoice },
+          companyProfile: profile,
+          isDraftPreview: true,
+        });
+        expect(docxBuf[0]).toBe(0x50);
+        expect(docxBuf[1]).toBe(0x4b);
+      }
+    });
+
+    it('8. Portrait and Landscape orientation switch effective PDF & DOCX width/height cleanly', async () => {
+      const profilePortrait = buildNammaMediaProfile(undefined, {
+        paperSize: 'A4',
+        orientation: 'portrait',
+      });
+      mockBrandingAndExportEnv(profilePortrait);
+      const invoice = buildSampleTwoItemInvoice(profilePortrait.id, 2);
+
+      const portraitPdf = await DocumentExportService.exportDocument(
+        superAdminActor,
+        { document: { type: 'INVOICE', data: invoice }, isDraftPreview: true },
+        'pdf'
+      );
+      const [pBox] = extractPdfMediaBoxes(portraitPdf.buffer);
+      expect(pBox[3]).toBeGreaterThan(pBox[2]);
+
+      const profileLandscape = buildNammaMediaProfile(undefined, {
+        paperSize: 'A4',
+        orientation: 'landscape',
+      });
+      mockBrandingAndExportEnv(profileLandscape);
+
+      const landscapePdf = await DocumentExportService.exportDocument(
+        superAdminActor,
+        { document: { type: 'INVOICE', data: invoice }, isDraftPreview: true },
+        'pdf'
+      );
+      const [lBox] = extractPdfMediaBoxes(landscapePdf.buffer);
+      expect(lBox[2]).toBeGreaterThan(lBox[3]);
+      expect(Math.abs(lBox[2] - 841.89)).toBeLessThan(2);
+      expect(Math.abs(lBox[3] - 595.28)).toBeLessThan(2);
+    });
+
+    it('9. Text corner resize proportionally scales fontSizePt [6..36] independently of drag movement across all 11 text elements', () => {
+      const elements = createDefaultVisualElements('A4', 'portrait');
+      const textKeys = ALL_VISUAL_ELEMENT_KEYS.filter((k) => !isImageVisualElement(k));
+      expect(textKeys).toHaveLength(11);
+
+      for (const key of textKeys) {
+        const initial = elements[key];
+        const initialFontPt = initial.fontSizePt!;
+        expect(initialFontPt).toBeGreaterThanOrEqual(MIN_TEXT_FONT_SIZE_PT);
+        expect(initialFontPt).toBeLessThanOrEqual(MAX_TEXT_FONT_SIZE_PT);
+
+        // Moving (dragging) must never mutate fontSizePt
+        const moved = moveVisualElement(initial, 6, 4, 210, 297);
+        expect(moved.fontSizePt).toBe(initialFontPt);
+
+        // Resizing from each of the 4 corners proportionally alters fontSizePt and respects bounds
+        for (const handle of ['nw', 'ne', 'sw', 'se'] as const) {
+          const expandDeltaX = handle === 'nw' || handle === 'sw' ? -12 : 12;
+          const expandDeltaY = handle === 'nw' || handle === 'ne' ? -6 : 6;
+          const grown = resizeVisualElementFromHandle(
+            initial,
+            handle,
+            expandDeltaX,
+            expandDeltaY,
+            210,
+            297,
+            12,
+            6,
+            true
+          );
+          expect(grown.fontSizePt!).toBeGreaterThanOrEqual(initialFontPt);
+          expect(grown.fontSizePt!).toBeLessThanOrEqual(MAX_TEXT_FONT_SIZE_PT);
+
+          const shrinkTiny = resizeVisualElementFromHandle(
+            { ...initial, fontSizePt: 7, widthMm: 60, heightMm: 20 },
+            handle,
+            handle === 'nw' || handle === 'sw' ? 50 : -50,
+            handle === 'nw' || handle === 'ne' ? 14 : -14,
+            210,
+            297,
+            8,
+            5,
+            true
+          );
+          expect(shrinkTiny.fontSizePt!).toBeGreaterThanOrEqual(MIN_TEXT_FONT_SIZE_PT);
+        }
+      }
+    });
+
+    it('10. Save Draft / Save Layout persistence & validation round-trip typography and geometry cleanly', () => {
+      const defaults = createDefaultPrintSettings();
+      const customElements = normalizeDocumentVisualElements(defaults.layouts.INVOICE.elements, 'A4', 'portrait');
+      customElements.companyName = {
+        ...customElements.companyName,
+        fontSizePt: 18,
+        fontWeight: '700',
+        fontFamily: 'serif',
+        lineHeight: 1.4,
+        letterSpacing: 1.5,
+        align: 'center',
+        widthMm: 120,
+        heightMm: 12,
+      };
+      customElements.financialTotals = {
+        ...customElements.financialTotals,
+        fontSizePt: 10.5,
+        fontWeight: '600',
+        fontFamily: 'mono',
+        lineHeight: 1.5,
+        letterSpacing: 0.5,
+      };
+
+      const candidate = mergeDocumentPrintSettings({
+        version: 1,
+        layouts: {
+          ...defaults.layouts,
+          INVOICE: {
+            ...defaults.layouts.INVOICE,
+            elements: customElements,
+          },
+        },
+      });
+
+      const validation = validatePrintSettingsPayload(candidate);
+      expect(validation.valid).toBe(true);
+      expect(candidate.layouts.INVOICE.elements?.companyName.fontSizePt).toBe(18);
+      expect(candidate.layouts.INVOICE.elements?.companyName.fontFamily).toBe('serif');
+      expect(candidate.layouts.INVOICE.elements?.financialTotals.fontFamily).toBe('mono');
+
+      // Invalid out-of-range fontSizePt (> 36) must be rejected cleanly by server validation
+      const invalid = structuredClone(candidate);
+      invalid.layouts.INVOICE.elements!.companyName.fontSizePt = 72;
+      expect(validatePrintSettingsPayload(invalid).valid).toBe(false);
+    });
+
+    it('11. English, Kannada, and Bilingual (EN_KN) render across PDF, DOCX, and normalized Print config', async () => {
+      for (const language of ['EN', 'KN', 'EN_KN'] as const) {
+        const profile = buildNammaMediaProfile(
+          { name: language === 'EN' ? 'NAMMA MEDIA' : 'NAMMA MEDIA / ನಮ್ಮ ಮೀಡಿಯಾ' },
+          { language }
+        );
+        mockBrandingAndExportEnv(profile);
+        const invoice = buildSampleTwoItemInvoice(profile.id, 2);
+
+        const pdfRes = await DocumentExportService.exportDocument(
+          superAdminActor,
+          { document: { type: 'INVOICE', data: invoice }, isDraftPreview: true },
+          'pdf'
+        );
+        expect(pdfRes.buffer.subarray(0, 5).toString('ascii')).toBe('%PDF-');
+        expect(countPdfPages(pdfRes.buffer)).toBe(1);
+
+        const docxBuf = await generateDocxBuffer({
+          document: { type: 'INVOICE', data: invoice },
+          companyProfile: profile,
+          isDraftPreview: true,
+        });
+        expect(docxBuf[0]).toBe(0x50);
+        if (language !== 'EN') {
+          expect(docxBuf.toString('latin1')).toContain('word/document.xml');
+        }
+      }
+    });
+
+    it('12. Single Source of Truth typography & normalization aligns PDF, DOCX, and Print defaults', () => {
+      const normalized = normalizeDocumentVisualElements(
+        {
+          // Simulate legacy partial config missing newly added elements
+          logo: createDefaultVisualElements('A4', 'portrait').logo,
+          companyName: {
+            ...createDefaultVisualElements('A4', 'portrait').companyName,
+            fontSizePt: 20,
+            fontFamily: 'serif',
+            fontWeight: '700',
+            lineHeight: 1.6,
+            letterSpacing: 1.2,
+          },
+        },
+        'A4',
+        'portrait'
+      );
+
+      for (const key of ALL_VISUAL_ELEMENT_KEYS) {
+        expect(normalized[key]).toBeDefined();
+      }
+      const typo = getVisualElementTypography(normalized.companyName);
+      expect(typo.fontSizePt).toBe(20);
+      expect(typo.fontFamily).toBe('serif');
+      expect(typo.fontWeight).toBe('700');
+      expect(typo.lineHeight).toBe(1.6);
+      expect(typo.letterSpacing).toBe(1.2);
+    });
+
+    it('13. Historical issued invoice snapshot remains immune to later draft/saved typography changes', async () => {
+      const originalProfile = buildNammaMediaProfile();
+      const snapshotLayout = structuredClone(originalProfile.printSettings!.layouts.INVOICE);
+      snapshotLayout.elements = normalizeDocumentVisualElements(
+        snapshotLayout.elements,
+        'A4',
+        'portrait'
+      );
+      snapshotLayout.elements.companyName.fontSizePt = 13;
+
+      const mutatedProfile = buildNammaMediaProfile(
+        { name: 'NAMMA MEDIA NEW ERA' },
+        { customDocumentTitle: 'PROFORMA TAX BILL' }
+      );
+
+      mockBrandingAndExportEnv(mutatedProfile);
+      vi.spyOn(BrandingAssetService, 'getDocumentSnapshot').mockResolvedValue({
+        capturedAt: '2026-11-15T05:00:00.000Z',
+        companyName: 'NAMMA MEDIA',
+        legalName: 'Namma Media Pvt Ltd',
+        taxId: '29AABCN1234F1Z2',
+        address: '42 MG Road, Bengaluru 560001',
+        phone: '+91 80 4123 9988',
+        email: 'billing@nammamedia.in',
+        website: 'https://nammamedia.in',
+        logoAssetId: 'snap-logo-1',
+        logoUrl: '/api/branding/test/logo.png',
+        sealAssetId: 'snap-seal-1',
+        sealUrl: '/api/branding/test/seal.png',
+        signatureAssetId: 'snap-sig-1',
+        signatureUrl: '/api/branding/test/sig.png',
+        signatoryName: 'Ramesh Rao',
+        signatoryTitle: 'Managing Director',
+        layout: snapshotLayout,
+      });
+
+      const issuedInvoice: InvoiceItem = {
+        ...buildSampleTwoItemInvoice(mutatedProfile.id, 2),
+        id: 'inv-issued-immutable',
+        status: 'ISSUED',
+      };
+
+      const pdfRes = await DocumentExportService.exportDocument(
+        superAdminActor,
+        { document: { type: 'INVOICE', data: issuedInvoice } },
+        'pdf'
+      );
+
+      expect(countPdfPages(pdfRes.buffer)).toBe(1);
+      expect(AuditService.log).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'DOCUMENT_EXPORT_PDF',
+          entityId: 'inv-issued-immutable',
+          details: expect.objectContaining({ usedHistoricalSnapshot: true }),
+        })
+      );
+    });
+  });
 });
+

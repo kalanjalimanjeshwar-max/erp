@@ -24,6 +24,8 @@ export type {
 export type {
   BrandingAssetType,
   VisualElementKey,
+  VisualTextFontWeight,
+  VisualTextFontFamily,
   ResizeCornerHandle,
   VisualElementConfig,
   DocumentVisualElements,

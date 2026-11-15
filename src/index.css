@@ -5,6 +5,10 @@
   font-family: 'Noto Sans Kannada', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
 }
 
+.coreerp-print-portal {
+  display: none;
+}
+
 @media print {
   html,
   body {
@@ -12,18 +16,42 @@
     color: #0f172a !important;
     margin: 0 !important;
     padding: 0 !important;
+    width: 100% !important;
+    height: auto !important;
+    overflow: visible !important;
     -webkit-print-color-adjust: exact !important;
     print-color-adjust: exact !important;
   }
 
-  /* Hide ERP app shell navigation, top header, and UI-only controls */
+  /* When a PrintableDocumentView portal is mounted, isolate printing strictly to the document sheet */
+  body.coreerp-has-print-portal > *:not(.coreerp-print-portal) {
+    display: none !important;
+  }
+
+  body.coreerp-has-print-portal > .coreerp-print-portal {
+    display: block !important;
+    position: static !important;
+    width: 100% !important;
+    height: auto !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+    color: #0f172a !important;
+  }
+
+  /* If Preview modal is open while Designer Live Print Sheet is mounted, print only the modal document */
+  body.coreerp-has-print-modal > .coreerp-print-portal--embedded {
+    display: none !important;
+  }
+
+  /* Legacy shell hiding for non-portal prints (e.g., Payslip vouchers) */
   aside,
   header,
   .no-print {
     display: none !important;
   }
 
-  /* Remove scroll clipping from app shell containers */
   main,
   .erp-scroll-container {
     overflow: visible !important;
@@ -33,7 +61,6 @@
     background: #ffffff !important;
   }
 
-  /* Hide non-print backdrops and modal toolbars inside print modal */
   .print-modal-backdrop {
     position: static !important;
     background: #ffffff !important;
@@ -53,12 +80,36 @@
     border-radius: 0 !important;
   }
 
+  /* Prevent double margins (@page sets margins) and oversized min-height overflow */
   .print-document-sheet {
     box-shadow: none !important;
     border: none !important;
     margin: 0 !important;
+    padding: 0 !important;
     width: 100% !important;
+    max-width: 100% !important;
     min-height: 0 !important;
+    height: auto !important;
+    overflow: visible !important;
     transform: none !important;
+    background: #ffffff !important;
+  }
+
+  .print-avoid-break {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+  }
+
+  .print-document-sheet table {
+    page-break-inside: auto;
+  }
+
+  .print-document-sheet thead {
+    display: table-header-group;
+  }
+
+  .print-document-sheet tr {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
   }
 }

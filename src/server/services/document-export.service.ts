@@ -8,9 +8,15 @@ import {
   CompanyProfile,
   DocumentPrintLayoutConfig,
   DocumentPrintType,
+  VisualElementKey,
+  VisualTextFontFamily,
+  VisualTextFontWeight,
 } from '../../shared/types.js';
 import { PAPER_DIMENSIONS_MM } from '../../shared/print-settings.js';
-import { createDefaultVisualElements } from '../../shared/branding.js';
+import {
+  getVisualElementTypography,
+  normalizeDocumentVisualElements,
+} from '../../shared/branding.js';
 import { DocumentPrintLabelKey, getDocumentLabel } from '../../shared/print-translations.js';
 import { formatMoney, normalizeCurrencyCode } from '../../shared/currency.js';
 import { formatDateTimeInTimezone, getEffectiveTimeZone } from '../../shared/timezone.js';
@@ -119,6 +125,10 @@ function woffToTtf(woff: Buffer): Buffer {
 interface FontAssets {
   latinRegular: Buffer | null;
   latinBold: Buffer | null;
+  serifRegular: Buffer | null;
+  serifBold: Buffer | null;
+  monoRegular: Buffer | null;
+  monoBold: Buffer | null;
   kannadaRegular: Buffer | null;
   kannadaBold: Buffer | null;
 }
@@ -156,6 +166,22 @@ function loadFontAssets(): FontAssets {
     tryRead('/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf') ||
     latinRegular;
 
+  const serifRegular =
+    tryRead('/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf') ||
+    tryRead('/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf');
+  const serifBold =
+    tryRead('/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf') ||
+    tryRead('/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf') ||
+    serifRegular;
+
+  const monoRegular =
+    tryRead('/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf') ||
+    tryRead('/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf');
+  const monoBold =
+    tryRead('/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf') ||
+    tryRead('/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf') ||
+    monoRegular;
+
   const kannadaRegular = tryReadWoffAsTtf(
     path.join(cwd, 'node_modules/@fontsource/noto-sans-kannada/files/noto-sans-kannada-kannada-400-normal.woff')
   );
@@ -167,6 +193,10 @@ function loadFontAssets(): FontAssets {
   cachedFonts = {
     latinRegular,
     latinBold,
+    serifRegular,
+    serifBold,
+    monoRegular,
+    monoBold,
     kannadaRegular,
     kannadaBold,
   };
@@ -426,9 +456,13 @@ export class DocumentExportService {
     } = params;
     const docType = docPayload.type;
     const fonts = loadFontAssets();
-    const visualElements =
-      layout.elements ||
-      createDefaultVisualElements(layout.paperSize, layout.orientation, layout.margins);
+    const visualElements = normalizeDocumentVisualElements(
+      layout.elements,
+      layout.paperSize,
+      layout.orientation,
+      layout.margins
+    );
+    const useVisual = Boolean(layout.visualLayoutEnabled);
 
     const dimsMm = PAPER_DIMENSIONS_MM[layout.paperSize] || PAPER_DIMENSIONS_MM.A4;
     const portraitWidthPt = mmToPt(dimsMm.width);
@@ -455,11 +489,19 @@ export class DocumentExportService {
 
     const fontRegularLatin = fonts.latinRegular ? 'LatinRegular' : 'Helvetica';
     const fontBoldLatin = fonts.latinBold ? 'LatinBold' : 'Helvetica-Bold';
+    const fontRegularSerif = fonts.serifRegular ? 'SerifRegular' : 'Times-Roman';
+    const fontBoldSerif = fonts.serifBold ? 'SerifBold' : 'Times-Bold';
+    const fontRegularMono = fonts.monoRegular ? 'MonoRegular' : 'Courier';
+    const fontBoldMono = fonts.monoBold ? 'MonoBold' : 'Courier-Bold';
     const fontRegularKn = fonts.kannadaRegular ? 'KannadaRegular' : fontRegularLatin;
     const fontBoldKn = fonts.kannadaBold ? 'KannadaBold' : fontBoldLatin;
 
     if (fonts.latinRegular) doc.registerFont('LatinRegular', fonts.latinRegular);
     if (fonts.latinBold) doc.registerFont('LatinBold', fonts.latinBold);
+    if (fonts.serifRegular) doc.registerFont('SerifRegular', fonts.serifRegular);
+    if (fonts.serifBold) doc.registerFont('SerifBold', fonts.serifBold);
+    if (fonts.monoRegular) doc.registerFont('MonoRegular', fonts.monoRegular);
+    if (fonts.monoBold) doc.registerFont('MonoBold', fonts.monoBold);
     if (fonts.kannadaRegular) doc.registerFont('KannadaRegular', fonts.kannadaRegular);
     if (fonts.kannadaBold) doc.registerFont('KannadaBold', fonts.kannadaBold);
 
@@ -471,7 +513,28 @@ export class DocumentExportService {
       doc.on('error', reject);
     });
 
-    // Helper for mixed Latin + Kannada text rendering
+    const isBoldWeight = (weight?: VisualTextFontWeight): boolean =>
+      weight === '600' || weight === '700';
+
+    const pickLatinFont = (family?: VisualTextFontFamily, bold = false): string => {
+      if (family === 'serif') return bold ? fontBoldSerif : fontRegularSerif;
+      if (family === 'mono') return bold ? fontBoldMono : fontRegularMono;
+      return bold ? fontBoldLatin : fontRegularLatin;
+    };
+
+    const typoGap = (lineHeight: number, fontSizePt: number): number =>
+      Math.max(0.5, Math.round((lineHeight - 1.15) * fontSizePt * 10) / 10);
+
+    const typoFor = (key: VisualElementKey) => {
+      const typo = getVisualElementTypography(visualElements[key]);
+      return {
+        ...typo,
+        bold: isBoldWeight(typo.fontWeight),
+        lineGap: typoGap(typo.lineHeight, typo.fontSizePt),
+      };
+    };
+
+    // Helper for mixed Latin + Kannada text rendering with full typography controls
     const writeMixedText = (
       text: string,
       x: number,
@@ -481,16 +544,20 @@ export class DocumentExportService {
         align?: 'left' | 'center' | 'right';
         fontSize?: number;
         bold?: boolean;
+        fontFamily?: VisualTextFontFamily;
         color?: string;
         lineGap?: number;
+        characterSpacing?: number;
       }
     ): number => {
-      const fontSize = options?.fontSize ?? 9.5;
+      const fontSize = options?.fontSize ?? 9;
       const bold = options?.bold ?? false;
+      const fontFamily = options?.fontFamily;
       const color = options?.color ?? '#0f172a';
       const align = options?.align ?? 'left';
       const width = options?.width;
-      const lineGap = options?.lineGap ?? 2;
+      const lineGap = options?.lineGap ?? 1.5;
+      const characterSpacing = options?.characterSpacing ?? 0;
 
       const cleanText = String(text ?? '');
       const segments = cleanText.split(/([\u0C80-\u0CFF]+)/).filter(Boolean);
@@ -501,33 +568,52 @@ export class DocumentExportService {
         return y;
       }
 
+      const textOpts = {
+        width,
+        align,
+        lineGap,
+        ...(characterSpacing !== 0 ? { characterSpacing } : {}),
+      };
+
       if (segments.length === 1) {
         const isKn = /[\u0C80-\u0CFF]/.test(segments[0]);
-        doc.font(isKn ? (bold ? fontBoldKn : fontRegularKn) : bold ? fontBoldLatin : fontRegularLatin);
-        doc.text(segments[0], x, y, { width, align, lineGap });
+        doc.font(isKn ? (bold ? fontBoldKn : fontRegularKn) : pickLatinFont(fontFamily, bold));
+        doc.text(segments[0], x, y, textOpts);
         return doc.y;
       }
 
       segments.forEach((seg, idx) => {
         const isKn = /[\u0C80-\u0CFF]/.test(seg);
-        doc.font(isKn ? (bold ? fontBoldKn : fontRegularKn) : bold ? fontBoldLatin : fontRegularLatin);
+        doc.font(isKn ? (bold ? fontBoldKn : fontRegularKn) : pickLatinFont(fontFamily, bold));
         const isFirst = idx === 0;
         const isLast = idx === segments.length - 1;
         if (isFirst) {
-          doc.text(seg, x, y, { width, align, lineGap, continued: !isLast });
+          doc.text(seg, x, y, { ...textOpts, continued: !isLast });
         } else {
-          doc.text(seg, { width, align, lineGap, continued: !isLast });
+          doc.text(seg, { ...textOpts, continued: !isLast });
         }
       });
 
       return doc.y;
     };
 
-    const measureMixedHeight = (text: string, width: number, fontSize: number, bold = false): number => {
+    const measureMixedHeight = (
+      text: string,
+      width: number,
+      fontSize: number,
+      bold = false,
+      fontFamily?: VisualTextFontFamily,
+      lineGap = 1.5,
+      characterSpacing = 0
+    ): number => {
       const isKn = /[\u0C80-\u0CFF]/.test(text);
-      doc.font(isKn ? (bold ? fontBoldKn : fontRegularKn) : bold ? fontBoldLatin : fontRegularLatin);
+      doc.font(isKn ? (bold ? fontBoldKn : fontRegularKn) : pickLatinFont(fontFamily, bold));
       doc.fontSize(fontSize);
-      return doc.heightOfString(text || '', { width, lineGap: 2 });
+      return doc.heightOfString(text || '', {
+        width: Math.max(10, width),
+        lineGap,
+        ...(characterSpacing !== 0 ? { characterSpacing } : {}),
+      });
     };
 
     const pageW = doc.page.width;
@@ -535,14 +621,6 @@ export class DocumentExportService {
     const contentLeft = margins.left;
     const contentRight = pageW - margins.right;
     const contentWidth = contentRight - contentLeft;
-    const bottomLimit = pageH - margins.bottom - 24;
-
-    const ensurePageSpace = (neededPt: number) => {
-      if (doc.y + neededPt > bottomLimit) {
-        doc.addPage();
-        doc.y = margins.top;
-      }
-    };
 
     const companyName = companyProfile?.name || 'CoreERP Enterprise';
     const timezone = getEffectiveTimeZone(companyProfile?.timezone);
@@ -608,6 +686,81 @@ export class DocumentExportService {
         ? 'invoiceNumber'
         : 'receiptNumber';
 
+    // Pre-calculate exact footer height so body content reserves clean footer space without auto-pagination
+    const footerEl = visualElements.footer;
+    const footerTypo = typoFor('footer');
+    const footerVisible = !useVisual || footerEl.visible;
+    const printedAtLabel = formatDateTimeInTimezone(new Date(), timezone, {
+      includeZoneAbbr: true,
+    });
+    const footerParts = [
+      layout.footerText || '',
+      layout.showPrintedTimestamp
+        ? `${formatLabelText('generatedOn', layout.language)}: ${printedAtLabel} (${timezone})`
+        : '',
+    ].filter(Boolean);
+    const footerJoined = footerParts.join('  |  ');
+    const footerX = useVisual
+      ? Math.max(contentLeft, Math.min(contentRight - 80, mmToPt(footerEl.xMm)))
+      : contentLeft;
+    const rawFooterW = useVisual
+      ? Math.max(80, Math.min(contentRight - footerX, mmToPt(footerEl.widthMm)))
+      : contentWidth;
+    const pageNumReserveW = 58;
+    const footerTextW =
+      footerTypo.align === 'right'
+        ? rawFooterW
+        : Math.max(60, Math.min(rawFooterW, contentRight - pageNumReserveW - footerX));
+    const measuredFooterH =
+      footerVisible && footerJoined
+        ? measureMixedHeight(
+            footerJoined,
+            footerTextW,
+            footerTypo.fontSizePt,
+            footerTypo.bold,
+            footerTypo.fontFamily,
+            footerTypo.lineGap,
+            footerTypo.letterSpacing
+          )
+        : footerVisible
+        ? footerTypo.fontSizePt * 1.3
+        : 0;
+    const footerReserve = footerVisible ? Math.max(22, Math.ceil(measuredFooterH) + 8) : 8;
+    const bottomLimit = pageH - margins.bottom - footerReserve;
+
+    const startContinuationPage = (): number => {
+      doc.addPage();
+      let contY = margins.top;
+      contY = writeMixedText(
+        `${companyName}  •  ${resolvedTitle.toUpperCase()}  •  ${docNumber || 'DRAFT PREVIEW'} (Continued)`,
+        contentLeft,
+        contY,
+        {
+          width: contentWidth,
+          fontSize: 7.5,
+          bold: true,
+          color: '#64748b',
+        }
+      );
+      contY += 3;
+      doc
+        .moveTo(contentLeft, contY)
+        .lineTo(contentRight, contY)
+        .strokeColor('#cbd5e1')
+        .lineWidth(0.5)
+        .stroke();
+      contY += 6;
+      doc.y = contY;
+      return contY;
+    };
+
+    const ensurePageSpace = (neededPt: number): number => {
+      if (doc.y + neededPt > bottomLimit) {
+        return startContinuationPage();
+      }
+      return doc.y;
+    };
+
     let cursorY = margins.top;
 
     // Optional top header bar
@@ -619,39 +772,46 @@ export class DocumentExportService {
       ].filter(Boolean);
       cursorY = writeMixedText(topParts.join('  |  '), contentLeft, cursorY, {
         width: contentWidth,
-        fontSize: 8,
+        fontSize: 7.5,
         color: '#64748b',
       });
-      cursorY += 4;
+      cursorY += 3;
       doc
         .moveTo(contentLeft, cursorY)
         .lineTo(contentRight, cursorY)
         .strokeColor('#cbd5e1')
         .lineWidth(0.5)
         .stroke();
-      cursorY += 8;
+      cursorY += 6;
     }
 
-    // Header: Company Logo, Company Header Block, Document Title/Number using Visual Elements
+    // Header: Logo, Company Name, Company Header, Document Title & Number using 14-Element Config
     const headerStartY = cursorY;
     const headerBannerShift = Math.max(0, headerStartY - margins.top);
 
     const logoEl = visualElements.logo;
+    const companyNameEl = visualElements.companyName;
     const headerEl = visualElements.companyHeader;
     const titleEl = visualElements.documentTitle;
+    const docNumEl = visualElements.documentNumber;
 
-    const useVisual = Boolean(layout.visualLayoutEnabled);
+    const nameTypo = typoFor('companyName');
+    const headerTypo = typoFor('companyHeader');
+    const titleTypo = typoFor('documentTitle');
+    const docNumTypo = typoFor('documentNumber');
 
-    const logoX = useVisual ? Math.max(contentLeft, mmToPt(logoEl.xMm)) : contentLeft;
+    const logoX = useVisual
+      ? Math.max(contentLeft, Math.min(contentRight - 24, mmToPt(logoEl.xMm)))
+      : contentLeft;
     const logoY = useVisual ? Math.max(headerStartY, mmToPt(logoEl.yMm) + headerBannerShift) : headerStartY;
-    const logoW = useVisual ? Math.max(24, mmToPt(logoEl.widthMm)) : 102;
+    const logoW = useVisual ? Math.max(24, Math.min(contentWidth * 0.65, mmToPt(logoEl.widthMm))) : 96;
     const logoH = useVisual
-      ? Math.max(16, mmToPt(logoEl.heightMm))
+      ? Math.max(16, Math.min(54, mmToPt(logoEl.heightMm)))
       : layout.logoSize === 'sm'
-      ? 28
+      ? 26
       : layout.logoSize === 'lg'
-      ? 48
-      : 36;
+      ? 44
+      : 34;
 
     let logoBottomY = headerStartY;
     const logoVisible = layout.showLogo && (!useVisual || logoEl.visible);
@@ -667,59 +827,91 @@ export class DocumentExportService {
             fit: [logoW, logoH],
             ...(logoAlign === 'center' || logoAlign === 'right' ? { align: logoAlign } : {}),
           });
-          logoBottomY = logoY + logoH + mmToPt(logoEl.spacingMm || 3);
+          logoBottomY = logoY + logoH + mmToPt(logoEl.spacingMm || 2);
         } catch {
           // ignore unreadable image
         }
       }
     }
 
-    const headerX = useVisual ? Math.max(contentLeft, mmToPt(headerEl.xMm)) : contentLeft;
+    const nameVisible = layout.showCompanyName && (!useVisual || companyNameEl.visible);
+    const nameX = useVisual
+      ? Math.max(contentLeft, Math.min(contentRight - 60, mmToPt(companyNameEl.xMm)))
+      : contentLeft;
+    const nameW = useVisual
+      ? Math.max(60, Math.min(contentRight - nameX, mmToPt(companyNameEl.widthMm)))
+      : contentWidth * 0.56;
+    let nameY = useVisual
+      ? Math.max(headerStartY, mmToPt(companyNameEl.yMm) + headerBannerShift)
+      : logoBottomY;
+
+    const logoOverlapsNameHoriz =
+      logoBottomY > headerStartY && nameX < logoX + logoW && nameX + nameW > logoX;
+    if (logoOverlapsNameHoriz && nameY < logoBottomY) {
+      nameY = logoBottomY;
+    }
+
+    let nameBottomY = nameY;
+    if (nameVisible) {
+      nameBottomY = writeMixedText(companyName, nameX, nameY, {
+        width: nameW,
+        align: nameTypo.align,
+        fontSize: nameTypo.fontSizePt,
+        bold: nameTypo.bold,
+        fontFamily: nameTypo.fontFamily,
+        lineGap: nameTypo.lineGap,
+        characterSpacing: nameTypo.letterSpacing,
+        color: '#0f172a',
+      });
+      if (companyProfile?.legalName && companyProfile.legalName !== companyName) {
+        nameBottomY = writeMixedText(companyProfile.legalName, nameX, nameBottomY + 1, {
+          width: nameW,
+          align: nameTypo.align,
+          fontSize: Math.max(7, nameTypo.fontSizePt - 4),
+          fontFamily: nameTypo.fontFamily,
+          color: '#475569',
+        });
+      }
+      nameBottomY += mmToPt(companyNameEl.spacingMm || 1.5);
+    }
+
+    const headerX = useVisual
+      ? Math.max(contentLeft, Math.min(contentRight - 60, mmToPt(headerEl.xMm)))
+      : contentLeft;
     const headerW = useVisual
-      ? Math.max(80, Math.min(contentRight - headerX, mmToPt(headerEl.widthMm)))
+      ? Math.max(60, Math.min(contentRight - headerX, mmToPt(headerEl.widthMm)))
       : contentWidth * 0.56;
     let leftY = useVisual
       ? Math.max(headerStartY, mmToPt(headerEl.yMm) + headerBannerShift)
+      : nameVisible
+      ? nameBottomY
       : logoBottomY;
 
-    // Prevent vertical overlap if logo and company header sit in the same horizontal span
-    const horizontalOverlap =
-      logoVisible &&
-      logoBottomY > headerStartY &&
-      headerX < logoX + logoW &&
-      headerX + headerW > logoX;
-    if (horizontalOverlap && leftY < logoBottomY) {
+    const horizontalOverlapLogo =
+      logoBottomY > headerStartY && headerX < logoX + logoW && headerX + headerW > logoX;
+    if (horizontalOverlapLogo && leftY < logoBottomY) {
       leftY = logoBottomY;
     }
+    const horizontalOverlapName =
+      nameVisible && headerX < nameX + nameW && headerX + headerW > nameX;
+    if (horizontalOverlapName && leftY < nameBottomY) {
+      leftY = nameBottomY;
+    }
 
-    const headerAlign = useVisual ? headerEl.align : 'left';
+    const headerAlign = useVisual ? headerTypo.align : 'left';
     const headerVisible = !useVisual || headerEl.visible;
 
     if (headerVisible) {
-      if (layout.showCompanyName) {
-        leftY = writeMixedText(companyName, headerX, leftY, {
-          width: headerW,
-          align: headerAlign,
-          fontSize: 15,
-          bold: true,
-          color: '#0f172a',
-        });
-        if (companyProfile?.legalName && companyProfile.legalName !== companyName) {
-          leftY = writeMixedText(companyProfile.legalName, headerX, leftY + 1, {
-            width: headerW,
-            align: headerAlign,
-            fontSize: 8.5,
-            color: '#475569',
-          });
-        }
-      }
-
       if (layout.showCompanyContact) {
         if (companyProfile?.address) {
-          leftY = writeMixedText(companyProfile.address, headerX, leftY + 2, {
+          leftY = writeMixedText(companyProfile.address, headerX, leftY, {
             width: headerW,
             align: headerAlign,
-            fontSize: 8.5,
+            fontSize: headerTypo.fontSizePt,
+            bold: headerTypo.bold,
+            fontFamily: headerTypo.fontFamily,
+            lineGap: headerTypo.lineGap,
+            characterSpacing: headerTypo.letterSpacing,
             color: '#475569',
           });
         }
@@ -730,7 +922,11 @@ export class DocumentExportService {
           leftY = writeMixedText(contactLine, headerX, leftY + 1, {
             width: headerW,
             align: headerAlign,
-            fontSize: 8.5,
+            fontSize: headerTypo.fontSizePt,
+            bold: headerTypo.bold,
+            fontFamily: headerTypo.fontFamily,
+            lineGap: headerTypo.lineGap,
+            characterSpacing: headerTypo.letterSpacing,
             color: '#475569',
           });
         }
@@ -740,12 +936,15 @@ export class DocumentExportService {
         leftY = writeMixedText(
           `${formatLabelText('taxId', layout.language)}: ${companyProfile.taxId}`,
           headerX,
-          leftY + 2,
+          leftY + 1.5,
           {
             width: headerW,
             align: headerAlign,
-            fontSize: 8.5,
+            fontSize: headerTypo.fontSizePt,
             bold: true,
+            fontFamily: headerTypo.fontFamily,
+            lineGap: headerTypo.lineGap,
+            characterSpacing: headerTypo.letterSpacing,
             color: '#334155',
           }
         );
@@ -754,57 +953,92 @@ export class DocumentExportService {
     }
 
     const titleX = useVisual
-      ? Math.max(contentLeft, mmToPt(titleEl.xMm))
+      ? Math.max(contentLeft, Math.min(contentRight - 60, mmToPt(titleEl.xMm)))
       : contentLeft + contentWidth * 0.58;
     const titleW = useVisual
-      ? Math.max(70, Math.min(contentRight - titleX, mmToPt(titleEl.widthMm)))
+      ? Math.max(60, Math.min(contentRight - titleX, mmToPt(titleEl.widthMm)))
       : contentWidth * 0.42;
     let rightY = useVisual
       ? Math.max(headerStartY, mmToPt(titleEl.yMm) + headerBannerShift)
       : headerStartY;
     const titleAlign: 'left' | 'center' | 'right' = useVisual
-      ? titleEl.align
+      ? titleTypo.align
       : layout.titlePlacement === 'left'
       ? 'left'
       : layout.titlePlacement === 'center'
       ? 'center'
       : 'right';
 
-    if (!useVisual || titleEl.visible) {
+    const titleVisible = !useVisual || titleEl.visible;
+    if (titleVisible) {
       rightY = writeMixedText(resolvedTitle.toUpperCase(), titleX, rightY, {
         width: titleW,
         align: titleAlign,
-        fontSize: 15,
-        bold: true,
+        fontSize: titleTypo.fontSizePt,
+        bold: titleTypo.bold,
+        fontFamily: titleTypo.fontFamily,
+        lineGap: titleTypo.lineGap,
+        characterSpacing: titleTypo.letterSpacing,
         color: '#0f172a',
       });
+      rightY += mmToPt(titleEl.spacingMm || 1.5);
+    }
 
-      rightY = writeMixedText(
+    let docNumBottomY = rightY;
+    const docNumVisible = !useVisual || docNumEl.visible;
+    if (docNumVisible && layout.numberPlacement !== 'meta-grid') {
+      const numX = useVisual
+        ? Math.max(contentLeft, Math.min(contentRight - 60, mmToPt(docNumEl.xMm)))
+        : titleX;
+      const numW = useVisual
+        ? Math.max(60, Math.min(contentRight - numX, mmToPt(docNumEl.widthMm)))
+        : titleW;
+      let numY = useVisual
+        ? Math.max(headerStartY, mmToPt(docNumEl.yMm) + headerBannerShift)
+        : rightY + 2;
+
+      const titleOverlapsNum =
+        titleVisible && numX < titleX + titleW && numX + numW > titleX;
+      if (titleOverlapsNum && numY < rightY) {
+        numY = rightY;
+      }
+
+      docNumBottomY = writeMixedText(
         `${formatLabelText(docNumberLabelKey, layout.language)}: ${docNumber || 'DRAFT PREVIEW'}`,
-        titleX,
-        rightY + 4,
+        numX,
+        numY,
         {
-          width: titleW,
-          align: titleAlign,
-          fontSize: 9.5,
-          bold: true,
+          width: numW,
+          align: useVisual ? docNumTypo.align : titleAlign,
+          fontSize: docNumTypo.fontSizePt,
+          bold: docNumTypo.bold,
+          fontFamily: docNumTypo.fontFamily,
+          lineGap: docNumTypo.lineGap,
+          characterSpacing: docNumTypo.letterSpacing,
           color: '#1e293b',
         }
       );
-      rightY += mmToPt(titleEl.spacingMm || 2);
+      docNumBottomY += mmToPt(docNumEl.spacingMm || 1.5);
     }
 
-    cursorY = Math.max(logoBottomY, leftY, rightY) + 8;
+    cursorY = Math.max(logoBottomY, nameBottomY, leftY, rightY, docNumBottomY) + 5;
     doc
       .moveTo(contentLeft, cursorY)
       .lineTo(contentRight, cursorY)
       .strokeColor('#0f172a')
-      .lineWidth(1.4)
+      .lineWidth(1.2)
       .stroke();
-    cursorY += 12;
+    cursorY += 8;
 
     // Party + Metadata 2-Column Boxes
-    const boxGap = 12;
+    const customerEl = visualElements.customerDetails;
+    const datesEl = visualElements.dates;
+    const customerTypo = typoFor('customerDetails');
+    const datesTypo = typoFor('dates');
+    const customerVisible = !useVisual || customerEl.visible;
+    const datesVisible = !useVisual || datesEl.visible;
+
+    const boxGap = 10;
     const boxW = (contentWidth - boxGap) / 2;
     const boxStartY = cursorY;
 
@@ -818,13 +1052,13 @@ export class DocumentExportService {
     const partyLines: Array<{ text: string; size: number; bold?: boolean; color: string }> = [
       {
         text: formatLabelText(partyLabelKey, layout.language).toUpperCase(),
-        size: 7.5,
+        size: Math.max(6.5, customerTypo.fontSizePt - 1),
         bold: true,
         color: '#64748b',
       },
       {
         text: docPayload.data.customerName,
-        size: 10.5,
+        size: Math.max(9, customerTypo.fontSizePt + 1.5),
         bold: true,
         color: '#0f172a',
       },
@@ -834,7 +1068,8 @@ export class DocumentExportService {
       if (layout.showCustomerAddress && docPayload.data.customerAddress) {
         partyLines.push({
           text: docPayload.data.customerAddress,
-          size: 8.5,
+          size: customerTypo.fontSizePt,
+          bold: customerTypo.bold,
           color: '#475569',
         });
       }
@@ -846,14 +1081,15 @@ export class DocumentExportService {
           text: [docPayload.data.customerEmail, docPayload.data.customerPhone]
             .filter(Boolean)
             .join('  •  '),
-          size: 8.5,
+          size: customerTypo.fontSizePt,
+          bold: customerTypo.bold,
           color: '#475569',
         });
       }
       if (layout.showCustomerTaxId && docPayload.data.customerTaxId) {
         partyLines.push({
           text: `${formatLabelText('taxId', layout.language)}: ${docPayload.data.customerTaxId}`,
-          size: 8.5,
+          size: customerTypo.fontSizePt,
           bold: true,
           color: '#334155',
         });
@@ -867,9 +1103,14 @@ export class DocumentExportService {
         ? docPayload.data.invoiceDate
         : docPayload.data.receiptDate;
 
-    const metaRows: Array<{ label: string; value: string }> = [
-      { label: formatLabelText('date', layout.language), value: docDate },
-    ];
+    const metaRows: Array<{ label: string; value: string }> = [];
+    if (layout.numberPlacement === 'meta-grid' && docNumVisible) {
+      metaRows.push({
+        label: formatLabelText(docNumberLabelKey, layout.language),
+        value: docNumber || 'DRAFT PREVIEW',
+      });
+    }
+    metaRows.push({ label: formatLabelText('date', layout.language), value: docDate });
     if (docPayload.type === 'QUOTATION') {
       metaRows.push({
         label: formatLabelText('validUntil', layout.language),
@@ -897,55 +1138,84 @@ export class DocumentExportService {
       { label: formatLabelText('status', layout.language), value: docPayload.data.status }
     );
 
-    const innerPad = 8;
+    const innerPad = 7;
     const partyInnerW = boxW - innerPad * 2;
-    let estPartyH = innerPad * 2;
-    for (const pl of partyLines) {
-      estPartyH += measureMixedHeight(pl.text, partyInnerW, pl.size, pl.bold) + 3;
+    let estPartyH = customerVisible ? innerPad * 2 : 0;
+    if (customerVisible) {
+      for (const pl of partyLines) {
+        estPartyH +=
+          measureMixedHeight(
+            pl.text,
+            partyInnerW,
+            pl.size,
+            pl.bold,
+            customerTypo.fontFamily,
+            customerTypo.lineGap,
+            customerTypo.letterSpacing
+          ) + 2;
+      }
     }
-    const estMetaH = innerPad * 2 + metaRows.length * 14;
-    const boxH = Math.max(estPartyH, estMetaH, 68);
+    const metaRowStep = Math.max(12, Math.round(datesTypo.fontSizePt * datesTypo.lineHeight) + 2);
+    const estMetaH = datesVisible ? innerPad * 2 + metaRows.length * metaRowStep : 0;
+    const boxH =
+      customerVisible || datesVisible ? Math.max(estPartyH, estMetaH, 54) : 0;
 
-    // Draw Party Box
-    doc
-      .roundedRect(contentLeft, boxStartY, boxW, boxH, 4)
-      .fillAndStroke('#f8fafc', '#cbd5e1');
+    if (customerVisible) {
+      doc
+        .roundedRect(contentLeft, boxStartY, boxW, boxH, 4)
+        .fillAndStroke('#f8fafc', '#cbd5e1');
 
-    let py = boxStartY + innerPad;
-    for (const pl of partyLines) {
-      py = writeMixedText(pl.text, contentLeft + innerPad, py, {
-        width: partyInnerW,
-        fontSize: pl.size,
-        bold: pl.bold,
-        color: pl.color,
-      });
-      py += 2;
-    }
-
-    // Draw Metadata Box
-    const metaX = contentLeft + boxW + boxGap;
-    doc.roundedRect(metaX, boxStartY, boxW, boxH, 4).strokeColor('#cbd5e1').lineWidth(0.75).stroke();
-
-    let my = boxStartY + innerPad;
-    for (const row of metaRows) {
-      writeMixedText(`${row.label}:`, metaX + innerPad, my, {
-        width: boxW * 0.52,
-        fontSize: 8.5,
-        color: '#64748b',
-      });
-      writeMixedText(row.value, metaX + boxW * 0.5, my, {
-        width: boxW * 0.5 - innerPad,
-        align: 'right',
-        fontSize: 8.5,
-        bold: true,
-        color: '#0f172a',
-      });
-      my += 14;
+      let py = boxStartY + innerPad;
+      for (const pl of partyLines) {
+        py = writeMixedText(pl.text, contentLeft + innerPad, py, {
+          width: partyInnerW,
+          align: customerTypo.align,
+          fontSize: pl.size,
+          bold: pl.bold,
+          fontFamily: customerTypo.fontFamily,
+          lineGap: customerTypo.lineGap,
+          characterSpacing: customerTypo.letterSpacing,
+          color: pl.color,
+        });
+        py += 1.5;
+      }
     }
 
-    cursorY = boxStartY + boxH + 14;
+    if (datesVisible) {
+      const metaX = contentLeft + boxW + boxGap;
+      doc.roundedRect(metaX, boxStartY, boxW, boxH, 4).strokeColor('#cbd5e1').lineWidth(0.75).stroke();
+
+      let my = boxStartY + innerPad;
+      for (const row of metaRows) {
+        writeMixedText(`${row.label}:`, metaX + innerPad, my, {
+          width: boxW * 0.52,
+          fontSize: datesTypo.fontSizePt,
+          bold: datesTypo.bold,
+          fontFamily: datesTypo.fontFamily,
+          lineGap: datesTypo.lineGap,
+          characterSpacing: datesTypo.letterSpacing,
+          color: '#64748b',
+        });
+        writeMixedText(row.value, metaX + boxW * 0.5, my, {
+          width: boxW * 0.5 - innerPad,
+          align: 'right',
+          fontSize: datesTypo.fontSizePt,
+          bold: true,
+          fontFamily: datesTypo.fontFamily,
+          lineGap: datesTypo.lineGap,
+          characterSpacing: datesTypo.letterSpacing,
+          color: '#0f172a',
+        });
+        my += metaRowStep;
+      }
+    }
+
+    cursorY = boxStartY + boxH + (boxH > 0 ? 10 : 4);
 
     // Line Items Table (Quotation / Invoice) or Receipt Summary
+    const thTypo = typoFor('tableHeadings');
+    const tableHeadingsVisible = !useVisual || visualElements.tableHeadings.visible;
+
     if (docPayload.type !== 'RECEIPT') {
       const colDefs: Array<{
         key: string;
@@ -998,18 +1268,33 @@ export class DocumentExportService {
       }));
 
       const drawTableHeader = (y: number): number => {
-        let headerH = 20;
+        if (!tableHeadingsVisible) return y;
+        let headerH = 18;
         for (const col of cols) {
-          headerH = Math.max(headerH, measureMixedHeight(col.label, col.widthPt - 8, 7.5, true) + 10);
+          headerH = Math.max(
+            headerH,
+            measureMixedHeight(
+              col.label,
+              col.widthPt - 8,
+              thTypo.fontSizePt,
+              thTypo.bold,
+              thTypo.fontFamily,
+              thTypo.lineGap,
+              thTypo.letterSpacing
+            ) + 8
+          );
         }
         doc.rect(contentLeft, y, contentWidth, headerH).fill('#0f172a');
         let cx = contentLeft;
         for (const col of cols) {
-          writeMixedText(col.label, cx + 4, y + 5, {
+          writeMixedText(col.label, cx + 4, y + 4, {
             width: col.widthPt - 8,
             align: col.align,
-            fontSize: 7.5,
-            bold: true,
+            fontSize: thTypo.fontSizePt,
+            bold: thTypo.bold,
+            fontFamily: thTypo.fontFamily,
+            lineGap: thTypo.lineGap,
+            characterSpacing: thTypo.letterSpacing,
             color: '#ffffff',
           });
           cx += col.widthPt;
@@ -1034,8 +1319,8 @@ export class DocumentExportService {
           amt: fmt(line.lineTotal),
         };
 
-        const rowPadY = layout.serviceLayout === 'compact' ? 4 : 6;
-        let rowH = layout.serviceLayout === 'compact' ? 18 : 22;
+        const rowPadY = layout.serviceLayout === 'compact' ? 3.5 : 5;
+        let rowH = layout.serviceLayout === 'compact' ? 16 : 20;
         for (const col of cols) {
           const val = cellValues[col.key] || '';
           const h = measureMixedHeight(val, col.widthPt - 8, 8.5, col.key === 'amt') + rowPadY * 2;
@@ -1043,8 +1328,7 @@ export class DocumentExportService {
         }
 
         if (cursorY + rowH > bottomLimit) {
-          doc.addPage();
-          cursorY = margins.top;
+          cursorY = startContinuationPage();
           cursorY = drawTableHeader(cursorY);
         }
 
@@ -1073,75 +1357,48 @@ export class DocumentExportService {
       });
     } else {
       // Receipt Amount Banner
-      doc.roundedRect(contentLeft, cursorY, contentWidth, 34, 4).fillAndStroke('#f8fafc', '#cbd5e1');
-      writeMixedText(formatLabelText('amountReceived', layout.language), contentLeft + 10, cursorY + 11, {
+      doc.roundedRect(contentLeft, cursorY, contentWidth, 32, 4).fillAndStroke('#f8fafc', '#cbd5e1');
+      writeMixedText(formatLabelText('amountReceived', layout.language), contentLeft + 10, cursorY + 10, {
         width: contentWidth * 0.5,
         fontSize: 9.5,
         bold: true,
         color: '#475569',
       });
-      writeMixedText(fmt(docPayload.data.amount), contentLeft + contentWidth * 0.5, cursorY + 10, {
+      writeMixedText(fmt(docPayload.data.amount), contentLeft + contentWidth * 0.5, cursorY + 9, {
         width: contentWidth * 0.5 - 10,
         align: 'right',
         fontSize: 12,
         bold: true,
         color: '#0f172a',
       });
-      cursorY += 44;
+      cursorY += 38;
     }
 
-    cursorY += 12;
-    doc.y = cursorY;
-    ensurePageSpace(95);
-    cursorY = doc.y;
-
     // Bank Details (left) + Totals Box (right)
-    const summaryStartY = cursorY;
-    const bankW = contentWidth * 0.52;
-    const totalsW = contentWidth * 0.44;
-    const totalsX = contentRight - totalsW;
+    const totalsTypo = typoFor('financialTotals');
+    const totalsVisible =
+      layout.showTotalsSummary && (!useVisual || visualElements.financialTotals.visible);
 
-    let bankEndY = summaryStartY;
+    const bankLines: string[] = [];
     if (layout.showBankDetails && bankAccount) {
-      const bankLines: string[] = [
+      bankLines.push(
         `${formatLabelText('bankName', layout.language)}: ${bankAccount.bankName}${
           bankAccount.branchName ? ` (${bankAccount.branchName})` : ''
         }`,
         `${formatLabelText('accountHolder', layout.language)}: ${bankAccount.accountHolderName}`,
-        `${formatLabelText('accountNumber', layout.language)}: ${bankAccount.accountNumber}`,
-      ];
+        `${formatLabelText('accountNumber', layout.language)}: ${bankAccount.accountNumber}`
+      );
       if (bankAccount.routingCode) {
         bankLines.push(`${formatLabelText('routingIfsc', layout.language)}: ${bankAccount.routingCode}`);
       }
       if (bankAccount.upiId) {
         bankLines.push(`${formatLabelText('upiId', layout.language)}: ${bankAccount.upiId}`);
       }
-
-      const bankBoxH = 22 + bankLines.length * 13;
-      doc.roundedRect(contentLeft, summaryStartY, bankW, bankBoxH, 4).fillAndStroke('#f8fafc', '#cbd5e1');
-
-      let by = summaryStartY + 7;
-      by = writeMixedText(formatLabelText('bankDetails', layout.language).toUpperCase(), contentLeft + 8, by, {
-        width: bankW - 16,
-        fontSize: 7.5,
-        bold: true,
-        color: '#475569',
-      });
-      by += 3;
-      for (const line of bankLines) {
-        by = writeMixedText(line, contentLeft + 8, by, {
-          width: bankW - 16,
-          fontSize: 8.2,
-          color: '#0f172a',
-        });
-        by += 2;
-      }
-      bankEndY = summaryStartY + bankBoxH;
     }
+    const bankBoxH = bankLines.length > 0 ? 18 + bankLines.length * 11.5 : 0;
 
-    let totalsEndY = summaryStartY;
-    if (layout.showTotalsSummary) {
-      const totalRows: Array<{ label: string; value: string; bold?: boolean; topBorder?: boolean }> = [];
+    const totalRows: Array<{ label: string; value: string; bold?: boolean; topBorder?: boolean }> = [];
+    if (totalsVisible) {
       if (docPayload.type !== 'RECEIPT') {
         totalRows.push({
           label: formatLabelText('subtotal', layout.language),
@@ -1194,11 +1451,50 @@ export class DocumentExportService {
           }
         );
       }
+    }
+    const totalRowStep = Math.max(13.5, Math.round(totalsTypo.fontSizePt * totalsTypo.lineHeight) + 2);
+    const totalsBoxH = totalRows.length > 0 ? 12 + totalRows.length * totalRowStep : 0;
+    const summaryNeeded = Math.max(bankBoxH, totalsBoxH);
 
-      const totalsBoxH = 14 + totalRows.length * 16;
+    cursorY += 8;
+    doc.y = cursorY;
+    if (summaryNeeded > 0) {
+      cursorY = ensurePageSpace(summaryNeeded + 4);
+    }
+
+    const summaryStartY = cursorY;
+    const bankW = contentWidth * 0.52;
+    const totalsW = contentWidth * 0.44;
+    const totalsX = contentRight - totalsW;
+
+    let bankEndY = summaryStartY;
+    if (bankLines.length > 0) {
+      doc.roundedRect(contentLeft, summaryStartY, bankW, bankBoxH, 4).fillAndStroke('#f8fafc', '#cbd5e1');
+
+      let by = summaryStartY + 6;
+      by = writeMixedText(formatLabelText('bankDetails', layout.language).toUpperCase(), contentLeft + 8, by, {
+        width: bankW - 16,
+        fontSize: 7.5,
+        bold: true,
+        color: '#475569',
+      });
+      by += 2;
+      for (const line of bankLines) {
+        by = writeMixedText(line, contentLeft + 8, by, {
+          width: bankW - 16,
+          fontSize: 8,
+          color: '#0f172a',
+        });
+        by += 1;
+      }
+      bankEndY = summaryStartY + bankBoxH;
+    }
+
+    let totalsEndY = summaryStartY;
+    if (totalRows.length > 0) {
       doc.roundedRect(totalsX, summaryStartY, totalsW, totalsBoxH, 4).strokeColor('#cbd5e1').lineWidth(0.75).stroke();
 
-      let ty = summaryStartY + 8;
+      let ty = summaryStartY + 6;
       for (const row of totalRows) {
         if (row.topBorder) {
           doc
@@ -1208,70 +1504,116 @@ export class DocumentExportService {
             .lineWidth(0.5)
             .stroke();
         }
+        const rowFontPt = row.bold ? totalsTypo.fontSizePt + 0.8 : totalsTypo.fontSizePt;
         writeMixedText(row.label, totalsX + 8, ty, {
           width: totalsW * 0.56,
-          fontSize: row.bold ? 9.5 : 8.5,
-          bold: row.bold,
+          fontSize: rowFontPt,
+          bold: row.bold || totalsTypo.bold,
+          fontFamily: totalsTypo.fontFamily,
+          lineGap: totalsTypo.lineGap,
+          characterSpacing: totalsTypo.letterSpacing,
           color: row.bold ? '#0f172a' : '#475569',
         });
         writeMixedText(row.value, totalsX + totalsW * 0.5, ty, {
           width: totalsW * 0.5 - 8,
           align: 'right',
-          fontSize: row.bold ? 9.5 : 8.5,
-          bold: row.bold,
+          fontSize: rowFontPt,
+          bold: row.bold || totalsTypo.bold,
+          fontFamily: totalsTypo.fontFamily,
+          lineGap: totalsTypo.lineGap,
+          characterSpacing: totalsTypo.letterSpacing,
           color: '#0f172a',
         });
-        ty += 16;
+        ty += totalRowStep;
       }
       totalsEndY = summaryStartY + totalsBoxH;
     }
 
-    cursorY = Math.max(bankEndY, totalsEndY) + 14;
+    cursorY = Math.max(bankEndY, totalsEndY) + 8;
     doc.y = cursorY;
 
     // Notes & Terms
     const notesText = docPayload.data.notes;
     const termsText =
       (docPayload.type !== 'RECEIPT' ? docPayload.data.terms : null) || layout.defaultTermsText;
+    const termsTypo = typoFor('termsAndConditions');
+    const termsVisible =
+      layout.showTermsAndConditions &&
+      Boolean(termsText) &&
+      (!useVisual || visualElements.termsAndConditions.visible);
 
     if (notesText) {
-      ensurePageSpace(40);
-      cursorY = doc.y;
+      const notesH =
+        12 +
+        measureMixedHeight(
+          notesText,
+          contentWidth,
+          termsTypo.fontSizePt,
+          termsTypo.bold,
+          termsTypo.fontFamily,
+          termsTypo.lineGap,
+          termsTypo.letterSpacing
+        );
+      cursorY = ensurePageSpace(notesH + 4);
       cursorY = writeMixedText(formatLabelText('notes', layout.language).toUpperCase(), contentLeft, cursorY, {
         width: contentWidth,
-        fontSize: 7.5,
+        align: termsTypo.align,
+        fontSize: Math.max(6.5, termsTypo.fontSizePt - 1),
         bold: true,
+        fontFamily: termsTypo.fontFamily,
         color: '#64748b',
       });
-      cursorY = writeMixedText(notesText, contentLeft, cursorY + 2, {
+      cursorY = writeMixedText(notesText, contentLeft, cursorY + 1.5, {
         width: contentWidth,
-        fontSize: 8.5,
+        align: termsTypo.align,
+        fontSize: termsTypo.fontSizePt,
+        bold: termsTypo.bold,
+        fontFamily: termsTypo.fontFamily,
+        lineGap: termsTypo.lineGap,
+        characterSpacing: termsTypo.letterSpacing,
         color: '#334155',
       });
-      cursorY += 8;
+      cursorY += 5;
       doc.y = cursorY;
     }
 
-    if (layout.showTermsAndConditions && termsText) {
-      ensurePageSpace(40);
-      cursorY = doc.y;
+    if (termsVisible && termsText) {
+      const termsH =
+        12 +
+        measureMixedHeight(
+          termsText,
+          contentWidth,
+          termsTypo.fontSizePt,
+          termsTypo.bold,
+          termsTypo.fontFamily,
+          termsTypo.lineGap,
+          termsTypo.letterSpacing
+        );
+      cursorY = ensurePageSpace(termsH + 4);
       cursorY = writeMixedText(
         formatLabelText('termsAndConditions', layout.language).toUpperCase(),
         contentLeft,
         cursorY,
         {
           width: contentWidth,
-          fontSize: 7.5,
+          align: termsTypo.align,
+          fontSize: Math.max(6.5, termsTypo.fontSizePt - 1),
           bold: true,
+          fontFamily: termsTypo.fontFamily,
           color: '#64748b',
         }
       );
-      cursorY = writeMixedText(termsText, contentLeft, cursorY + 2, {
+      cursorY = writeMixedText(termsText, contentLeft, cursorY + 1.5, {
         width: contentWidth,
-        fontSize: 8.5,
+        align: termsTypo.align,
+        fontSize: termsTypo.fontSizePt,
+        bold: termsTypo.bold,
+        fontFamily: termsTypo.fontFamily,
+        lineGap: termsTypo.lineGap,
+        characterSpacing: termsTypo.letterSpacing,
         color: '#334155',
       });
-      cursorY += 10;
+      cursorY += 6;
       doc.y = cursorY;
     }
 
@@ -1279,24 +1621,30 @@ export class DocumentExportService {
     if (layout.showSignatureSection) {
       const sealEl = visualElements.seal;
       const sigEl = visualElements.signature;
-      const useVisualSig = Boolean(layout.visualLayoutEnabled);
+      const sigLabelEl = visualElements.signatoryLabels;
+      const sigLabelTypo = typoFor('signatoryLabels');
 
-      const sealW = useVisualSig ? Math.max(24, mmToPt(sealEl.widthMm)) : 48;
-      const sealH = useVisualSig ? Math.max(24, mmToPt(sealEl.heightMm)) : 42;
-      const sigImgW = useVisualSig ? Math.max(40, mmToPt(sigEl.widthMm)) : 120;
-      const sigImgH = useVisualSig ? Math.max(18, mmToPt(sigEl.heightMm)) : 32;
-      const blockNeeded = Math.max(sealH, sigImgH) + 34;
+      const sealVisible = !useVisual || sealEl.visible;
+      const sigVisible = !useVisual || sigEl.visible;
+      const sigLabelsVisible = !useVisual || sigLabelEl.visible;
 
-      ensurePageSpace(blockNeeded);
-      cursorY = Math.max(doc.y + 10, cursorY + 10);
+      const sealW = useVisual ? Math.max(22, mmToPt(sealEl.widthMm)) : 44;
+      const sealH = useVisual ? Math.max(22, Math.min(60, mmToPt(sealEl.heightMm))) : 40;
+      const sigImgW = useVisual ? Math.max(36, mmToPt(sigEl.widthMm)) : 112;
+      const sigImgH = useVisual ? Math.max(16, Math.min(48, mmToPt(sigEl.heightMm))) : 28;
+      const labelsNeeded = sigLabelsVisible ? 26 : 0;
+      const blockNeeded = Math.max(sealVisible ? sealH : 0, (sigVisible ? sigImgH : 0) + labelsNeeded) + 4;
 
-      const sealX = useVisualSig
+      cursorY = ensurePageSpace(blockNeeded + 4);
+      cursorY = Math.max(doc.y + 4, cursorY + 4);
+
+      const sealX = useVisual
         ? Math.max(contentLeft, Math.min(contentRight - sealW, mmToPt(sealEl.xMm)))
-        : contentRight - 220;
-      const sigW = Math.max(130, sigImgW);
-      const sigX = useVisualSig
+        : contentRight - 210;
+      const sigW = Math.max(120, sigImgW);
+      const sigX = useVisual
         ? Math.max(contentLeft, Math.min(contentRight - sigW, mmToPt(sigEl.xMm)))
-        : contentRight - 160;
+        : contentRight - 150;
 
       const sealImgSource = isSupportedPdfImageBuffer(brandingImages?.seal as Buffer | null | undefined)
         ? (brandingImages?.seal as Buffer)
@@ -1304,7 +1652,7 @@ export class DocumentExportService {
             layout.sealUrl || companyProfile?.documentBranding?.sealUrl || companyProfile?.sealUrl
           );
 
-      if ((!useVisualSig || sealEl.visible) && sealImgSource) {
+      if (sealVisible && sealImgSource) {
         try {
           const sealAlign = sealEl.align || 'center';
           doc.image(sealImgSource, sealX, cursorY, {
@@ -1326,7 +1674,6 @@ export class DocumentExportService {
               companyProfile?.signatureUrl
           );
 
-      const sigVisible = !useVisualSig || sigEl.visible;
       if (sigVisible && sigImgSource) {
         try {
           const sigAlign = sigEl.align || 'center';
@@ -1339,8 +1686,8 @@ export class DocumentExportService {
         }
       }
 
-      if (sigVisible) {
-        const lineY = cursorY + Math.max(28, sigImgH + 4);
+      if (sigLabelsVisible) {
+        const lineY = cursorY + (sigVisible ? Math.max(24, sigImgH + 3) : 14);
         doc
           .moveTo(sigX, lineY)
           .lineTo(sigX + sigW, lineY)
@@ -1356,64 +1703,88 @@ export class DocumentExportService {
         const signatoryTitle =
           layout.signatoryTitle || companyProfile?.documentBranding?.signatureTitle || '';
 
-        let sy = writeMixedText(signatoryName, sigX, lineY + 4, {
+        let sy = writeMixedText(signatoryName, sigX, lineY + 3, {
           width: sigW,
-          align: sigEl.align || 'center',
-          fontSize: 8.5,
-          bold: true,
+          align: sigLabelTypo.align,
+          fontSize: sigLabelTypo.fontSizePt,
+          bold: sigLabelTypo.bold,
+          fontFamily: sigLabelTypo.fontFamily,
+          lineGap: sigLabelTypo.lineGap,
+          characterSpacing: sigLabelTypo.letterSpacing,
           color: '#0f172a',
         });
         if (signatoryTitle) {
           sy = writeMixedText(signatoryTitle, sigX, sy + 1, {
             width: sigW,
-            align: sigEl.align || 'center',
-            fontSize: 7.5,
+            align: sigLabelTypo.align,
+            fontSize: Math.max(6.5, sigLabelTypo.fontSizePt - 1),
+            fontFamily: sigLabelTypo.fontFamily,
             color: '#64748b',
           });
         }
-        cursorY = Math.max(sy + 10, cursorY + Math.max(sealH, sigImgH + 26));
-      } else if (sealImgSource && (!useVisualSig || sealEl.visible)) {
-        cursorY += sealH + 10;
+        cursorY = Math.max(sy + 4, cursorY + (sealVisible ? sealH : 0) + 4);
+      } else if (sealVisible && sealImgSource) {
+        cursorY += sealH + 4;
       }
+      doc.y = cursorY;
     }
 
-    // Footer & Timestamp
-    const footerEl = visualElements.footer;
-    const footerVisible = !layout.visualLayoutEnabled || footerEl.visible;
-    if (footerVisible && (layout.footerText || layout.showPrintedTimestamp)) {
-      const printedAtLabel = formatDateTimeInTimezone(new Date(), timezone, {
-        includeZoneAbbr: true,
-      });
-      const footerParts = [
-        layout.footerText || '',
-        layout.showPrintedTimestamp
-          ? `${formatLabelText('generatedOn', layout.language)}: ${printedAtLabel} (${timezone})`
-          : '',
-      ].filter(Boolean);
-
-      const footerX = layout.visualLayoutEnabled
-        ? Math.max(contentLeft, mmToPt(footerEl.xMm))
-        : contentLeft;
-      const footerW = layout.visualLayoutEnabled
-        ? Math.max(80, Math.min(contentRight - footerX, mmToPt(footerEl.widthMm)))
-        : contentWidth;
-      const footerY = Math.min(
-        pageH - margins.bottom - 10,
-        Math.max(cursorY + 8, pageH - margins.bottom - 14)
+    // Stamp consistent Footer & Page X of Y across ALL buffered pages without triggering auto-pagination
+    const range = doc.bufferedPageRange();
+    if (footerVisible && (footerJoined || range.count > 1)) {
+      const footerY = Math.max(
+        bottomLimit + 6,
+        Math.min(pageH - measuredFooterH - 6, pageH - margins.bottom - measuredFooterH)
       );
-      doc
-        .moveTo(contentLeft, footerY - 4)
-        .lineTo(contentRight, footerY - 4)
-        .strokeColor('#e2e8f0')
-        .lineWidth(0.5)
-        .stroke();
+      for (let pageIdx = 0; pageIdx < range.count; pageIdx += 1) {
+        doc.switchToPage(range.start + pageIdx);
+        const savedBottomMargin = doc.page.margins.bottom;
+        doc.page.margins.bottom = 0;
 
-      writeMixedText(footerParts.join('  |  '), footerX, footerY, {
-        width: footerW,
-        align: layout.visualLayoutEnabled ? footerEl.align : 'left',
-        fontSize: 7.5,
-        color: '#64748b',
-      });
+        doc
+          .moveTo(contentLeft, footerY - 3)
+          .lineTo(contentRight, footerY - 3)
+          .strokeColor('#e2e8f0')
+          .lineWidth(0.5)
+          .stroke();
+
+        const pageCounterText = `Page ${pageIdx + 1} of ${range.count}`;
+        if (footerJoined && footerTypo.align === 'right') {
+          writeMixedText(`${footerJoined}  |  ${pageCounterText}`, footerX, footerY, {
+            width: rawFooterW,
+            align: 'right',
+            fontSize: footerTypo.fontSizePt,
+            bold: footerTypo.bold,
+            fontFamily: footerTypo.fontFamily,
+            lineGap: footerTypo.lineGap,
+            characterSpacing: footerTypo.letterSpacing,
+            color: '#64748b',
+          });
+        } else {
+          if (footerJoined) {
+            writeMixedText(footerJoined, footerX, footerY, {
+              width: footerTextW,
+              align: footerTypo.align,
+              fontSize: footerTypo.fontSizePt,
+              bold: footerTypo.bold,
+              fontFamily: footerTypo.fontFamily,
+              lineGap: footerTypo.lineGap,
+              characterSpacing: footerTypo.letterSpacing,
+              color: '#64748b',
+            });
+          }
+          writeMixedText(pageCounterText, contentRight - pageNumReserveW, footerY, {
+            width: pageNumReserveW,
+            align: 'right',
+            fontSize: Math.max(7, footerTypo.fontSizePt),
+            bold: false,
+            fontFamily: footerTypo.fontFamily,
+            color: '#64748b',
+          });
+        }
+
+        doc.page.margins.bottom = savedBottomMargin;
+      }
     }
 
     doc.end();
