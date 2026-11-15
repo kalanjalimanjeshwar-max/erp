@@ -18,6 +18,8 @@ import { AuditService } from './audit.service.js';
 import { DocumentSequenceService } from './document-sequence.service.js';
 import { JournalService } from './journal.service.js';
 import { PermissionService } from './permission.service.js';
+import { CompanyService } from './company.service.js';
+import { getDefaultAccountNature } from '../../shared/account-nature.js';
 
 export const formatIsoDate = (d: any): string => {
   if (!d) return new Date().toISOString().slice(0, 10);
@@ -147,6 +149,7 @@ export class ExpenseClaimService {
         });
       }
 
+      const baseCurrency = await CompanyService.getBaseCurrency(companyId);
       payableLedger = await prisma.accountLedger.create({
         data: {
           companyId,
@@ -155,7 +158,8 @@ export class ExpenseClaimService {
           name: 'Employee Reimbursements Payable',
           description: 'Liabilities for approved employee expense claims awaiting payout',
           isActive: true,
-          currency: 'USD',
+          currency: baseCurrency,
+          openingBalanceType: getDefaultAccountNature(liabilityGroup),
         },
         include: { group: true },
       });
@@ -188,6 +192,7 @@ export class ExpenseClaimService {
         });
       }
 
+      const baseCurrency = await CompanyService.getBaseCurrency(companyId);
       expenseLedger = await prisma.accountLedger.create({
         data: {
           companyId,
@@ -196,7 +201,8 @@ export class ExpenseClaimService {
           name: 'General Operating & Travel Expenses',
           description: 'General employee business expenses',
           isActive: true,
-          currency: 'USD',
+          currency: baseCurrency,
+          openingBalanceType: getDefaultAccountNature(expenseGroup),
         },
         include: { group: true },
       });
@@ -356,6 +362,10 @@ export class ExpenseClaimService {
 
     const status: ExpenseClaimStatus = input.submitImmediately ? 'SUBMITTED' : 'DRAFT';
 
+    const claimCurrency =
+      input.currency?.trim().toUpperCase() ||
+      (await CompanyService.getBaseCurrency(actor.companyId));
+
     const claim = await prisma.$transaction(async (tx) => {
       const claimNumber = await this.allocateClaimNumber(actor.companyId, originalExpenseDate, tx);
 
@@ -367,7 +377,7 @@ export class ExpenseClaimService {
           title: input.title.trim(),
           description: input.description?.trim() || null,
           originalExpenseDate,
-          currency: input.currency || 'USD',
+          currency: claimCurrency,
           totalAmount,
           status,
           managerId: input.managerId || null,
@@ -1402,6 +1412,7 @@ export class ExpenseClaimService {
             },
           });
         }
+        const baseCurrency = await CompanyService.getBaseCurrency(actor.companyId);
         const createdLedger = await prisma.accountLedger.create({
           data: {
             companyId: actor.companyId,
@@ -1410,7 +1421,8 @@ export class ExpenseClaimService {
             name: 'Main Operating Bank Account',
             description: 'Default company cash/bank disbursement account',
             isActive: true,
-            currency: 'USD',
+            currency: baseCurrency,
+            openingBalanceType: getDefaultAccountNature(assetGroup),
           },
         });
         bankLedgerId = createdLedger.id;

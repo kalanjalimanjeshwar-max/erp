@@ -26,13 +26,21 @@ import {
   UpdateAttendanceRequest,
   CreateShiftRequest,
   UpdateShiftRequest,
+  CompanyProfile,
 } from '../../shared/types.ts';
+import {
+  formatTimeInTimezone,
+  formatUtcTimestamp,
+  getEffectiveTimeZone,
+} from '../../shared/timezone.ts';
 
 interface AttendancePageProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
 }
 
-export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser }) => {
+export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, companyProfile }) => {
+  const timezone = getEffectiveTimeZone(companyProfile?.timezone);
   const isEmployee = currentUser.role === 'EMPLOYEE';
   const [activeTab, setActiveTab] = useState<'attendance' | 'shifts'>('attendance');
 
@@ -310,13 +318,7 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser }) =
   };
 
   const formatTime = (isoString: string | null) => {
-    if (!isoString) return '—';
-    try {
-      const d = new Date(isoString);
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
-    } catch {
-      return '—';
-    }
+    return formatTimeInTimezone(isoString, timezone, { hour12: true, includeZoneAbbr: true });
   };
 
   const getStatusTextClass = (status: AttendanceStatus) => {
@@ -567,10 +569,16 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser }) =
                           </td>
                         )}
                         <td className="py-3 px-4 text-slate-400">{rec.shiftName || '—'}</td>
-                        <td className="py-3 px-4 font-mono tabular-nums text-slate-300">
+                        <td
+                          className="py-3 px-4 font-mono tabular-nums text-slate-300"
+                          title={rec.checkIn ? `UTC: ${formatUtcTimestamp(rec.checkIn)}` : undefined}
+                        >
                           {formatTime(rec.checkIn)}
                         </td>
-                        <td className="py-3 px-4 font-mono tabular-nums text-slate-300">
+                        <td
+                          className="py-3 px-4 font-mono tabular-nums text-slate-300"
+                          title={rec.checkOut ? `UTC: ${formatUtcTimestamp(rec.checkOut)}` : undefined}
+                        >
                           {formatTime(rec.checkOut)}
                         </td>
                         <td className="py-3 px-4">

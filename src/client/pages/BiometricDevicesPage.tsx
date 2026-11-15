@@ -35,13 +35,24 @@ import {
   PunchSyncSummaryResponse,
   PunchReconciliationResponse,
   CreateBiometricTerminalRequest,
+  CompanyProfile,
 } from '../../shared/types.ts';
+import {
+  formatDateTimeInTimezone,
+  formatUtcTimestamp,
+  getEffectiveTimeZone,
+} from '../../shared/timezone.ts';
 
 interface BiometricDevicesPageProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
 }
 
-export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({ currentUser }) => {
+export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
+  currentUser,
+  companyProfile,
+}) => {
+  const timezone = getEffectiveTimeZone(companyProfile?.timezone);
   const [activeTab, setActiveTab] = useState<'terminals' | 'punches' | 'sync'>('terminals');
 
   // Terminals State
@@ -610,14 +621,20 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({ curr
                               <span>{terminal.status}</span>
                             </span>
                           </td>
-                          <td className="py-3 px-4 text-slate-400 font-mono tabular-nums">
+                          <td
+                            className="py-3 px-4 text-slate-400 font-mono tabular-nums"
+                            title={terminal.lastHeartbeatAt ? `UTC: ${formatUtcTimestamp(terminal.lastHeartbeatAt)}` : undefined}
+                          >
                             {terminal.lastHeartbeatAt
-                              ? new Date(terminal.lastHeartbeatAt).toLocaleString()
+                              ? formatDateTimeInTimezone(terminal.lastHeartbeatAt, timezone, { includeZoneAbbr: true })
                               : 'Never'}
                           </td>
-                          <td className="py-3 px-4 text-slate-400 font-mono tabular-nums">
+                          <td
+                            className="py-3 px-4 text-slate-400 font-mono tabular-nums"
+                            title={terminal.lastSyncAt ? `UTC: ${formatUtcTimestamp(terminal.lastSyncAt)}` : undefined}
+                          >
                             {terminal.lastSyncAt
-                              ? new Date(terminal.lastSyncAt).toLocaleString()
+                              ? formatDateTimeInTimezone(terminal.lastSyncAt, timezone, { includeZoneAbbr: true })
                               : 'Never'}
                           </td>
                           <td className="py-3 px-4 font-mono text-slate-400">
@@ -801,8 +818,11 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({ curr
 
                       return (
                         <tr key={p.id} className="hover:bg-slate-800/30 transition-colors">
-                          <td className="py-3 px-4 font-mono tabular-nums text-slate-200 whitespace-nowrap">
-                            {new Date(p.punchTime).toLocaleString()}
+                          <td
+                            className="py-3 px-4 font-mono tabular-nums text-slate-200 whitespace-nowrap"
+                            title={`UTC: ${formatUtcTimestamp(p.punchTime)}`}
+                          >
+                            {formatDateTimeInTimezone(p.punchTime, timezone, { includeSeconds: true, includeZoneAbbr: true })}
                           </td>
                           <td className="py-3 px-4 font-mono font-medium text-indigo-300">
                             {p.userEnrollmentId}

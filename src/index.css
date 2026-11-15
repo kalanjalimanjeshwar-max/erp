@@ -1,1 +1,64 @@
 @import "tailwindcss";
+
+.font-kannada,
+.font-print-document {
+  font-family: 'Noto Sans Kannada', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+@media print {
+  html,
+  body {
+    background: #ffffff !important;
+    color: #0f172a !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  /* Hide ERP app shell navigation, top header, and UI-only controls */
+  aside,
+  header,
+  .no-print {
+    display: none !important;
+  }
+
+  /* Remove scroll clipping from app shell containers */
+  main,
+  .erp-scroll-container {
+    overflow: visible !important;
+    height: auto !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    background: #ffffff !important;
+  }
+
+  /* Hide non-print backdrops and modal toolbars inside print modal */
+  .print-modal-backdrop {
+    position: static !important;
+    background: #ffffff !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    display: block !important;
+  }
+
+  .print-modal-frame {
+    box-shadow: none !important;
+    border: none !important;
+    max-width: none !important;
+    width: 100% !important;
+    max-height: none !important;
+    overflow: visible !important;
+    background: #ffffff !important;
+    border-radius: 0 !important;
+  }
+
+  .print-document-sheet {
+    box-shadow: none !important;
+    border: none !important;
+    margin: 0 !important;
+    width: 100% !important;
+    min-height: 0 !important;
+    transform: none !important;
+  }
+}

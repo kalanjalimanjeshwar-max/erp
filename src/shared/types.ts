@@ -3,6 +3,22 @@
  * Used across Frontend, Backend, and Test suites
  */
 
+import type { DocumentPrintSettings } from './print-settings.js';
+export type {
+  DocumentPrintType,
+  PaperSize,
+  PageOrientation,
+  TitlePlacement,
+  LogoPlacement,
+  LogoDisplaySize,
+  ServiceDescriptionLayout,
+  DocumentPrintMargins,
+  DocumentPrintLayoutConfig,
+  DocumentPrintSettings,
+} from './print-settings.js';
+export type { DocumentLanguage } from './print-translations.js';
+export type { CurrencyDisplayMode } from './currency.js';
+
 export type Role = 'SUPER_ADMIN' | 'ADMIN' | 'VICE_ADMIN' | 'EMPLOYEE';
 
 export type AuditSeverity = 'INFO' | 'WARN' | 'CRITICAL';
@@ -190,6 +206,36 @@ export interface CompanyProfile {
   signatureUrl?: string | null;
   sealUrl?: string | null;
   salesInvoiceEnabled?: boolean;
+  roundingPrecision?: number;
+  defaultDocumentLanguage?: string;
+  printSettings?: DocumentPrintSettings;
+  pendingApproval?: boolean;
+  changeRequest?: CompanySettingsChangeRequestItem;
+}
+
+export type SettingsChangeRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'CANCELLED';
+
+export interface CompanySettingsChangeRequestItem {
+  id: string;
+  companyId: string;
+  requestedById: string;
+  requestedByName?: string | null;
+  requestedByEmail?: string | null;
+  payload: Record<string, unknown>;
+  status: SettingsChangeRequestStatus;
+  rejectionReason?: string | null;
+  reviewedById?: string | null;
+  reviewedByName?: string | null;
+  reviewedAt?: string | null;
+  appliedAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DocumentPrintSettingsUpdateResponse {
+  printSettings: DocumentPrintSettings;
+  pendingApproval: boolean;
+  changeRequest?: CompanySettingsChangeRequestItem;
 }
 
 export interface LoginRequest {
@@ -266,6 +312,7 @@ export interface UpdateCompanyProfileRequest {
   website?: string | null;
   appHeaderTitle?: string | null;
   salesInvoiceEnabled?: boolean;
+  defaultDocumentLanguage?: string;
 }
 
 export interface RolePermissionRule {
@@ -377,12 +424,21 @@ export interface AccountLedgerItem {
 export interface CreateAccountLedgerRequest {
   groupId: string;
   code?: string | null;
+  codeSource?: 'AUTO' | 'MANUAL';
   name: string;
   description?: string | null;
   currency?: string;
   openingBalance?: string;
   openingBalanceType?: BalanceType;
   employeeId?: string | null;
+}
+
+export interface SuggestedLedgerCodeResponse {
+  groupId: string;
+  groupCode: string;
+  groupName: string;
+  suggestedCode: string;
+  allowedRangeLabel: string;
 }
 
 export interface UpdateAccountLedgerRequest {
@@ -663,15 +719,35 @@ export type InvoiceStatus = 'DRAFT' | 'ISSUED' | 'PARTIALLY_PAID' | 'PAID' | 'VO
 export type PaymentMethod = 'CASH' | 'BANK_TRANSFER' | 'CHEQUE' | 'CREDIT_CARD' | 'OTHER';
 export type ReceiptStatus = 'POSTED' | 'VOID';
 
+export type CustomerType = 'INDIVIDUAL' | 'BUSINESS';
+
+export interface CustomerDuplicateMatch {
+  id: string;
+  code: string;
+  name: string;
+  email: string | null;
+  phone: string | null;
+  taxId: string | null;
+  matchedOn: Array<'name' | 'email' | 'phone' | 'taxId'>;
+}
+
 export interface CustomerItem {
   id: string;
   companyId: string;
   code: string;
   name: string;
+  customerType?: CustomerType;
+  contactPerson?: string | null;
   email: string | null;
   phone: string | null;
   address: string | null;
+  shippingAddress?: string | null;
+  country?: string | null;
+  state?: string | null;
+  city?: string | null;
+  postalCode?: string | null;
   taxId: string | null;
+  notes?: string | null;
   currency: string;
   paymentTermsDays: number;
   receivableLedgerId: string | null;
@@ -684,12 +760,21 @@ export interface CustomerItem {
 }
 
 export interface CreateCustomerRequest {
-  code: string;
+  code?: string;
   name: string;
+  customerType?: CustomerType;
+  contactPerson?: string | null;
   email?: string | null;
   phone?: string | null;
   address?: string | null;
+  shippingAddress?: string | null;
+  country?: string | null;
+  state?: string | null;
+  city?: string | null;
+  postalCode?: string | null;
   taxId?: string | null;
+  notes?: string | null;
+  currency?: string;
   paymentTermsDays?: number;
   receivableLedgerId?: string | null;
 }
@@ -697,10 +782,18 @@ export interface CreateCustomerRequest {
 export interface UpdateCustomerRequest {
   code?: string;
   name?: string;
+  customerType?: CustomerType;
+  contactPerson?: string | null;
   email?: string | null;
   phone?: string | null;
   address?: string | null;
+  shippingAddress?: string | null;
+  country?: string | null;
+  state?: string | null;
+  city?: string | null;
+  postalCode?: string | null;
   taxId?: string | null;
+  notes?: string | null;
   paymentTermsDays?: number;
   receivableLedgerId?: string | null;
   isActive?: boolean;
@@ -727,6 +820,7 @@ export interface QuotationItem {
   customerEmail: string | null;
   customerPhone: string | null;
   customerAddress: string | null;
+  customerTaxId?: string | null;
   quotationDate: string; // YYYY-MM-DD
   validUntilDate: string; // YYYY-MM-DD
   status: QuotationStatus;
@@ -755,6 +849,7 @@ export interface CreateQuotationRequest {
   notes?: string | null;
   terms?: string | null;
   documentTitle?: string | null;
+  currency?: string;
   lines: Array<{
     itemDescription: string;
     quantity: string | number;
@@ -854,6 +949,7 @@ export interface CreateInvoiceRequest {
   notes?: string | null;
   terms?: string | null;
   documentTitle?: string | null;
+  currency?: string;
   lines: Array<{
     itemDescription: string;
     quantity: string | number;
@@ -909,6 +1005,7 @@ export interface CustomerReceiptItem {
   receiptDate: string; // YYYY-MM-DD
   customerId: string;
   customerName: string;
+  currency?: string;
   amount: string;
   allocatedTotal: string;
   unallocatedAmount: string;

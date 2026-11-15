@@ -30,6 +30,7 @@ import {
   CreateContraEntryRequest,
   CompanyProfile,
 } from '../../shared/types.ts';
+import { formatMoney, formatNumberForCurrency } from '../../shared/currency.ts';
 import {
   previewStore,
   PREVIEW_ACCOUNT_LEDGERS,
@@ -389,6 +390,7 @@ export const ContraEntriesPage: React.FC<ContraEntriesPageProps> = ({
   };
 
   const currencyCode = companyProfile?.currency || 'USD';
+  const roundingPrecision = companyProfile?.roundingPrecision ?? 2;
 
   return (
     <div className="space-y-6">
@@ -642,8 +644,8 @@ export const ContraEntriesPage: React.FC<ContraEntriesPageProps> = ({
                         </span>
                       )}
                     </td>
-                    <td className="py-3 px-4 text-right font-bold text-slate-100 whitespace-nowrap font-mono">
-                      {currencyCode} {parseFloat(entry.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    <td className="py-3 px-4 text-right font-bold text-slate-100 whitespace-nowrap font-mono tabular-nums">
+                      {formatMoney(entry.amount, currencyCode, { decimals: roundingPrecision })}
                     </td>
                     <td className="py-3 px-4 text-center whitespace-nowrap">{getStatusBadge(entry.status)}</td>
                     <td className="py-3 px-4 text-right whitespace-nowrap">
@@ -889,7 +891,7 @@ export const ContraEntriesPage: React.FC<ContraEntriesPageProps> = ({
                       <div className="text-[10px] text-rose-400 uppercase font-semibold">Credit (Outflow)</div>
                       <div className="font-bold truncate">{selectedSource.name}</div>
                       <div className="text-[10px] font-mono text-slate-400">
-                        Amount: {currencyCode} {parseFloat(amount || '0').toFixed(2)}
+                        Amount: {formatMoney(amount || '0', currencyCode, { decimals: roundingPrecision })}
                       </div>
                     </div>
 
@@ -899,7 +901,7 @@ export const ContraEntriesPage: React.FC<ContraEntriesPageProps> = ({
                       <div className="text-[10px] text-emerald-400 uppercase font-semibold">Debit (Inflow)</div>
                       <div className="font-bold truncate">{selectedDest.name}</div>
                       <div className="text-[10px] font-mono text-slate-400">
-                        Amount: {currencyCode} {parseFloat(amount || '0').toFixed(2)}
+                        Amount: {formatMoney(amount || '0', currencyCode, { decimals: roundingPrecision })}
                       </div>
                     </div>
                   </div>
@@ -1011,8 +1013,8 @@ export const ContraEntriesPage: React.FC<ContraEntriesPageProps> = ({
 
                 <div>
                   <div className="text-slate-500 text-[10px] uppercase">Total Transfer Amount</div>
-                  <div className="font-mono font-bold text-slate-100 text-sm mt-0.5">
-                    {currencyCode} {parseFloat(viewingEntry.amount).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                  <div className="font-mono font-bold text-slate-100 text-sm mt-0.5 tabular-nums">
+                    {formatMoney(viewingEntry.amount, currencyCode, { decimals: roundingPrecision })}
                   </div>
                 </div>
 
@@ -1067,25 +1069,25 @@ export const ContraEntriesPage: React.FC<ContraEntriesPageProps> = ({
                               </span>
                             )}
                           </td>
-                          <td className="py-2 px-3 text-right text-emerald-400">
-                            {parseFloat(l.debit) > 0 ? parseFloat(l.debit).toFixed(2) : '-'}
+                          <td className="py-2 px-3 text-right text-emerald-400 tabular-nums">
+                            {parseFloat(l.debit) > 0 ? formatNumberForCurrency(l.debit, currencyCode, roundingPrecision) : '-'}
                           </td>
-                          <td className="py-2 px-3 text-right text-rose-400">
-                            {parseFloat(l.credit) > 0 ? parseFloat(l.credit).toFixed(2) : '-'}
+                          <td className="py-2 px-3 text-right text-rose-400 tabular-nums">
+                            {parseFloat(l.credit) > 0 ? formatNumberForCurrency(l.credit, currencyCode, roundingPrecision) : '-'}
                           </td>
                         </tr>
                       ))}
                     </tbody>
-                    <tfoot className="bg-slate-950/80 border-t border-slate-800 font-mono font-bold text-xs">
+                    <tfoot className="bg-slate-950/80 border-t border-slate-800 font-mono font-bold text-xs tabular-nums">
                       <tr>
                         <td colSpan={2} className="py-2 px-3 font-sans text-slate-400">
                           Total Equilibrium
                         </td>
                         <td className="py-2 px-3 text-right text-emerald-400">
-                          {parseFloat(viewingEntry.amount).toFixed(2)}
+                          {formatNumberForCurrency(viewingEntry.amount, currencyCode, roundingPrecision)}
                         </td>
                         <td className="py-2 px-3 text-right text-rose-400">
-                          {parseFloat(viewingEntry.amount).toFixed(2)}
+                          {formatNumberForCurrency(viewingEntry.amount, currencyCode, roundingPrecision)}
                         </td>
                       </tr>
                     </tfoot>
@@ -1123,7 +1125,7 @@ export const ContraEntriesPage: React.FC<ContraEntriesPageProps> = ({
               Reversing this voucher will create an inverse double-entry transaction that debits{' '}
               <strong className="text-slate-200">{reversingEntry.sourceLedgerName}</strong> and credits{' '}
               <strong className="text-slate-200">{reversingEntry.destinationLedgerName}</strong> for{' '}
-              <strong className="text-slate-200">{currencyCode} {parseFloat(reversingEntry.amount).toFixed(2)}</strong>.
+              <strong className="text-slate-200">{formatMoney(reversingEntry.amount, currencyCode, { decimals: roundingPrecision })}</strong>.
             </p>
 
             <div>

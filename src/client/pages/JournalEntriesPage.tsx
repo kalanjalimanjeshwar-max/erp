@@ -21,8 +21,11 @@ import {
   JournalStatus,
   AccountLedgerItem,
   AuthUser,
+  CompanyProfile,
   CreateJournalEntryRequest,
 } from '../../shared/types.ts';
+import { formatMoney, formatNumberForCurrency, getCurrencySymbol } from '../../shared/currency.ts';
+import { formatDateTimeInTimezone, formatUtcTimestamp, getEffectiveTimeZone } from '../../shared/timezone.ts';
 import {
   PREVIEW_JOURNALS,
   PREVIEW_ACCOUNT_LEDGERS,
@@ -31,6 +34,7 @@ import {
 
 interface JournalEntriesPageProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
 }
 
 interface JournalLineDraft {
@@ -40,7 +44,11 @@ interface JournalLineDraft {
   description: string;
 }
 
-export const JournalEntriesPage: React.FC<JournalEntriesPageProps> = ({ currentUser }) => {
+export const JournalEntriesPage: React.FC<JournalEntriesPageProps> = ({ currentUser, companyProfile }) => {
+  const baseCurrency = companyProfile?.currency || 'USD';
+  const roundingPrecision = companyProfile?.roundingPrecision ?? 2;
+  const currencySymbol = getCurrencySymbol(baseCurrency);
+  const timezone = getEffectiveTimeZone(companyProfile?.timezone);
   const [journals, setJournals] = useState<JournalEntryItem[]>([]);
   const [ledgers, setLedgers] = useState<AccountLedgerItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -499,11 +507,11 @@ export const JournalEntriesPage: React.FC<JournalEntriesPageProps> = ({ currentU
                     <td className="py-3 px-4 text-slate-300 max-w-xs truncate" title={j.narration}>
                       {j.narration}
                     </td>
-                    <td className="py-3 px-4 text-right font-mono font-medium text-emerald-400">
-                      ${parseFloat(j.totalDebit).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    <td className="py-3 px-4 text-right font-mono font-medium text-emerald-400 tabular-nums">
+                      {formatMoney(j.totalDebit, baseCurrency, { decimals: roundingPrecision })}
                     </td>
-                    <td className="py-3 px-4 text-right font-mono font-medium text-emerald-400">
-                      ${parseFloat(j.totalCredit).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    <td className="py-3 px-4 text-right font-mono font-medium text-emerald-400 tabular-nums">
+                      {formatMoney(j.totalCredit, baseCurrency, { decimals: roundingPrecision })}
                     </td>
                     <td className="py-3 px-4 whitespace-nowrap">{getStatusBadge(j.status)}</td>
                     <td className="py-3 px-4 text-slate-400 whitespace-nowrap">
@@ -644,8 +652,8 @@ export const JournalEntriesPage: React.FC<JournalEntriesPageProps> = ({ currentU
                         <th className="py-2.5 px-3 w-10">#</th>
                         <th className="py-2.5 px-3 w-1/3">Account Ledger</th>
                         <th className="py-2.5 px-3">Line Description</th>
-                        <th className="py-2.5 px-3 w-32 text-right">Debit ($)</th>
-                        <th className="py-2.5 px-3 w-32 text-right">Credit ($)</th>
+                        <th className="py-2.5 px-3 w-32 text-right">Debit ({currencySymbol})</th>
+                        <th className="py-2.5 px-3 w-32 text-right">Credit ({currencySymbol})</th>
                         <th className="py-2.5 px-3 w-10"></th>
                       </tr>
                     </thead>
@@ -719,11 +727,11 @@ export const JournalEntriesPage: React.FC<JournalEntriesPageProps> = ({ currentU
                         <td colSpan={3} className="py-3 px-3 text-right font-semibold text-slate-300">
                           Total:
                         </td>
-                        <td className="py-3 px-3 text-right font-bold text-emerald-400">
-                          ${totalDebitModal.toFixed(4)}
+                        <td className="py-3 px-3 text-right font-bold text-emerald-400 tabular-nums">
+                          {formatMoney(totalDebitModal, baseCurrency, { decimals: 4 })}
                         </td>
-                        <td className="py-3 px-3 text-right font-bold text-emerald-400">
-                          ${totalCreditModal.toFixed(4)}
+                        <td className="py-3 px-3 text-right font-bold text-emerald-400 tabular-nums">
+                          {formatMoney(totalCreditModal, baseCurrency, { decimals: 4 })}
                         </td>
                         <td></td>
                       </tr>
@@ -753,7 +761,7 @@ export const JournalEntriesPage: React.FC<JournalEntriesPageProps> = ({ currentU
                     <div className="text-[11px] opacity-80">
                       {isBalanced
                         ? 'Total debit matches total credit. Ready to save as draft.'
-                        : `Difference: $${difference.toFixed(4)}. Debit and Credit totals must be non-zero and equal.`}
+                        : `Difference: ${formatMoney(difference, baseCurrency, { decimals: 4 })}. Debit and Credit totals must be non-zero and equal.`}
                     </div>
                   </div>
                 </div>
@@ -825,29 +833,29 @@ export const JournalEntriesPage: React.FC<JournalEntriesPageProps> = ({ currentU
                         {l.ledgerName}
                       </td>
                       <td className="py-2.5 px-3 text-slate-400">{l.description || '—'}</td>
-                      <td className="py-2.5 px-3 text-right font-mono text-emerald-400 font-medium">
+                      <td className="py-2.5 px-3 text-right font-mono text-emerald-400 font-medium tabular-nums">
                         {parseFloat(l.debit) > 0
-                          ? `$${parseFloat(l.debit).toLocaleString(undefined, { minimumFractionDigits: 2 })}`
+                          ? formatMoney(l.debit, baseCurrency, { decimals: roundingPrecision })
                           : '—'}
                       </td>
-                      <td className="py-2.5 px-3 text-right font-mono text-emerald-400 font-medium">
+                      <td className="py-2.5 px-3 text-right font-mono text-emerald-400 font-medium tabular-nums">
                         {parseFloat(l.credit) > 0
-                          ? `$${parseFloat(l.credit).toLocaleString(undefined, { minimumFractionDigits: 2 })}`
+                          ? formatMoney(l.credit, baseCurrency, { decimals: roundingPrecision })
                           : '—'}
                       </td>
                     </tr>
                   ))}
                 </tbody>
-                <tfoot className="bg-slate-950 font-mono text-xs border-t border-slate-800">
+                <tfoot className="bg-slate-950 font-mono text-xs border-t border-slate-800 tabular-nums">
                   <tr>
                     <td colSpan={3} className="py-3 px-3 text-right font-semibold text-slate-300">
                       Total:
                     </td>
                     <td className="py-3 px-3 text-right font-bold text-emerald-400">
-                      ${parseFloat(viewingJournal.totalDebit).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      {formatMoney(viewingJournal.totalDebit, baseCurrency, { decimals: roundingPrecision })}
                     </td>
                     <td className="py-3 px-3 text-right font-bold text-emerald-400">
-                      ${parseFloat(viewingJournal.totalCredit).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      {formatMoney(viewingJournal.totalCredit, baseCurrency, { decimals: roundingPrecision })}
                     </td>
                   </tr>
                 </tfoot>
@@ -857,10 +865,16 @@ export const JournalEntriesPage: React.FC<JournalEntriesPageProps> = ({ currentU
             <div className="text-[11px] text-slate-400 space-y-1 bg-slate-950/60 p-3 rounded-xl border border-slate-800">
               <div>Created by: <span className="text-slate-300 font-medium">{viewingJournal.createdByUserName || 'System'}</span></div>
               {viewingJournal.postedByUserName && (
-                <div>Posted by: <span className="text-slate-300 font-medium">{viewingJournal.postedByUserName}</span> at {viewingJournal.postedAt}</div>
+                <div title={viewingJournal.postedAt ? `UTC: ${formatUtcTimestamp(viewingJournal.postedAt)}` : undefined}>
+                  Posted by: <span className="text-slate-300 font-medium">{viewingJournal.postedByUserName}</span> at{' '}
+                  {formatDateTimeInTimezone(viewingJournal.postedAt, timezone, { includeSeconds: true, includeZoneAbbr: true })}
+                </div>
               )}
               {viewingJournal.reversedByUserName && (
-                <div>Reversed by: <span className="text-slate-300 font-medium">{viewingJournal.reversedByUserName}</span> at {viewingJournal.reversedAt}</div>
+                <div title={viewingJournal.reversedAt ? `UTC: ${formatUtcTimestamp(viewingJournal.reversedAt)}` : undefined}>
+                  Reversed by: <span className="text-slate-300 font-medium">{viewingJournal.reversedByUserName}</span> at{' '}
+                  {formatDateTimeInTimezone(viewingJournal.reversedAt, timezone, { includeSeconds: true, includeZoneAbbr: true })}
+                </div>
               )}
             </div>
 

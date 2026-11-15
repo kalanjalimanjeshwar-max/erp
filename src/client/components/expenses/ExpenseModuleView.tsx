@@ -40,10 +40,18 @@ import {
   AccountLedgerItem,
   CompanyBankAccountItem,
   EmployeeItem,
+  CompanyProfile,
 } from '../../../shared/types.ts';
+import { formatMoney, getCurrencySymbol, normalizeCurrencyCode } from '../../../shared/currency.ts';
+import {
+  formatDateTimeInTimezone,
+  formatDateInTimezone,
+  formatUtcTimestamp,
+} from '../../../shared/timezone.ts';
 
 interface ExpenseModuleViewProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
 }
 
 const CATEGORIES: Array<{ value: ExpenseCategory; label: string }> = [
@@ -66,7 +74,14 @@ const DEFAULT_CAPABILITIES: ExpenseCapabilitiesResponse = {
   currentEmployeeId: null,
 };
 
-export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUser }) => {
+export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({
+  currentUser,
+  companyProfile,
+}) => {
+  const baseCurrency = normalizeCurrencyCode(companyProfile?.currency);
+  const roundingPrecision = companyProfile?.roundingPrecision;
+  const timezone = companyProfile?.timezone;
+  const currencySymbol = getCurrencySymbol(baseCurrency);
   const [capabilities, setCapabilities] = useState<ExpenseCapabilitiesResponse>(DEFAULT_CAPABILITIES);
   const [ledgers, setLedgers] = useState<AccountLedgerItem[]>([]);
   const [bankAccounts, setBankAccounts] = useState<CompanyBankAccountItem[]>([]);
@@ -348,7 +363,7 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
           title: claimTitle.trim(),
           description: claimDescription.trim() || undefined,
           originalExpenseDate,
-          currency: 'USD',
+          currency: baseCurrency,
           managerId: selectedManagerId || undefined,
           lines: formattedLines,
           submitImmediately,
@@ -627,8 +642,8 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
               <div className="text-xs text-amber-400 uppercase tracking-wider font-semibold">
                 Pending Reviews
               </div>
-              <div className="text-2xl font-bold text-white mt-1">
-                ${summaryReport.totalPendingAmount.toFixed(2)}
+              <div className="text-2xl font-bold text-white mt-1 tabular-nums">
+                {formatMoney(summaryReport.totalPendingAmount, baseCurrency, { decimals: roundingPrecision })}
               </div>
               <div className="text-[11px] text-amber-400/80 mt-0.5">
                 {summaryReport.submittedCount + summaryReport.managerApprovedCount} claims in queue
@@ -644,8 +659,8 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
               <div className="text-xs text-indigo-400 uppercase tracking-wider font-semibold">
                 Approved Unpaid (AP)
               </div>
-              <div className="text-2xl font-bold text-white mt-1">
-                ${summaryReport.totalApprovedUnpaidAmount.toFixed(2)}
+              <div className="text-2xl font-bold text-white mt-1 tabular-nums">
+                {formatMoney(summaryReport.totalApprovedUnpaidAmount, baseCurrency, { decimals: roundingPrecision })}
               </div>
               <div className="text-[11px] text-indigo-400/80 mt-0.5">
                 {summaryReport.accountsApprovedCount} awaiting payout
@@ -661,8 +676,8 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
               <div className="text-xs text-emerald-400 uppercase tracking-wider font-semibold">
                 Total Reimbursed
               </div>
-              <div className="text-2xl font-bold text-white mt-1">
-                ${summaryReport.totalReimbursedAmount.toFixed(2)}
+              <div className="text-2xl font-bold text-white mt-1 tabular-nums">
+                {formatMoney(summaryReport.totalReimbursedAmount, baseCurrency, { decimals: roundingPrecision })}
               </div>
               <div className="text-[11px] text-emerald-400/80 mt-0.5">
                 {summaryReport.paidCount} claims settled
@@ -846,7 +861,7 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
                           key={idx}
                           className="px-2 py-0.5 rounded text-[10px] font-mono bg-slate-800 text-slate-300 border border-slate-700"
                         >
-                          {l.category} (${l.amount.toFixed(2)})
+                          {l.category} ({formatMoney(l.amount, claim.currency || baseCurrency, { decimals: roundingPrecision })})
                         </span>
                       ))}
                       {claim.lines.length > 2 && (
@@ -856,8 +871,8 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
                       )}
                     </div>
                   </td>
-                  <td className="py-3 px-4 font-mono font-bold text-emerald-400 text-sm">
-                    ${claim.totalAmount.toFixed(2)}
+                  <td className="py-3 px-4 font-mono font-bold text-emerald-400 text-sm tabular-nums">
+                    {formatMoney(claim.totalAmount, claim.currency || baseCurrency, { decimals: roundingPrecision })}
                   </td>
                   <td className="py-3 px-4">{renderStatusBadge(claim.status)}</td>
                   <td className="py-3 px-4 text-right">
@@ -1052,7 +1067,7 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
                         </div>
 
                         <div>
-                          <label className="block text-slate-400 font-medium mb-1 text-[11px]">Amount ($) *</label>
+                          <label className="block text-slate-400 font-medium mb-1 text-[11px]">Amount ({currencySymbol}) *</label>
                           <input
                             type="number"
                             step="0.01"
@@ -1126,8 +1141,8 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
               {/* Total Calculation */}
               <div className="flex items-center justify-between bg-slate-950 p-4 rounded-xl border border-slate-800 font-semibold">
                 <span className="text-slate-300">Total Claim Amount:</span>
-                <span className="text-emerald-400 text-lg font-mono">
-                  ${computedTotal.toFixed(2)} USD
+                <span className="text-emerald-400 text-lg font-mono tabular-nums">
+                  {formatMoney(computedTotal, baseCurrency, { decimals: roundingPrecision, displayMode: 'both' })}
                 </span>
               </div>
             </div>
@@ -1239,8 +1254,11 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
               </div>
               <div>
                 <span className="text-slate-500 block">Total Amount</span>
-                <span className="font-mono font-bold text-emerald-400 text-sm">
-                  ${selectedClaim.totalAmount.toFixed(2)} {selectedClaim.currency}
+                <span className="font-mono font-bold text-emerald-400 text-sm tabular-nums">
+                  {formatMoney(selectedClaim.totalAmount, selectedClaim.currency || baseCurrency, {
+                    decimals: roundingPrecision,
+                    displayMode: 'both',
+                  })}
                 </span>
               </div>
               <div>
@@ -1291,8 +1309,8 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
                         <td className="py-2.5 px-3 font-mono text-slate-400 text-[11px]">
                           {l.expenseDate}
                         </td>
-                        <td className="py-2.5 px-3 font-mono font-bold text-emerald-400">
-                          ${l.amount.toFixed(2)}
+                        <td className="py-2.5 px-3 font-mono font-bold text-emerald-400 tabular-nums">
+                          {formatMoney(l.amount, selectedClaim.currency || baseCurrency, { decimals: roundingPrecision })}
                         </td>
                         <td className="py-2.5 px-3">
                           {l.attachmentId ? (
@@ -1335,8 +1353,11 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
                     <div className="flex-1">
                       <div className="flex items-center justify-between">
                         <span className="font-semibold text-slate-200">{e.action}</span>
-                        <span className="text-[10px] text-slate-500 font-mono">
-                          {new Date(e.createdAt).toLocaleString()}
+                        <span
+                          className="text-[10px] text-slate-500 font-mono tabular-nums"
+                          title={`UTC: ${formatUtcTimestamp(e.createdAt)}`}
+                        >
+                          {formatDateTimeInTimezone(e.createdAt, timezone, { includeZoneAbbr: true })}
                         </span>
                       </div>
                       <div className="text-[11px] text-slate-400">
@@ -1622,7 +1643,13 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
                       className="flex items-center gap-1.5 px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold shadow-sm shadow-emerald-600/30"
                     >
                       <CheckCircle2 className="w-4 h-4" />
-                      <span>Disburse Payout & Mark Settled (${selectedClaim.totalAmount.toFixed(2)})</span>
+                      <span>
+                        Disburse Payout & Mark Settled (
+                        {formatMoney(selectedClaim.totalAmount, selectedClaim.currency || baseCurrency, {
+                          decimals: roundingPrecision,
+                        })}
+                        )
+                      </span>
                     </button>
                   </div>
                 )}
@@ -1631,8 +1658,12 @@ export const ExpenseModuleView: React.FC<ExpenseModuleViewProps> = ({ currentUse
               {selectedClaim.status === 'PAID' && (
                 <div className="flex items-center gap-2 text-emerald-400 font-semibold">
                   <CheckCircle2 className="w-4 h-4" />
-                  <span>
-                    Claim fully reimbursed on {selectedClaim.paidAt?.slice(0, 10)} via {selectedClaim.paymentMethod || 'Bank Transfer'}. Ref: {selectedClaim.paymentReference || 'N/A'}.
+                  <span
+                    title={selectedClaim.paidAt ? `UTC: ${formatUtcTimestamp(selectedClaim.paidAt)}` : undefined}
+                  >
+                    Claim fully reimbursed on{' '}
+                    {selectedClaim.paidAt ? formatDateInTimezone(selectedClaim.paidAt, timezone) : '—'} via{' '}
+                    {selectedClaim.paymentMethod || 'Bank Transfer'}. Ref: {selectedClaim.paymentReference || 'N/A'}.
                   </span>
                 </div>
               )}

@@ -18,17 +18,29 @@ import { api, ApiError } from '../services/api.ts';
 import { previewStore } from '../services/previewStore.ts';
 import {
   CustomerItem,
+  CustomerType,
   AccountLedgerItem,
   AuthUser,
+  CompanyProfile,
 } from '../../shared/types.ts';
+import { formatMoney } from '../../shared/currency.ts';
+import {
+  COMMON_CUSTOMER_COUNTRIES,
+  findDuplicateCustomers,
+  getCountryTaxLabel,
+  normalizeCountryKey,
+  validateInlineCustomerInput,
+} from '../../shared/customer-validation.ts';
 
 interface CustomersPageProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
   onNavigateToInvoice?: (customerId: string) => void;
 }
 
 export const CustomersPage: React.FC<CustomersPageProps> = ({
   currentUser,
+  companyProfile,
   onNavigateToInvoice,
 }) => {
   const [customers, setCustomers] = useState<CustomerItem[]>([]);
@@ -45,13 +57,24 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingCustomer, setEditingCustomer] = useState<CustomerItem | null>(null);
   const [code, setCode] = useState('');
+  const [customerType, setCustomerType] = useState<CustomerType>('BUSINESS');
   const [name, setName] = useState('');
+  const [contactPerson, setContactPerson] = useState('');
   const [email, setEmail] = useState('');
   const [phone, setPhone] = useState('');
+  const [country, setCountry] = useState(
+    (companyProfile?.currency || 'INR').toUpperCase() === 'INR' ? 'India' : 'United States'
+  );
+  const [stateName, setStateName] = useState('');
+  const [city, setCity] = useState('');
+  const [postalCode, setPostalCode] = useState('');
   const [address, setAddress] = useState('');
+  const [shippingAddress, setShippingAddress] = useState('');
   const [taxId, setTaxId] = useState('');
+  const [notes, setNotes] = useState('');
   const [paymentTermsDays, setPaymentTermsDays] = useState(30);
   const [receivableLedgerId, setReceivableLedgerId] = useState('');
+  const [modalError, setModalError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
   const fetchCustomers = useCallback(async () => {
@@ -95,65 +118,116 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
     fetchCustomers();
   }, [fetchCustomers]);
 
+  const defaultCountry =
+    (companyProfile?.currency || 'INR').toUpperCase() === 'INR' ? 'India' : 'United States';
+
   const handleOpenCreateModal = () => {
     setEditingCustomer(null);
-    // Generate suggested code based on count
     const nextSeq = (customers.length + 1).toString().padStart(4, '0');
     setCode(`CUST-${nextSeq}`);
+    setCustomerType('BUSINESS');
     setName('');
+    setContactPerson('');
     setEmail('');
     setPhone('');
+    setCountry(defaultCountry);
+    setStateName('');
+    setCity('');
+    setPostalCode('');
     setAddress('');
+    setShippingAddress('');
     setTaxId('');
+    setNotes('');
     setPaymentTermsDays(30);
     setReceivableLedgerId('');
+    setModalError(null);
     setIsModalOpen(true);
   };
 
   const handleOpenEditModal = (c: CustomerItem) => {
     setEditingCustomer(c);
     setCode(c.code);
+    setCustomerType(c.customerType || 'BUSINESS');
     setName(c.name);
+    setContactPerson(c.contactPerson || '');
     setEmail(c.email || '');
     setPhone(c.phone || '');
+    setCountry(c.country || defaultCountry);
+    setStateName(c.state || '');
+    setCity(c.city || '');
+    setPostalCode(c.postalCode || '');
     setAddress(c.address || '');
+    setShippingAddress(c.shippingAddress || '');
     setTaxId(c.taxId || '');
+    setNotes(c.notes || '');
     setPaymentTermsDays(c.paymentTermsDays);
     setReceivableLedgerId(c.receivableLedgerId || '');
+    setModalError(null);
     setIsModalOpen(true);
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setIsSubmitting(true);
+    setModalError(null);
     setErrorMessage(null);
     setSuccessMessage(null);
 
+    const validation = validateInlineCustomerInput({
+      name,
+      customerType,
+      email,
+      phone,
+      country,
+      postalCode,
+      taxId,
+    });
+    if (!validation.valid) {
+      setModalError(Object.values(validation.errors)[0] || 'Please fix highlighted customer errors.');
+      return;
+    }
+
+    const localDups = findDuplicateCustomers(
+      { name, email, phone, taxId },
+      customers,
+      editingCustomer?.id
+    );
+    if (localDups.length > 0) {
+      const first = localDups[0];
+      setModalError(
+        `Possible duplicate customer detected: "${first.name}" (${first.code}) matches on ${first.matchedOn.join(', ')}.`
+      );
+      return;
+    }
+
+    setIsSubmitting(true);
+
     try {
+      const commonFields = {
+        code: code.trim() ? code.trim().toUpperCase() : undefined,
+        name: name.trim(),
+        customerType,
+        contactPerson: contactPerson.trim() || null,
+        email: email.trim() || null,
+        phone: phone.trim() || null,
+        address: address.trim() || null,
+        shippingAddress: shippingAddress.trim() || null,
+        country: country.trim() || null,
+        state: stateName.trim() || null,
+        city: city.trim() || null,
+        postalCode: postalCode.trim() || null,
+        taxId: taxId.trim() || null,
+        notes: notes.trim() || null,
+        currency: (companyProfile?.currency || 'INR').toUpperCase(),
+        paymentTermsDays,
+        receivableLedgerId: receivableLedgerId || null,
+      };
+
       if (currentUser?.isPreview) {
         if (editingCustomer) {
-          previewStore.updateCustomer(editingCustomer.id, {
-            code: code.trim().toUpperCase(),
-            name: name.trim(),
-            email: email.trim() || null,
-            phone: phone.trim() || null,
-            address: address.trim() || null,
-            taxId: taxId.trim() || null,
-            paymentTermsDays,
-            receivableLedgerId: receivableLedgerId || null,
-          });
+          previewStore.updateCustomer(editingCustomer.id, commonFields);
           setSuccessMessage(`[Preview Demo] Customer "${name}" updated in-memory. Not saved to database.`);
         } else {
-          previewStore.createCustomer({
-            code: code.trim().toUpperCase(),
-            name: name.trim(),
-            email: email.trim() || null,
-            phone: phone.trim() || null,
-            address: address.trim() || null,
-            taxId: taxId.trim() || null,
-            paymentTermsDays,
-            receivableLedgerId: receivableLedgerId || null,
-          });
+          previewStore.createCustomer(commonFields);
           setSuccessMessage(`[Preview Demo] Customer "${name}" created in-memory. Not saved to database.`);
         }
         setIsModalOpen(false);
@@ -162,37 +236,19 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
       }
 
       if (editingCustomer) {
-        await api.updateCustomer(editingCustomer.id, {
-          code: code.trim().toUpperCase(),
-          name: name.trim(),
-          email: email.trim() || null,
-          phone: phone.trim() || null,
-          address: address.trim() || null,
-          taxId: taxId.trim() || null,
-          paymentTermsDays,
-          receivableLedgerId: receivableLedgerId || null,
-        });
+        await api.updateCustomer(editingCustomer.id, commonFields);
         setSuccessMessage(`Customer "${name}" updated successfully.`);
       } else {
-        await api.createCustomer({
-          code: code.trim().toUpperCase(),
-          name: name.trim(),
-          email: email.trim() || null,
-          phone: phone.trim() || null,
-          address: address.trim() || null,
-          taxId: taxId.trim() || null,
-          paymentTermsDays,
-          receivableLedgerId: receivableLedgerId || null,
-        });
+        await api.createCustomer(commonFields);
         setSuccessMessage(`Customer "${name}" created successfully.`);
       }
       setIsModalOpen(false);
       fetchCustomers();
     } catch (err: unknown) {
       if (err instanceof ApiError) {
-        setErrorMessage(err.message);
+        setModalError(err.message);
       } else {
-        setErrorMessage('Failed to save customer.');
+        setModalError(err instanceof Error ? err.message : 'Failed to save customer.');
       }
     } finally {
       setIsSubmitting(false);
@@ -242,15 +298,19 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
 
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
           <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Total Sales Invoiced</div>
-          <div className="text-xl font-bold font-mono text-indigo-400 mt-1">
-            ${totalInvoiced.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          <div className="text-xl font-bold font-mono text-indigo-400 mt-1 tabular-nums">
+            {formatMoney(totalInvoiced, companyProfile?.currency, {
+              decimals: companyProfile?.roundingPrecision,
+            })}
           </div>
         </div>
 
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-4">
           <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Outstanding Receivables</div>
-          <div className={`text-xl font-bold font-mono mt-1 ${totalOutstanding > 0 ? 'text-amber-400' : 'text-emerald-400'}`}>
-            ${totalOutstanding.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+          <div className={`text-xl font-bold font-mono mt-1 tabular-nums ${totalOutstanding > 0 ? 'text-amber-400' : 'text-emerald-400'}`}>
+            {formatMoney(totalOutstanding, companyProfile?.currency, {
+              decimals: companyProfile?.roundingPrecision,
+            })}
           </div>
         </div>
       </div>
@@ -371,12 +431,16 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
                       {!c.email && !c.phone && '—'}
                     </td>
                     <td className="py-3 px-4 text-slate-300">Net {c.paymentTermsDays} days</td>
-                    <td className="py-3 px-4 text-right font-mono text-slate-200">
-                      ${parseFloat(c.totalInvoiced || '0').toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    <td className="py-3 px-4 text-right font-mono text-slate-200 tabular-nums">
+                      {formatMoney(c.totalInvoiced || '0', c.currency || companyProfile?.currency, {
+                        decimals: companyProfile?.roundingPrecision,
+                      })}
                     </td>
-                    <td className="py-3 px-4 text-right font-mono font-medium">
+                    <td className="py-3 px-4 text-right font-mono font-medium tabular-nums">
                       <span className={parseFloat(c.balanceDue || '0') > 0 ? 'text-amber-400' : 'text-emerald-400'}>
-                        ${parseFloat(c.balanceDue || '0').toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                        {formatMoney(c.balanceDue || '0', c.currency || companyProfile?.currency, {
+                          decimals: companyProfile?.roundingPrecision,
+                        })}
                       </span>
                     </td>
                     <td className="py-3 px-4">
@@ -410,8 +474,8 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
 
       {/* Customer Create/Edit Modal */}
       {isModalOpen && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg shadow-2xl p-6 space-y-4">
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl shadow-2xl p-6 space-y-4 my-6">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <h3 className="text-base font-bold text-slate-100 flex items-center gap-2">
                 <Building className="w-5 h-5 text-indigo-400" />
@@ -422,17 +486,37 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
               </button>
             </div>
 
-            <form onSubmit={handleSubmit} className="space-y-4">
-              <div className="grid grid-cols-2 gap-3">
+            {modalError && (
+              <div className="p-3 rounded-xl bg-rose-950/50 border border-rose-800 text-xs text-rose-200 flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                <span>{modalError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleSubmit} className="space-y-4 max-h-[78vh] overflow-y-auto pr-1">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Customer Code <span className="text-red-400">*</span>
+                    Customer Type
+                  </label>
+                  <select
+                    value={customerType}
+                    onChange={(e) => setCustomerType(e.target.value as CustomerType)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  >
+                    <option value="BUSINESS">Business</option>
+                    <option value="INDIVIDUAL">Individual</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Customer Code
                   </label>
                   <input
                     type="text"
-                    required
                     value={code}
                     onChange={(e) => setCode(e.target.value.toUpperCase())}
+                    placeholder="Auto (CUST-XXXX)"
                     className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 uppercase font-mono focus:outline-none focus:border-indigo-500"
                   />
                 </div>
@@ -444,32 +528,46 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
                     type="number"
                     min="0"
                     value={paymentTermsDays}
-                    onChange={(e) => setPaymentTermsDays(parseInt(e.target.value) || 30)}
+                    onChange={(e) => setPaymentTermsDays(parseInt(e.target.value, 10) || 30)}
                     className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
                   />
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">
-                  Customer / Business Name <span className="text-red-400">*</span>
-                </label>
-                <input
-                  type="text"
-                  required
-                  placeholder="e.g. Acme Corporation"
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
-                />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Customer / Business Name <span className="text-red-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    placeholder="e.g. Namma Media Partners"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Contact Person
+                  </label>
+                  <input
+                    type="text"
+                    placeholder="Primary contact name"
+                    value={contactPerson}
+                    onChange={(e) => setContactPerson(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1">Email Address</label>
                   <input
                     type="email"
-                    placeholder="billing@customer.com"
+                    placeholder="billing@customer.in"
                     value={email}
                     onChange={(e) => setEmail(e.target.value)}
                     className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
@@ -479,7 +577,7 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
                   <label className="block text-xs font-medium text-slate-300 mb-1">Phone Number</label>
                   <input
                     type="text"
-                    placeholder="+1 (555) 000-0000"
+                    placeholder="+91 98450 00000"
                     value={phone}
                     onChange={(e) => setPhone(e.target.value)}
                     className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
@@ -487,15 +585,68 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
                 <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Tax / VAT ID</label>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">Country</label>
+                  <select
+                    value={
+                      COMMON_CUSTOMER_COUNTRIES.some((c) => c.name === country) ? country : 'Other Country'
+                    }
+                    onChange={(e) => setCountry(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  >
+                    {COMMON_CUSTOMER_COUNTRIES.map((c) => (
+                      <option key={c.code} value={c.name}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">State</label>
                   <input
                     type="text"
-                    placeholder="e.g. US123456789"
-                    value={taxId}
-                    onChange={(e) => setTaxId(e.target.value)}
+                    placeholder="Karnataka"
+                    value={stateName}
+                    onChange={(e) => setStateName(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">City</label>
+                  <input
+                    type="text"
+                    placeholder="Bengaluru"
+                    value={city}
+                    onChange={(e) => setCity(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    {normalizeCountryKey(country) === 'IN' ? 'PIN Code' : 'Postal Code'}
+                  </label>
+                  <input
+                    type="text"
+                    placeholder={normalizeCountryKey(country) === 'IN' ? '560001' : 'Postal Code'}
+                    value={postalCode}
+                    onChange={(e) => setPostalCode(e.target.value)}
                     className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    {getCountryTaxLabel(country)} (Optional)
+                  </label>
+                  <input
+                    type="text"
+                    placeholder={normalizeCountryKey(country) === 'IN' ? '29ABCDE1234F1Z5' : 'Tax ID'}
+                    value={taxId}
+                    onChange={(e) => setTaxId(e.target.value.toUpperCase())}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 font-mono uppercase focus:outline-none focus:border-indigo-500"
                   />
                 </div>
                 <div>
@@ -513,18 +664,41 @@ export const CustomersPage: React.FC<CustomersPageProps> = ({
                 </div>
               </div>
 
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">Billing Address</label>
+                  <textarea
+                    rows={2}
+                    placeholder="Street, Area, Landmark"
+                    value={address}
+                    onChange={(e) => setAddress(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">Shipping Address (Optional)</label>
+                  <textarea
+                    rows={2}
+                    placeholder="If different from billing address"
+                    value={shippingAddress}
+                    onChange={(e) => setShippingAddress(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+              </div>
+
               <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">Billing Address</label>
+                <label className="block text-xs font-medium text-slate-300 mb-1">Customer Notes</label>
                 <textarea
                   rows={2}
-                  placeholder="Street, City, Country"
-                  value={address}
-                  onChange={(e) => setAddress(e.target.value)}
+                  placeholder="Account preferences or internal notes"
+                  value={notes}
+                  onChange={(e) => setNotes(e.target.value)}
                   className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
                 />
               </div>
 
-              <div className="flex items-center justify-end gap-3 pt-3">
+              <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
                 <button
                   type="button"
                   onClick={() => setIsModalOpen(false)}

@@ -9,6 +9,17 @@ export class CompanyBankAccountController {
   static async list(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const actor = req.user!;
+      const allowed = await CompanyBankAccountService.canViewBankDetails(actor);
+      if (!allowed) {
+        res.status(403).json({
+          error: {
+            code: 'FORBIDDEN_PERMISSION_DENIED',
+            message: 'Access denied: You do not have permission to view company bank account details.',
+          },
+        });
+        return;
+      }
+
       const isActiveQuery = req.query.isActive;
       const isActive =
         isActiveQuery !== undefined
@@ -31,6 +42,17 @@ export class CompanyBankAccountController {
   static async getById(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const actor = req.user!;
+      const allowed = await CompanyBankAccountService.canViewBankDetails(actor);
+      if (!allowed) {
+        res.status(403).json({
+          error: {
+            code: 'FORBIDDEN_PERMISSION_DENIED',
+            message: 'Access denied: You do not have permission to view company bank account details.',
+          },
+        });
+        return;
+      }
+
       const { id } = req.params;
       const account = await CompanyBankAccountService.getBankAccountById(actor, id);
       res.status(200).json(account);

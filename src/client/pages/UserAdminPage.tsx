@@ -15,10 +15,17 @@ import {
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
 import { previewStore } from '../services/previewStore.ts';
-import { UserListItem, AuthUser, Role, EmployeeItem } from '../../shared/types.ts';
+import { UserListItem, AuthUser, Role, EmployeeItem, CompanyProfile } from '../../shared/types.ts';
+import {
+  formatDateTimeInTimezone,
+  formatUtcTimestamp,
+  getEffectiveTimeZone,
+  getTimezoneShortName,
+} from '../../shared/timezone.ts';
 
 interface UserAdminPageProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
   initialOpenCreate?: boolean;
   onSwitchPreviewUser?: (user: AuthUser) => void;
 }
@@ -27,9 +34,12 @@ const ROLES: Role[] = ['SUPER_ADMIN', 'ADMIN', 'VICE_ADMIN', 'EMPLOYEE'];
 
 export const UserAdminPage: React.FC<UserAdminPageProps> = ({
   currentUser,
+  companyProfile,
   initialOpenCreate = false,
   onSwitchPreviewUser,
 }) => {
+  const timezone = getEffectiveTimeZone(companyProfile?.timezone);
+  const tzAbbr = getTimezoneShortName(timezone);
   const [users, setUsers] = useState<UserListItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -419,7 +429,7 @@ export const UserAdminPage: React.FC<UserAdminPageProps> = ({
                 <th className="px-5 py-3">User</th>
                 <th className="px-4 py-3">Role</th>
                 <th className="px-4 py-3">Account Status</th>
-                <th className="px-4 py-3">Last Active</th>
+                <th className="px-4 py-3">Last Active ({tzAbbr})</th>
                 <th className="px-4 py-3 text-right">Actions</th>
               </tr>
             </thead>
@@ -506,8 +516,13 @@ export const UserAdminPage: React.FC<UserAdminPageProps> = ({
                       </td>
 
                       {/* Last Active */}
-                      <td className="px-4 py-3.5 text-[11px] text-slate-400 font-mono">
-                        {u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleString() : 'Never logged in'}
+                      <td
+                        className="px-4 py-3.5 text-[11px] text-slate-400 font-mono tabular-nums"
+                        title={u.lastLoginAt ? `UTC: ${formatUtcTimestamp(u.lastLoginAt)}` : undefined}
+                      >
+                        {u.lastLoginAt
+                          ? formatDateTimeInTimezone(u.lastLoginAt, timezone, { includeZoneAbbr: true })
+                          : 'Never logged in'}
                       </td>
 
                       {/* Actions */}

@@ -64,6 +64,27 @@ export class BillingController {
     }
   }
 
+  static async update(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const invoice = await BillingService.updateInvoice(
+        actor,
+        req.params.id,
+        req.body,
+        req.headers['x-correlation-id'] as string
+      );
+      res.json(invoice);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: 'INVOICE_UPDATE_FAILED',
+          message: (err as Error).message,
+        },
+      });
+    }
+  }
+
   static async issue(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;

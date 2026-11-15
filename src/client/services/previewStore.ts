@@ -28,15 +28,32 @@ import {
   ReceiptStatus,
   QuotationItem,
   CreateQuotationRequest,
+  UpdateQuotationRequest,
   QuotationStatus,
   CreateCustomerRequest,
   UpdateCustomerRequest,
+  CustomerDuplicateMatch,
   CreateInvoiceRequest,
+  UpdateInvoiceRequest,
   CreateJournalEntryRequest,
   CreateAccountGroupRequest,
   CreateAccountLedgerRequest,
+  SuggestedLedgerCodeResponse,
   JournalStatus,
 } from '../../shared/types.ts';
+import { getDefaultAccountNature } from '../../shared/account-nature.ts';
+import {
+  getAllowedCodeRangeLabel,
+  getDefaultRootCodeForType,
+  suggestNextLedgerCode,
+  validateLedgerCodeForGroup,
+} from '../../shared/account-code.ts';
+import {
+  findDuplicateCustomers,
+  formatCustomerBillingAddress,
+  validateInlineCustomerInput,
+  validateTaxRegistrationNumber,
+} from '../../shared/customer-validation.ts';
 
 /**
  * In-memory store for temporary preview demo data.
@@ -1192,24 +1209,108 @@ class PreviewUserStore {
     return result;
   }
 
+  suggestAccountLedgerCode(groupId: string): SuggestedLedgerCodeResponse {
+    const grp = this.accountGroups.find((g) => g.id === groupId);
+    if (!grp) {
+      throw new Error('Target account group not found.');
+    }
+    const existingLedgerCodes = this.accountLedgers
+      .map((l) => l.code)
+      .filter((c): c is string => Boolean(c));
+    return {
+      groupId: grp.id,
+      groupCode: grp.code || getDefaultRootCodeForType(grp.rootType),
+      groupName: grp.name,
+      suggestedCode: suggestNextLedgerCode({
+        targetGroup: grp,
+        allGroups: this.accountGroups,
+        existingLedgerCodes,
+      }),
+      allowedRangeLabel: getAllowedCodeRangeLabel(grp, this.accountGroups),
+    };
+  }
+
   createAccountLedger(input: CreateAccountLedgerRequest): AccountLedgerItem {
     const grp = this.accountGroups.find((g) => g.id === input.groupId);
+    if (!grp) {
+      throw new Error('Target account group not found.');
+    }
+    const name = input.name.trim();
+    if (!name) {
+      throw new Error('Ledger name is required.');
+    }
     const ob = parseFloat(input.openingBalance || '0').toFixed(4);
-    const obType =
-      input.openingBalanceType ||
-      (grp?.rootType === 'LIABILITY' ||
-      grp?.rootType === 'EQUITY' ||
-      grp?.rootType === 'INCOME'
-        ? 'CREDIT'
-        : 'DEBIT');
+    const derivedNature = getDefaultAccountNature(grp);
+    if (input.openingBalanceType && input.openingBalanceType !== derivedNature) {
+      throw new Error(
+        `Account nature "${input.openingBalanceType}" is not allowed for account group "${grp.name}". Default nature must be ${derivedNature}.`
+      );
+    }
+
+    const existingCodes = this.accountLedgers
+      .map((l) => l.code)
+      .filter((c): c is string => Boolean(c));
+    const rawCode = input.code ? input.code.trim() : '';
+    const isAuto = !rawCode || input.codeSource === 'AUTO';
+
+    let resolvedCode: string;
+    if (isAuto) {
+      if (rawCode) {
+        const check = validateLedgerCodeForGroup({
+          code: rawCode,
+          targetGroup: grp,
+          allGroups: this.accountGroups,
+        });
+        if (!check.valid) {
+          throw new Error(check.error || 'Invalid ledger code.');
+        }
+        const usedSet = new Set(existingCodes.map((c) => c.toUpperCase()));
+        resolvedCode = usedSet.has(check.normalizedCode.toUpperCase())
+          ? suggestNextLedgerCode({
+              targetGroup: grp,
+              allGroups: this.accountGroups,
+              existingLedgerCodes: existingCodes,
+            })
+          : check.normalizedCode;
+      } else {
+        resolvedCode = suggestNextLedgerCode({
+          targetGroup: grp,
+          allGroups: this.accountGroups,
+          existingLedgerCodes: existingCodes,
+        });
+      }
+    } else {
+      const check = validateLedgerCodeForGroup({
+        code: rawCode,
+        targetGroup: grp,
+        allGroups: this.accountGroups,
+      });
+      if (!check.valid) {
+        throw new Error(check.error || 'Invalid ledger code.');
+      }
+      resolvedCode = check.normalizedCode;
+    }
+
+    if (this.accountLedgers.some((l) => l.name.toLowerCase() === name.toLowerCase())) {
+      throw new Error(`A ledger with name "${name}" already exists.`);
+    }
+    if (
+      this.accountLedgers.some(
+        (l) => l.code && l.code.toUpperCase() === resolvedCode.toUpperCase()
+      )
+    ) {
+      throw new Error(`Ledger code "${resolvedCode}" already exists.`);
+    }
+
+    const obType = derivedNature;
     const newLedger: AccountLedgerItem = {
-      id: `preview-ldr-${Date.now()}`,
+      id: `preview-ldr-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
       companyId: 'preview-company-id',
       groupId: input.groupId,
-      groupName: grp?.name || 'General',
-      rootType: grp?.rootType || 'ASSET',
-      code: input.code ? input.code.trim() : null,
-      name: input.name.trim(),
+      groupName: grp.name,
+      rootType: grp.rootType,
+      code: resolvedCode,
+      name,
       description: input.description ? input.description.trim() : null,
       currency: input.currency || 'USD',
       isActive: true,
@@ -1411,22 +1512,108 @@ class PreviewUserStore {
     return result;
   }
 
+  checkCustomerDuplicates(
+    candidate: {
+      name?: string | null;
+      email?: string | null;
+      phone?: string | null;
+      taxId?: string | null;
+    },
+    excludeCustomerId?: string
+  ): CustomerDuplicateMatch[] {
+    return findDuplicateCustomers(candidate, this.customers, excludeCustomerId);
+  }
+
+  private generateNextCustomerCode(): string {
+    let maxNum = this.customers.length;
+    for (const c of this.customers) {
+      const m = c.code.match(/^CUST-(\d+)$/i);
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (!Number.isNaN(n) && n > maxNum) maxNum = n;
+      }
+    }
+    let candidate = `CUST-${String(maxNum + 1).padStart(4, '0')}`;
+    while (this.customers.some((c) => c.code.toUpperCase() === candidate)) {
+      maxNum += 1;
+      candidate = `CUST-${String(maxNum + 1).padStart(4, '0')}`;
+    }
+    return candidate;
+  }
+
   createCustomer(input: CreateCustomerRequest): CustomerItem {
+    const validation = validateInlineCustomerInput({
+      name: input.name,
+      customerType: input.customerType,
+      email: input.email,
+      phone: input.phone,
+      country: input.country,
+      postalCode: input.postalCode,
+      taxId: input.taxId,
+    });
+    if (!validation.valid) {
+      const firstErr = Object.values(validation.errors)[0] || 'Invalid customer fields.';
+      throw new Error(firstErr);
+    }
+
+    const taxCheck = validateTaxRegistrationNumber(input.taxId, input.country);
+    const normalizedTaxId = taxCheck.normalized;
+
+    const duplicates = findDuplicateCustomers(
+      {
+        name: input.name,
+        email: input.email,
+        phone: input.phone,
+        taxId: normalizedTaxId,
+      },
+      this.customers
+    );
+    if (duplicates.length > 0) {
+      const first = duplicates[0];
+      throw new Error(
+        `Possible duplicate customer detected: "${first.name}" (${first.code}) matches on ${first.matchedOn.join(', ')}.`
+      );
+    }
+
+    const code = input.code && input.code.trim()
+      ? input.code.trim().toUpperCase()
+      : this.generateNextCustomerCode();
+
+    if (this.customers.some((c) => c.code.toUpperCase() === code)) {
+      throw new Error(`Customer code "${code}" already exists.`);
+    }
+
     const arLedger = input.receivableLedgerId
       ? this.accountLedgers.find((l) => l.id === input.receivableLedgerId)
       : this.accountLedgers.find((l) => l.name.toLowerCase().includes('receivable'));
 
+    const formattedAddress = formatCustomerBillingAddress({
+      address: input.address,
+      city: input.city,
+      state: input.state,
+      postalCode: input.postalCode,
+      country: input.country,
+    });
+
     const newCustomer: CustomerItem = {
       id: `preview-cust-${Date.now()}`,
       companyId: 'preview-company-id',
-      code: input.code.trim().toUpperCase(),
+      code,
       name: input.name.trim(),
+      customerType: input.customerType || 'BUSINESS',
+      contactPerson: input.contactPerson ? input.contactPerson.trim() : null,
       email: input.email ? input.email.trim() : null,
       phone: input.phone ? input.phone.trim() : null,
-      address: input.address ? input.address.trim() : null,
-      taxId: input.taxId ? input.taxId.trim() : null,
-      currency: 'USD',
-      paymentTermsDays: input.paymentTermsDays || 30,
+      address: formattedAddress,
+      shippingAddress: input.shippingAddress ? input.shippingAddress.trim() : null,
+      country: input.country ? input.country.trim() : null,
+      state: input.state ? input.state.trim() : null,
+      city: input.city ? input.city.trim() : null,
+      postalCode: input.postalCode ? input.postalCode.trim() : null,
+      taxId: normalizedTaxId,
+      notes: input.notes ? input.notes.trim() : null,
+      currency: (input.currency || 'INR').trim().toUpperCase(),
+      paymentTermsDays: input.paymentTermsDays ?? 30,
       receivableLedgerId: arLedger ? arLedger.id : null,
       receivableLedgerName: arLedger ? arLedger.name : null,
       isActive: true,
@@ -1445,18 +1632,104 @@ class PreviewUserStore {
       throw new Error(`Customer with id "${id}" not found.`);
     }
     const current = this.customers[idx];
+
+    const nextCountry = input.country !== undefined ? input.country : current.country;
+    const nextTaxIdRaw = input.taxId !== undefined ? input.taxId : current.taxId;
+    const validation = validateInlineCustomerInput({
+      name: input.name !== undefined ? input.name : current.name,
+      customerType: input.customerType || current.customerType,
+      email: input.email !== undefined ? input.email : current.email,
+      phone: input.phone !== undefined ? input.phone : current.phone,
+      country: nextCountry,
+      postalCode: input.postalCode !== undefined ? input.postalCode : current.postalCode,
+      taxId: nextTaxIdRaw,
+    });
+    if (!validation.valid) {
+      const firstErr = Object.values(validation.errors)[0] || 'Invalid customer fields.';
+      throw new Error(firstErr);
+    }
+
+    const taxCheck = validateTaxRegistrationNumber(nextTaxIdRaw, nextCountry);
+    const normalizedTaxId = taxCheck.normalized;
+
+    const duplicates = findDuplicateCustomers(
+      {
+        name: input.name !== undefined ? input.name : current.name,
+        email: input.email !== undefined ? input.email : current.email,
+        phone: input.phone !== undefined ? input.phone : current.phone,
+        taxId: normalizedTaxId,
+      },
+      this.customers,
+      id
+    );
+    if (duplicates.length > 0) {
+      const first = duplicates[0];
+      throw new Error(
+        `Update conflicts with existing customer "${first.name}" (${first.code}) on ${first.matchedOn.join(', ')}.`
+      );
+    }
+
     const arLedger = input.receivableLedgerId
       ? this.accountLedgers.find((l) => l.id === input.receivableLedgerId)
       : this.accountLedgers.find((l) => l.id === current.receivableLedgerId);
+
+    const nextAddress =
+      input.address !== undefined ||
+      input.city !== undefined ||
+      input.state !== undefined ||
+      input.postalCode !== undefined ||
+      input.country !== undefined
+        ? formatCustomerBillingAddress({
+            address: input.address !== undefined ? input.address : current.address,
+            city: input.city !== undefined ? input.city : current.city,
+            state: input.state !== undefined ? input.state : current.state,
+            postalCode: input.postalCode !== undefined ? input.postalCode : current.postalCode,
+            country: nextCountry,
+          })
+        : current.address;
 
     const updated: CustomerItem = {
       ...current,
       code: input.code ? input.code.trim().toUpperCase() : current.code,
       name: input.name !== undefined ? input.name.trim() : current.name,
+      customerType: input.customerType !== undefined ? input.customerType : current.customerType,
+      contactPerson:
+        input.contactPerson !== undefined
+          ? input.contactPerson
+            ? input.contactPerson.trim()
+            : null
+          : current.contactPerson,
       email: input.email !== undefined ? (input.email ? input.email.trim() : null) : current.email,
       phone: input.phone !== undefined ? (input.phone ? input.phone.trim() : null) : current.phone,
-      address: input.address !== undefined ? (input.address ? input.address.trim() : null) : current.address,
-      taxId: input.taxId !== undefined ? (input.taxId ? input.taxId.trim() : null) : current.taxId,
+      address: nextAddress,
+      shippingAddress:
+        input.shippingAddress !== undefined
+          ? input.shippingAddress
+            ? input.shippingAddress.trim()
+            : null
+          : current.shippingAddress,
+      country: nextCountry ? nextCountry.trim() : null,
+      state:
+        input.state !== undefined
+          ? input.state
+            ? input.state.trim()
+            : null
+          : current.state,
+      city:
+        input.city !== undefined ? (input.city ? input.city.trim() : null) : current.city,
+      postalCode:
+        input.postalCode !== undefined
+          ? input.postalCode
+            ? input.postalCode.trim()
+            : null
+          : current.postalCode,
+      taxId: normalizedTaxId,
+      notes:
+        input.notes !== undefined
+          ? input.notes
+            ? input.notes.trim()
+            : null
+          : current.notes,
       paymentTermsDays:
         input.paymentTermsDays !== undefined ? input.paymentTermsDays : current.paymentTermsDays,
       receivableLedgerId: arLedger ? arLedger.id : null,
@@ -1533,6 +1806,9 @@ class PreviewUserStore {
     });
 
     const totalNum = subtotalNum - discNum + taxNum;
+    const linkedCust = input.customerId
+      ? this.customers.find((c) => c.id === input.customerId)
+      : undefined;
 
     const newQuotation: QuotationItem = {
       id: `preview-qt-${Date.now()}`,
@@ -1543,10 +1819,11 @@ class PreviewUserStore {
       customerEmail: input.customerEmail || null,
       customerPhone: input.customerPhone || null,
       customerAddress: input.customerAddress || null,
+      customerTaxId: linkedCust?.taxId || null,
       quotationDate: input.quotationDate,
       validUntilDate: input.validUntilDate,
       status: 'DRAFT',
-      currency: 'USD',
+      currency: (input.currency || 'INR').trim().toUpperCase(),
       subtotal: subtotalNum.toFixed(4),
       discountTotal: discNum.toFixed(4),
       taxTotal: taxNum.toFixed(4),
@@ -1562,6 +1839,91 @@ class PreviewUserStore {
 
     this.quotations = [newQuotation, ...this.quotations];
     return newQuotation;
+  }
+
+  updateQuotation(id: string, input: UpdateQuotationRequest): QuotationItem {
+    const idx = this.quotations.findIndex((q) => q.id === id);
+    if (idx === -1) {
+      throw new Error(`Quotation with id "${id}" not found.`);
+    }
+    const current = this.quotations[idx];
+    if (current.status !== 'DRAFT') {
+      throw new Error('Only DRAFT quotations can be edited.');
+    }
+
+    let lines = current.lines;
+    let subtotalStr = current.subtotal;
+    let discStr = current.discountTotal;
+    let taxStr = current.taxTotal;
+    let totalStr = current.total;
+
+    if (input.lines && input.lines.length > 0) {
+      let subtotalNum = 0;
+      let discNum = 0;
+      let taxNum = 0;
+      lines = input.lines.map((l, i) => {
+        const qty = parseFloat(String(l.quantity) || '0');
+        const unit = parseFloat(String(l.unitPrice) || '0');
+        const disc = parseFloat(String(l.discountAmount) || '0');
+        const rate = parseFloat(String(l.taxRate) || '0');
+        const base = Math.max(0, qty * unit - disc);
+        const tax = base * (rate / 100);
+        const lineTot = base + tax;
+
+        subtotalNum += qty * unit;
+        discNum += disc;
+        taxNum += tax;
+
+        return {
+          id: `qt-line-${Date.now()}-${i + 1}`,
+          lineNumber: i + 1,
+          itemDescription: l.itemDescription.trim(),
+          quantity: qty.toFixed(4),
+          unitPrice: unit.toFixed(4),
+          discountAmount: disc.toFixed(4),
+          taxRate: rate.toFixed(4),
+          taxAmount: tax.toFixed(4),
+          lineTotal: lineTot.toFixed(4),
+        };
+      });
+      const totalNum = subtotalNum - discNum + taxNum;
+      subtotalStr = subtotalNum.toFixed(4);
+      discStr = discNum.toFixed(4);
+      taxStr = taxNum.toFixed(4);
+      totalStr = totalNum.toFixed(4);
+    }
+
+    const nextCustId = input.customerId !== undefined ? input.customerId : current.customerId;
+    const linkedCust = nextCustId
+      ? this.customers.find((c) => c.id === nextCustId)
+      : undefined;
+
+    const updated: QuotationItem = {
+      ...current,
+      customerId: nextCustId,
+      customerName:
+        input.customerName !== undefined ? input.customerName.trim() : current.customerName,
+      customerEmail:
+        input.customerEmail !== undefined ? input.customerEmail : current.customerEmail,
+      customerPhone:
+        input.customerPhone !== undefined ? input.customerPhone : current.customerPhone,
+      customerAddress:
+        input.customerAddress !== undefined ? input.customerAddress : current.customerAddress,
+      customerTaxId: linkedCust?.taxId || current.customerTaxId || null,
+      quotationDate: input.quotationDate || current.quotationDate,
+      validUntilDate: input.validUntilDate || current.validUntilDate,
+      notes: input.notes !== undefined ? input.notes : current.notes,
+      terms: input.terms !== undefined ? input.terms : current.terms,
+      documentTitle:
+        input.documentTitle !== undefined ? input.documentTitle : current.documentTitle,
+      subtotal: subtotalStr,
+      discountTotal: discStr,
+      taxTotal: taxStr,
+      total: totalStr,
+      lines,
+    };
+    this.quotations[idx] = updated;
+    return updated;
   }
 
   updateQuotationStatus(id: string, status: QuotationStatus): QuotationItem {
@@ -1585,6 +1947,9 @@ class PreviewUserStore {
     const now = new Date().toISOString();
     const today = now.split('T')[0];
     const dueDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    const linkedCust = q.customerId
+      ? this.customers.find((c) => c.id === q.customerId)
+      : undefined;
 
     const lines = q.lines.map((l, idx) => ({
       id: `line-inv-${Date.now()}-${idx + 1}`,
@@ -1610,11 +1975,11 @@ class PreviewUserStore {
       customerEmail: q.customerEmail,
       customerPhone: q.customerPhone,
       customerAddress: q.customerAddress,
-      customerTaxId: null,
+      customerTaxId: q.customerTaxId || linkedCust?.taxId || null,
       invoiceDate: today,
       dueDate,
       status: 'DRAFT',
-      currency: 'USD',
+      currency: q.currency || 'INR',
       subtotal: q.subtotal,
       discountTotal: q.discountTotal,
       taxTotal: q.taxTotal,
@@ -1737,7 +2102,7 @@ class PreviewUserStore {
       invoiceDate: input.invoiceDate,
       dueDate: input.dueDate,
       status: 'DRAFT',
-      currency: 'USD',
+      currency: (input.currency || 'INR').trim().toUpperCase(),
       subtotal: subtotalNum.toFixed(4),
       discountTotal: discNum.toFixed(4),
       taxTotal: taxNum.toFixed(4),
@@ -1761,6 +2126,97 @@ class PreviewUserStore {
 
     this.invoices = [newInvoice, ...this.invoices];
     return newInvoice;
+  }
+
+  updateInvoice(id: string, input: UpdateInvoiceRequest): InvoiceItem {
+    const idx = this.invoices.findIndex((inv) => inv.id === id);
+    if (idx === -1) {
+      throw new Error(`Invoice with id "${id}" not found.`);
+    }
+    const current = this.invoices[idx];
+    if (current.status !== 'DRAFT') {
+      throw new Error('Only DRAFT invoices can be edited.');
+    }
+
+    let lines = current.lines;
+    let subtotalStr = current.subtotal;
+    let discStr = current.discountTotal;
+    let taxStr = current.taxTotal;
+    let totalStr = current.total;
+
+    if (input.lines && input.lines.length > 0) {
+      let subtotalNum = 0;
+      let discNum = 0;
+      let taxNum = 0;
+
+      lines = input.lines.map((l, i) => {
+        const qty = parseFloat(String(l.quantity) || '0');
+        const unit = parseFloat(String(l.unitPrice) || '0');
+        const disc = parseFloat(String(l.discountAmount) || '0');
+        const rate = parseFloat(String(l.taxRate) || '0');
+        const base = Math.max(0, qty * unit - disc);
+        const tax = base * (rate / 100);
+        const lineTot = base + tax;
+
+        subtotalNum += qty * unit;
+        discNum += disc;
+        taxNum += tax;
+
+        const revLedger = l.revenueLedgerId
+          ? this.accountLedgers.find((al) => al.id === l.revenueLedgerId)
+          : this.accountLedgers.find((al) => al.rootType === 'INCOME');
+
+        return {
+          id: `line-inv-${Date.now()}-${i + 1}`,
+          lineNumber: i + 1,
+          itemDescription: l.itemDescription.trim(),
+          quantity: qty.toFixed(4),
+          unitPrice: unit.toFixed(4),
+          discountAmount: disc.toFixed(4),
+          taxRate: rate.toFixed(4),
+          taxAmount: tax.toFixed(4),
+          lineTotal: lineTot.toFixed(4),
+          revenueLedgerId: revLedger ? revLedger.id : null,
+          revenueLedgerName: revLedger ? revLedger.name : null,
+        };
+      });
+
+      const totalNum = subtotalNum - discNum + taxNum;
+      subtotalStr = subtotalNum.toFixed(4);
+      discStr = discNum.toFixed(4);
+      taxStr = taxNum.toFixed(4);
+      totalStr = totalNum.toFixed(4);
+    }
+
+    const updated: InvoiceItem = {
+      ...current,
+      customerId: input.customerId !== undefined ? input.customerId : current.customerId,
+      customerName:
+        input.customerName !== undefined ? input.customerName.trim() : current.customerName,
+      customerEmail:
+        input.customerEmail !== undefined ? input.customerEmail : current.customerEmail,
+      customerPhone:
+        input.customerPhone !== undefined ? input.customerPhone : current.customerPhone,
+      customerAddress:
+        input.customerAddress !== undefined ? input.customerAddress : current.customerAddress,
+      customerTaxId:
+        input.customerTaxId !== undefined ? input.customerTaxId : current.customerTaxId,
+      invoiceDate: input.invoiceDate || current.invoiceDate,
+      dueDate: input.dueDate || current.dueDate,
+      notes: input.notes !== undefined ? input.notes : current.notes,
+      terms: input.terms !== undefined ? input.terms : current.terms,
+      documentTitle:
+        input.documentTitle !== undefined ? input.documentTitle : current.documentTitle,
+      subtotal: subtotalStr,
+      discountTotal: discStr,
+      taxTotal: taxStr,
+      total: totalStr,
+      balanceDue: totalStr,
+      lines,
+    };
+
+    this.invoices[idx] = updated;
+    return updated;
   }
 
   issueInvoice(

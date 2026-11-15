@@ -15,6 +15,7 @@ import { LeaveService } from './leave.service.js';
 import { JournalService } from './journal.service.js';
 import { AuditService } from './audit.service.js';
 import { PermissionService } from './permission.service.js';
+import { CompanyService } from './company.service.js';
 
 export class PayrollService {
   /**
@@ -571,9 +572,10 @@ export class PayrollService {
           throw err;
         }
 
+        const baseCurrency = await CompanyService.getBaseCurrency(actor.companyId);
         const payslipNotes = leaveSummary.warnings && leaveSummary.warnings.length > 0
-          ? `Reconciled: Excess Leave -$${leaveSummary.excessLeaveDeduction}, Short Hours -$${leaveSummary.shortHoursDeduction}. ${leaveSummary.warnings.join(' ')}`
-          : `Reconciled: Excess Leave -$${leaveSummary.excessLeaveDeduction}, Short Hours -$${leaveSummary.shortHoursDeduction}.`;
+          ? `Reconciled: Excess Leave -${baseCurrency} ${leaveSummary.excessLeaveDeduction}, Short Hours -${baseCurrency} ${leaveSummary.shortHoursDeduction}. ${leaveSummary.warnings.join(' ')}`
+          : `Reconciled: Excess Leave -${baseCurrency} ${leaveSummary.excessLeaveDeduction}, Short Hours -${baseCurrency} ${leaveSummary.shortHoursDeduction}.`;
 
         await tx.payslip.create({
           data: {

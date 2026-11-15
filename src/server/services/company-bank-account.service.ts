@@ -20,8 +20,28 @@ import {
 } from '../../shared/types.js';
 import { EncryptionService } from '../security/encryption.service.js';
 import { AuditService } from './audit.service.js';
+import { CompanyService } from './company.service.js';
+import { PermissionService } from './permission.service.js';
 
 export class CompanyBankAccountService {
+  /**
+   * Ensures only users with billing, accounting, or company-admin privileges can view company bank details.
+   * Standard EMPLOYEE users have COMPANY:VIEW by default and must NOT be exposed to company bank details.
+   */
+  public static async canViewBankDetails(actor: AuthUser): Promise<boolean> {
+    if (!actor || !actor.isActive) return false;
+    if (actor.role === 'SUPER_ADMIN') return true;
+
+    const checks = await Promise.all([
+      PermissionService.hasPermission(actor.companyId, actor.role, 'COMPANY', 'EDIT'),
+      PermissionService.hasPermission(actor.companyId, actor.role, 'INVOICE', 'VIEW'),
+      PermissionService.hasPermission(actor.companyId, actor.role, 'QUOTATION', 'VIEW'),
+      PermissionService.hasPermission(actor.companyId, actor.role, 'RECEIPT', 'VIEW'),
+      PermissionService.hasPermission(actor.companyId, actor.role, 'ACCOUNTING', 'VIEW'),
+    ]);
+
+    return checks.some(Boolean);
+  }
   /**
    * Helper to format database record into masked API response
    */
@@ -81,7 +101,11 @@ export class CompanyBankAccountService {
       throw err;
     }
 
-    const currency = (input.currency || 'USD').trim().toUpperCase();
+    const currency = (
+      input.currency || (await CompanyService.getBaseCurrency(actor.companyId))
+    )
+      .trim()
+      .toUpperCase();
     if (!/^[A-Z]{3}$/.test(currency)) {
       const err = new Error('currency must be a valid 3-letter ISO code (e.g. USD, EUR, INR).');
       (err as { statusCode?: number }).statusCode = 400;

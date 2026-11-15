@@ -9,6 +9,7 @@ import {
 } from '../../shared/types.js';
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
 import { AuditService } from './audit.service.js';
+import { CompanyService } from './company.service.js';
 import { DocumentSequenceService } from './document-sequence.service.js';
 
 export class QuotationService {
@@ -69,6 +70,7 @@ export class QuotationService {
       orderBy: [{ quotationDate: 'desc' }, { quotationNumber: 'desc' }],
       include: {
         createdByUser: { select: { fullName: true } },
+        customer: { select: { taxId: true } },
         lines: { orderBy: { lineNumber: 'asc' } },
       },
     });
@@ -82,6 +84,7 @@ export class QuotationService {
       customerEmail: q.customerEmail,
       customerPhone: q.customerPhone,
       customerAddress: q.customerAddress,
+      customerTaxId: (q as { customer?: { taxId?: string | null } | null }).customer?.taxId || null,
       quotationDate: q.quotationDate.toISOString().split('T')[0],
       validUntilDate: q.validUntilDate.toISOString().split('T')[0],
       status: q.status,
@@ -118,6 +121,7 @@ export class QuotationService {
       where: { id },
       include: {
         createdByUser: { select: { fullName: true } },
+        customer: { select: { taxId: true } },
         lines: { orderBy: { lineNumber: 'asc' } },
       },
     });
@@ -137,6 +141,7 @@ export class QuotationService {
       customerEmail: q.customerEmail,
       customerPhone: q.customerPhone,
       customerAddress: q.customerAddress,
+      customerTaxId: (q as { customer?: { taxId?: string | null } | null }).customer?.taxId || null,
       quotationDate: q.quotationDate.toISOString().split('T')[0],
       validUntilDate: q.validUntilDate.toISOString().split('T')[0],
       status: q.status,
@@ -277,6 +282,10 @@ export class QuotationService {
 
     const total = subtotal.minus(discountTotal).plus(taxTotal);
 
+    const currency =
+      input.currency?.trim().toUpperCase() ||
+      (await CompanyService.getBaseCurrency(actor.companyId));
+
     const created = await prisma.$transaction(async (tx) => {
       const seq = await DocumentSequenceService.allocateNextNumber(actor.companyId, 'QUOTATION', {
         date: qDate,
@@ -296,6 +305,7 @@ export class QuotationService {
           quotationDate: qDate,
           validUntilDate: vDate,
           status: 'DRAFT',
+          currency,
           subtotal,
           discountTotal,
           taxTotal,

@@ -29,6 +29,8 @@ import {
   CompanyProfile,
   CreateCustomerReceiptRequest,
 } from '../../shared/types.ts';
+import { formatMoney, getCurrencySymbol } from '../../shared/currency.ts';
+import { PrintableDocumentView } from '../components/print/PrintableDocumentView.tsx';
 
 interface ReceiptsPageProps {
   currentUser: AuthUser;
@@ -251,6 +253,9 @@ export const ReceiptsPage: React.FC<ReceiptsPageProps> = ({
 
   const receiptAmountNum = parseFloat(amount) || 0;
   const unallocatedAmount = Math.max(0, receiptAmountNum - totalAllocated);
+  const baseCurrency = companyProfile?.currency || 'INR';
+  const roundingPrecision = companyProfile?.roundingPrecision ?? 2;
+  const currencySymbol = getCurrencySymbol(baseCurrency);
 
   // Create Receipt Submit
   const handleCreateSubmit = async (e: React.FormEvent) => {
@@ -282,7 +287,7 @@ export const ReceiptsPage: React.FC<ReceiptsPageProps> = ({
       const bal = parseFloat(inv.balanceDue) || 0;
       if (alloc > bal + 0.0001) {
         setErrorMessage(
-          `Allocation for Invoice ${inv.invoiceNumber} ($${alloc.toFixed(2)}) exceeds balance due ($${bal.toFixed(2)}).`
+          `Allocation for Invoice ${inv.invoiceNumber} (${formatMoney(alloc, baseCurrency, { decimals: roundingPrecision })}) exceeds balance due (${formatMoney(bal, baseCurrency, { decimals: roundingPrecision })}).`
         );
         return;
       }
@@ -584,11 +589,11 @@ export const ReceiptsPage: React.FC<ReceiptsPageProps> = ({
                         </div>
                       )}
                     </td>
-                    <td className="py-3 px-4 text-right font-mono font-semibold text-emerald-400">
-                      ${parseFloat(rct.amount).toFixed(2)}
+                    <td className="py-3 px-4 text-right font-mono font-semibold text-emerald-400 tabular-nums">
+                      {formatMoney(rct.amount, rct.currency || baseCurrency, { decimals: roundingPrecision })}
                     </td>
-                    <td className="py-3 px-4 text-right font-mono text-slate-300">
-                      ${parseFloat(rct.allocatedTotal).toFixed(2)}
+                    <td className="py-3 px-4 text-right font-mono text-slate-300 tabular-nums">
+                      {formatMoney(rct.allocatedTotal, rct.currency || baseCurrency, { decimals: roundingPrecision })}
                     </td>
                     <td className="py-3 px-4 text-center">{getStatusBadge(rct.status)}</td>
                     <td className="py-3 px-4 text-center">
@@ -691,7 +696,7 @@ export const ReceiptsPage: React.FC<ReceiptsPageProps> = ({
 
                 <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Amount Received <span className="text-rose-400">*</span>
+                    Amount Received ({currencySymbol}) <span className="text-rose-400">*</span>
                   </label>
                   <input
                     type="number"
@@ -766,10 +771,10 @@ export const ReceiptsPage: React.FC<ReceiptsPageProps> = ({
                   <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">
                     Outstanding Invoices to Settle
                   </h4>
-                  <div className="text-xs font-mono text-slate-300">
-                    Allocated: <span className="text-emerald-400 font-bold">${totalAllocated.toFixed(2)}</span> / ${receiptAmountNum.toFixed(2)}
+                  <div className="text-xs font-mono text-slate-300 tabular-nums">
+                    Allocated: <span className="text-emerald-400 font-bold">{formatMoney(totalAllocated, baseCurrency, { decimals: roundingPrecision })}</span> / {formatMoney(receiptAmountNum, baseCurrency, { decimals: roundingPrecision })}
                     {unallocatedAmount > 0 && (
-                      <span className="text-slate-500 ml-2">(${unallocatedAmount.toFixed(2)} on account)</span>
+                      <span className="text-slate-500 ml-2">({formatMoney(unallocatedAmount, baseCurrency, { decimals: roundingPrecision })} on account)</span>
                     )}
                   </div>
                 </div>
@@ -802,9 +807,9 @@ export const ReceiptsPage: React.FC<ReceiptsPageProps> = ({
                               {inv.invoiceNumber}
                             </td>
                             <td className="py-2 px-3 text-slate-400">{inv.invoiceDate}</td>
-                            <td className="py-2 px-3 text-right font-mono">${parseFloat(inv.total).toFixed(2)}</td>
-                            <td className="py-2 px-3 text-right font-mono font-semibold text-amber-400">
-                              ${parseFloat(inv.balanceDue).toFixed(2)}
+                            <td className="py-2 px-3 text-right font-mono tabular-nums">{formatMoney(inv.total, baseCurrency, { decimals: roundingPrecision })}</td>
+                            <td className="py-2 px-3 text-right font-mono font-semibold text-amber-400 tabular-nums">
+                              {formatMoney(inv.balanceDue, baseCurrency, { decimals: roundingPrecision })}
                             </td>
                             <td className="py-2 px-3 text-right">
                               <input
@@ -853,7 +858,7 @@ export const ReceiptsPage: React.FC<ReceiptsPageProps> = ({
                 </div>
                 <p className="text-[11px] text-slate-300 mt-1">
                   Saving this receipt will immediately post an atomic balanced double-entry voucher:
-                  Debit Cash/Bank (${receiptAmountNum.toFixed(2)}) & Credit Accounts Receivable (${receiptAmountNum.toFixed(2)}).
+                  Debit Cash/Bank ({formatMoney(receiptAmountNum, baseCurrency, { decimals: roundingPrecision })}) &amp; Credit Accounts Receivable ({formatMoney(receiptAmountNum, baseCurrency, { decimals: roundingPrecision })}).
                 </p>
               </div>
 
@@ -936,148 +941,15 @@ export const ReceiptsPage: React.FC<ReceiptsPageProps> = ({
 
       {/* View / Print Receipt Voucher Modal */}
       {selectedReceipt && isPrintModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 overflow-y-auto">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full p-8 space-y-6 shadow-2xl my-8">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-4 print:hidden">
-              <div className="flex items-center gap-3">
-                <span className="text-xs font-semibold text-slate-400">Payment Voucher</span>
-                {getStatusBadge(selectedReceipt.status)}
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => window.print()}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-lg cursor-pointer"
-                >
-                  <Printer className="w-3.5 h-3.5" /> Print Voucher
-                </button>
-                <button
-                  onClick={() => {
-                    setSelectedReceipt(null);
-                    setIsPrintModalOpen(false);
-                  }}
-                  className="p-1.5 text-slate-400 hover:text-white cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-            </div>
-
-            {/* Voucher Body */}
-            <div className="space-y-6 text-slate-200">
-              <div className="flex justify-between items-start">
-                <div>
-                  <h1 className="text-2xl font-black tracking-tight text-white uppercase">
-                    OFFICIAL RECEIPT
-                  </h1>
-                  <p className="text-xs font-mono text-emerald-400 mt-0.5">
-                    {selectedReceipt.receiptNumber}
-                  </p>
-                  {selectedReceipt.journalVoucherNumber && (
-                    <p className="text-[11px] font-mono text-slate-400 mt-1">
-                      GL Voucher: {selectedReceipt.journalVoucherNumber}
-                    </p>
-                  )}
-                </div>
-
-                <div className="text-right">
-                  <div className="text-sm font-bold text-white">
-                    {companyProfile?.legalName || companyProfile?.name || 'CoreERP Enterprise'}
-                  </div>
-                  {companyProfile?.address && (
-                    <div className="text-xs text-slate-400 max-w-xs whitespace-pre-line">
-                      {companyProfile.address}
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Receipt Details Box */}
-              <div className="p-4 rounded-xl bg-slate-800/40 border border-slate-800 grid grid-cols-2 gap-4 text-xs">
-                <div>
-                  <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">
-                    Received From:
-                  </div>
-                  <div className="text-sm font-bold text-white mt-0.5">{selectedReceipt.customerName}</div>
-                </div>
-                <div className="text-right">
-                  <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">
-                    Receipt Date:
-                  </div>
-                  <div className="text-xs font-medium text-white mt-0.5">{selectedReceipt.receiptDate}</div>
-                </div>
-                <div>
-                  <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">
-                    Payment Method:
-                  </div>
-                  <div className="text-xs text-slate-300 capitalize mt-0.5">
-                    {selectedReceipt.paymentMethod.replace('_', ' ').toLowerCase()}
-                  </div>
-                </div>
-                <div className="text-right">
-                  <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">
-                    Reference / Transaction #:
-                  </div>
-                  <div className="text-xs font-mono text-slate-300 mt-0.5">
-                    {selectedReceipt.referenceNumber || '—'}
-                  </div>
-                </div>
-              </div>
-
-              {/* Amount Box */}
-              <div className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-900/60 flex items-center justify-between">
-                <span className="text-xs font-bold uppercase tracking-wider text-emerald-300">
-                  Amount Received
-                </span>
-                <span className="text-xl font-bold font-mono text-emerald-400">
-                  ${parseFloat(selectedReceipt.amount).toFixed(2)}
-                </span>
-              </div>
-
-              {/* Allocations Table */}
-              {selectedReceipt.allocations && selectedReceipt.allocations.length > 0 && (
-                <div className="space-y-2">
-                  <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">
-                    Invoice Allocations
-                  </div>
-                  <div className="border border-slate-800 rounded-xl overflow-hidden">
-                    <table className="w-full text-left text-xs">
-                      <thead className="bg-slate-800/80 text-slate-400 uppercase text-[10px]">
-                        <tr>
-                          <th className="py-2 px-3">Invoice #</th>
-                          <th className="py-2 px-3 text-right">Invoice Total</th>
-                          <th className="py-2 px-3 text-right">Settled Amount</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-800">
-                        {selectedReceipt.allocations.map((alloc) => (
-                          <tr key={alloc.id}>
-                            <td className="py-2 px-3 font-mono font-medium text-indigo-300">
-                              {alloc.invoiceNumber}
-                            </td>
-                            <td className="py-2 px-3 text-right font-mono text-slate-400">
-                              ${parseFloat(alloc.invoiceTotal).toFixed(2)}
-                            </td>
-                            <td className="py-2 px-3 text-right font-mono font-semibold text-emerald-400">
-                              ${parseFloat(alloc.allocatedAmount).toFixed(2)}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
-              )}
-
-              {/* Notes */}
-              {selectedReceipt.notes && (
-                <div className="text-xs pt-3 border-t border-slate-800">
-                  <div className="font-semibold text-slate-400 uppercase text-[10px]">Notes:</div>
-                  <div className="text-slate-300 whitespace-pre-line mt-0.5">{selectedReceipt.notes}</div>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+        <PrintableDocumentView
+          document={{ type: 'RECEIPT', data: selectedReceipt }}
+          companyProfile={companyProfile}
+          currentUser={currentUser}
+          onClose={() => {
+            setSelectedReceipt(null);
+            setIsPrintModalOpen(false);
+          }}
+        />
       )}
     </div>
   );

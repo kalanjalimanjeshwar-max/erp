@@ -41,6 +41,27 @@ export class CustomerController {
     }
   }
 
+  static async checkDuplicates(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const { name, email, phone, taxId, excludeId } = req.body || {};
+      const matches = await CustomerService.checkDuplicates(
+        actor.companyId,
+        { name, email, phone, taxId },
+        typeof excludeId === 'string' ? excludeId : undefined
+      );
+      res.json({ duplicates: matches });
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: 'CUSTOMER_DUPLICATE_CHECK_FAILED',
+          message: (err as Error).message,
+        },
+      });
+    }
+  }
+
   static async create(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;
@@ -51,11 +72,13 @@ export class CustomerController {
       );
       res.status(201).json(customer);
     } catch (err: unknown) {
-      const status = (err as { statusCode?: number }).statusCode || 500;
+      const typedErr = err as { statusCode?: number; details?: unknown };
+      const status = typedErr.statusCode || 500;
       res.status(status).json({
         error: {
-          code: 'CUSTOMER_CREATE_FAILED',
+          code: status === 409 ? 'CUSTOMER_DUPLICATE' : 'CUSTOMER_CREATE_FAILED',
           message: (err as Error).message,
+          details: typedErr.details,
         },
       });
     }
@@ -72,11 +95,13 @@ export class CustomerController {
       );
       res.json(customer);
     } catch (err: unknown) {
-      const status = (err as { statusCode?: number }).statusCode || 500;
+      const typedErr = err as { statusCode?: number; details?: unknown };
+      const status = typedErr.statusCode || 500;
       res.status(status).json({
         error: {
-          code: 'CUSTOMER_UPDATE_FAILED',
+          code: status === 409 ? 'CUSTOMER_DUPLICATE' : 'CUSTOMER_UPDATE_FAILED',
           message: (err as Error).message,
+          details: typedErr.details,
         },
       });
     }

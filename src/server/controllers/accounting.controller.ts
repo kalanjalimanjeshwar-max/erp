@@ -63,6 +63,29 @@ export class AccountingController {
     }
   }
 
+  static async suggestLedgerCode(req: Request, res: Response, next: NextFunction): Promise<void> {
+    try {
+      const companyId = req.user!.companyId;
+      const groupId = String(req.query.groupId || '').trim();
+
+      if (!groupId) {
+        res.status(400).json({
+          error: {
+            code: 'VALIDATION_ERROR',
+            message: 'groupId query parameter is required.',
+            timestamp: new Date().toISOString(),
+          },
+        });
+        return;
+      }
+
+      const suggestion = await CoaService.suggestNextCode(companyId, groupId);
+      res.status(200).json(suggestion);
+    } catch (error) {
+      next(error);
+    }
+  }
+
   static async createLedger(req: Request, res: Response, next: NextFunction): Promise<void> {
     try {
       const actor = req.user!;

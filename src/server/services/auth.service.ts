@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { prisma } from '../db/client.js';
 import { Role, AuthUser, CompanyProfile, LoginResponse } from '../../shared/types.js';
 import { AuditService } from './audit.service.js';
+import { CompanyService } from './company.service.js';
 import { getConfig } from '../config/env.js';
 
 export interface SessionPayload {
@@ -246,21 +247,23 @@ export class AuthService {
       tokenVersion: user.tokenVersion,
     };
 
-    const companyProfile: CompanyProfile = {
-      id: user.company.id,
-      code: user.company.code,
-      name: user.company.name,
-      legalName: user.company.legalName,
-      taxId: user.company.taxId,
-      currency: user.company.currency,
-      timezone: user.company.timezone,
-      logoUrl: user.company.logoUrl,
-      address: user.company.address,
-      phone: user.company.phone,
-      email: user.company.email,
-      website: user.company.website,
-      appHeaderTitle: user.company.appHeaderTitle,
-    };
+    const companyProfile: CompanyProfile = await CompanyService.getProfile(user.companyId).catch(
+      () => ({
+        id: user.company.id,
+        code: user.company.code,
+        name: user.company.name,
+        legalName: user.company.legalName,
+        taxId: user.company.taxId,
+        currency: user.company.currency,
+        timezone: user.company.timezone,
+        logoUrl: user.company.logoUrl,
+        address: user.company.address,
+        phone: user.company.phone,
+        email: user.company.email,
+        website: user.company.website,
+        appHeaderTitle: user.company.appHeaderTitle,
+      })
+    );
 
     const sessionToken = this.generateSessionToken({
       userId: user.id,

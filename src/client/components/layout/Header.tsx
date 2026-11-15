@@ -143,6 +143,7 @@ export const Header: React.FC<HeaderProps> = ({
         <WorkingHoursLogoutModal
           isOpen={showLogoutModal}
           currentUser={currentUser}
+          companyProfile={companyProfile}
           onClose={() => setShowLogoutModal(false)}
           onConfirmLogout={() => {
             setShowLogoutModal(false);

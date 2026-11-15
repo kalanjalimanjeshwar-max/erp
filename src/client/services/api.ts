@@ -11,6 +11,10 @@ import {
   CreateUserRequest,
   UpdateCompanyProfileRequest,
   CompanyProfile,
+  DocumentPrintSettings,
+  DocumentPrintSettingsUpdateResponse,
+  CompanySettingsChangeRequestItem,
+  SettingsChangeRequestStatus,
   Role,
   AppModule,
   AppAction,
@@ -22,6 +26,7 @@ import {
   AccountLedgerItem,
   CreateAccountLedgerRequest,
   UpdateAccountLedgerRequest,
+  SuggestedLedgerCodeResponse,
   JournalEntryItem,
   CreateJournalEntryRequest,
   ContraEntryItem,
@@ -109,7 +114,10 @@ import {
   ExpenseSummaryReport,
   CompanyBankAccountItem,
   ExpenseCapabilitiesResponse,
+  CustomerDuplicateMatch,
+  DocumentPrintLayoutConfig,
 } from '../../shared/types.ts';
+import type { ExportableDocumentPayload } from '../../shared/export/docx-builder.ts';
 
 export class ApiError extends Error {
   code: string;
@@ -159,6 +167,49 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   }
 
   return response.json() as Promise<T>;
+}
+
+async function requestBlob(
+  path: string,
+  options?: RequestInit
+): Promise<{ blob: Blob; fileName: string | null }> {
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        ...options?.headers,
+      },
+      ...options,
+    });
+  } catch (err: unknown) {
+    throw new ApiError(
+      'Unable to connect to CoreERP backend server. Please check if the service is running.',
+      0,
+      'NETWORK_FAILURE',
+      err
+    );
+  }
+
+  if (!response.ok) {
+    let errorData: ApiErrorResponse | null = null;
+    try {
+      errorData = (await response.json()) as ApiErrorResponse;
+    } catch {
+      // Non-JSON response
+    }
+
+    const code = errorData?.error?.code || `HTTP_${response.status}`;
+    const message = errorData?.error?.message || response.statusText || 'An API error occurred';
+    throw new ApiError(message, response.status, code, errorData?.error?.details);
+  }
+
+  const disposition = response.headers.get('Content-Disposition') || '';
+  const match = disposition.match(/filename\*?=(?:UTF-8'')?"?([^";\n]+)"?/i);
+  const fileName = match && match[1] ? decodeURIComponent(match[1].trim()) : null;
+  const blob = await response.blob();
+  return { blob, fileName };
 }
 
 export const api = {
@@ -225,6 +276,26 @@ export const api = {
     request<CompanyProfile>('/api/company/profile', {
       method: 'PATCH',
       body: JSON.stringify(data),
+    }),
+  getDocumentPrintSettings: () => request<DocumentPrintSettings>('/api/company/print-settings'),
+  updateDocumentPrintSettings: (data: DocumentPrintSettings) =>
+    request<DocumentPrintSettingsUpdateResponse>('/api/company/print-settings', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  getCompanySettingsChangeRequests: (status?: SettingsChangeRequestStatus) =>
+    request<CompanySettingsChangeRequestItem[]>(
+      `/api/company/change-requests${status ? `?status=${encodeURIComponent(status)}` : ''}`
+    ),
+  approveCompanySettingsChangeRequest: (id: string) =>
+    request<{ request: CompanySettingsChangeRequestItem; profile: CompanyProfile }>(
+      `/api/company/change-requests/${id}/approve`,
+      { method: 'POST' }
+    ),
+  rejectCompanySettingsChangeRequest: (id: string, reason?: string) =>
+    request<CompanySettingsChangeRequestItem>(`/api/company/change-requests/${id}/reject`, {
+      method: 'POST',
+      body: JSON.stringify({ reason }),
     }),
   getCompanyBankAccounts: (isActive?: boolean) =>
     request<CompanyBankAccountItem[]>(
@@ -296,6 +367,10 @@ export const api = {
     const qs = searchParams.toString();
     return request<AccountLedgerItem[]>(`/api/accounting/ledgers${qs ? `?${qs}` : ''}`);
   },
+  suggestAccountLedgerCode: (groupId: string) =>
+    request<SuggestedLedgerCodeResponse>(
+      `/api/accounting/ledgers/suggest-code?groupId=${encodeURIComponent(groupId)}`
+    ),
   createAccountLedger: (data: CreateAccountLedgerRequest) =>
     request<AccountLedgerItem>('/api/accounting/ledgers', {
       method: 'POST',
@@ -454,6 +529,17 @@ export const api = {
     return request<CustomerItem[]>(`/api/customers${qs ? `?${qs}` : ''}`);
   },
   getCustomer: (id: string) => request<CustomerItem>(`/api/customers/${id}`),
+  checkCustomerDuplicates: (data: {
+    name?: string | null;
+    email?: string | null;
+    phone?: string | null;
+    taxId?: string | null;
+    excludeId?: string;
+  }) =>
+    request<{ duplicates: CustomerDuplicateMatch[] }>('/api/customers/check-duplicates', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
   createCustomer: (data: CreateCustomerRequest) =>
     request<CustomerItem>('/api/customers', {
       method: 'POST',
@@ -524,6 +610,11 @@ export const api = {
   createInvoice: (data: CreateInvoiceRequest) =>
     request<InvoiceItem>('/api/invoices', {
       method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateInvoice: (id: string, data: UpdateInvoiceRequest) =>
+    request<InvoiceItem>(`/api/invoices/${id}`, {
+      method: 'PATCH',
       body: JSON.stringify(data),
     }),
   issueInvoice: (id: string, data?: IssueInvoiceRequest) =>
@@ -979,5 +1070,27 @@ export const api = {
     request<ExpenseCapabilitiesResponse>('/api/expenses/capabilities'),
   getExpenseSummaryReport: () =>
     request<ExpenseSummaryReport>('/api/expenses/reports/summary'),
+
+  // ==========================================
+  // Document Export (PDF & Word .docx)
+  // ==========================================
+  exportDocumentPdf: (data: {
+    document: ExportableDocumentPayload;
+    layoutOverride?: DocumentPrintLayoutConfig;
+    isDraftPreview?: boolean;
+  }) =>
+    requestBlob('/api/documents/export/pdf', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  exportDocumentDocx: (data: {
+    document: ExportableDocumentPayload;
+    layoutOverride?: DocumentPrintLayoutConfig;
+    isDraftPreview?: boolean;
+  }) =>
+    requestBlob('/api/documents/export/docx', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
 };
 

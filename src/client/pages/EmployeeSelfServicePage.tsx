@@ -26,10 +26,14 @@ import {
   LeaveTypeItem,
   MonthlyLeaveSummary,
   PayslipItem,
+  CompanyProfile,
 } from '../../shared/types.ts';
+import { formatMoney, getCurrencySymbol } from '../../shared/currency.ts';
+import { formatDateInTimezone, formatUtcTimestamp } from '../../shared/timezone.ts';
 
 interface EmployeeSelfServicePageProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
 }
 
 export interface DemoSalaryAdvance {
@@ -49,8 +53,13 @@ export interface DemoSalaryAdvance {
 
 export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = ({
   currentUser,
+  companyProfile,
 }) => {
   const isPreview = Boolean(currentUser.isPreview);
+  const baseCurrency = companyProfile?.currency;
+  const roundingPrecision = companyProfile?.roundingPrecision;
+  const timezone = companyProfile?.timezone;
+  const currencySymbol = getCurrencySymbol(baseCurrency);
   const [activeTab, setActiveTab] = useState<'leave' | 'payslips' | 'advances' | 'expenses'>('leave');
 
   // Filter State
@@ -844,7 +853,9 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                 <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
                   <span className="text-[10px] text-slate-500 uppercase font-semibold">Daily Salary Rate</span>
                   <div className="text-sm font-bold text-slate-200 mt-1">
-                    {leaveSummary.dailySalaryRate ? `$${leaveSummary.dailySalaryRate}` : '--'}
+                    {leaveSummary.dailySalaryRate
+                      ? formatMoney(leaveSummary.dailySalaryRate, baseCurrency, { decimals: roundingPrecision })
+                      : '--'}
                     <span className="text-[10px] text-slate-500 font-normal ml-1">/ 30d</span>
                   </div>
                 </div>
@@ -852,7 +863,9 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                 <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
                   <span className="text-[10px] text-slate-500 uppercase font-semibold">Hourly Salary Rate</span>
                   <div className="text-sm font-bold text-slate-200 mt-1">
-                    {leaveSummary.hourlySalaryRate ? `$${leaveSummary.hourlySalaryRate}` : '--'}
+                    {leaveSummary.hourlySalaryRate
+                      ? formatMoney(leaveSummary.hourlySalaryRate, baseCurrency, { decimals: roundingPrecision })
+                      : '--'}
                     <span className="text-[10px] text-slate-500 font-normal ml-1">/ hr</span>
                   </div>
                 </div>
@@ -873,7 +886,7 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                       </div>
                     </div>
                     <div className="text-sm font-bold text-rose-400">
-                      ${leaveSummary.excessLeaveDeduction || '0.00'}
+                      {formatMoney(leaveSummary.excessLeaveDeduction || 0, baseCurrency, { decimals: roundingPrecision })}
                     </div>
                   </div>
 
@@ -885,7 +898,7 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                       </div>
                     </div>
                     <div className="text-sm font-bold text-rose-400">
-                      ${leaveSummary.shortHoursDeduction || '0.00'}
+                      {formatMoney(leaveSummary.shortHoursDeduction || 0, baseCurrency, { decimals: roundingPrecision })}
                     </div>
                   </div>
 
@@ -895,7 +908,7 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                       <div className="text-[10px] text-slate-500">Excess Leave + Short Hours</div>
                     </div>
                     <div className="text-base font-extrabold text-rose-400">
-                      ${leaveSummary.totalSalaryDeductions || '0.00'}
+                      {formatMoney(leaveSummary.totalSalaryDeductions || 0, baseCurrency, { decimals: roundingPrecision })}
                     </div>
                   </div>
                 </div>
@@ -996,8 +1009,11 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                             '--'
                           )}
                         </td>
-                        <td className="py-3 px-4 text-slate-500 font-mono text-[11px]">
-                          {req.createdAt ? req.createdAt.split('T')[0] : '--'}
+                        <td
+                          className="py-3 px-4 text-slate-500 font-mono text-[11px]"
+                          title={req.createdAt ? `UTC: ${formatUtcTimestamp(req.createdAt)}` : undefined}
+                        >
+                          {req.createdAt ? formatDateInTimezone(req.createdAt, timezone) : '--'}
                         </td>
                       </tr>
                     ))}
@@ -1095,14 +1111,22 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                         <td className="py-3 px-4 font-semibold text-slate-200">
                           {ps.payrollPeriodName || `${ps.payrollPeriodYear}-${String(ps.payrollPeriodMonth).padStart(2, '0')}`}
                         </td>
-                        <td className="py-3 px-4 font-mono">${ps.grossSalary}</td>
-                        <td className="py-3 px-4 font-mono text-emerald-400">+${ps.allowances}</td>
-                        <td className="py-3 px-4 font-mono text-rose-400">-${ps.deductions}</td>
+                        <td className="py-3 px-4 font-mono">
+                          {formatMoney(ps.grossSalary, baseCurrency, { decimals: roundingPrecision })}
+                        </td>
+                        <td className="py-3 px-4 font-mono text-emerald-400">
+                          +{formatMoney(ps.allowances, baseCurrency, { decimals: roundingPrecision })}
+                        </td>
+                        <td className="py-3 px-4 font-mono text-rose-400">
+                          {formatMoney(-Math.abs(Number(ps.deductions)), baseCurrency, { decimals: roundingPrecision })}
+                        </td>
                         <td className="py-3 px-4 font-mono text-amber-400">
-                          {parseFloat(ps.lossOfPayDeduction) > 0 ? `-$${ps.lossOfPayDeduction}` : '$0.00'}
+                          {parseFloat(ps.lossOfPayDeduction) > 0
+                            ? formatMoney(-Math.abs(Number(ps.lossOfPayDeduction)), baseCurrency, { decimals: roundingPrecision })
+                            : formatMoney(0, baseCurrency, { decimals: roundingPrecision })}
                         </td>
                         <td className="py-3 px-4 font-mono font-bold text-white text-sm">
-                          ${ps.netSalary}
+                          {formatMoney(ps.netSalary, baseCurrency, { decimals: roundingPrecision })}
                         </td>
                         <td className="py-3 px-4">
                           <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[11px] font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
@@ -1192,10 +1216,10 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                       {adv.id}
                     </td>
                     <td className="py-3 px-4 font-mono font-bold text-amber-300 text-sm">
-                      ${adv.amount.toFixed(2)}
+                      {formatMoney(adv.amount, baseCurrency, { decimals: roundingPrecision })}
                     </td>
                     <td className="py-3 px-4 text-slate-300">
-                      ${adv.monthlyDeduction.toFixed(2)}/mo × {adv.repaymentMonths} mo
+                      {formatMoney(adv.monthlyDeduction, baseCurrency, { decimals: roundingPrecision })}/mo × {adv.repaymentMonths} mo
                     </td>
                     <td className="py-3 px-4 text-slate-400 max-w-xs truncate" title={adv.reason}>
                       {adv.reason}
@@ -1239,7 +1263,7 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
       {/* TAB 4: EXPENSE CLAIMS & REIMBURSEMENTS (PRODUCTION DATABASE-BACKED)       */}
       {/* ========================================================================= */}
       {activeTab === 'expenses' && (
-        <ExpenseModuleView currentUser={currentUser} />
+        <ExpenseModuleView currentUser={currentUser} companyProfile={companyProfile} />
       )}
 
       {/* ========================================================================= */}
@@ -1415,19 +1439,27 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                 </h4>
                 <div className="flex justify-between text-slate-400">
                   <span>Basic Fixed Salary:</span>
-                  <span className="font-mono text-slate-200">${selectedPayslip.basicSalary}</span>
+                  <span className="font-mono text-slate-200">
+                    {formatMoney(selectedPayslip.basicSalary, baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
                 <div className="flex justify-between text-slate-400">
                   <span>Allowances:</span>
-                  <span className="font-mono text-emerald-400">+${selectedPayslip.allowances}</span>
+                  <span className="font-mono text-emerald-400">
+                    +{formatMoney(selectedPayslip.allowances, baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
                 <div className="flex justify-between text-slate-400">
                   <span>Overtime Pay:</span>
-                  <span className="font-mono text-emerald-400">+${selectedPayslip.overtimePay}</span>
+                  <span className="font-mono text-emerald-400">
+                    +{formatMoney(selectedPayslip.overtimePay, baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
                 <div className="pt-2 border-t border-slate-800 flex justify-between font-bold text-slate-200">
                   <span>Total Gross Earnings:</span>
-                  <span className="font-mono">${selectedPayslip.grossSalary}</span>
+                  <span className="font-mono">
+                    {formatMoney(selectedPayslip.grossSalary, baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
               </div>
 
@@ -1438,16 +1470,24 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                 </h4>
                 <div className="flex justify-between text-slate-400">
                   <span>Loss of Pay (LOP):</span>
-                  <span className="font-mono text-rose-400">-${selectedPayslip.lossOfPayDeduction}</span>
+                  <span className="font-mono text-rose-400">
+                    {formatMoney(-Math.abs(Number(selectedPayslip.lossOfPayDeduction)), baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
                 <div className="flex justify-between text-slate-400">
                   <span>Other Deductions:</span>
-                  <span className="font-mono text-rose-400">-${selectedPayslip.deductions}</span>
+                  <span className="font-mono text-rose-400">
+                    {formatMoney(-Math.abs(Number(selectedPayslip.deductions)), baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
                 <div className="pt-2 border-t border-slate-800 flex justify-between font-bold text-slate-200">
                   <span>Total Deductions:</span>
                   <span className="font-mono text-rose-300">
-                    -${(parseFloat(selectedPayslip.deductions) + parseFloat(selectedPayslip.lossOfPayDeduction)).toFixed(2)}
+                    {formatMoney(
+                      -(parseFloat(selectedPayslip.deductions) + parseFloat(selectedPayslip.lossOfPayDeduction)),
+                      baseCurrency,
+                      { decimals: roundingPrecision }
+                    )}
                   </span>
                 </div>
               </div>
@@ -1462,7 +1502,7 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                 <p className="text-xs text-emerald-200/70">Credited to employee bank account / ledger</p>
               </div>
               <div className="text-3xl font-extrabold text-white font-mono">
-                ${selectedPayslip.netSalary}
+                {formatMoney(selectedPayslip.netSalary, baseCurrency, { decimals: roundingPrecision })}
               </div>
             </div>
 
@@ -1508,7 +1548,7 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
             <form onSubmit={handleApplyAdvance} className="space-y-4 text-xs">
               <div>
                 <label className="block text-slate-300 font-medium mb-1">
-                  Requested Advance Amount ($) *
+                  Requested Advance Amount ({currencySymbol}) *
                 </label>
                 <input
                   type="number"

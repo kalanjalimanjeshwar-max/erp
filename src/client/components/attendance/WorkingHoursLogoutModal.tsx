@@ -11,12 +11,14 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { api, ApiError } from '../../services/api.ts';
-import { WorkingHoursSummary, AuthUser } from '../../../shared/types.ts';
+import { WorkingHoursSummary, AuthUser, CompanyProfile } from '../../../shared/types.ts';
+import { formatTimeInTimezone, getEffectiveTimeZone, getTimezoneShortName } from '../../../shared/timezone.ts';
 import { LoadingSpinner } from '../common/LoadingSpinner.tsx';
 
 interface WorkingHoursLogoutModalProps {
   isOpen: boolean;
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
   onClose: () => void;
   onConfirmLogout: () => void;
   onNavigateToAttendance?: () => void;
@@ -25,6 +27,7 @@ interface WorkingHoursLogoutModalProps {
 export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = ({
   isOpen,
   currentUser,
+  companyProfile,
   onClose,
   onConfirmLogout,
   onNavigateToAttendance,
@@ -48,9 +51,15 @@ export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = (
     if (currentUser.isPreview) {
       setTimeout(() => {
         if (!isMounted) return;
+        const previewTz = getEffectiveTimeZone(companyProfile?.timezone);
+        const previewTzAbbr = getTimezoneShortName(previewTz);
+        const previewCheckInIso = `${new Date().toISOString().split('T')[0]}T03:35:00.000Z`;
+        const formattedCheckIn = formatTimeInTimezone(previewCheckInIso, previewTz, {
+          includeZoneAbbr: true,
+        });
         setSummary({
           workDate: new Date().toISOString().split('T')[0],
-          timezone: 'UTC',
+          timezone: previewTz,
           employeeId: 'emp-preview-01',
           employeeName: currentUser.fullName || 'Preview Employee',
           employeeCode: 'EMP-PREVIEW',
@@ -58,14 +67,13 @@ export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = (
           shiftName: 'General Morning Shift',
           shiftSchedule: 'General Morning Shift (09:00 – 17:00)',
           expectedDurationHours: 8.0,
-          checkIn: `${new Date().toISOString().split('T')[0]}T09:05:00.000Z`,
+          checkIn: previewCheckInIso,
           checkOut: null, // Simulated missing punch
           workedDurationHours: null,
           shortDurationMinutes: 0,
           overtimeDurationMinutes: 0,
           status: 'INCOMPLETE_ATTENDANCE',
-          statusMessage:
-            'Attendance Incomplete: You checked in today at 09:05 UTC, but have not recorded a check-out punch. Logging out of CoreERP will NOT record your check-out. Please punch out on the Attendance page if your workday has ended.',
+          statusMessage: `Attendance Incomplete: You checked in today at ${formattedCheckIn} (${previewTzAbbr}), but have not recorded a check-out punch. Logging out of CoreERP will NOT record your check-out. Please punch out on the Attendance page if your workday has ended.`,
           requiresAttendanceAction: true,
         });
         setIsLoading(false);
@@ -156,12 +164,11 @@ export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = (
 
   const formatIsoTime = (iso: string | null) => {
     if (!iso) return 'None';
-    try {
-      const d = new Date(iso);
-      return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: true });
-    } catch {
-      return iso;
-    }
+    return formatTimeInTimezone(iso, summary?.timezone || companyProfile?.timezone, {
+      hour12: true,
+      includeZoneAbbr: true,
+      fallback: iso,
+    });
   };
 
   return (

@@ -25,7 +25,9 @@ import {
   AccountLedgerItem,
   AuthUser,
   CashBankBookReport,
+  CompanyProfile,
 } from '../../shared/types.ts';
+import { formatMoney, getCurrencySymbol } from '../../shared/currency.ts';
 import {
   previewStore,
   PREVIEW_ACCOUNT_LEDGERS,
@@ -33,6 +35,7 @@ import {
 
 interface FinancialReportsPageProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
   initialLedgerId?: string | null;
 }
 
@@ -47,9 +50,11 @@ type ReportTab =
 
 export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
   currentUser,
+  companyProfile,
   initialLedgerId,
 }) => {
   const isPreview = Boolean(currentUser?.isPreview);
+  const currencySymbol = getCurrencySymbol(companyProfile?.currency);
 
   const [activeTab, setActiveTab] = useState<ReportTab>(
     initialLedgerId ? 'ledger-statement' : 'trial-balance'
@@ -245,10 +250,10 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
     loadReport();
   }, [loadReport]);
 
-  const formatCurrency = (val: string | number) => {
-    const num = typeof val === 'string' ? parseFloat(val) : val;
-    return `$${(num || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
-  };
+  const formatCurrency = (val: string | number, currencyCode?: string | null) =>
+    formatMoney(val, currencyCode || companyProfile?.currency, {
+      decimals: companyProfile?.roundingPrecision,
+    });
 
   return (
     <div className="space-y-6">
@@ -535,8 +540,8 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
                     <th className="py-3 px-4">Ledger Name</th>
                     <th className="py-3 px-4">Group</th>
                     <th className="py-3 px-4">Classification</th>
-                    <th className="py-3 px-4 text-right">Debit ($)</th>
-                    <th className="py-3 px-4 text-right">Credit ($)</th>
+                    <th className="py-3 px-4 text-right">Debit ({currencySymbol})</th>
+                    <th className="py-3 px-4 text-right">Credit ({currencySymbol})</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60">
@@ -1193,9 +1198,9 @@ export const FinancialReportsPage: React.FC<FinancialReportsPageProps> = ({
                     <th className="py-3 px-4">Date</th>
                     <th className="py-3 px-4">Voucher No</th>
                     <th className="py-3 px-4">Particulars / Narration</th>
-                    <th className="py-3 px-4 text-right">Debit ($)</th>
-                    <th className="py-3 px-4 text-right">Credit ($)</th>
-                    <th className="py-3 px-4 text-right">Running Balance ($)</th>
+                    <th className="py-3 px-4 text-right">Debit ({currencySymbol})</th>
+                    <th className="py-3 px-4 text-right">Credit ({currencySymbol})</th>
+                    <th className="py-3 px-4 text-right">Running Balance ({currencySymbol})</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-800/60 font-sans">

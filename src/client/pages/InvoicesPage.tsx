@@ -18,6 +18,7 @@ import {
   Building,
   CreditCard,
   BookOpen,
+  Edit2,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
 import {
@@ -27,8 +28,13 @@ import {
   AccountLedgerItem,
   AuthUser,
   CompanyProfile,
+  CompanyBankAccountItem,
   CreateInvoiceRequest,
+  UpdateInvoiceRequest,
 } from '../../shared/types.ts';
+import { formatMoney, getCurrencySymbol } from '../../shared/currency.ts';
+import { PrintableDocumentView } from '../components/print/PrintableDocumentView.tsx';
+import { CustomerSelectorWithCreate } from '../components/customers/CustomerSelectorWithCreate.tsx';
 import {
   PREVIEW_INVOICES,
   PREVIEW_CUSTOMERS,
@@ -76,6 +82,7 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
   // Selected for View / Print Modal
   const [selectedInvoice, setSelectedInvoice] = useState<InvoiceItem | null>(null);
   const [isPrintModalOpen, setIsPrintModalOpen] = useState(false);
+  const [defaultBankAccount, setDefaultBankAccount] = useState<CompanyBankAccountItem | null>(null);
 
   // Issue confirmation modal
   const [issueModalInvoice, setIssueModalInvoice] = useState<InvoiceItem | null>(null);
@@ -89,11 +96,13 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
   const [voidReason, setVoidReason] = useState('');
   const [isVoiding, setIsVoiding] = useState(false);
 
-  // Create Invoice Modal
+  // Create / Edit Invoice Modal & Draft Preview
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  const [editingInvoice, setEditingInvoice] = useState<InvoiceItem | null>(null);
+  const [draftPreviewInvoice, setDraftPreviewInvoice] = useState<InvoiceItem | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
-  // Create Form State
+  // Create / Edit Form State
   const [selectedCustomerId, setSelectedCustomerId] = useState<string>('');
   const [customerName, setCustomerName] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
@@ -149,7 +158,8 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
     }
 
     try {
-      const [invList, custList, ledgerList] = await Promise.all([
+      const canFetchBank = currentUser?.role !== 'EMPLOYEE';
+      const [invList, custList, ledgerList, bankList] = await Promise.all([
         api.getInvoices({
           status: statusFilter === 'ALL' ? undefined : statusFilter,
           search: search.trim() || undefined,
@@ -158,11 +168,15 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
         }),
         api.getCustomers({ isActive: true }),
         api.getLedgers(),
+        canFetchBank
+          ? api.getCompanyBankAccounts(true).catch(() => [] as CompanyBankAccountItem[])
+          : Promise.resolve([] as CompanyBankAccountItem[]),
       ]);
 
       setInvoices(invList);
       setCustomers(custList);
       setLedgers(ledgerList);
+      setDefaultBankAccount(bankList.find((b) => b.isDefault) || bankList[0] || null);
 
       if (initialInvoiceId) {
         const target = invList.find((i: InvoiceItem) => i.id === initialInvoiceId);
@@ -180,30 +194,37 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
     } finally {
       setIsLoading(false);
     }
-  }, [currentUser?.isPreview, statusFilter, search, fromDate, toDate, initialInvoiceId]);
+  }, [currentUser?.isPreview, currentUser?.role, statusFilter, search, fromDate, toDate, initialInvoiceId]);
 
   useEffect(() => {
     loadData();
   }, [loadData]);
 
-  // Handle customer selection in create modal
-  const handleCustomerChange = (cId: string) => {
-    setSelectedCustomerId(cId);
-    if (!cId) return;
-
-    const cust = customers.find((c) => c.id === cId);
-    if (cust) {
-      setCustomerName(cust.name);
-      setCustomerEmail(cust.email || '');
-      setCustomerPhone(cust.phone || '');
-      setCustomerAddress(cust.address || '');
-      setCustomerTaxId(cust.taxId || '');
-
-      // Set due date based on payment terms
-      const d = new Date(invoiceDate || new Date());
-      d.setDate(d.getDate() + (cust.paymentTermsDays || 30));
-      setDueDate(d.toISOString().split('T')[0]);
+  // Handle customer selection in create/edit modal without overwriting line items, dates, or notes
+  const handleCustomerChange = (cust: CustomerItem | null) => {
+    if (!cust) {
+      setSelectedCustomerId('');
+      return;
     }
+
+    setSelectedCustomerId(cust.id);
+    setCustomerName(cust.name);
+    setCustomerEmail(cust.email || '');
+    setCustomerPhone(cust.phone || '');
+    setCustomerAddress(cust.address || '');
+    setCustomerTaxId(cust.taxId || '');
+
+    const d = new Date(invoiceDate || new Date());
+    d.setDate(d.getDate() + (cust.paymentTermsDays || 30));
+    setDueDate(d.toISOString().split('T')[0]);
+  };
+
+  const handleCustomerCreated = (newCustomer: CustomerItem) => {
+    setCustomers((prev) => {
+      const exists = prev.some((c) => c.id === newCustomer.id);
+      return exists ? prev.map((c) => (c.id === newCustomer.id ? newCustomer : c)) : [newCustomer, ...prev];
+    });
+    handleCustomerChange(newCustomer);
   };
 
   // Add line item
@@ -264,8 +285,82 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
   };
 
   const calculated = calculateTotals();
+  const baseCurrency = companyProfile?.currency || 'INR';
+  const roundingPrecision = companyProfile?.roundingPrecision ?? 2;
+  const currencySymbol = getCurrencySymbol(baseCurrency);
 
-  // Create invoice submit
+  const handlePreviewDraft = () => {
+    setErrorMessage(null);
+    if (!customerName.trim()) {
+      setErrorMessage('Please enter or select a customer before previewing the invoice.');
+      return;
+    }
+
+    const previewLines = lines.map((l, idx) => {
+      const qty = parseFloat(l.quantity) || 0;
+      const price = parseFloat(l.unitPrice) || 0;
+      const disc = parseFloat(l.discountAmount) || 0;
+      const taxRate = parseFloat(l.taxRate) || 0;
+      const afterDiscount = Math.max(0, qty * price - disc);
+      const taxAmount = (afterDiscount * taxRate) / 100;
+      const lineTotal = afterDiscount + taxAmount;
+      const ledger = l.revenueLedgerId
+        ? ledgers.find((al) => al.id === l.revenueLedgerId)
+        : undefined;
+
+      return {
+        id: `preview-inv-line-${idx + 1}`,
+        lineNumber: idx + 1,
+        itemDescription: l.itemDescription.trim() || `Service Line ${idx + 1}`,
+        quantity: qty.toFixed(4),
+        unitPrice: price.toFixed(4),
+        discountAmount: disc.toFixed(4),
+        taxRate: taxRate.toFixed(4),
+        taxAmount: taxAmount.toFixed(4),
+        lineTotal: lineTotal.toFixed(4),
+        revenueLedgerId: l.revenueLedgerId || null,
+        revenueLedgerName: ledger?.name || null,
+      };
+    });
+
+    setDraftPreviewInvoice({
+      id: editingInvoice?.id || 'unsaved-invoice-preview',
+      companyId: companyProfile?.id || 'company-preview',
+      invoiceNumber: editingInvoice?.invoiceNumber || 'DRAFT PREVIEW',
+      quotationId: editingInvoice?.quotationId || null,
+      customerId: selectedCustomerId || null,
+      customerName: customerName.trim(),
+      customerEmail: customerEmail.trim() || null,
+      customerPhone: customerPhone.trim() || null,
+      customerAddress: customerAddress.trim() || null,
+      customerTaxId: customerTaxId.trim() || null,
+      invoiceDate,
+      dueDate,
+      status: editingInvoice?.status || 'DRAFT',
+      currency: editingInvoice?.currency || baseCurrency,
+      subtotal: parseFloat(calculated.subtotal).toFixed(4),
+      discountTotal: parseFloat(calculated.discountTotal).toFixed(4),
+      taxTotal: parseFloat(calculated.taxTotal).toFixed(4),
+      total: parseFloat(calculated.total).toFixed(4),
+      amountPaid: editingInvoice?.amountPaid || '0.0000',
+      balanceDue: editingInvoice?.balanceDue || parseFloat(calculated.total).toFixed(4),
+      notes: notes.trim() || null,
+      terms: terms.trim() || null,
+      documentTitle: documentTitle.trim() || 'Invoice',
+      journalEntryId: editingInvoice?.journalEntryId || null,
+      journalVoucherNumber: editingInvoice?.journalVoucherNumber || null,
+      issuedAt: null,
+      issuedByUserName: null,
+      voidedAt: null,
+      voidedByUserName: null,
+      voidReason: null,
+      createdByUserName: currentUser?.fullName || null,
+      createdAt: editingInvoice?.createdAt || new Date().toISOString(),
+      lines: previewLines,
+    });
+  };
+
+  // Create or update draft invoice submit
   const handleCreateSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!customerName.trim()) {
@@ -301,6 +396,50 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
 
     try {
       setIsSubmitting(true);
+      const normalizedLines = lines.map((l) => ({
+        itemDescription: l.itemDescription.trim(),
+        quantity: l.quantity,
+        unitPrice: l.unitPrice,
+        discountAmount: l.discountAmount,
+        taxRate: l.taxRate,
+        revenueLedgerId: l.revenueLedgerId || null,
+      }));
+
+      if (editingInvoice) {
+        const updatePayload: UpdateInvoiceRequest = {
+          customerId: selectedCustomerId || null,
+          customerName: customerName.trim(),
+          customerEmail: customerEmail.trim() || null,
+          customerPhone: customerPhone.trim() || null,
+          customerAddress: customerAddress.trim() || null,
+          customerTaxId: customerTaxId.trim() || null,
+          invoiceDate,
+          dueDate,
+          notes: notes.trim() || null,
+          terms: terms.trim() || null,
+          documentTitle: documentTitle.trim() || 'Invoice',
+          lines: normalizedLines,
+        };
+
+        if (currentUser?.isPreview) {
+          const updated = previewStore.updateInvoice(editingInvoice.id, updatePayload);
+          setSuccessMessage(
+            `[Preview Demo] Draft Invoice ${updated.invoiceNumber} updated in-memory.`
+          );
+          setIsCreateModalOpen(false);
+          resetCreateForm();
+          loadData();
+          return;
+        }
+
+        const updated = await api.updateInvoice(editingInvoice.id, updatePayload);
+        setSuccessMessage(`Draft Invoice ${updated.invoiceNumber} updated successfully.`);
+        setIsCreateModalOpen(false);
+        resetCreateForm();
+        loadData();
+        return;
+      }
+
       const payload: CreateInvoiceRequest = {
         customerId: selectedCustomerId || undefined,
         customerName: customerName.trim(),
@@ -310,16 +449,11 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
         customerTaxId: customerTaxId.trim() || undefined,
         invoiceDate,
         dueDate,
+        currency: companyProfile?.currency || 'INR',
         notes: notes.trim() || undefined,
         terms: terms.trim() || undefined,
         documentTitle: documentTitle.trim() || undefined,
-        lines: lines.map((l) => ({
-          itemDescription: l.itemDescription.trim(),
-          quantity: l.quantity,
-          unitPrice: l.unitPrice,
-          discountAmount: l.discountAmount,
-          taxRate: l.taxRate,
-        })),
+        lines: normalizedLines,
       };
 
       if (currentUser?.isPreview) {
@@ -342,7 +476,9 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
       if (err instanceof ApiError) {
         setErrorMessage(err.message);
       } else {
-        setErrorMessage('Failed to create invoice.');
+        setErrorMessage(
+          err instanceof Error ? err.message : 'Failed to save invoice.'
+        );
       }
     } finally {
       setIsSubmitting(false);
@@ -350,6 +486,7 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
   };
 
   const resetCreateForm = () => {
+    setEditingInvoice(null);
     setSelectedCustomerId('');
     setCustomerName('');
     setCustomerEmail('');
@@ -372,6 +509,42 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
         taxRate: '0.00',
       },
     ]);
+  };
+
+  const openEditInvoiceModal = (inv: InvoiceItem) => {
+    setEditingInvoice(inv);
+    setSelectedCustomerId(inv.customerId || '');
+    setCustomerName(inv.customerName || '');
+    setCustomerEmail(inv.customerEmail || '');
+    setCustomerPhone(inv.customerPhone || '');
+    setCustomerAddress(inv.customerAddress || '');
+    setCustomerTaxId(inv.customerTaxId || '');
+    setInvoiceDate(inv.invoiceDate);
+    setDueDate(inv.dueDate);
+    setDocumentTitle(inv.documentTitle || 'Invoice');
+    setNotes(inv.notes || '');
+    setTerms(inv.terms || '');
+    setLines(
+      inv.lines.length > 0
+        ? inv.lines.map((l) => ({
+            itemDescription: l.itemDescription,
+            quantity: String(parseFloat(l.quantity) || 1),
+            unitPrice: (parseFloat(l.unitPrice) || 0).toFixed(2),
+            discountAmount: (parseFloat(l.discountAmount) || 0).toFixed(2),
+            taxRate: (parseFloat(l.taxRate) || 0).toFixed(2),
+            revenueLedgerId: l.revenueLedgerId || undefined,
+          }))
+        : [
+            {
+              itemDescription: '',
+              quantity: '1',
+              unitPrice: '0.00',
+              discountAmount: '0.00',
+              taxRate: '0.00',
+            },
+          ]
+    );
+    setIsCreateModalOpen(true);
   };
 
   // Open Issue Confirmation
@@ -590,7 +763,7 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
       {currentUser?.isPreview && (
         <div className="bg-amber-950/60 border border-amber-800/70 rounded-xl p-4 text-xs text-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-2 shadow">
           <div className="flex items-center gap-2.5">
-            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse shrink-0" />
+            <ShieldAlert className="w-4 h-4 text-amber-400 shrink-0" />
             <div>
               <strong className="text-amber-100">Preview Mode Active — In-Memory Billing Exploration</strong>
               <p className="text-amber-300/80 mt-0.5">
@@ -726,16 +899,18 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
                         <div className="text-[10px] text-slate-500">{inv.customerEmail}</div>
                       )}
                     </td>
-                    <td className="py-3 px-4 text-right font-mono font-semibold text-slate-200">
-                      {inv.currency} {parseFloat(inv.total).toFixed(2)}
+                    <td className="py-3 px-4 text-right font-mono font-semibold text-slate-200 tabular-nums">
+                      {formatMoney(inv.total, inv.currency || baseCurrency, { decimals: roundingPrecision })}
                     </td>
-                    <td className="py-3 px-4 text-right font-mono font-semibold">
+                    <td className="py-3 px-4 text-right font-mono font-semibold tabular-nums">
                       {parseFloat(inv.balanceDue) > 0 ? (
                         <span className="text-amber-400">
-                          {inv.currency} {parseFloat(inv.balanceDue).toFixed(2)}
+                          {formatMoney(inv.balanceDue, inv.currency || baseCurrency, { decimals: roundingPrecision })}
                         </span>
                       ) : (
-                        <span className="text-emerald-400">0.00</span>
+                        <span className="text-emerald-400">
+                          {formatMoney(0, inv.currency || baseCurrency, { decimals: roundingPrecision })}
+                        </span>
                       )}
                     </td>
                     <td className="py-3 px-4 text-center">{getStatusBadge(inv.status)}</td>
@@ -753,23 +928,34 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
                       )}
                     </td>
                     <td className="py-3 px-4 text-right space-x-1.5 whitespace-nowrap">
-                      {/* View / Print */}
+                      {/* View / Print / Export */}
                       <button
                         onClick={() => {
                           setSelectedInvoice(inv);
                           setIsPrintModalOpen(true);
                         }}
                         className="p-1 hover:bg-slate-800 rounded text-slate-400 hover:text-white transition cursor-pointer"
-                        title="View / Print Document"
+                        title="Preview, Print & Export"
                       >
                         <Eye className="w-4 h-4" />
                       </button>
+
+                      {/* Edit Action (If Draft) */}
+                      {inv.status === 'DRAFT' && (
+                        <button
+                          onClick={() => openEditInvoiceModal(inv)}
+                          className="p-1 hover:bg-slate-800 rounded text-indigo-300 hover:text-indigo-200 transition cursor-pointer"
+                          title="Edit Draft Invoice"
+                        >
+                          <Edit2 className="w-4 h-4" />
+                        </button>
+                      )}
 
                       {/* Issue Action (If Draft) */}
                       {inv.status === 'DRAFT' && companyProfile?.salesInvoiceEnabled !== false && (
                         <button
                           onClick={() => openIssueModal(inv)}
-                          className="px-2 py-1 bg-indigo-600/80 hover:bg-indigo-600 text-white rounded text-[11px] font-medium transition cursor-pointer"
+                          className="px-2 py-1 bg-indigo-600/80 hover:bg-indigo-600 text-white rounded text-[11px] font-medium transition whitespace-nowrap cursor-pointer"
                           title="Issue and Post to Accounting"
                         >
                           Issue
@@ -831,10 +1017,10 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
                 Issuing this invoice will automatically finalize its contents and post an atomic, balanced General Journal entry:
               </p>
               <ul className="list-disc list-inside mt-1 space-y-0.5 text-[11px] text-slate-300">
-                <li>Debit: Accounts Receivable ({issueModalInvoice.currency} {parseFloat(issueModalInvoice.total).toFixed(2)})</li>
-                <li>Credit: Sales Revenue ({issueModalInvoice.currency} {(parseFloat(issueModalInvoice.subtotal) - parseFloat(issueModalInvoice.discountTotal)).toFixed(2)})</li>
+                <li>Debit: Accounts Receivable ({formatMoney(issueModalInvoice.total, issueModalInvoice.currency || baseCurrency, { decimals: roundingPrecision })})</li>
+                <li>Credit: Sales Revenue ({formatMoney(parseFloat(issueModalInvoice.subtotal) - parseFloat(issueModalInvoice.discountTotal), issueModalInvoice.currency || baseCurrency, { decimals: roundingPrecision })})</li>
                 {parseFloat(issueModalInvoice.taxTotal) > 0 && (
-                  <li>Credit: Tax Payable ({issueModalInvoice.currency} {parseFloat(issueModalInvoice.taxTotal).toFixed(2)})</li>
+                  <li>Credit: Tax Payable ({formatMoney(issueModalInvoice.taxTotal, issueModalInvoice.currency || baseCurrency, { decimals: roundingPrecision })})</li>
                 )}
               </ul>
             </div>
@@ -981,234 +1167,39 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
 
       {/* View / Printable Invoice Modal */}
       {selectedInvoice && isPrintModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 overflow-y-auto">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-3xl w-full p-8 space-y-6 shadow-2xl my-8">
-            {/* Modal Controls */}
-            <div className="flex items-center justify-between border-b border-slate-800 pb-4 print:hidden">
-              <div className="flex items-center gap-3">
-                <span className="text-xs font-semibold text-slate-400">Document Preview</span>
-                {getStatusBadge(selectedInvoice.status)}
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => window.print()}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium rounded-lg cursor-pointer"
-                >
-                  <Printer className="w-3.5 h-3.5" /> Print
-                </button>
-                <button
-                  onClick={() => {
-                    setSelectedInvoice(null);
-                    setIsPrintModalOpen(false);
-                  }}
-                  className="p-1.5 text-slate-400 hover:text-white cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-            </div>
-
-            {/* Document Content */}
-            <div className="space-y-6 text-slate-200">
-              {/* Document Header */}
-              <div className="flex justify-between items-start">
-                <div>
-                  <h1 className="text-2xl font-black tracking-tight text-white uppercase">
-                    {selectedInvoice.documentTitle || 'INVOICE'}
-                  </h1>
-                  <p className="text-xs font-mono text-indigo-400 mt-0.5">
-                    {selectedInvoice.invoiceNumber}
-                  </p>
-                  {selectedInvoice.journalVoucherNumber && (
-                    <p className="text-[11px] font-mono text-slate-400 mt-1">
-                      GL Voucher: {selectedInvoice.journalVoucherNumber}
-                    </p>
-                  )}
-                </div>
-
-                <div className="text-right">
-                  <div className="text-sm font-bold text-white">
-                    {companyProfile?.legalName || companyProfile?.name || 'CoreERP Enterprise'}
-                  </div>
-                  {companyProfile?.address && (
-                    <div className="text-xs text-slate-400 max-w-xs whitespace-pre-line">
-                      {companyProfile.address}
-                    </div>
-                  )}
-                  {companyProfile?.taxId && (
-                    <div className="text-xs text-slate-400">Tax ID: {companyProfile.taxId}</div>
-                  )}
-                </div>
-              </div>
-
-              {/* Bill To & Dates */}
-              <div className="grid grid-cols-2 gap-6 p-4 rounded-xl bg-slate-800/40 border border-slate-800">
-                <div>
-                  <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider mb-1">
-                    Billed To:
-                  </div>
-                  <div className="text-sm font-bold text-white">{selectedInvoice.customerName}</div>
-                  {selectedInvoice.customerAddress && (
-                    <div className="text-xs text-slate-300 whitespace-pre-line mt-0.5">
-                      {selectedInvoice.customerAddress}
-                    </div>
-                  )}
-                  {selectedInvoice.customerEmail && (
-                    <div className="text-xs text-slate-400 mt-0.5">{selectedInvoice.customerEmail}</div>
-                  )}
-                  {selectedInvoice.customerPhone && (
-                    <div className="text-xs text-slate-400">{selectedInvoice.customerPhone}</div>
-                  )}
-                  {selectedInvoice.customerTaxId && (
-                    <div className="text-xs text-slate-400">Tax ID: {selectedInvoice.customerTaxId}</div>
-                  )}
-                </div>
-
-                <div className="space-y-2 text-right">
-                  <div>
-                    <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">
-                      Invoice Date:
-                    </div>
-                    <div className="text-xs font-medium text-white">{selectedInvoice.invoiceDate}</div>
-                  </div>
-                  <div>
-                    <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">
-                      Due Date:
-                    </div>
-                    <div className="text-xs font-medium text-white">{selectedInvoice.dueDate}</div>
-                  </div>
-                  {selectedInvoice.issuedAt && (
-                    <div>
-                      <div className="text-[10px] uppercase font-bold text-slate-400 tracking-wider">
-                        Issued Date:
-                      </div>
-                      <div className="text-xs text-slate-300">
-                        {new Date(selectedInvoice.issuedAt).toLocaleDateString()}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              </div>
-
-              {/* Line Items Table */}
-              <div className="border border-slate-800 rounded-xl overflow-hidden">
-                <table className="w-full text-left text-xs">
-                  <thead className="bg-slate-800/80 text-slate-400 font-semibold uppercase text-[10px]">
-                    <tr>
-                      <th className="py-2.5 px-3">#</th>
-                      <th className="py-2.5 px-3">Item Description</th>
-                      <th className="py-2.5 px-3 text-right">Qty</th>
-                      <th className="py-2.5 px-3 text-right">Unit Price</th>
-                      <th className="py-2.5 px-3 text-right">Discount</th>
-                      <th className="py-2.5 px-3 text-right">Tax %</th>
-                      <th className="py-2.5 px-3 text-right">Total</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800">
-                    {selectedInvoice.lines.map((line, idx) => (
-                      <tr key={idx} className="hover:bg-slate-800/20">
-                        <td className="py-2.5 px-3 text-slate-500">{line.lineNumber}</td>
-                        <td className="py-2.5 px-3 font-medium text-white">{line.itemDescription}</td>
-                        <td className="py-2.5 px-3 text-right">{parseFloat(line.quantity).toFixed(2)}</td>
-                        <td className="py-2.5 px-3 text-right font-mono">
-                          {selectedInvoice.currency} {parseFloat(line.unitPrice).toFixed(2)}
-                        </td>
-                        <td className="py-2.5 px-3 text-right font-mono text-slate-400">
-                          {parseFloat(line.discountAmount) > 0
-                            ? `${selectedInvoice.currency} ${parseFloat(line.discountAmount).toFixed(2)}`
-                            : '—'}
-                        </td>
-                        <td className="py-2.5 px-3 text-right font-mono text-slate-400">
-                          {parseFloat(line.taxRate) > 0 ? `${parseFloat(line.taxRate).toFixed(1)}%` : '0%'}
-                        </td>
-                        <td className="py-2.5 px-3 text-right font-mono font-bold text-white">
-                          {selectedInvoice.currency} {parseFloat(line.lineTotal).toFixed(2)}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              {/* Totals Summary */}
-              <div className="flex justify-end">
-                <div className="w-64 space-y-1.5 text-xs">
-                  <div className="flex justify-between py-1 text-slate-400 border-b border-slate-800">
-                    <span>Subtotal:</span>
-                    <span className="font-mono text-slate-200">
-                      {selectedInvoice.currency} {parseFloat(selectedInvoice.subtotal).toFixed(2)}
-                    </span>
-                  </div>
-                  {parseFloat(selectedInvoice.discountTotal) > 0 && (
-                    <div className="flex justify-between py-1 text-slate-400 border-b border-slate-800">
-                      <span>Discount Total:</span>
-                      <span className="font-mono text-rose-300">
-                        -{selectedInvoice.currency} {parseFloat(selectedInvoice.discountTotal).toFixed(2)}
-                      </span>
-                    </div>
-                  )}
-                  {parseFloat(selectedInvoice.taxTotal) > 0 && (
-                    <div className="flex justify-between py-1 text-slate-400 border-b border-slate-800">
-                      <span>Tax:</span>
-                      <span className="font-mono text-slate-200">
-                        {selectedInvoice.currency} {parseFloat(selectedInvoice.taxTotal).toFixed(2)}
-                      </span>
-                    </div>
-                  )}
-                  <div className="flex justify-between py-2 text-sm font-bold text-white border-b-2 border-slate-700">
-                    <span>Total Amount:</span>
-                    <span className="font-mono text-indigo-400">
-                      {selectedInvoice.currency} {parseFloat(selectedInvoice.total).toFixed(2)}
-                    </span>
-                  </div>
-                  <div className="flex justify-between py-1 text-xs text-slate-400">
-                    <span>Amount Paid:</span>
-                    <span className="font-mono text-emerald-400">
-                      {selectedInvoice.currency} {parseFloat(selectedInvoice.amountPaid).toFixed(2)}
-                    </span>
-                  </div>
-                  <div className="flex justify-between py-1 text-xs font-bold text-amber-300">
-                    <span>Balance Due:</span>
-                    <span className="font-mono">
-                      {selectedInvoice.currency} {parseFloat(selectedInvoice.balanceDue).toFixed(2)}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Notes & Terms */}
-              {(selectedInvoice.notes || selectedInvoice.terms) && (
-                <div className="pt-4 border-t border-slate-800 space-y-3 text-xs">
-                  {selectedInvoice.notes && (
-                    <div>
-                      <div className="font-semibold text-slate-400 uppercase text-[10px]">Notes:</div>
-                      <div className="text-slate-300 whitespace-pre-line mt-0.5">{selectedInvoice.notes}</div>
-                    </div>
-                  )}
-                  {selectedInvoice.terms && (
-                    <div>
-                      <div className="font-semibold text-slate-400 uppercase text-[10px]">Terms & Conditions:</div>
-                      <div className="text-slate-300 whitespace-pre-line mt-0.5">{selectedInvoice.terms}</div>
-                    </div>
-                  )}
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
+        <PrintableDocumentView
+          document={{ type: 'INVOICE', data: selectedInvoice }}
+          companyProfile={companyProfile}
+          bankAccount={defaultBankAccount}
+          currentUser={currentUser}
+          onClose={() => {
+            setSelectedInvoice(null);
+            setIsPrintModalOpen(false);
+          }}
+        />
       )}
 
-      {/* Create Invoice Modal */}
+      {/* Create / Edit Invoice Modal */}
       {isCreateModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 overflow-y-auto">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-4xl w-full p-6 space-y-6 shadow-2xl my-6">
             <div className="flex items-center justify-between border-b border-slate-800 pb-3">
               <div>
-                <h3 className="text-lg font-bold text-white">Create New Customer Invoice</h3>
-                <p className="text-xs text-slate-400">Draft an accounts receivable billing document.</p>
+                <h3 className="text-lg font-bold text-white">
+                  {editingInvoice
+                    ? `Edit Draft Invoice — ${editingInvoice.invoiceNumber}`
+                    : 'Create New Customer Invoice'}
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Draft an accounts receivable billing document (accounting-neutral until issued).
+                </p>
               </div>
               <button
-                onClick={() => setIsCreateModalOpen(false)}
+                type="button"
+                onClick={() => {
+                  setIsCreateModalOpen(false);
+                  resetCreateForm();
+                }}
                 className="text-slate-400 hover:text-white cursor-pointer"
               >
                 <X className="w-5 h-5" />
@@ -1216,37 +1207,17 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
             </div>
 
             <form onSubmit={handleCreateSubmit} className="space-y-6">
-              {/* Customer Selector & Title */}
+              {/* Customer Selector with Inline + New Customer & Title */}
               <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Select Customer
-                  </label>
-                  <select
-                    value={selectedCustomerId}
-                    onChange={(e) => handleCustomerChange(e.target.value)}
-                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
-                  >
-                    <option value="">-- Choose Existing or Enter Ad-Hoc --</option>
-                    {customers.map((c) => (
-                      <option key={c.id} value={c.id}>
-                        {c.name} {c.code ? `(${c.code})` : ''}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Customer Name <span className="text-rose-400">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={customerName}
-                    onChange={(e) => setCustomerName(e.target.value)}
-                    placeholder="Customer / Company Name"
-                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                <div className="md:col-span-2">
+                  <CustomerSelectorWithCreate
+                    customers={customers}
+                    selectedCustomerId={selectedCustomerId}
+                    onSelectCustomer={handleCustomerChange}
+                    onCustomerCreated={handleCustomerCreated}
+                    currentUser={currentUser}
+                    companyProfile={companyProfile}
+                    label="Select Customer"
                   />
                 </div>
 
@@ -1264,15 +1235,29 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
                 </div>
               </div>
 
-              {/* Customer Contact & Address */}
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {/* Customer Details, Contact & Billing Address */}
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Customer Name <span className="text-rose-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={customerName}
+                    onChange={(e) => setCustomerName(e.target.value)}
+                    placeholder="Customer / Company Name"
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+
                 <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1">Customer Email</label>
                   <input
                     type="email"
                     value={customerEmail}
                     onChange={(e) => setCustomerEmail(e.target.value)}
-                    placeholder="billing@customer.com"
+                    placeholder="billing@customer.in"
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
                   />
                 </div>
@@ -1283,21 +1268,32 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
                     type="text"
                     value={customerPhone}
                     onChange={(e) => setCustomerPhone(e.target.value)}
-                    placeholder="+1 555-0199"
+                    placeholder="+91 98450 00000"
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
                   />
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Tax ID / VAT</label>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">GSTIN / Tax ID</label>
                   <input
                     type="text"
                     value={customerTaxId}
-                    onChange={(e) => setCustomerTaxId(e.target.value)}
-                    placeholder="e.g. US-12345678"
-                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                    onChange={(e) => setCustomerTaxId(e.target.value.toUpperCase())}
+                    placeholder="e.g. 29ABCDE1234F1Z5"
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono uppercase focus:outline-none focus:border-indigo-500"
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1">Billing Address</label>
+                <input
+                  type="text"
+                  value={customerAddress}
+                  onChange={(e) => setCustomerAddress(e.target.value)}
+                  placeholder="Street, City, State, Postal Code, Country"
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                />
               </div>
 
               {/* Dates */}
@@ -1350,8 +1346,8 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
                       <tr>
                         <th className="py-2 px-3">Item Description</th>
                         <th className="py-2 px-3 w-20">Qty</th>
-                        <th className="py-2 px-3 w-28">Unit Price</th>
-                        <th className="py-2 px-3 w-24">Discount</th>
+                        <th className="py-2 px-3 w-28">Unit Price ({currencySymbol})</th>
+                        <th className="py-2 px-3 w-24">Discount ({currencySymbol})</th>
                         <th className="py-2 px-3 w-20">Tax %</th>
                         <th className="py-2 px-3 w-36">Revenue Ledger</th>
                         <th className="py-2 px-2 w-10"></th>
@@ -1447,26 +1443,26 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
 
                 {/* Totals Preview */}
                 <div className="flex justify-end pt-2">
-                  <div className="w-64 space-y-1 text-xs">
+                  <div className="w-64 space-y-1 text-xs tabular-nums">
                     <div className="flex justify-between text-slate-400">
                       <span>Subtotal:</span>
-                      <span className="font-mono text-slate-200">${calculated.subtotal}</span>
+                      <span className="font-mono text-slate-200">{formatMoney(calculated.subtotal, baseCurrency, { decimals: roundingPrecision })}</span>
                     </div>
                     {parseFloat(calculated.discountTotal) > 0 && (
                       <div className="flex justify-between text-rose-300">
                         <span>Discount:</span>
-                        <span className="font-mono">-${calculated.discountTotal}</span>
+                        <span className="font-mono">{formatMoney(-parseFloat(calculated.discountTotal), baseCurrency, { decimals: roundingPrecision })}</span>
                       </div>
                     )}
                     {parseFloat(calculated.taxTotal) > 0 && (
                       <div className="flex justify-between text-slate-400">
                         <span>Tax:</span>
-                        <span className="font-mono text-slate-200">${calculated.taxTotal}</span>
+                        <span className="font-mono text-slate-200">{formatMoney(calculated.taxTotal, baseCurrency, { decimals: roundingPrecision })}</span>
                       </div>
                     )}
                     <div className="flex justify-between font-bold text-sm text-white pt-1 border-t border-slate-800">
                       <span>Total:</span>
-                      <span className="font-mono text-indigo-400">${calculated.total}</span>
+                      <span className="font-mono text-indigo-400">{formatMoney(calculated.total, baseCurrency, { decimals: roundingPrecision })}</span>
                     </div>
                   </div>
                 </div>
@@ -1498,25 +1494,56 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
               </div>
 
               {/* Modal Actions */}
-              <div className="flex justify-end gap-3 pt-4 border-t border-slate-800">
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-4 border-t border-slate-800">
                 <button
                   type="button"
-                  onClick={() => setIsCreateModalOpen(false)}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg cursor-pointer"
+                  onClick={handlePreviewDraft}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 text-xs font-semibold rounded-lg transition whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  Cancel
+                  <Eye className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>Preview</span>
                 </button>
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg cursor-pointer disabled:opacity-50"
-                >
-                  {isSubmitting ? 'Saving Draft...' : 'Save Draft Invoice'}
-                </button>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsCreateModalOpen(false);
+                      resetCreateForm();
+                    }}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-50"
+                  >
+                    {isSubmitting
+                      ? 'Saving Draft...'
+                      : editingInvoice
+                      ? 'Update Draft Invoice'
+                      : 'Save Draft Invoice'}
+                  </button>
+                </div>
               </div>
             </form>
           </div>
         </div>
+      )}
+
+      {/* Draft / Unsaved Invoice Preview (Stacked cleanly above edit modal) */}
+      {draftPreviewInvoice && (
+        <PrintableDocumentView
+          document={{ type: 'INVOICE', data: draftPreviewInvoice }}
+          companyProfile={companyProfile}
+          bankAccount={defaultBankAccount}
+          currentUser={currentUser}
+          isDraftPreview={!editingInvoice}
+          onBackToEdit={() => setDraftPreviewInvoice(null)}
+          onClose={() => setDraftPreviewInvoice(null)}
+        />
       )}
     </div>
   );

@@ -8,6 +8,7 @@ import {
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
 import { JournalService } from './journal.service.js';
 import { AuditService } from './audit.service.js';
+import { CompanyService } from './company.service.js';
 import { DocumentSequenceService } from './document-sequence.service.js';
 
 export class ReceiptService {
@@ -67,6 +68,7 @@ export class ReceiptService {
       where,
       orderBy: [{ receiptDate: 'desc' }, { receiptNumber: 'desc' }],
       include: {
+        company: { select: { currency: true } },
         customer: { select: { name: true } },
         receivingLedger: { select: { name: true } },
         receivableLedger: { select: { name: true } },
@@ -88,6 +90,7 @@ export class ReceiptService {
       receiptDate: r.receiptDate.toISOString().split('T')[0],
       customerId: r.customerId,
       customerName: r.customer.name,
+      currency: r.company?.currency || 'USD',
       amount: AccountingMath.format(r.amount),
       allocatedTotal: AccountingMath.format(r.allocatedTotal),
       unallocatedAmount: AccountingMath.format(r.unallocatedAmount),
@@ -124,6 +127,7 @@ export class ReceiptService {
     const r = await prisma.customerReceipt.findUnique({
       where: { id },
       include: {
+        company: { select: { currency: true } },
         customer: { select: { name: true } },
         receivingLedger: { select: { name: true } },
         receivableLedger: { select: { name: true } },
@@ -151,6 +155,7 @@ export class ReceiptService {
       receiptDate: r.receiptDate.toISOString().split('T')[0],
       customerId: r.customerId,
       customerName: r.customer.name,
+      currency: r.company?.currency || 'USD',
       amount: AccountingMath.format(r.amount),
       allocatedTotal: AccountingMath.format(r.allocatedTotal),
       unallocatedAmount: AccountingMath.format(r.unallocatedAmount),
@@ -188,6 +193,7 @@ export class ReceiptService {
     input: CreateCustomerReceiptRequest,
     correlationId?: string
   ): Promise<CustomerReceiptItem> {
+    const currencyCode = await CompanyService.getBaseCurrency(actor.companyId);
     const totalAmount = AccountingMath.from(input.amount);
     if (!AccountingMath.gt(totalAmount, 0)) {
       const err = new Error('Receipt amount must be strictly greater than zero.');
@@ -304,8 +310,9 @@ export class ReceiptService {
         }
 
         if (AccountingMath.gt(allocAmount, invoice.balanceDue)) {
+          const invCurr = invoice.currency || currencyCode;
           const err = new Error(
-            `Allocated amount ($${AccountingMath.format(allocAmount)}) exceeds invoice ${invoice.invoiceNumber} balance due ($${AccountingMath.format(invoice.balanceDue)}).`
+            `Allocated amount (${invCurr} ${AccountingMath.format(allocAmount)}) exceeds invoice ${invoice.invoiceNumber} balance due (${invCurr} ${AccountingMath.format(invoice.balanceDue)}).`
           );
           (err as { statusCode?: number }).statusCode = 400;
           throw err;
@@ -327,7 +334,7 @@ export class ReceiptService {
 
     if (AccountingMath.gt(allocatedTotal, totalAmount)) {
       const err = new Error(
-        `Total allocated amounts ($${AccountingMath.format(allocatedTotal)}) exceed the receipt amount ($${AccountingMath.format(totalAmount)}).`
+        `Total allocated amounts (${currencyCode} ${AccountingMath.format(allocatedTotal)}) exceed the receipt amount (${currencyCode} ${AccountingMath.format(totalAmount)}).`
       );
       (err as { statusCode?: number }).statusCode = 400;
       throw err;

@@ -23,6 +23,7 @@ import { LeaveController } from '../controllers/leave.controller.js';
 import { PayrollController } from '../controllers/payroll.controller.js';
 import { BiometricController } from '../controllers/biometric.controller.js';
 import { ExpenseClaimController } from '../controllers/expense-claim.controller.js';
+import { DocumentExportController } from '../controllers/document-export.controller.js';
 import { requireAuth, requirePermission } from '../middleware/auth.middleware.js';
 import { requireDeviceAuth } from '../middleware/device-auth.middleware.js';
 
@@ -53,6 +54,11 @@ apiRouter.post('/users/:id/reset-password', requireAuth, requirePermission('USER
 // 5. Company Administration Endpoints
 apiRouter.get('/company/profile', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyController.getProfile);
 apiRouter.patch('/company/profile', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyController.updateProfile);
+apiRouter.get('/company/print-settings', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyController.getPrintSettings);
+apiRouter.put('/company/print-settings', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyController.updatePrintSettings);
+apiRouter.get('/company/change-requests', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyController.listChangeRequests);
+apiRouter.post('/company/change-requests/:id/approve', requireAuth, requirePermission('COMPANY', 'APPROVE'), CompanyController.approveChangeRequest);
+apiRouter.post('/company/change-requests/:id/reject', requireAuth, requirePermission('COMPANY', 'APPROVE'), CompanyController.rejectChangeRequest);
 apiRouter.get('/company/sequences', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyController.getSequences);
 apiRouter.get('/company/bank-accounts', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyBankAccountController.list);
 apiRouter.get('/company/bank-accounts/:id', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyBankAccountController.getById);
@@ -76,6 +82,7 @@ apiRouter.post('/accounting/groups', requireAuth, requirePermission('ACCOUNTING'
 
 // Account Ledgers
 apiRouter.get('/accounting/ledgers', requireAuth, requirePermission('ACCOUNTING', 'VIEW'), AccountingController.listLedgers);
+apiRouter.get('/accounting/ledgers/suggest-code', requireAuth, requirePermission('ACCOUNTING', 'CREATE'), AccountingController.suggestLedgerCode);
 apiRouter.post('/accounting/ledgers', requireAuth, requirePermission('ACCOUNTING', 'CREATE'), AccountingController.createLedger);
 apiRouter.patch('/accounting/ledgers/:id', requireAuth, requirePermission('ACCOUNTING', 'EDIT'), AccountingController.updateLedger);
 apiRouter.patch('/accounting/ledgers/:id/status', requireAuth, requirePermission('ACCOUNTING', 'EDIT'), AccountingController.toggleLedgerStatus);
@@ -110,6 +117,7 @@ apiRouter.get('/accounting/reports/bank-book', requireAuth, requirePermission('A
 
 // 9. Customer Management Endpoints (Phase 5)
 apiRouter.get('/customers', requireAuth, requirePermission('CUSTOMER', 'VIEW'), CustomerController.list);
+apiRouter.post('/customers/check-duplicates', requireAuth, requirePermission('CUSTOMER', 'VIEW'), CustomerController.checkDuplicates);
 apiRouter.get('/customers/:id', requireAuth, requirePermission('CUSTOMER', 'VIEW'), CustomerController.getById);
 apiRouter.post('/customers', requireAuth, requirePermission('CUSTOMER', 'CREATE'), CustomerController.create);
 apiRouter.patch('/customers/:id', requireAuth, requirePermission('CUSTOMER', 'EDIT'), CustomerController.update);
@@ -126,8 +134,13 @@ apiRouter.post('/quotations/:id/convert-to-invoice', requireAuth, requirePermiss
 apiRouter.get('/invoices', requireAuth, requirePermission('INVOICE', 'VIEW'), BillingController.list);
 apiRouter.get('/invoices/:id', requireAuth, requirePermission('INVOICE', 'VIEW'), BillingController.getById);
 apiRouter.post('/invoices', requireAuth, requirePermission('INVOICE', 'CREATE'), BillingController.create);
+apiRouter.patch('/invoices/:id', requireAuth, requirePermission('INVOICE', 'EDIT'), BillingController.update);
 apiRouter.post('/invoices/:id/issue', requireAuth, requirePermission('INVOICE', 'APPROVE'), BillingController.issue);
 apiRouter.post('/invoices/:id/void', requireAuth, requirePermission('INVOICE', 'EDIT'), BillingController.void);
+
+// 11b. Document Export Endpoints (PDF & Word .docx)
+apiRouter.post('/documents/export/pdf', requireAuth, DocumentExportController.exportPdf);
+apiRouter.post('/documents/export/docx', requireAuth, DocumentExportController.exportDocx);
 
 // 12. Customer Receipts Endpoints (Accounting Integrated, Phase 5)
 apiRouter.get('/receipts', requireAuth, requirePermission('RECEIPT', 'VIEW'), ReceiptController.list);

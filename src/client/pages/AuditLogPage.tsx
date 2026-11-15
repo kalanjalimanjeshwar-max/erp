@@ -5,16 +5,28 @@ import {
   RefreshCw,
   Search,
   Clock,
-  Terminal,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
-import { AuditLogData } from '../../shared/types.ts';
+import { AuditLogData, CompanyProfile } from '../../shared/types.ts';
+import {
+  formatDateTimeInTimezone,
+  formatUtcTimestamp,
+  getEffectiveTimeZone,
+  getTimezoneShortName,
+} from '../../shared/timezone.ts';
 
-export const AuditLogPage: React.FC = () => {
+interface AuditLogPageProps {
+  companyProfile?: CompanyProfile | null;
+}
+
+export const AuditLogPage: React.FC<AuditLogPageProps> = ({ companyProfile }) => {
   const [logs, setLogs] = useState<AuditLogData[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [entityFilter, setEntityFilter] = useState('');
+
+  const timezone = getEffectiveTimeZone(companyProfile?.timezone);
+  const tzAbbr = getTimezoneShortName(timezone);
 
   const fetchLogs = async () => {
     setIsLoading(true);
@@ -49,7 +61,11 @@ export const AuditLogPage: React.FC = () => {
             Security &amp; Administrative Audit Trail
           </h2>
           <p className="text-xs text-slate-400 mt-1">
-            Tamper-evident system activity logs scoped to your tenant. All secrets are cryptographically redacted.
+            Tamper-evident system activity logs scoped to your tenant. Displaying timestamps in{' '}
+            <span className="font-mono text-indigo-300">
+              {timezone} ({tzAbbr})
+            </span>{' '}
+            with original UTC preserved for audit traceability.
           </p>
         </div>
 
@@ -89,7 +105,9 @@ export const AuditLogPage: React.FC = () => {
           <table className="w-full text-left text-xs border-collapse">
             <thead>
               <tr className="bg-slate-950/60 border-b border-slate-800 text-slate-400 font-semibold uppercase tracking-wider text-[10px]">
-                <th className="px-5 py-3">Timestamp (UTC)</th>
+                <th className="px-5 py-3">
+                  Timestamp ({timezone}{tzAbbr !== timezone ? ` / ${tzAbbr}` : ''})
+                </th>
                 <th className="px-4 py-3">Action</th>
                 <th className="px-4 py-3">Entity &amp; Target ID</th>
                 <th className="px-4 py-3">Actor</th>
@@ -105,58 +123,70 @@ export const AuditLogPage: React.FC = () => {
                   </td>
                 </tr>
               ) : (
-                logs.map((log) => (
-                  <tr key={log.id} className="hover:bg-slate-800/40 transition">
-                    <td className="px-5 py-3 text-slate-400 whitespace-nowrap">
-                      <div className="flex items-center gap-1.5">
-                        <Clock className="w-3.5 h-3.5 text-slate-400" />
-                        <span>{new Date(log.createdAt).toISOString().replace('T', ' ').substring(0, 19)}</span>
-                      </div>
-                    </td>
+                logs.map((log) => {
+                  const localTs = formatDateTimeInTimezone(log.createdAt, timezone, {
+                    includeSeconds: true,
+                    includeZoneAbbr: true,
+                  });
+                  const utcTs = formatUtcTimestamp(log.createdAt);
 
-                    <td className="px-4 py-3 font-semibold text-slate-100">
-                      {log.action}
-                    </td>
-
-                    <td className="px-4 py-3 text-slate-300">
-                      <span className="text-indigo-400 font-medium">{log.entity}</span>
-                      {log.entityId && (
-                        <span className="text-slate-400 text-[10px] block truncate max-w-[120px]">
-                          {log.entityId}
-                        </span>
-                      )}
-                    </td>
-
-                    <td className="px-4 py-3 font-sans text-xs">
-                      {log.user ? (
-                        <div>
-                          <div className="text-slate-200 font-medium">{log.user.fullName}</div>
-                          <div className="text-slate-400 text-[10px]">{log.user.email}</div>
-                        </div>
-                      ) : (
-                        <span className="text-slate-400 italic font-mono text-[10px]">System / Anonymous</span>
-                      )}
-                    </td>
-
-                    <td className="px-4 py-3 text-slate-400 text-[10px] truncate max-w-[140px]">
-                      {log.correlationId || 'N/A'}
-                    </td>
-
-                    <td className="px-4 py-3">
-                      <span
-                        className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold ${
-                          log.severity === 'CRITICAL'
-                            ? 'bg-red-950/80 text-red-300 border border-red-800/50'
-                            : log.severity === 'WARN'
-                            ? 'bg-amber-950/80 text-amber-300 border border-amber-800/50'
-                            : 'bg-slate-800 text-slate-300 border border-slate-700'
-                        }`}
+                  return (
+                    <tr key={log.id} className="hover:bg-slate-800/40 transition">
+                      <td
+                        className="px-5 py-3 text-slate-200 whitespace-nowrap"
+                        title={`Original UTC Timestamp: ${utcTs}`}
                       >
-                        {log.severity}
-                      </span>
-                    </td>
-                  </tr>
-                ))
+                        <div className="flex items-center gap-1.5">
+                          <Clock className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                          <span>{localTs}</span>
+                        </div>
+                        <div className="text-[10px] text-slate-500 pl-5">UTC: {utcTs}</div>
+                      </td>
+
+                      <td className="px-4 py-3 font-semibold text-slate-100">{log.action}</td>
+
+                      <td className="px-4 py-3 text-slate-300">
+                        <span className="text-indigo-400 font-medium">{log.entity}</span>
+                        {log.entityId && (
+                          <span className="text-slate-400 text-[10px] block truncate max-w-[120px]">
+                            {log.entityId}
+                          </span>
+                        )}
+                      </td>
+
+                      <td className="px-4 py-3 font-sans text-xs">
+                        {log.user ? (
+                          <div>
+                            <div className="text-slate-200 font-medium">{log.user.fullName}</div>
+                            <div className="text-slate-400 text-[10px]">{log.user.email}</div>
+                          </div>
+                        ) : (
+                          <span className="text-slate-400 italic font-mono text-[10px]">
+                            System / Anonymous
+                          </span>
+                        )}
+                      </td>
+
+                      <td className="px-4 py-3 text-slate-400 text-[10px] truncate max-w-[140px]">
+                        {log.correlationId || 'N/A'}
+                      </td>
+
+                      <td className="px-4 py-3">
+                        <span
+                          className={`inline-block px-2 py-0.5 rounded text-[10px] font-bold ${
+                            log.severity === 'CRITICAL'
+                              ? 'bg-red-950/80 text-red-300 border border-red-800/50'
+                              : log.severity === 'WARN'
+                              ? 'bg-amber-950/80 text-amber-300 border border-amber-800/50'
+                              : 'bg-slate-800 text-slate-300 border border-slate-700'
+                          }`}
+                        >
+                          {log.severity}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>

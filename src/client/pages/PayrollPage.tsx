@@ -31,7 +31,10 @@ import {
   PayslipStatus,
   CreatePayrollPeriodRequest,
   AccountLedgerItem,
+  CompanyProfile,
 } from '../../shared/types.ts';
+import { formatMoney } from '../../shared/currency.ts';
+import { formatDateTimeInTimezone, formatUtcTimestamp } from '../../shared/timezone.ts';
 import {
   PREVIEW_PAYROLL_PERIODS,
   PREVIEW_PAYSLIPS,
@@ -40,11 +43,19 @@ import {
 
 interface PayrollPageProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
   onNavigateToJournals?: () => void;
 }
 
-export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigateToJournals }) => {
+export const PayrollPage: React.FC<PayrollPageProps> = ({
+  currentUser,
+  companyProfile,
+  onNavigateToJournals,
+}) => {
   const isEmployee = currentUser.role === 'EMPLOYEE';
+  const baseCurrency = companyProfile?.currency;
+  const roundingPrecision = companyProfile?.roundingPrecision;
+  const timezone = companyProfile?.timezone;
 
   // Manager State: Payroll Periods
   const [periods, setPeriods] = useState<PayrollPeriodItem[]>([]);
@@ -549,22 +560,26 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                         </div>
                       </td>
                       <td className="py-3 px-4 text-right font-mono tabular-nums text-slate-300">
-                        ${ps.basicSalary}
+                        {formatMoney(ps.basicSalary, baseCurrency, { decimals: roundingPrecision })}
                       </td>
                       <td className="py-3 px-4 text-right font-mono tabular-nums text-slate-400">
-                        ${ps.allowances}
+                        {formatMoney(ps.allowances, baseCurrency, { decimals: roundingPrecision })}
                       </td>
                       <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold text-slate-200">
-                        ${ps.grossSalary}
+                        {formatMoney(ps.grossSalary, baseCurrency, { decimals: roundingPrecision })}
                       </td>
                       <td className="py-3 px-4 text-right font-mono tabular-nums text-amber-400">
-                        {Number(ps.lossOfPayDeduction) > 0 ? `-$${ps.lossOfPayDeduction}` : '$0.00'}
+                        {Number(ps.lossOfPayDeduction) > 0
+                          ? formatMoney(-Math.abs(Number(ps.lossOfPayDeduction)), baseCurrency, { decimals: roundingPrecision })
+                          : formatMoney(0, baseCurrency, { decimals: roundingPrecision })}
                       </td>
                       <td className="py-3 px-4 text-right font-mono tabular-nums text-rose-400">
-                        {Number(ps.deductions) > 0 ? `-$${ps.deductions}` : '$0.00'}
+                        {Number(ps.deductions) > 0
+                          ? formatMoney(-Math.abs(Number(ps.deductions)), baseCurrency, { decimals: roundingPrecision })
+                          : formatMoney(0, baseCurrency, { decimals: roundingPrecision })}
                       </td>
                       <td className="py-3 px-4 text-right font-mono tabular-nums font-bold text-emerald-400 text-sm">
-                        ${ps.netSalary}
+                        {formatMoney(ps.netSalary, baseCurrency, { decimals: roundingPrecision })}
                       </td>
                       <td className="py-3 px-4">
                         <span className={`font-semibold ${getStatusTextClass(ps.status)}`}>
@@ -727,13 +742,13 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                             {p.payslipsCount ?? '—'}
                           </td>
                           <td className="py-3 px-4 text-right font-mono tabular-nums text-slate-300">
-                            ${p.totalGross || '0.00'}
+                            {formatMoney(p.totalGross || 0, baseCurrency, { decimals: roundingPrecision })}
                           </td>
                           <td className="py-3 px-4 text-right font-mono tabular-nums text-rose-400">
-                            ${p.totalDeductions || '0.00'}
+                            {formatMoney(p.totalDeductions || 0, baseCurrency, { decimals: roundingPrecision })}
                           </td>
                           <td className="py-3 px-4 text-right font-mono tabular-nums font-bold text-emerald-400 text-sm">
-                            ${p.totalNet || '0.00'}
+                            {formatMoney(p.totalNet || 0, baseCurrency, { decimals: roundingPrecision })}
                           </td>
                           <td className="py-3 px-4 text-right">
                             <span className="text-slate-500 inline-flex items-center gap-1 group-hover:text-slate-300">
@@ -928,8 +943,13 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                           </div>
                           <div>
                             Timestamp:{' '}
-                            <span className="font-mono tabular-nums text-slate-300">
-                              {new Date(selectedPeriod.accountsApprovedAt).toLocaleString()}
+                            <span
+                              className="font-mono tabular-nums text-slate-300"
+                              title={`UTC: ${formatUtcTimestamp(selectedPeriod.accountsApprovedAt)}`}
+                            >
+                              {formatDateTimeInTimezone(selectedPeriod.accountsApprovedAt, timezone, {
+                                includeZoneAbbr: true,
+                              })}
                             </span>
                           </div>
                           {selectedPeriod.accountsApprovalNotes && (
@@ -990,10 +1010,17 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                           </div>
                           <div>
                             Timestamp:{' '}
-                            <span className="font-mono tabular-nums text-slate-300">
-                              {new Date(
-                                selectedPeriod.adminApprovedAt || selectedPeriod.postedAt || ''
-                              ).toLocaleString()}
+                            <span
+                              className="font-mono tabular-nums text-slate-300"
+                              title={`UTC: ${formatUtcTimestamp(
+                                selectedPeriod.adminApprovedAt || selectedPeriod.postedAt
+                              )}`}
+                            >
+                              {formatDateTimeInTimezone(
+                                selectedPeriod.adminApprovedAt || selectedPeriod.postedAt,
+                                timezone,
+                                { includeZoneAbbr: true }
+                              )}
                             </span>
                           </div>
                         </>
@@ -1014,7 +1041,7 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                 <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
                   <div className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">Gross Payroll</div>
                   <div className="text-lg font-bold font-mono tabular-nums text-slate-100 mt-1">
-                    ${selectedPeriod.totalGross || '0.00'}
+                    {formatMoney(selectedPeriod.totalGross || 0, baseCurrency, { decimals: roundingPrecision })}
                   </div>
                   <div className="text-[10px] text-slate-500 mt-0.5">Basic + Allowances + OT</div>
                 </div>
@@ -1022,7 +1049,7 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                 <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
                   <div className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">Total Deductions</div>
                   <div className="text-lg font-bold font-mono tabular-nums text-rose-400 mt-1">
-                    ${selectedPeriod.totalDeductions || '0.00'}
+                    {formatMoney(selectedPeriod.totalDeductions || 0, baseCurrency, { decimals: roundingPrecision })}
                   </div>
                   <div className="text-[10px] text-slate-500 mt-0.5">LOP + Mandatory Deductions</div>
                 </div>
@@ -1030,7 +1057,7 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                 <div className="bg-slate-950 border border-slate-800 rounded-xl p-4">
                   <div className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">Net Disbursement</div>
                   <div className="text-lg font-bold font-mono tabular-nums text-emerald-400 mt-1">
-                    ${selectedPeriod.totalNet || '0.00'}
+                    {formatMoney(selectedPeriod.totalNet || 0, baseCurrency, { decimals: roundingPrecision })}
                   </div>
                   <div className="text-[10px] text-slate-500 mt-0.5">Total Company Net Payable</div>
                 </div>
@@ -1090,25 +1117,29 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                               <div className="text-[11px] text-slate-500 font-mono">{ps.employeeCode}</div>
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-300">
-                              ${ps.basicSalary}
+                              {formatMoney(ps.basicSalary, baseCurrency, { decimals: roundingPrecision })}
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-400">
-                              ${ps.allowances}
+                              {formatMoney(ps.allowances, baseCurrency, { decimals: roundingPrecision })}
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-400">
-                              ${ps.overtimePay}
+                              {formatMoney(ps.overtimePay, baseCurrency, { decimals: roundingPrecision })}
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono tabular-nums font-semibold text-slate-200">
-                              ${ps.grossSalary}
+                              {formatMoney(ps.grossSalary, baseCurrency, { decimals: roundingPrecision })}
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono tabular-nums text-amber-400">
-                              {Number(ps.lossOfPayDeduction) > 0 ? `-$${ps.lossOfPayDeduction}` : '$0.00'}
+                              {Number(ps.lossOfPayDeduction) > 0
+                                ? formatMoney(-Math.abs(Number(ps.lossOfPayDeduction)), baseCurrency, { decimals: roundingPrecision })
+                                : formatMoney(0, baseCurrency, { decimals: roundingPrecision })}
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono tabular-nums text-rose-400">
-                              {Number(ps.deductions) > 0 ? `-$${ps.deductions}` : '$0.00'}
+                              {Number(ps.deductions) > 0
+                                ? formatMoney(-Math.abs(Number(ps.deductions)), baseCurrency, { decimals: roundingPrecision })
+                                : formatMoney(0, baseCurrency, { decimals: roundingPrecision })}
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono tabular-nums font-bold text-emerald-400">
-                              ${ps.netSalary}
+                              {formatMoney(ps.netSalary, baseCurrency, { decimals: roundingPrecision })}
                             </td>
                             <td className="py-2.5 px-3 text-slate-400 max-w-xs truncate font-mono text-[11px]">
                               {ps.ledgerName || 'General Payroll Payable'}
@@ -1187,19 +1218,27 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                 <div className="space-y-2">
                   <div className="flex items-center justify-between">
                     <span className="text-slate-400">Basic Salary</span>
-                    <span className="font-mono tabular-nums text-slate-200">${viewingPayslip.basicSalary}</span>
+                    <span className="font-mono tabular-nums text-slate-200">
+                      {formatMoney(viewingPayslip.basicSalary, baseCurrency, { decimals: roundingPrecision })}
+                    </span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-slate-400">Allowances</span>
-                    <span className="font-mono tabular-nums text-slate-200">${viewingPayslip.allowances}</span>
+                    <span className="font-mono tabular-nums text-slate-200">
+                      {formatMoney(viewingPayslip.allowances, baseCurrency, { decimals: roundingPrecision })}
+                    </span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-slate-400">Overtime Pay</span>
-                    <span className="font-mono tabular-nums text-slate-200">${viewingPayslip.overtimePay}</span>
+                    <span className="font-mono tabular-nums text-slate-200">
+                      {formatMoney(viewingPayslip.overtimePay, baseCurrency, { decimals: roundingPrecision })}
+                    </span>
                   </div>
                   <div className="flex items-center justify-between pt-2 border-t border-slate-800 font-semibold">
                     <span className="text-slate-300">Total Gross Pay</span>
-                    <span className="font-mono tabular-nums text-indigo-300">${viewingPayslip.grossSalary}</span>
+                    <span className="font-mono tabular-nums text-indigo-300">
+                      {formatMoney(viewingPayslip.grossSalary, baseCurrency, { decimals: roundingPrecision })}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -1213,18 +1252,24 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                   <div className="flex items-center justify-between">
                     <span className="text-slate-400">Loss of Pay (LOP)</span>
                     <span className="font-mono tabular-nums text-amber-400">
-                      ${viewingPayslip.lossOfPayDeduction}
+                      {formatMoney(viewingPayslip.lossOfPayDeduction, baseCurrency, { decimals: roundingPrecision })}
                     </span>
                   </div>
                   <div className="flex items-center justify-between">
                     <span className="text-slate-400">Other Deductions</span>
                     <span className="font-mono tabular-nums text-rose-400">
-                      ${(Number(viewingPayslip.deductions) - Number(viewingPayslip.lossOfPayDeduction)).toFixed(2)}
+                      {formatMoney(
+                        Number(viewingPayslip.deductions) - Number(viewingPayslip.lossOfPayDeduction),
+                        baseCurrency,
+                        { decimals: roundingPrecision }
+                      )}
                     </span>
                   </div>
                   <div className="flex items-center justify-between pt-2 border-t border-slate-800 font-semibold">
                     <span className="text-slate-300">Total Deductions</span>
-                    <span className="font-mono tabular-nums text-rose-400">-${viewingPayslip.deductions}</span>
+                    <span className="font-mono tabular-nums text-rose-400">
+                      {formatMoney(-Math.abs(Number(viewingPayslip.deductions)), baseCurrency, { decimals: roundingPrecision })}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -1241,7 +1286,7 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
                 </span>
               </div>
               <div className="text-2xl font-bold font-mono tabular-nums text-emerald-300">
-                ${viewingPayslip.netSalary}
+                {formatMoney(viewingPayslip.netSalary, baseCurrency, { decimals: roundingPrecision })}
               </div>
             </div>
 
@@ -1439,15 +1484,21 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
               <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg space-y-1.5 font-mono text-[11px]">
                 <div className="flex justify-between">
                   <span className="text-slate-400">Total Gross Pay:</span>
-                  <span className="text-slate-200">${selectedPeriod.totalGross}</span>
+                  <span className="text-slate-200">
+                    {formatMoney(selectedPeriod.totalGross || 0, baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-400">Total Deductions:</span>
-                  <span className="text-rose-400">${selectedPeriod.totalDeductions}</span>
+                  <span className="text-rose-400">
+                    {formatMoney(selectedPeriod.totalDeductions || 0, baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
                 <div className="flex justify-between font-bold">
                   <span className="text-slate-300">Total Net Payable:</span>
-                  <span className="text-emerald-400">${selectedPeriod.totalNet}</span>
+                  <span className="text-emerald-400">
+                    {formatMoney(selectedPeriod.totalNet || 0, baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-400">Employee Payslips:</span>
@@ -1527,16 +1578,22 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({ currentUser, onNavigat
               <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg space-y-1.5 font-mono">
                 <div className="flex justify-between">
                   <span className="text-slate-400">Debit Gross Expense:</span>
-                  <span className="text-slate-200">${selectedPeriod.totalGross}</span>
+                  <span className="text-slate-200">
+                    {formatMoney(selectedPeriod.totalGross || 0, baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
                 <div className="flex justify-between">
                   <span className="text-slate-400">Credit Net Salaries Payable:</span>
-                  <span className="text-emerald-400">${selectedPeriod.totalNet}</span>
+                  <span className="text-emerald-400">
+                    {formatMoney(selectedPeriod.totalNet || 0, baseCurrency, { decimals: roundingPrecision })}
+                  </span>
                 </div>
                 {Number(selectedPeriod.totalDeductions) > 0 && (
                   <div className="flex justify-between">
                     <span className="text-slate-400">Credit Payroll Deductions:</span>
-                    <span className="text-rose-400">${selectedPeriod.totalDeductions}</span>
+                    <span className="text-rose-400">
+                      {formatMoney(selectedPeriod.totalDeductions || 0, baseCurrency, { decimals: roundingPrecision })}
+                    </span>
                   </div>
                 )}
               </div>

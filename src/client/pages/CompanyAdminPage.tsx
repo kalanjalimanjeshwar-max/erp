@@ -13,10 +13,12 @@ import {
   Coins,
   Layout,
   FileText,
+  Printer,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
 import { CompanyProfile, AuthUser } from '../../shared/types.ts';
 import { SUPPORTED_CURRENCIES, COMMON_TIMEZONES } from '../../shared/constants.ts';
+import { DocumentPrintSettingsSection } from '../components/company/DocumentPrintSettingsSection.tsx';
 
 interface CompanyAdminPageProps {
   currentUser?: AuthUser | null;
@@ -24,11 +26,13 @@ interface CompanyAdminPageProps {
 }
 
 export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser, onProfileUpdated }) => {
+  const [activeTab, setActiveTab] = useState<'PROFILE' | 'PRINT_SETTINGS'>('PROFILE');
   const [profile, setProfile] = useState<CompanyProfile | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [pendingMessage, setPendingMessage] = useState<string | null>(null);
 
   // Form fields
   const [name, setName] = useState('');
@@ -88,6 +92,7 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
     e.preventDefault();
     setErrorMessage(null);
     setSuccessMessage(null);
+    setPendingMessage(null);
 
     if (!name.trim()) {
       setErrorMessage('Company display name is required.');
@@ -137,9 +142,15 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
       });
 
       setProfile(updated);
-      setSuccessMessage('Company profile and settings updated successfully.');
-      if (onProfileUpdated) {
-        onProfileUpdated(updated);
+      if (updated.pendingApproval) {
+        setPendingMessage(
+          'Protected company settings changes were submitted for Super Admin approval (Maker-Checker).'
+        );
+      } else {
+        setSuccessMessage('Company profile and settings updated successfully.');
+        if (onProfileUpdated) {
+          onProfileUpdated(updated);
+        }
       }
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -162,32 +173,79 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
   }
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
-      <div>
-        <h2 className="text-xl font-bold tracking-tight text-slate-100 flex items-center gap-2">
-          <Building2 className="w-6 h-6 text-indigo-400" />
-          Company Profile &amp; Operational Settings
-        </h2>
-        <p className="text-xs text-slate-400 mt-1">
-          Configure multi-tenant branding, operating currency, legal registration, and contact details
-        </p>
+    <div className="max-w-6xl mx-auto space-y-6">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h2 className="text-xl font-bold tracking-tight text-slate-100 flex items-center gap-2">
+            <Building2 className="w-6 h-6 text-indigo-400" />
+            Company Profile &amp; Operational Settings
+          </h2>
+          <p className="text-xs text-slate-400 mt-1">
+            Configure multi-tenant branding, operating currency, timezone, and document print templates
+          </p>
+        </div>
+
+        <div className="inline-flex items-center gap-1 bg-slate-900 border border-slate-800 rounded-xl p-1">
+          <button
+            type="button"
+            onClick={() => setActiveTab('PROFILE')}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold transition cursor-pointer ${
+              activeTab === 'PROFILE'
+                ? 'bg-indigo-600 text-white shadow'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Building2 className="w-3.5 h-3.5" />
+            <span>Company Profile</span>
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('PRINT_SETTINGS')}
+            className={`inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg text-xs font-semibold transition cursor-pointer ${
+              activeTab === 'PRINT_SETTINGS'
+                ? 'bg-indigo-600 text-white shadow'
+                : 'text-slate-400 hover:text-slate-200'
+            }`}
+          >
+            <Printer className="w-3.5 h-3.5" />
+            <span>Document Print Settings</span>
+          </button>
+        </div>
       </div>
 
-      {errorMessage && (
-        <div className="bg-red-950/60 border border-red-800/60 rounded-xl p-3.5 text-xs text-red-200 flex items-center gap-2">
-          <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
-          <span>{errorMessage}</span>
-        </div>
-      )}
+      {activeTab === 'PRINT_SETTINGS' ? (
+        <DocumentPrintSettingsSection
+          companyProfile={profile}
+          currentUser={currentUser}
+          onProfileUpdated={(updated) => {
+            setProfile(updated);
+            if (onProfileUpdated) onProfileUpdated(updated);
+          }}
+        />
+      ) : (
+        <>
+          {errorMessage && (
+            <div className="bg-red-950/60 border border-red-800/60 rounded-xl p-3.5 text-xs text-red-200 flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+              <span>{errorMessage}</span>
+            </div>
+          )}
 
-      {successMessage && (
-        <div className="bg-emerald-950/60 border border-emerald-800/60 rounded-xl p-3.5 text-xs text-emerald-200 flex items-center gap-2">
-          <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
-          <span>{successMessage}</span>
-        </div>
-      )}
+          {successMessage && (
+            <div className="bg-emerald-950/60 border border-emerald-800/60 rounded-xl p-3.5 text-xs text-emerald-200 flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+              <span>{successMessage}</span>
+            </div>
+          )}
 
-      <form onSubmit={handleSubmit} className="space-y-6">
+          {pendingMessage && (
+            <div className="bg-amber-950/60 border border-amber-700/60 rounded-xl p-3.5 text-xs text-amber-200 flex items-center gap-2">
+              <Clock className="w-4 h-4 text-amber-400 shrink-0" />
+              <span>{pendingMessage}</span>
+            </div>
+          )}
+
+          <form onSubmit={handleSubmit} className="space-y-6">
         {/* Section 1: Core Corporate Identity */}
         <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
           <div className="text-sm font-semibold text-slate-200 pb-2 border-b border-slate-800 flex items-center gap-2">
@@ -449,7 +507,9 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
             )}
           </button>
         </div>
-      </form>
+          </form>
+        </>
+      )}
     </div>
   );
 };

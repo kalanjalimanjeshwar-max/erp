@@ -26,6 +26,15 @@ import {
   PREVIEW_ACCOUNT_LEDGERS,
   previewStore,
 } from '../services/previewStore.ts';
+import {
+  formatAccountNatureDisplay,
+  getDefaultAccountNature,
+} from '../../shared/account-nature.ts';
+import {
+  getAllowedCodeRangeLabel,
+  suggestNextLedgerCode,
+  validateLedgerCodeForGroup,
+} from '../../shared/account-code.ts';
 
 interface ChartOfAccountsPageProps {
   currentUser: AuthUser;
@@ -69,11 +78,43 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
   // Ledger Form
   const [ledgerGroupId, setLedgerGroupId] = useState('');
   const [ledgerCode, setLedgerCode] = useState('');
+  const [isManualCode, setIsManualCode] = useState(false);
+  const [suggestedCode, setSuggestedCode] = useState('');
+  const [allowedRangeLabel, setAllowedRangeLabel] = useState('');
+  const [isLoadingSuggestedCode, setIsLoadingSuggestedCode] = useState(false);
   const [ledgerName, setLedgerName] = useState('');
   const [ledgerDesc, setLedgerDesc] = useState('');
   const [ledgerOpeningBal, setLedgerOpeningBal] = useState('0.0000');
-  const [ledgerBalType, setLedgerBalType] = useState<BalanceType>('DEBIT');
   const [isSubmittingLedger, setIsSubmittingLedger] = useState(false);
+  const [modalLedgerError, setModalLedgerError] = useState<string | null>(null);
+
+  const selectedLedgerGroup = groups.find((g) => g.id === ledgerGroupId) || groups[0] || null;
+  const derivedLedgerNature: BalanceType | null = selectedLedgerGroup
+    ? getDefaultAccountNature(selectedLedgerGroup)
+    : null;
+
+  const ledgerCodeValidationError: string | null = (() => {
+    if (!isLedgerModalOpen || !selectedLedgerGroup) return null;
+    const trimmed = ledgerCode.trim();
+    if (!trimmed) {
+      return isManualCode ? 'Ledger code is required.' : null;
+    }
+    const groupCheck = validateLedgerCodeForGroup({
+      code: trimmed,
+      targetGroup: selectedLedgerGroup,
+      allGroups: groups,
+    });
+    if (!groupCheck.valid) {
+      return groupCheck.error || 'Invalid ledger code for selected Account Group.';
+    }
+    const duplicate = ledgers.find(
+      (l) => l.code && l.code.trim().toUpperCase() === groupCheck.normalizedCode.toUpperCase()
+    );
+    if (duplicate && isManualCode) {
+      return `Ledger code "${groupCheck.normalizedCode}" already exists (${duplicate.name}).`;
+    }
+    return null;
+  })();
 
   const fetchData = useCallback(async () => {
     setIsLoading(true);
@@ -123,6 +164,62 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
     fetchData();
   }, [fetchData]);
 
+  const isManualCodeRef = React.useRef(isManualCode);
+  useEffect(() => {
+    isManualCodeRef.current = isManualCode;
+  }, [isManualCode]);
+
+  useEffect(() => {
+    if (!isLedgerModalOpen || !selectedLedgerGroup) return;
+
+    let cancelled = false;
+
+    if (currentUser?.isPreview) {
+      const suggestion = previewStore.suggestAccountLedgerCode(selectedLedgerGroup.id);
+      setSuggestedCode(suggestion.suggestedCode);
+      setAllowedRangeLabel(suggestion.allowedRangeLabel);
+      if (!isManualCodeRef.current) {
+        setLedgerCode(suggestion.suggestedCode);
+      }
+      return;
+    }
+
+    const localSuggestion = suggestNextLedgerCode({
+      targetGroup: selectedLedgerGroup,
+      allGroups: groups,
+      existingLedgerCodes: ledgers.map((l) => l.code),
+    });
+    const localRange = getAllowedCodeRangeLabel(selectedLedgerGroup, groups);
+    setSuggestedCode(localSuggestion);
+    setAllowedRangeLabel(localRange);
+    if (!isManualCodeRef.current) {
+      setLedgerCode(localSuggestion);
+    }
+
+    setIsLoadingSuggestedCode(true);
+    api
+      .suggestAccountLedgerCode(selectedLedgerGroup.id)
+      .then((res) => {
+        if (cancelled) return;
+        setSuggestedCode(res.suggestedCode);
+        setAllowedRangeLabel(res.allowedRangeLabel);
+        if (!isManualCodeRef.current) {
+          setLedgerCode(res.suggestedCode);
+        }
+      })
+      .catch(() => {
+        // Keep local fallback suggestion if suggest-code call fails
+      })
+      .finally(() => {
+        if (!cancelled) setIsLoadingSuggestedCode(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLedgerModalOpen, selectedLedgerGroup?.id, currentUser?.isPreview]);
+
   const handleCreateGroup = async (e: React.FormEvent) => {
     e.preventDefault();
     if (currentUser?.isPreview) {
@@ -170,43 +267,72 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
     }
   };
 
+  const openCreateLedgerModal = () => {
+    setModalLedgerError(null);
+    setIsManualCode(false);
+    setLedgerName('');
+    setLedgerDesc('');
+    setLedgerOpeningBal('0.0000');
+    if (!ledgerGroupId && groups.length > 0) {
+      setLedgerGroupId(groups[0].id);
+    }
+    setIsLedgerModalOpen(true);
+  };
+
   const handleCreateLedger = async (e: React.FormEvent) => {
     e.preventDefault();
+    const effectiveGroupId = ledgerGroupId || selectedLedgerGroup?.id || '';
+    if (!effectiveGroupId) {
+      setModalLedgerError('Please select an Account Group.');
+      return;
+    }
+    if (ledgerCodeValidationError) {
+      setModalLedgerError(ledgerCodeValidationError);
+      return;
+    }
+    setModalLedgerError(null);
+
     if (currentUser?.isPreview) {
-      previewStore.createAccountLedger({
-        groupId: ledgerGroupId,
-        code: ledgerCode.trim() || null,
-        name: ledgerName.trim(),
-        description: ledgerDesc.trim() || null,
-        openingBalance: ledgerOpeningBal,
-        openingBalanceType: ledgerBalType,
-      });
-      setSuccessMessage(
-        `[Preview Demo] Ledger "${ledgerName}" created in-memory. Not saved to database.`
-      );
-      setIsLedgerModalOpen(false);
-      setLedgerCode('');
-      setLedgerName('');
-      setLedgerDesc('');
-      setLedgerOpeningBal('0.0000');
-      fetchData();
+      try {
+        const created = previewStore.createAccountLedger({
+          groupId: effectiveGroupId,
+          code: ledgerCode.trim() || null,
+          codeSource: isManualCode ? 'MANUAL' : 'AUTO',
+          name: ledgerName.trim(),
+          description: ledgerDesc.trim() || null,
+          openingBalance: ledgerOpeningBal,
+        });
+        setSuccessMessage(
+          `[Preview Demo] Ledger "${created.name}" (${created.code}) created in-memory. Not saved to database.`
+        );
+        setIsLedgerModalOpen(false);
+        setIsManualCode(false);
+        setLedgerCode('');
+        setLedgerName('');
+        setLedgerDesc('');
+        setLedgerOpeningBal('0.0000');
+        fetchData();
+      } catch (err: unknown) {
+        setModalLedgerError(err instanceof Error ? err.message : 'Failed to create ledger.');
+      }
       return;
     }
     setIsSubmittingLedger(true);
     setErrorMessage(null);
 
     try {
-      await api.createAccountLedger({
-        groupId: ledgerGroupId,
+      const created = await api.createAccountLedger({
+        groupId: effectiveGroupId,
         code: ledgerCode.trim() || null,
+        codeSource: isManualCode ? 'MANUAL' : 'AUTO',
         name: ledgerName.trim(),
         description: ledgerDesc.trim() || null,
         openingBalance: ledgerOpeningBal,
-        openingBalanceType: ledgerBalType,
       });
 
-      setSuccessMessage(`Ledger "${ledgerName}" created successfully.`);
+      setSuccessMessage(`Ledger "${created.name}" (${created.code}) created successfully.`);
       setIsLedgerModalOpen(false);
+      setIsManualCode(false);
       setLedgerCode('');
       setLedgerName('');
       setLedgerDesc('');
@@ -214,9 +340,9 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
       fetchData();
     } catch (err: unknown) {
       if (err instanceof ApiError) {
-        setErrorMessage(err.message);
+        setModalLedgerError(err.message);
       } else {
-        setErrorMessage('Failed to create ledger.');
+        setModalLedgerError('Failed to create ledger.');
       }
     } finally {
       setIsSubmittingLedger(false);
@@ -278,7 +404,7 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
           </button>
 
           <button
-            onClick={() => setIsLedgerModalOpen(true)}
+            onClick={openCreateLedgerModal}
             title="New Ledger"
             className="inline-flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-semibold shadow-md transition bg-indigo-600 hover:bg-indigo-500 text-white cursor-pointer"
           >
@@ -638,6 +764,13 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
             </div>
 
             <form onSubmit={handleCreateLedger} className="space-y-3.5">
+              {modalLedgerError && (
+                <div className="bg-red-950/70 border border-red-800/70 rounded-lg p-3 text-xs text-red-200 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                  <span>{modalLedgerError}</span>
+                </div>
+              )}
+
               <div>
                 <label className="block text-xs font-medium text-slate-300 mb-1">
                   Account Group <span className="text-red-400">*</span>
@@ -645,7 +778,10 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
                 <select
                   required
                   value={ledgerGroupId}
-                  onChange={(e) => setLedgerGroupId(e.target.value)}
+                  onChange={(e) => {
+                    setLedgerGroupId(e.target.value);
+                    setModalLedgerError(null);
+                  }}
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                 >
                   {groups.map((g) => (
@@ -658,16 +794,55 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
 
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Ledger Code (Optional)
-                  </label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-medium text-slate-300">
+                      Ledger Code <span className="text-red-400">*</span>
+                    </label>
+                    {isManualCode && suggestedCode ? (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsManualCode(false);
+                          setLedgerCode(suggestedCode);
+                          setModalLedgerError(null);
+                        }}
+                        className="text-[10px] text-indigo-400 hover:text-indigo-300 underline cursor-pointer"
+                      >
+                        Use {suggestedCode}
+                      </button>
+                    ) : (
+                      <span className="text-[10px] font-mono text-indigo-300">
+                        {isLoadingSuggestedCode ? 'Checking...' : 'Auto'}
+                      </span>
+                    )}
+                  </div>
                   <input
                     type="text"
+                    required
                     value={ledgerCode}
-                    onChange={(e) => setLedgerCode(e.target.value)}
-                    placeholder="e.g. 1010"
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500 font-mono"
+                    onChange={(e) => {
+                      setIsManualCode(true);
+                      setLedgerCode(e.target.value);
+                      setModalLedgerError(null);
+                    }}
+                    placeholder={suggestedCode || 'e.g. 1001'}
+                    className={`w-full bg-slate-950 border rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none font-mono ${
+                      ledgerCodeValidationError
+                        ? 'border-red-500/80 focus:border-red-400'
+                        : 'border-slate-800 focus:border-indigo-500'
+                    }`}
                   />
+                  {ledgerCodeValidationError ? (
+                    <p className="mt-1 text-[11px] text-red-400 leading-tight">
+                      {ledgerCodeValidationError}
+                    </p>
+                  ) : (
+                    allowedRangeLabel && (
+                      <p className="mt-1 text-[10px] text-slate-400 font-mono">
+                        Group range: {allowedRangeLabel}
+                      </p>
+                    )
+                  )}
                 </div>
 
                 <div>
@@ -678,7 +853,10 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
                     type="text"
                     required
                     value={ledgerName}
-                    onChange={(e) => setLedgerName(e.target.value)}
+                    onChange={(e) => {
+                      setLedgerName(e.target.value);
+                      setModalLedgerError(null);
+                    }}
                     placeholder="e.g. Main Operating Bank"
                     className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
                   />
@@ -714,17 +892,25 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
                 </div>
 
                 <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Nature
-                  </label>
-                  <select
-                    value={ledgerBalType}
-                    onChange={(e) => setLedgerBalType(e.target.value as BalanceType)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500 font-mono"
+                  <span className="block text-xs font-medium text-slate-300 mb-1">
+                    Account Nature
+                  </span>
+                  <div
+                    data-testid="default-account-nature"
+                    aria-live="polite"
+                    className={`w-full rounded-lg px-3 py-2 text-xs font-mono border flex items-center justify-between ${
+                      derivedLedgerNature === 'CREDIT'
+                        ? 'bg-amber-950/30 border-amber-800/50 text-amber-200'
+                        : 'bg-emerald-950/30 border-emerald-800/50 text-emerald-200'
+                    }`}
                   >
-                    <option value="DEBIT">Debit (Dr)</option>
-                    <option value="CREDIT">Credit (Cr)</option>
-                  </select>
+                    <span>
+                      Default Nature:{' '}
+                      <strong>
+                        {derivedLedgerNature ? formatAccountNatureDisplay(derivedLedgerNature) : '—'}
+                      </strong>
+                    </span>
+                  </div>
                 </div>
               </div>
 
@@ -744,7 +930,11 @@ export const ChartOfAccountsPage: React.FC<ChartOfAccountsPageProps> = ({
                 </button>
                 <button
                   type="submit"
-                  disabled={currentUser?.isPreview || isSubmittingLedger}
+                  disabled={
+                    currentUser?.isPreview ||
+                    isSubmittingLedger ||
+                    Boolean(ledgerCodeValidationError)
+                  }
                   className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold shadow transition cursor-pointer disabled:opacity-50"
                 >
                   {isSubmittingLedger ? 'Saving...' : 'Create Ledger'}

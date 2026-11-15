@@ -15,6 +15,7 @@ import {
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
 import { AuditService } from './audit.service.js';
 import { PermissionService } from './permission.service.js';
+import { getDefaultAccountNature } from '../../shared/account-nature.js';
 
 export function calculateShiftDurationHours(shift: {
   startTime: string;
@@ -827,6 +828,7 @@ export class EmployeeService {
     if (input.createLedger) {
       // Find or require appropriate group
       let groupId = input.groupId;
+      let resolvedGroup: { id: string; companyId: string; code: string; name: string; rootType: 'ASSET' | 'LIABILITY' | 'EQUITY' | 'INCOME' | 'EXPENSE' } | null = null;
       if (!groupId) {
         // Find existing "Payroll" or "Employees" or "Current Liabilities" group
         const group = await prisma.accountGroup.findFirst({
@@ -841,7 +843,18 @@ export class EmployeeService {
         });
         if (group) {
           groupId = group.id;
+          resolvedGroup = group;
         }
+      } else if (typeof prisma.accountGroup?.findUnique === 'function') {
+        const group = await prisma.accountGroup.findUnique({
+          where: { id: groupId },
+        });
+        if (!group || group.companyId !== actor.companyId) {
+          const err = new Error('Target account group not found in this company.');
+          (err as { statusCode?: number }).statusCode = 400;
+          throw err;
+        }
+        resolvedGroup = group;
       }
 
       if (!groupId) {
@@ -866,6 +879,7 @@ export class EmployeeService {
       if (duplicate) {
         targetLedgerId = duplicate.id;
       } else {
+        const derivedNature = resolvedGroup ? getDefaultAccountNature(resolvedGroup) : 'CREDIT';
         const newLedger = await prisma.accountLedger.create({
           data: {
             companyId: actor.companyId,
@@ -875,7 +889,7 @@ export class EmployeeService {
             description: `Employee ledger for ${employee.fullName} (${employee.employeeCode})`,
             isActive: true,
             openingBalance: new Decimal(0),
-            openingBalanceType: 'CREDIT',
+            openingBalanceType: derivedNature,
             employeeId: employee.id,
           },
         });

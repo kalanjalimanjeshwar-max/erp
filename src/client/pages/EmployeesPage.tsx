@@ -41,19 +41,26 @@ import {
   UpdateEmployeeRequest,
   CreateEmployeeLoginRequest,
   CreateSalaryRevisionRequest,
+  CompanyProfile,
 } from '../../shared/types.ts';
+import { formatMoney, getCurrencySymbol } from '../../shared/currency.ts';
 
 interface EmployeesPageProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
   isSelfServiceOnly?: boolean;
 }
 
 export const EmployeesPage: React.FC<EmployeesPageProps> = ({
   currentUser,
+  companyProfile,
   isSelfServiceOnly = false,
 }) => {
   const isEmployeeRole = currentUser.role === 'EMPLOYEE';
   const showSelfServiceOnly = isSelfServiceOnly || isEmployeeRole;
+  const baseCurrency = companyProfile?.currency;
+  const roundingPrecision = companyProfile?.roundingPrecision;
+  const currencySymbol = getCurrencySymbol(baseCurrency);
 
   // List State
   const [employees, setEmployees] = useState<EmployeeItem[]>([]);
@@ -552,7 +559,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
             <div className="p-4 rounded-xl bg-emerald-950/20 border border-emerald-900/60 space-y-1">
               <span className="text-emerald-400 text-[10px] uppercase font-semibold">Current Monthly Salary</span>
               <div className="font-mono font-bold text-emerald-300 text-sm">
-                ${selfEmployee.currentSalary || '0.00'}
+                {formatMoney(selfEmployee.currentSalary || 0, baseCurrency, { decimals: roundingPrecision })}
               </div>
             </div>
           </div>
@@ -578,7 +585,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                       <td className="py-2.5 px-3 font-medium text-white">{sal.effectiveFrom}</td>
                       <td className="py-2.5 px-3 text-slate-400">{sal.effectiveTo || 'Current / Ongoing'}</td>
                       <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-400">
-                        ${sal.fixedSalary}
+                        {formatMoney(sal.fixedSalary, baseCurrency, { decimals: roundingPrecision })}
                       </td>
                       <td className="py-2.5 px-3 text-slate-400">{sal.revisionReason || '—'}</td>
                     </tr>
@@ -712,7 +719,11 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                         </td>
                         <td className="py-3 px-4 text-slate-400">{emp.dateOfJoining}</td>
                         <td className="py-3 px-4 text-right font-mono font-semibold text-emerald-400">
-                          {emp.currentSalary ? `$${emp.currentSalary}` : <span className="text-slate-500">—</span>}
+                          {emp.currentSalary ? (
+                            formatMoney(emp.currentSalary, baseCurrency, { decimals: roundingPrecision })
+                          ) : (
+                            <span className="text-slate-500">—</span>
+                          )}
                         </td>
                         <td className="py-3 px-4 text-center">
                           {emp.ledgerId ? (
@@ -901,7 +912,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                   </h4>
                   <form onSubmit={handleAddSalaryRevision} className="grid grid-cols-1 md:grid-cols-4 gap-3 text-xs">
                     <div>
-                      <label className="block text-slate-400 mb-1">Monthly Salary ($) *</label>
+                      <label className="block text-slate-400 mb-1">Monthly Salary ({currencySymbol}) *</label>
                       <input
                         type="number"
                         step="0.01"
@@ -978,7 +989,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                               {sal.effectiveTo || <span className="text-emerald-400 font-semibold">Current / Ongoing</span>}
                             </td>
                             <td className="py-2.5 px-3 text-right font-mono font-bold text-emerald-400">
-                              ${sal.fixedSalary}
+                              {formatMoney(sal.fixedSalary, baseCurrency, { decimals: roundingPrecision })}
                             </td>
                             <td className="py-2.5 px-3 text-slate-300">{sal.revisionReason || '—'}</td>
                             <td className="py-2.5 px-3 text-slate-400">{sal.createdByUserName || 'Admin'}</td>
@@ -1330,7 +1341,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 p-3 rounded-xl bg-slate-800/40 border border-slate-800">
                   <div>
                     <label className="block text-emerald-400 font-semibold mb-1">
-                      Initial Monthly Fixed Salary ($)
+                      Initial Monthly Fixed Salary ({currencySymbol})
                     </label>
                     <input
                       type="number"

@@ -924,6 +924,7 @@ describe('Phase 2.3: Company Bank Accounts, AES-256-GCM Encryption & Security', 
   // --------------------------------------------------------------------------
   describe('Controller Endpoints Integration', () => {
     it('should handle list and status query parameters correctly in controller', async () => {
+      vi.spyOn(CompanyBankAccountService, 'canViewBankDetails').mockResolvedValue(true);
       const listSpy = vi
         .spyOn(CompanyBankAccountService, 'listBankAccounts')
         .mockResolvedValue([]);
@@ -943,6 +944,26 @@ describe('Phase 2.3: Company Bank Accounts, AES-256-GCM Encryption & Security', 
       expect(listSpy).toHaveBeenCalledWith(mockActor, { isActive: true });
       expect(res.status).toHaveBeenCalledWith(200);
       expect(res.json).toHaveBeenCalledWith([]);
+    });
+
+    it('should deny bank account list with 403 when actor cannot view bank details', async () => {
+      vi.spyOn(CompanyBankAccountService, 'canViewBankDetails').mockResolvedValue(false);
+      const listSpy = vi.spyOn(CompanyBankAccountService, 'listBankAccounts');
+
+      const req: any = {
+        user: { ...mockActor, role: 'EMPLOYEE' },
+        query: { isActive: 'true' },
+      };
+      const res: any = {
+        status: vi.fn().mockReturnThis(),
+        json: vi.fn(),
+      };
+      const next = vi.fn();
+
+      await CompanyBankAccountController.list(req, res, next);
+
+      expect(listSpy).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(403);
     });
 
     it('should reject non-boolean isActive in updateStatus', async () => {

@@ -255,6 +255,7 @@ export default function App() {
           ) : (
             <UserAdminPage
               currentUser={currentUser}
+              companyProfile={companyProfile}
               initialOpenCreate={currentTab === 'users-create'}
               onSwitchPreviewUser={setCurrentUser}
             />
@@ -308,6 +309,7 @@ export default function App() {
           ) : (
             <CustomersPage
               currentUser={currentUser!}
+              companyProfile={companyProfile}
               onNavigateToInvoice={(_customerId) => {
                 setCurrentTab('invoices');
               }}
@@ -398,7 +400,7 @@ export default function App() {
           ) : isEmployee ? (
             <AccessDenied onBackToDashboard={() => setCurrentTab('dashboard')} requiredRole="ADMIN" />
           ) : (
-            <EmployeesPage currentUser={currentUser!} />
+            <EmployeesPage currentUser={currentUser!} companyProfile={companyProfile} />
           ))}
 
         {currentTab === 'departments' &&
@@ -430,7 +432,7 @@ export default function App() {
               onNavigateToLogin={() => setCurrentTab('login')}
             />
           ) : (
-            <EmployeesPage currentUser={currentUser!} isSelfServiceOnly={true} />
+            <EmployeesPage currentUser={currentUser!} companyProfile={companyProfile} isSelfServiceOnly={true} />
           ))}
 
         {currentTab === 'self-service' &&
@@ -445,7 +447,7 @@ export default function App() {
               onNavigateToLogin={() => setCurrentTab('login')}
             />
           ) : (
-            <EmployeeSelfServicePage currentUser={currentUser!} />
+            <EmployeeSelfServicePage currentUser={currentUser!} companyProfile={companyProfile} />
           ))}
 
         {currentTab === 'attendance' &&
@@ -460,7 +462,7 @@ export default function App() {
               onNavigateToLogin={() => setCurrentTab('login')}
             />
           ) : (
-            <AttendancePage currentUser={currentUser!} />
+            <AttendancePage currentUser={currentUser!} companyProfile={companyProfile} />
           ))}
 
         {currentTab === 'biometric' &&
@@ -477,7 +479,7 @@ export default function App() {
           ) : isEmployee ? (
             <AccessDenied onBackToDashboard={() => setCurrentTab('dashboard')} requiredRole="ADMIN" />
           ) : (
-            <BiometricDevicesPage currentUser={currentUser!} />
+            <BiometricDevicesPage currentUser={currentUser!} companyProfile={companyProfile} />
           ))}
 
         {currentTab === 'leave' &&
@@ -509,6 +511,7 @@ export default function App() {
           ) : (
             <PayrollPage
               currentUser={currentUser!}
+              companyProfile={companyProfile}
               onNavigateToJournals={() => setCurrentTab('journals')}
             />
           ))}
@@ -541,7 +544,7 @@ export default function App() {
                   </div>
                 </div>
               </div>
-              <ExpenseModuleView currentUser={currentUser!} />
+              <ExpenseModuleView currentUser={currentUser!} companyProfile={companyProfile} />
             </div>
           ))}
 
@@ -600,7 +603,7 @@ export default function App() {
               onNavigateToLogin={() => setCurrentTab('login')}
             />
           ) : (
-            <JournalEntriesPage currentUser={currentUser} />
+            <JournalEntriesPage currentUser={currentUser} companyProfile={companyProfile} />
           ))}
 
         {currentTab === 'reports' &&
@@ -617,6 +620,7 @@ export default function App() {
           ) : (
             <FinancialReportsPage
               currentUser={currentUser}
+              companyProfile={companyProfile}
               initialLedgerId={statementLedgerId}
             />
           ))}
@@ -635,7 +639,7 @@ export default function App() {
           ) : isEmployee ? (
             <AccessDenied onBackToDashboard={() => setCurrentTab('dashboard')} requiredRole="ADMIN" />
           ) : (
-            <AuditLogPage />
+            <AuditLogPage companyProfile={companyProfile} />
           ))}
 
         {currentTab === 'health' && <SystemHealthPage />}

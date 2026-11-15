@@ -346,6 +346,10 @@ export class BillingService {
 
     const total = subtotal.minus(discountTotal).plus(taxTotal);
 
+    const currency =
+      input.currency?.trim().toUpperCase() ||
+      (await CompanyService.getBaseCurrency(actor.companyId));
+
     const created = await prisma.$transaction(async (tx) => {
       const seq = await DocumentSequenceService.allocateNextNumber(actor.companyId, 'INVOICE', {
         date: invDate,
@@ -367,6 +371,7 @@ export class BillingService {
           invoiceDate: invDate,
           dueDate,
           status: 'DRAFT',
+          currency,
           subtotal,
           discountTotal,
           taxTotal,
@@ -414,6 +419,225 @@ export class BillingService {
   }
 
   /**
+   * Updates an existing DRAFT invoice cleanly.
+   * GUARANTEE: Strictly restricted to DRAFT invoices; creates NO journal entries.
+   */
+  static async updateInvoice(
+    actor: AuthUser,
+    id: string,
+    input: UpdateInvoiceRequest,
+    correlationId?: string
+  ): Promise<InvoiceItem> {
+    const isEnabled = await CompanyService.isSalesInvoiceEnabled(actor.companyId);
+    if (!isEnabled) {
+      const err = new Error('Sales Invoice feature is disabled for this company in Company Settings.');
+      (err as { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
+    const existing = await prisma.invoice.findUnique({
+      where: { id },
+      include: { lines: true },
+    });
+
+    if (!existing || existing.companyId !== actor.companyId) {
+      const err = new Error('Invoice not found in this company.');
+      (err as { statusCode?: number }).statusCode = 404;
+      throw err;
+    }
+
+    if (existing.status !== 'DRAFT') {
+      const err = new Error(
+        `Only DRAFT invoices can be modified. Current status: ${existing.status}.`
+      );
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (input.customerName !== undefined && !input.customerName.trim()) {
+      const err = new Error('Customer name is required.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    const invDate = input.invoiceDate ? new Date(input.invoiceDate) : existing.invoiceDate;
+    const dueDate = input.dueDate ? new Date(input.dueDate) : existing.dueDate;
+
+    if (isNaN(invDate.getTime()) || isNaN(dueDate.getTime())) {
+      const err = new Error('Invalid invoice or due dates.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (dueDate < invDate) {
+      const err = new Error('Due date cannot be earlier than invoice date.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (input.lines && input.lines.length === 0) {
+      const err = new Error('Invoice must contain at least one line item.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    let parsedLines:
+      | Array<{
+          lineNumber: number;
+          itemDescription: string;
+          quantity: Decimal;
+          unitPrice: Decimal;
+          discountAmount: Decimal;
+          taxRate: Decimal;
+          taxAmount: Decimal;
+          lineTotal: Decimal;
+          revenueLedgerId: string | null;
+        }>
+      | null = null;
+    let subtotal = existing.subtotal;
+    let discountTotal = existing.discountTotal;
+    let taxTotal = existing.taxTotal;
+    let total = existing.total;
+
+    if (input.lines) {
+      subtotal = new Decimal(0);
+      discountTotal = new Decimal(0);
+      taxTotal = new Decimal(0);
+      parsedLines = [];
+
+      for (let i = 0; i < input.lines.length; i++) {
+        const line = input.lines[i];
+        if (!line.itemDescription || !line.itemDescription.trim()) {
+          const err = new Error(`Line ${i + 1} must have a description.`);
+          (err as { statusCode?: number }).statusCode = 400;
+          throw err;
+        }
+
+        const qty = AccountingMath.from(line.quantity);
+        const price = AccountingMath.from(line.unitPrice);
+        const discount = AccountingMath.from(line.discountAmount || 0);
+        const taxRate = AccountingMath.from(line.taxRate || 0);
+
+        if (AccountingMath.lt(qty, 0) || AccountingMath.isZero(qty)) {
+          const err = new Error(`Line ${i + 1} quantity must be greater than zero.`);
+          (err as { statusCode?: number }).statusCode = 400;
+          throw err;
+        }
+        if (AccountingMath.lt(price, 0)) {
+          const err = new Error(`Line ${i + 1} unit price cannot be negative.`);
+          (err as { statusCode?: number }).statusCode = 400;
+          throw err;
+        }
+        if (AccountingMath.lt(discount, 0)) {
+          const err = new Error(`Line ${i + 1} discount cannot be negative.`);
+          (err as { statusCode?: number }).statusCode = 400;
+          throw err;
+        }
+
+        const baseAmount = qty.times(price);
+        if (AccountingMath.gt(discount, baseAmount)) {
+          const err = new Error(`Line ${i + 1} discount exceeds line item base total.`);
+          (err as { statusCode?: number }).statusCode = 400;
+          throw err;
+        }
+
+        const afterDiscount = baseAmount.minus(discount);
+        const taxAmount = afterDiscount.times(taxRate).dividedBy(100);
+        const lineTotal = afterDiscount.plus(taxAmount);
+
+        subtotal = subtotal.plus(baseAmount);
+        discountTotal = discountTotal.plus(discount);
+        taxTotal = taxTotal.plus(taxAmount);
+
+        parsedLines.push({
+          lineNumber: i + 1,
+          itemDescription: line.itemDescription.trim(),
+          quantity: qty,
+          unitPrice: price,
+          discountAmount: discount,
+          taxRate,
+          taxAmount,
+          lineTotal,
+          revenueLedgerId: line.revenueLedgerId || null,
+        });
+      }
+
+      total = subtotal.minus(discountTotal).plus(taxTotal);
+    }
+
+    await prisma.$transaction(async (tx) => {
+      if (parsedLines) {
+        await tx.invoiceLine.deleteMany({ where: { invoiceId: id } });
+        for (const line of parsedLines) {
+          await tx.invoiceLine.create({
+            data: {
+              invoiceId: id,
+              lineNumber: line.lineNumber,
+              itemDescription: line.itemDescription,
+              quantity: line.quantity,
+              unitPrice: line.unitPrice,
+              discountAmount: line.discountAmount,
+              taxRate: line.taxRate,
+              taxAmount: line.taxAmount,
+              lineTotal: line.lineTotal,
+              revenueLedgerId: line.revenueLedgerId,
+            },
+          });
+        }
+      }
+
+      await tx.invoice.update({
+        where: { id },
+        data: {
+          customerId: input.customerId !== undefined ? input.customerId : existing.customerId,
+          customerName: input.customerName?.trim() || existing.customerName,
+          customerEmail:
+            input.customerEmail !== undefined
+              ? input.customerEmail?.trim() || null
+              : existing.customerEmail,
+          customerPhone:
+            input.customerPhone !== undefined
+              ? input.customerPhone?.trim() || null
+              : existing.customerPhone,
+          customerAddress:
+            input.customerAddress !== undefined
+              ? input.customerAddress?.trim() || null
+              : existing.customerAddress,
+          customerTaxId:
+            input.customerTaxId !== undefined
+              ? input.customerTaxId?.trim() || null
+              : existing.customerTaxId,
+          invoiceDate: invDate,
+          dueDate,
+          subtotal,
+          discountTotal,
+          taxTotal,
+          total,
+          balanceDue: total,
+          notes: input.notes !== undefined ? input.notes?.trim() || null : existing.notes,
+          terms: input.terms !== undefined ? input.terms?.trim() || null : existing.terms,
+          documentTitle:
+            input.documentTitle !== undefined
+              ? input.documentTitle?.trim() || null
+              : existing.documentTitle,
+        },
+      });
+    });
+
+    await AuditService.log({
+      companyId: actor.companyId,
+      userId: actor.userId,
+      action: 'INVOICE_UPDATE_DRAFT',
+      entity: 'Invoice',
+      entityId: id,
+      correlationId,
+      details: { invoiceNumber: existing.invoiceNumber, total: AccountingMath.format(total) },
+    });
+
+    return this.getInvoiceById(actor.companyId, id);
+  }
+
+  /**
    * Converts an ACCEPTED quotation into a DRAFT invoice
    * Idempotent: returns existing invoice if already converted
    */
@@ -431,7 +655,10 @@ export class BillingService {
 
     const quotation = await prisma.quotation.findUnique({
       where: { id: quotationId },
-      include: { lines: { orderBy: { lineNumber: 'asc' } } },
+      include: {
+        customer: { select: { taxId: true } },
+        lines: { orderBy: { lineNumber: 'asc' } },
+      },
     });
 
     if (!quotation || quotation.companyId !== actor.companyId) {
@@ -459,11 +686,13 @@ export class BillingService {
         customerEmail: quotation.customerEmail,
         customerPhone: quotation.customerPhone,
         customerAddress: quotation.customerAddress,
+        customerTaxId: (quotation as { customer?: { taxId?: string | null } | null }).customer?.taxId || null,
         invoiceDate: today.toISOString().split('T')[0],
         dueDate: dueDate.toISOString().split('T')[0],
         notes: quotation.notes,
         terms: quotation.terms,
         documentTitle: quotation.documentTitle,
+        currency: quotation.currency,
         lines: quotation.lines.map((l) => ({
           itemDescription: l.itemDescription,
           quantity: AccountingMath.format(l.quantity),
@@ -782,7 +1011,7 @@ export class BillingService {
 
     if (AccountingMath.gt(invoice.amountPaid, 0)) {
       const err = new Error(
-        `Cannot void invoice with existing payments (Paid: $${AccountingMath.format(invoice.amountPaid)}). Void all related customer receipts first.`
+        `Cannot void invoice with existing payments (Paid: ${invoice.currency} ${AccountingMath.format(invoice.amountPaid)}). Void all related customer receipts first.`
       );
       (err as { statusCode?: number }).statusCode = 400;
       throw err;

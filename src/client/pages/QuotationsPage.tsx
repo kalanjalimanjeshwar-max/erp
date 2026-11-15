@@ -16,6 +16,7 @@ import {
   XCircle,
   FileCheck,
   Trash2,
+  Edit2,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
 import { previewStore } from '../services/previewStore.ts';
@@ -25,8 +26,13 @@ import {
   CustomerItem,
   AuthUser,
   CompanyProfile,
+  CompanyBankAccountItem,
   CreateQuotationRequest,
+  UpdateQuotationRequest,
 } from '../../shared/types.ts';
+import { formatMoney, getCurrencySymbol } from '../../shared/currency.ts';
+import { PrintableDocumentView } from '../components/print/PrintableDocumentView.tsx';
+import { CustomerSelectorWithCreate } from '../components/customers/CustomerSelectorWithCreate.tsx';
 
 interface QuotationsPageProps {
   currentUser: AuthUser;
@@ -61,16 +67,20 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
 
   // Modals
   const [isCreateModalOpen, setIsCreateModalOpen] = useState(false);
+  const [editingQuotation, setEditingQuotation] = useState<QuotationItem | null>(null);
   const [viewingQuotation, setViewingQuotation] = useState<QuotationItem | null>(null);
+  const [draftPreviewQuotation, setDraftPreviewQuotation] = useState<QuotationItem | null>(null);
+  const [defaultBankAccount, setDefaultBankAccount] = useState<CompanyBankAccountItem | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
 
-  // Create Form State
+  // Create / Edit Form State
   const [selectedCustomerId, setSelectedCustomerId] = useState('');
   const [customerName, setCustomerName] = useState('');
   const [customerEmail, setCustomerEmail] = useState('');
   const [customerPhone, setCustomerPhone] = useState('');
   const [customerAddress, setCustomerAddress] = useState('');
+  const [customerTaxId, setCustomerTaxId] = useState('');
   const [quotationDate, setQuotationDate] = useState(() => new Date().toISOString().split('T')[0]);
   const [validUntilDate, setValidUntilDate] = useState(() => {
     const d = new Date();
@@ -103,7 +113,8 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
     }
 
     try {
-      const [qData, cData] = await Promise.all([
+      const canFetchBank = currentUser?.role !== 'EMPLOYEE';
+      const [qData, cData, bankList] = await Promise.all([
         api.getQuotations({
           status: statusFilter === 'ALL' ? undefined : statusFilter,
           search: search.trim() || undefined,
@@ -111,9 +122,13 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
           toDate: toDate || undefined,
         }),
         api.getCustomers({ isActive: true }),
+        canFetchBank
+          ? api.getCompanyBankAccounts(true).catch(() => [] as CompanyBankAccountItem[])
+          : Promise.resolve([] as CompanyBankAccountItem[]),
       ]);
       setQuotations(qData);
       setCustomers(cData);
+      setDefaultBankAccount(bankList.find((b) => b.isDefault) || bankList[0] || null);
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         setErrorMessage(err.message);
@@ -123,24 +138,84 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
     } finally {
       setIsLoading(false);
     }
-  }, [currentUser?.isPreview, statusFilter, search, fromDate, toDate]);
+  }, [currentUser?.isPreview, currentUser?.role, statusFilter, search, fromDate, toDate]);
 
   useEffect(() => {
     fetchData();
   }, [fetchData]);
 
-  const handleCustomerSelect = (custId: string) => {
-    setSelectedCustomerId(custId);
-    const c = customers.find((cust) => cust.id === custId);
-    if (c) {
-      setCustomerName(c.name);
-      setCustomerEmail(c.email || '');
-      setPhone(c.phone || '');
-      setCustomerAddress(c.address || '');
+  const handleCustomerSelect = (c: CustomerItem | null) => {
+    if (!c) {
+      setSelectedCustomerId('');
+      return;
     }
+    setSelectedCustomerId(c.id);
+    setCustomerName(c.name);
+    setCustomerEmail(c.email || '');
+    setCustomerPhone(c.phone || '');
+    setCustomerAddress(c.address || '');
+    setCustomerTaxId(c.taxId || '');
   };
 
-  const setPhone = (p: string) => setCustomerPhone(p);
+  const handleCustomerCreated = (newCustomer: CustomerItem) => {
+    setCustomers((prev) => {
+      const exists = prev.some((c) => c.id === newCustomer.id);
+      return exists ? prev.map((c) => (c.id === newCustomer.id ? newCustomer : c)) : [newCustomer, ...prev];
+    });
+    handleCustomerSelect(newCustomer);
+  };
+
+  const resetForm = () => {
+    setEditingQuotation(null);
+    setSelectedCustomerId('');
+    setCustomerName('');
+    setCustomerEmail('');
+    setCustomerPhone('');
+    setCustomerAddress('');
+    setCustomerTaxId('');
+    setQuotationDate(new Date().toISOString().split('T')[0]);
+    const d = new Date();
+    d.setDate(d.getDate() + 30);
+    setValidUntilDate(d.toISOString().split('T')[0]);
+    setDocumentTitle('Quotation');
+    setNotes('Thank you for your business. Please contact us with any questions.');
+    setTerms('This quotation is valid for 30 days. Payment terms Net 30 upon invoice.');
+    setDraftLines([
+      { itemDescription: '', quantity: '1', unitPrice: '', discountAmount: '0', taxRate: '0' },
+    ]);
+  };
+
+  const openCreateModal = () => {
+    resetForm();
+    setIsCreateModalOpen(true);
+  };
+
+  const openEditModal = (q: QuotationItem) => {
+    setEditingQuotation(q);
+    setSelectedCustomerId(q.customerId || '');
+    setCustomerName(q.customerName || '');
+    setCustomerEmail(q.customerEmail || '');
+    setCustomerPhone(q.customerPhone || '');
+    setCustomerAddress(q.customerAddress || '');
+    setCustomerTaxId(q.customerTaxId || '');
+    setQuotationDate(q.quotationDate);
+    setValidUntilDate(q.validUntilDate);
+    setDocumentTitle(q.documentTitle || 'Quotation');
+    setNotes(q.notes || '');
+    setTerms(q.terms || '');
+    setDraftLines(
+      q.lines.length > 0
+        ? q.lines.map((l) => ({
+            itemDescription: l.itemDescription,
+            quantity: String(parseFloat(l.quantity) || 1),
+            unitPrice: String(parseFloat(l.unitPrice) || 0),
+            discountAmount: String(parseFloat(l.discountAmount) || 0),
+            taxRate: String(parseFloat(l.taxRate) || 0),
+          }))
+        : [{ itemDescription: '', quantity: '1', unitPrice: '', discountAmount: '0', taxRate: '0' }]
+    );
+    setIsCreateModalOpen(true);
+  };
 
   const handleAddLine = () => {
     setDraftLines([
@@ -186,14 +261,119 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
   };
 
   const totals = calculateTotals();
+  const baseCurrency = companyProfile?.currency || 'INR';
+  const roundingPrecision = companyProfile?.roundingPrecision ?? 2;
+  const currencySymbol = getCurrencySymbol(baseCurrency);
 
-  const handleCreateQuotation = async (e: React.FormEvent) => {
+  const handlePreviewDraft = () => {
+    setErrorMessage(null);
+    if (!customerName.trim()) {
+      setErrorMessage('Please enter or select a customer before previewing the quotation.');
+      return;
+    }
+
+    const previewLines = draftLines.map((l, idx) => {
+      const q = parseFloat(l.quantity) || 0;
+      const p = parseFloat(l.unitPrice) || 0;
+      const d = parseFloat(l.discountAmount) || 0;
+      const t = parseFloat(l.taxRate) || 0;
+      const base = Math.max(0, q * p - d);
+      const tax = (base * t) / 100;
+      const lineTotal = base + tax;
+      return {
+        id: `preview-qt-line-${idx + 1}`,
+        lineNumber: idx + 1,
+        itemDescription: l.itemDescription.trim() || `Service Line ${idx + 1}`,
+        quantity: q.toFixed(4),
+        unitPrice: p.toFixed(4),
+        discountAmount: d.toFixed(4),
+        taxRate: t.toFixed(4),
+        taxAmount: tax.toFixed(4),
+        lineTotal: lineTotal.toFixed(4),
+      };
+    });
+
+    const linkedCust = selectedCustomerId
+      ? customers.find((c) => c.id === selectedCustomerId)
+      : undefined;
+
+    setDraftPreviewQuotation({
+      id: editingQuotation?.id || 'unsaved-quotation-preview',
+      companyId: companyProfile?.id || 'company-preview',
+      quotationNumber: editingQuotation?.quotationNumber || 'DRAFT PREVIEW',
+      customerId: selectedCustomerId || null,
+      customerName: customerName.trim(),
+      customerEmail: customerEmail.trim() || null,
+      customerPhone: customerPhone.trim() || null,
+      customerAddress: customerAddress.trim() || null,
+      customerTaxId: customerTaxId.trim() || linkedCust?.taxId || null,
+      quotationDate,
+      validUntilDate,
+      status: editingQuotation?.status || 'DRAFT',
+      currency: editingQuotation?.currency || baseCurrency,
+      subtotal: totals.sub.toFixed(4),
+      discountTotal: totals.disc.toFixed(4),
+      taxTotal: totals.tax.toFixed(4),
+      total: totals.grand.toFixed(4),
+      notes: notes.trim() || null,
+      terms: terms.trim() || null,
+      documentTitle: documentTitle.trim() || 'Quotation',
+      convertedToInvoiceId: editingQuotation?.convertedToInvoiceId || null,
+      createdByUserName: currentUser?.fullName || null,
+      createdAt: editingQuotation?.createdAt || new Date().toISOString(),
+      lines: previewLines,
+    });
+  };
+
+  const handleSaveQuotation = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmitting(true);
     setErrorMessage(null);
     setSuccessMessage(null);
 
     try {
+      const normalizedLines = draftLines.map((l) => ({
+        itemDescription: l.itemDescription.trim(),
+        quantity: l.quantity,
+        unitPrice: l.unitPrice,
+        discountAmount: l.discountAmount || '0',
+        taxRate: l.taxRate || '0',
+      }));
+
+      if (editingQuotation) {
+        const updatePayload: UpdateQuotationRequest = {
+          customerId: selectedCustomerId || null,
+          customerName: customerName.trim(),
+          customerEmail: customerEmail.trim() || null,
+          customerPhone: customerPhone.trim() || null,
+          customerAddress: customerAddress.trim() || null,
+          quotationDate,
+          validUntilDate,
+          documentTitle: documentTitle.trim() || 'Quotation',
+          notes: notes.trim() || null,
+          terms: terms.trim() || null,
+          lines: normalizedLines,
+        };
+
+        if (currentUser?.isPreview) {
+          const updated = previewStore.updateQuotation(editingQuotation.id, updatePayload);
+          setSuccessMessage(
+            `[Preview Demo] Draft Quotation ${updated.quotationNumber} updated in-memory.`
+          );
+          setIsCreateModalOpen(false);
+          resetForm();
+          fetchData();
+          return;
+        }
+
+        const updated = await api.updateQuotation(editingQuotation.id, updatePayload);
+        setSuccessMessage(`Draft Quotation ${updated.quotationNumber} updated successfully.`);
+        setIsCreateModalOpen(false);
+        resetForm();
+        fetchData();
+        return;
+      }
+
       const payload: CreateQuotationRequest = {
         customerId: selectedCustomerId || null,
         customerName: customerName.trim(),
@@ -202,16 +382,11 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
         customerAddress: customerAddress.trim() || null,
         quotationDate,
         validUntilDate,
+        currency: companyProfile?.currency || 'INR',
         documentTitle: documentTitle.trim() || 'Quotation',
         notes: notes.trim() || null,
         terms: terms.trim() || null,
-        lines: draftLines.map((l) => ({
-          itemDescription: l.itemDescription.trim(),
-          quantity: l.quantity,
-          unitPrice: l.unitPrice,
-          discountAmount: l.discountAmount || '0',
-          taxRate: l.taxRate || '0',
-        })),
+        lines: normalizedLines,
       };
 
       if (currentUser?.isPreview) {
@@ -220,11 +395,7 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
           `[Preview Demo] Quotation ${created.quotationNumber} created as DRAFT in-memory. Not saved to database.`
         );
         setIsCreateModalOpen(false);
-        setCustomerName('');
-        setSelectedCustomerId('');
-        setDraftLines([
-          { itemDescription: '', quantity: '1', unitPrice: '', discountAmount: '0', taxRate: '0' },
-        ]);
+        resetForm();
         fetchData();
         return;
       }
@@ -232,18 +403,15 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
       const created = await api.createQuotation(payload);
       setSuccessMessage(`Quotation ${created.quotationNumber} created as DRAFT.`);
       setIsCreateModalOpen(false);
-      // Reset
-      setCustomerName('');
-      setSelectedCustomerId('');
-      setDraftLines([
-        { itemDescription: '', quantity: '1', unitPrice: '', discountAmount: '0', taxRate: '0' },
-      ]);
+      resetForm();
       fetchData();
     } catch (err: unknown) {
       if (err instanceof ApiError) {
         setErrorMessage(err.message);
       } else {
-        setErrorMessage('Failed to create quotation.');
+        setErrorMessage(
+          err instanceof Error ? err.message : 'Failed to save quotation.'
+        );
       }
     } finally {
       setIsSubmitting(false);
@@ -346,8 +514,8 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
         </div>
 
         <button
-          onClick={() => setIsCreateModalOpen(true)}
-          className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold shadow-md transition cursor-pointer"
+          onClick={openCreateModal}
+          className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold shadow-md transition whitespace-nowrap shrink-0 cursor-pointer"
         >
           <Plus className="w-4 h-4" />
           <span>New Quotation</span>
@@ -486,25 +654,35 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
                     </td>
                     <td className="py-3 px-4 text-slate-300">{q.quotationDate}</td>
                     <td className="py-3 px-4 text-slate-300">{q.validUntilDate}</td>
-                    <td className="py-3 px-4 text-right font-mono font-bold text-slate-100">
-                      ${parseFloat(q.total).toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    <td className="py-3 px-4 text-right font-mono font-bold text-slate-100 tabular-nums">
+                      {formatMoney(q.total, q.currency || baseCurrency, { decimals: roundingPrecision })}
                     </td>
                     <td className="py-3 px-4">{getStatusBadge(q.status)}</td>
                     <td className="py-3 px-4 text-right whitespace-nowrap">
                       <div className="inline-flex items-center gap-1.5">
                         <button
                           onClick={() => setViewingQuotation(q)}
-                          className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] font-medium transition cursor-pointer"
-                          title="View & Print"
+                          className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] font-medium transition whitespace-nowrap cursor-pointer"
+                          title="View, Print & Export"
                         >
-                          <Eye className="w-3.5 h-3.5 inline mr-1" /> View
+                          <Eye className="w-3.5 h-3.5 inline mr-1" /> Preview
                         </button>
+
+                        {q.status === 'DRAFT' && (
+                          <button
+                            onClick={() => openEditModal(q)}
+                            className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-indigo-300 rounded text-[11px] font-medium transition whitespace-nowrap cursor-pointer"
+                            title="Edit Draft Quotation"
+                          >
+                            <Edit2 className="w-3 h-3 inline mr-1" /> Edit
+                          </button>
+                        )}
 
                         {q.status === 'DRAFT' && (
                           <button
                             onClick={() => handleUpdateStatus(q, 'SENT')}
                             disabled={actionLoadingId === q.id}
-                            className="px-2 py-1 bg-sky-950/80 hover:bg-sky-900 border border-sky-800 text-sky-300 rounded text-[11px] font-medium transition cursor-pointer"
+                            className="px-2 py-1 bg-sky-950/80 hover:bg-sky-900 border border-sky-800 text-sky-300 rounded text-[11px] font-medium transition whitespace-nowrap cursor-pointer"
                             title="Mark as Sent"
                           >
                             <Send className="w-3 h-3 inline mr-1" /> Mark Sent
@@ -542,52 +720,46 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
         </div>
       </div>
 
-      {/* 1. Create Quotation Modal */}
+      {/* 1. Create / Edit Quotation Modal */}
       {isCreateModalOpen && (
         <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
           <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl shadow-2xl p-6 space-y-5 my-8">
             <div className="flex items-center justify-between border-b border-slate-800 pb-4">
               <div>
                 <h3 className="text-base font-bold text-slate-100 flex items-center gap-2">
-                  <Plus className="w-5 h-5 text-indigo-400" />
-                  Create Sales Quotation
+                  <FileText className="w-5 h-5 text-indigo-400" />
+                  {editingQuotation
+                    ? `Edit Draft Quotation — ${editingQuotation.quotationNumber}`
+                    : 'Create Sales Quotation'}
                 </h3>
                 <p className="text-xs text-slate-400 mt-0.5">
                   Accounting-neutral commercial estimate with exact decimal calculations
                 </p>
               </div>
-              <button onClick={() => setIsCreateModalOpen(false)} className="text-slate-400 hover:text-slate-200 cursor-pointer">
+              <button
+                type="button"
+                onClick={() => {
+                  setIsCreateModalOpen(false);
+                  resetForm();
+                }}
+                className="text-slate-400 hover:text-slate-200 cursor-pointer"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            <form onSubmit={handleCreateQuotation} className="space-y-4">
-              {/* Header Info */}
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Select Customer</label>
-                  <select
-                    value={selectedCustomerId}
-                    onChange={(e) => handleCustomerSelect(e.target.value)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
-                  >
-                    <option value="">-- Choose existing customer --</option>
-                    {customers.map((c) => (
-                      <option key={c.id} value={c.id}>{c.name} ({c.code})</option>
-                    ))}
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Customer Name <span className="text-red-400">*</span>
-                  </label>
-                  <input
-                    type="text"
-                    required
-                    value={customerName}
-                    onChange={(e) => setCustomerName(e.target.value)}
-                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+            <form onSubmit={handleSaveQuotation} className="space-y-4">
+              {/* Customer Selector with Inline + New Customer */}
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-3">
+                <div className="lg:col-span-2">
+                  <CustomerSelectorWithCreate
+                    customers={customers}
+                    selectedCustomerId={selectedCustomerId}
+                    onSelectCustomer={handleCustomerSelect}
+                    onCustomerCreated={handleCustomerCreated}
+                    currentUser={currentUser}
+                    companyProfile={companyProfile}
+                    label="Customer"
                   />
                 </div>
 
@@ -603,7 +775,22 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
                 </div>
               </div>
 
+              {/* Customer Name, Tax ID & Dates */}
               <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Customer Name <span className="text-red-400">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={customerName}
+                    onChange={(e) => setCustomerName(e.target.value)}
+                    placeholder="Customer / Business Name"
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+
                 <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1">Quote Date</label>
                   <input
@@ -627,6 +814,19 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
                 </div>
 
                 <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">GSTIN / Tax ID</label>
+                  <input
+                    type="text"
+                    value={customerTaxId}
+                    onChange={(e) => setCustomerTaxId(e.target.value.toUpperCase())}
+                    placeholder="Optional tax ID"
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 font-mono uppercase focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1">Email</label>
                   <input
                     type="email"
@@ -642,6 +842,17 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
                     type="text"
                     value={customerPhone}
                     onChange={(e) => setCustomerPhone(e.target.value)}
+                    className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-medium text-slate-300 mb-1">Billing Address</label>
+                  <input
+                    type="text"
+                    value={customerAddress}
+                    onChange={(e) => setCustomerAddress(e.target.value)}
+                    placeholder="Street, City, State, PIN"
                     className="w-full px-3 py-2 bg-slate-950 border border-slate-800 rounded-xl text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
                   />
                 </div>
@@ -668,8 +879,8 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
                         <th className="py-2.5 px-3 w-8">#</th>
                         <th className="py-2.5 px-3 w-1/3">Description</th>
                         <th className="py-2.5 px-3 w-20 text-right">Qty</th>
-                        <th className="py-2.5 px-3 w-28 text-right">Unit Price ($)</th>
-                        <th className="py-2.5 px-3 w-24 text-right">Discount ($)</th>
+                        <th className="py-2.5 px-3 w-28 text-right">Unit Price ({currencySymbol})</th>
+                        <th className="py-2.5 px-3 w-24 text-right">Discount ({currencySymbol})</th>
                         <th className="py-2.5 px-3 w-20 text-right">Tax (%)</th>
                         <th className="py-2.5 px-3 w-10"></th>
                       </tr>
@@ -749,11 +960,11 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
                 </div>
 
                 {/* Calculation summary bar */}
-                <div className="bg-slate-950 p-3 border-t border-slate-800 flex flex-wrap items-center justify-end gap-6 text-xs font-mono">
-                  <div>Subtotal: <span className="text-slate-200 font-bold">${totals.sub.toFixed(2)}</span></div>
-                  <div>Discount: <span className="text-rose-400 font-bold">-${totals.disc.toFixed(2)}</span></div>
-                  <div>Tax: <span className="text-slate-200 font-bold">${totals.tax.toFixed(2)}</span></div>
-                  <div className="text-sm">Total: <span className="text-emerald-400 font-bold">${totals.grand.toFixed(2)}</span></div>
+                <div className="bg-slate-950 p-3 border-t border-slate-800 flex flex-wrap items-center justify-end gap-6 text-xs font-mono tabular-nums">
+                  <div>Subtotal: <span className="text-slate-200 font-bold">{formatMoney(totals.sub, baseCurrency, { decimals: roundingPrecision })}</span></div>
+                  <div>Discount: <span className="text-rose-400 font-bold">{formatMoney(-totals.disc, baseCurrency, { decimals: roundingPrecision })}</span></div>
+                  <div>Tax: <span className="text-slate-200 font-bold">{formatMoney(totals.tax, baseCurrency, { decimals: roundingPrecision })}</span></div>
+                  <div className="text-sm">Total: <span className="text-emerald-400 font-bold">{formatMoney(totals.grand, baseCurrency, { decimals: roundingPrecision })}</span></div>
                 </div>
               </div>
 
@@ -779,175 +990,67 @@ export const QuotationsPage: React.FC<QuotationsPageProps> = ({
                 </div>
               </div>
 
-              <div className="flex items-center justify-end gap-3 pt-3">
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-3 border-t border-slate-800">
                 <button
                   type="button"
-                  onClick={() => setIsCreateModalOpen(false)}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold cursor-pointer"
+                  onClick={handlePreviewDraft}
+                  className="inline-flex items-center gap-1.5 px-4 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-100 rounded-xl text-xs font-semibold transition whitespace-nowrap shrink-0 cursor-pointer"
                 >
-                  Cancel
+                  <Eye className="w-3.5 h-3.5 text-indigo-400" />
+                  <span>Preview</span>
                 </button>
-                <button
-                  type="submit"
-                  disabled={isSubmitting}
-                  className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl text-xs font-semibold shadow-md cursor-pointer"
-                >
-                  {isSubmitting ? 'Saving...' : 'Save Draft Quotation'}
-                </button>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsCreateModalOpen(false);
+                      resetForm();
+                    }}
+                    className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-xl text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={isSubmitting}
+                    className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl text-xs font-semibold shadow-md whitespace-nowrap shrink-0 cursor-pointer"
+                  >
+                    {isSubmitting
+                      ? 'Saving...'
+                      : editingQuotation
+                      ? 'Update Draft Quotation'
+                      : 'Save Draft Quotation'}
+                  </button>
+                </div>
               </div>
             </form>
           </div>
         </div>
       )}
 
-      {/* 2. Printable Quotation Modal */}
+      {/* 2. Printable Quotation Modal (Saved Quotation) */}
       {viewingQuotation && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl shadow-2xl p-6 space-y-6 my-8">
-            {/* Action Bar */}
-            <div className="flex items-center justify-between border-b border-slate-800 pb-4">
-              <div className="flex items-center gap-2">
-                <h3 className="text-base font-bold text-slate-100 font-mono">
-                  {viewingQuotation.quotationNumber}
-                </h3>
-                {getStatusBadge(viewingQuotation.status)}
-              </div>
+        <PrintableDocumentView
+          document={{ type: 'QUOTATION', data: viewingQuotation }}
+          companyProfile={companyProfile}
+          bankAccount={defaultBankAccount}
+          currentUser={currentUser}
+          onClose={() => setViewingQuotation(null)}
+        />
+      )}
 
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={() => window.print()}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-semibold cursor-pointer"
-                >
-                  <Printer className="w-3.5 h-3.5" /> Print
-                </button>
-                <button
-                  onClick={() => setViewingQuotation(null)}
-                  className="text-slate-400 hover:text-slate-200 cursor-pointer p-1"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-            </div>
-
-            {/* Printable Document Sheet */}
-            <div className="bg-slate-950 p-6 sm:p-8 rounded-xl border border-slate-800 space-y-6 text-slate-200">
-              {/* Document Header */}
-              <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-4 border-b border-slate-800 pb-6">
-                <div>
-                  {companyProfile?.logoUrl && (
-                    <img src={companyProfile.logoUrl} alt="Logo" className="h-10 mb-2 object-contain" />
-                  )}
-                  <h1 className="text-lg font-bold text-slate-100">
-                    {companyProfile?.name || 'CoreERP Enterprise'}
-                  </h1>
-                  {companyProfile?.address && <div className="text-xs text-slate-400">{companyProfile.address}</div>}
-                  {companyProfile?.phone && <div className="text-xs text-slate-400">Tel: {companyProfile.phone}</div>}
-                  {companyProfile?.email && <div className="text-xs text-slate-400">Email: {companyProfile.email}</div>}
-                  {companyProfile?.taxId && <div className="text-xs text-slate-400">Tax ID: {companyProfile.taxId}</div>}
-                </div>
-
-                <div className="sm:text-right">
-                  <div className="text-xl font-bold uppercase tracking-wider text-indigo-400 font-sans">
-                    {viewingQuotation.documentTitle || 'Sales Quotation'}
-                  </div>
-                  <div className="text-xs font-mono text-slate-300 mt-1">
-                    Quote #: <span className="font-bold">{viewingQuotation.quotationNumber}</span>
-                  </div>
-                  <div className="text-xs text-slate-400">Date: {viewingQuotation.quotationDate}</div>
-                  <div className="text-xs text-slate-400">Valid Until: {viewingQuotation.validUntilDate}</div>
-                </div>
-              </div>
-
-              {/* Bill To */}
-              <div>
-                <div className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">Quotation Prepared For:</div>
-                <div className="text-sm font-bold text-slate-100 mt-1">{viewingQuotation.customerName}</div>
-                {viewingQuotation.customerAddress && <div className="text-xs text-slate-400">{viewingQuotation.customerAddress}</div>}
-                {viewingQuotation.customerEmail && <div className="text-xs text-slate-400">Email: {viewingQuotation.customerEmail}</div>}
-                {viewingQuotation.customerPhone && <div className="text-xs text-slate-400">Phone: {viewingQuotation.customerPhone}</div>}
-              </div>
-
-              {/* Items Table */}
-              <div className="border border-slate-800 rounded-lg overflow-hidden">
-                <table className="w-full text-left text-xs">
-                  <thead className="bg-slate-900 text-slate-400 text-[11px] uppercase tracking-wider border-b border-slate-800">
-                    <tr>
-                      <th className="py-2 px-3 w-8">#</th>
-                      <th className="py-2 px-3">Description</th>
-                      <th className="py-2 px-3 text-right">Qty</th>
-                      <th className="py-2 px-3 text-right">Price</th>
-                      <th className="py-2 px-3 text-right">Disc</th>
-                      <th className="py-2 px-3 text-right">Tax</th>
-                      <th className="py-2 px-3 text-right">Total</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/80 font-sans">
-                    {viewingQuotation.lines.map((l) => (
-                      <tr key={l.id}>
-                        <td className="py-2 px-3 font-mono text-slate-400">{l.lineNumber}</td>
-                        <td className="py-2 px-3 font-medium text-slate-200">{l.itemDescription}</td>
-                        <td className="py-2 px-3 text-right font-mono">{parseFloat(l.quantity)}</td>
-                        <td className="py-2 px-3 text-right font-mono">${parseFloat(l.unitPrice).toFixed(2)}</td>
-                        <td className="py-2 px-3 text-right font-mono text-rose-400">
-                          {parseFloat(l.discountAmount) > 0 ? `-$${parseFloat(l.discountAmount).toFixed(2)}` : '—'}
-                        </td>
-                        <td className="py-2 px-3 text-right font-mono">
-                          {parseFloat(l.taxRate) > 0 ? `${parseFloat(l.taxRate)}%` : '—'}
-                        </td>
-                        <td className="py-2 px-3 text-right font-mono font-bold text-slate-100">
-                          ${parseFloat(l.lineTotal).toFixed(2)}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              {/* Totals Summary */}
-              <div className="flex justify-end">
-                <div className="w-64 space-y-1.5 text-xs font-mono">
-                  <div className="flex justify-between text-slate-400">
-                    <span>Subtotal:</span>
-                    <span>${parseFloat(viewingQuotation.subtotal).toFixed(2)}</span>
-                  </div>
-                  {parseFloat(viewingQuotation.discountTotal) > 0 && (
-                    <div className="flex justify-between text-rose-400">
-                      <span>Discount Total:</span>
-                      <span>-${parseFloat(viewingQuotation.discountTotal).toFixed(2)}</span>
-                    </div>
-                  )}
-                  {parseFloat(viewingQuotation.taxTotal) > 0 && (
-                    <div className="flex justify-between text-slate-400">
-                      <span>Configured Tax:</span>
-                      <span>+${parseFloat(viewingQuotation.taxTotal).toFixed(2)}</span>
-                    </div>
-                  )}
-                  <div className="flex justify-between text-sm font-bold text-emerald-400 border-t border-slate-800 pt-2">
-                    <span>Quotation Total:</span>
-                    <span>${parseFloat(viewingQuotation.total).toFixed(2)}</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Terms & Notes */}
-              {(viewingQuotation.notes || viewingQuotation.terms) && (
-                <div className="border-t border-slate-800 pt-4 space-y-2 text-xs text-slate-400">
-                  {viewingQuotation.notes && <div><span className="font-semibold text-slate-300">Notes:</span> {viewingQuotation.notes}</div>}
-                  {viewingQuotation.terms && <div><span className="font-semibold text-slate-300">Terms:</span> {viewingQuotation.terms}</div>}
-                </div>
-              )}
-            </div>
-
-            <div className="flex justify-end">
-              <button
-                onClick={() => setViewingQuotation(null)}
-                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-xl text-xs font-semibold cursor-pointer"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
+      {/* 3. Draft / Unsaved Quotation Preview (Stacked cleanly above edit modal) */}
+      {draftPreviewQuotation && (
+        <PrintableDocumentView
+          document={{ type: 'QUOTATION', data: draftPreviewQuotation }}
+          companyProfile={companyProfile}
+          bankAccount={defaultBankAccount}
+          currentUser={currentUser}
+          isDraftPreview={!editingQuotation}
+          onBackToEdit={() => setDraftPreviewQuotation(null)}
+          onClose={() => setDraftPreviewQuotation(null)}
+        />
       )}
     </div>
   );
