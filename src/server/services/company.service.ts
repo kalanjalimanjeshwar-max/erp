@@ -13,9 +13,14 @@ import {
   mergeDocumentPrintSettings,
   validatePrintSettingsPayload,
 } from '../../shared/print-settings.js';
+import {
+  BRANDING_ASSETS_SETTING_KEY,
+  CompanyBrandingAssetsState,
+} from '../../shared/branding.js';
 import { isValidTimeZone } from '../../shared/timezone.js';
 import { getCurrencyMeta } from '../../shared/currency.js';
 import { AuditService } from './audit.service.js';
+import { BrandingAssetService } from './branding-asset.service.js';
 
 function mapChangeRequest(row: {
   id: string;
@@ -85,17 +90,35 @@ export class CompanyService {
 
     let salesInvoiceEnabled = false;
     let rawPrintSettings: unknown = null;
+    let brandingAssets: CompanyBrandingAssetsState = {
+      version: 1,
+      logo: null,
+      seal: null,
+      signature: null,
+    };
     try {
       const settings = await prisma.companySetting.findMany({
         where: {
           companyId,
-          key: { in: ['SALES_INVOICE_ENABLED', DOCUMENT_PRINT_SETTING_KEY] },
+          key: {
+            in: ['SALES_INVOICE_ENABLED', DOCUMENT_PRINT_SETTING_KEY, BRANDING_ASSETS_SETTING_KEY],
+          },
         },
       });
       const salesSetting = settings.find((s) => s.key === 'SALES_INVOICE_ENABLED');
       const printSetting = settings.find((s) => s.key === DOCUMENT_PRINT_SETTING_KEY);
+      const assetsSetting = settings.find((s) => s.key === BRANDING_ASSETS_SETTING_KEY);
       salesInvoiceEnabled = salesSetting ? salesSetting.value === 'true' : false;
       rawPrintSettings = printSetting ? printSetting.value : null;
+      if (assetsSetting?.value) {
+        const parsedAssets = JSON.parse(assetsSetting.value) as Partial<CompanyBrandingAssetsState>;
+        brandingAssets = {
+          version: 1,
+          logo: parsedAssets.logo || null,
+          seal: parsedAssets.seal || null,
+          signature: parsedAssets.signature || null,
+        };
+      }
     } catch {
       salesInvoiceEnabled = false;
     }
@@ -118,9 +141,18 @@ export class CompanyService {
       // Graceful fallback for offline/mocked tests
     }
 
+    const activeLogoUrl = brandingAssets.logo?.url || company.logoUrl || null;
     const printSettings = mergeDocumentPrintSettings(rawPrintSettings, {
       defaultDocumentLanguage: company.defaultDocumentLanguage,
+      documentBranding: {
+        sealUrl: brandingAssets.seal?.url || null,
+        signatureUrl: brandingAssets.signature?.url || null,
+      },
     });
+
+    const activeLayout = printSettings.layouts.INVOICE;
+    const sealUrl = brandingAssets.seal?.url || activeLayout.sealUrl || null;
+    const signatureUrl = brandingAssets.signature?.url || activeLayout.signatureUrl || null;
 
     return {
       id: company.id,
@@ -130,7 +162,18 @@ export class CompanyService {
       taxId: company.taxId,
       currency: company.currency,
       timezone: company.timezone,
-      logoUrl: company.logoUrl,
+      logoUrl: activeLogoUrl,
+      sealUrl,
+      signatureUrl,
+      brandingAssets,
+      documentBranding: {
+        logoSize: activeLayout.logoSize || 'md',
+        logoAlignment: activeLayout.logoPosition || 'left',
+        sealUrl,
+        signatureUrl,
+        signatoryName: activeLayout.signatoryName || null,
+        signatureTitle: activeLayout.signatoryTitle || null,
+      },
       address: company.address,
       phone: company.phone,
       email: company.email,
@@ -186,8 +229,27 @@ export class CompanyService {
       },
     });
 
+    let sealUrl: string | null = null;
+    let signatureUrl: string | null = null;
+    try {
+      const assetRows = await prisma.companySetting.findMany({
+        where: { companyId, key: BRANDING_ASSETS_SETTING_KEY },
+      });
+      if (Array.isArray(assetRows) && assetRows[0]?.value) {
+        const parsed = JSON.parse(assetRows[0].value) as Partial<CompanyBrandingAssetsState>;
+        sealUrl = parsed.seal?.url || null;
+        signatureUrl = parsed.signature?.url || null;
+      }
+    } catch {
+      // ignore if mocked
+    }
+
     return mergeDocumentPrintSettings(setting?.value || null, {
       defaultDocumentLanguage: company.defaultDocumentLanguage,
+      documentBranding: {
+        sealUrl,
+        signatureUrl,
+      },
     });
   }
 
@@ -445,6 +507,10 @@ export class CompanyService {
             value: JSON.stringify(merged),
           },
         });
+      }
+
+      if (payload.type === 'COMPANY_BRANDING_ASSET') {
+        await BrandingAssetService.applyBrandingAssetMutation(tx, actor.companyId, payload as any);
       }
 
       return tx.companySettingsChangeRequest.update({

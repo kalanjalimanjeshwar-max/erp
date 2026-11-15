@@ -6,6 +6,17 @@
 
 import { CurrencyDisplayMode } from './currency.js';
 import { DocumentLanguage } from './print-translations.js';
+import {
+  clampVisualElementBounds,
+  createDefaultVisualElements,
+  DocumentVisualElements,
+  getEffectivePaperDimensionsMm,
+  isValidBrandingUrl,
+  PAPER_SIZE_DIMENSIONS_MM,
+  sanitizeBrandingUrl,
+  VisualElementConfig,
+  VisualElementKey,
+} from './branding.js';
 
 export type DocumentPrintType = 'QUOTATION' | 'INVOICE' | 'RECEIPT';
 export type PaperSize = 'A4' | 'A5' | 'Letter';
@@ -67,6 +78,10 @@ export interface DocumentPrintLayoutConfig {
   signatureUrl: string;
   sealUrl: string;
   showPrintedTimestamp: boolean;
+
+  // Visual Canvas Designer Elements
+  visualLayoutEnabled: boolean;
+  elements: DocumentVisualElements;
 }
 
 export interface DocumentPrintSettings {
@@ -76,11 +91,8 @@ export interface DocumentPrintSettings {
 
 export const DOCUMENT_PRINT_SETTING_KEY = 'DOCUMENT_PRINT_SETTINGS_V1';
 
-export const PAPER_DIMENSIONS_MM: Record<PaperSize, { width: number; height: number }> = {
-  A4: { width: 210, height: 297 },
-  A5: { width: 148, height: 210 },
-  Letter: { width: 215.9, height: 279.4 },
-};
+export const PAPER_DIMENSIONS_MM: Record<PaperSize, { width: number; height: number }> =
+  PAPER_SIZE_DIMENSIONS_MM;
 
 const DEFAULT_BASE_LAYOUT: DocumentPrintLayoutConfig = {
   paperSize: 'A4',
@@ -122,6 +134,13 @@ const DEFAULT_BASE_LAYOUT: DocumentPrintLayoutConfig = {
   signatureUrl: '',
   sealUrl: '',
   showPrintedTimestamp: true,
+  visualLayoutEnabled: true,
+  elements: createDefaultVisualElements('A4', 'portrait', {
+    topMm: 14,
+    rightMm: 14,
+    bottomMm: 16,
+    leftMm: 14,
+  }),
 };
 
 function normalizeLanguage(lang?: string | null): DocumentLanguage {
@@ -153,12 +172,16 @@ export function createDefaultPrintSettings(company?: {
     sealUrl: branding?.sealUrl || '',
   };
 
+  const makeElements = () =>
+    createDefaultVisualElements('A4', 'portrait', { ...DEFAULT_BASE_LAYOUT.margins });
+
   return {
     version: 1,
     layouts: {
       QUOTATION: {
         ...DEFAULT_BASE_LAYOUT,
         margins: { ...DEFAULT_BASE_LAYOUT.margins },
+        elements: makeElements(),
         ...sharedOverrides,
         customDocumentTitle: 'QUOTATION',
         showBankDetails: false,
@@ -167,6 +190,7 @@ export function createDefaultPrintSettings(company?: {
       INVOICE: {
         ...DEFAULT_BASE_LAYOUT,
         margins: { ...DEFAULT_BASE_LAYOUT.margins },
+        elements: makeElements(),
         ...sharedOverrides,
         customDocumentTitle: 'TAX INVOICE',
         showBankDetails: true,
@@ -175,6 +199,7 @@ export function createDefaultPrintSettings(company?: {
       RECEIPT: {
         ...DEFAULT_BASE_LAYOUT,
         margins: { ...DEFAULT_BASE_LAYOUT.margins },
+        elements: makeElements(),
         ...sharedOverrides,
         customDocumentTitle: 'PAYMENT RECEIPT',
         showDiscountColumn: false,
@@ -193,15 +218,57 @@ function clampMargin(val: unknown, fallback: number): number {
   return Math.min(50, Math.max(4, Math.round(num)));
 }
 
-function sanitizeOptionalUrl(url: unknown): string {
-  if (typeof url !== 'string') return '';
-  const trimmed = url.trim();
-  if (!trimmed) return '';
-  if (/^(javascript|data|vbscript):/i.test(trimmed)) return '';
-  if (/^https?:\/\//i.test(trimmed) || /^\/[a-zA-Z0-9_\-./]+$/i.test(trimmed)) {
-    return trimmed;
+function mergeVisualElements(
+  base: DocumentVisualElements,
+  incoming: Partial<DocumentVisualElements> | undefined | null,
+  paperSize: PaperSize,
+  orientation: PageOrientation
+): DocumentVisualElements {
+  const { widthMm, heightMm } = getEffectivePaperDimensionsMm(paperSize, orientation);
+  const keys: VisualElementKey[] = [
+    'logo',
+    'seal',
+    'signature',
+    'companyHeader',
+    'documentTitle',
+    'footer',
+  ];
+
+  const merged = {} as DocumentVisualElements;
+  for (const key of keys) {
+    const baseEl = base[key];
+    const incEl = incoming?.[key] as Partial<VisualElementConfig> | undefined;
+    const raw: VisualElementConfig = {
+      visible: incEl?.visible ?? baseEl.visible,
+      xMm: typeof incEl?.xMm === 'number' && Number.isFinite(incEl.xMm) ? incEl.xMm : baseEl.xMm,
+      yMm: typeof incEl?.yMm === 'number' && Number.isFinite(incEl.yMm) ? incEl.yMm : baseEl.yMm,
+      widthMm:
+        typeof incEl?.widthMm === 'number' && Number.isFinite(incEl.widthMm)
+          ? incEl.widthMm
+          : baseEl.widthMm,
+      heightMm:
+        typeof incEl?.heightMm === 'number' && Number.isFinite(incEl.heightMm)
+          ? incEl.heightMm
+          : baseEl.heightMm,
+      aspectRatio:
+        typeof incEl?.aspectRatio === 'number' &&
+        Number.isFinite(incEl.aspectRatio) &&
+        incEl.aspectRatio > 0
+          ? incEl.aspectRatio
+          : baseEl.aspectRatio,
+      lockAspectRatio: incEl?.lockAspectRatio ?? baseEl.lockAspectRatio,
+      align:
+        incEl?.align === 'left' || incEl?.align === 'center' || incEl?.align === 'right'
+          ? incEl.align
+          : baseEl.align,
+      spacingMm:
+        typeof incEl?.spacingMm === 'number' && Number.isFinite(incEl.spacingMm)
+          ? incEl.spacingMm
+          : baseEl.spacingMm,
+    };
+    merged[key] = clampVisualElementBounds(raw, widthMm, heightMm);
   }
-  return '';
+  return merged;
 }
 
 function mergeSingleLayout(
@@ -209,7 +276,12 @@ function mergeSingleLayout(
   incoming?: Partial<DocumentPrintLayoutConfig> | null
 ): DocumentPrintLayoutConfig {
   if (!incoming || typeof incoming !== 'object') {
-    return { ...base, margins: { ...base.margins } };
+    const paperDims = getEffectivePaperDimensionsMm(base.paperSize, base.orientation);
+    return {
+      ...base,
+      margins: { ...base.margins },
+      elements: mergeVisualElements(base.elements, undefined, base.paperSize, base.orientation),
+    };
   }
 
   const paperSize: PaperSize =
@@ -264,15 +336,25 @@ function mergeSingleLayout(
       ? incoming.currencyDisplayMode
       : base.currencyDisplayMode;
 
+  const margins: DocumentPrintMargins = {
+    topMm: clampMargin(incoming.margins?.topMm, base.margins.topMm),
+    rightMm: clampMargin(incoming.margins?.rightMm, base.margins.rightMm),
+    bottomMm: clampMargin(incoming.margins?.bottomMm, base.margins.bottomMm),
+    leftMm: clampMargin(incoming.margins?.leftMm, base.margins.leftMm),
+  };
+
+  const defaultElementsForPaper = createDefaultVisualElements(paperSize, orientation, margins);
+  const elements = mergeVisualElements(
+    incoming.elements ? base.elements : defaultElementsForPaper,
+    incoming.elements,
+    paperSize,
+    orientation
+  );
+
   return {
     paperSize,
     orientation,
-    margins: {
-      topMm: clampMargin(incoming.margins?.topMm, base.margins.topMm),
-      rightMm: clampMargin(incoming.margins?.rightMm, base.margins.rightMm),
-      bottomMm: clampMargin(incoming.margins?.bottomMm, base.margins.bottomMm),
-      leftMm: clampMargin(incoming.margins?.leftMm, base.margins.leftMm),
-    },
+    margins,
     language,
     showLogo: incoming.showLogo ?? base.showLogo,
     logoSize,
@@ -317,9 +399,11 @@ function mergeSingleLayout(
         ? incoming.signatoryTitle.slice(0, 120)
         : base.signatoryTitle,
     signatureUrl:
-      incoming.signatureUrl !== undefined ? sanitizeOptionalUrl(incoming.signatureUrl) : base.signatureUrl,
-    sealUrl: incoming.sealUrl !== undefined ? sanitizeOptionalUrl(incoming.sealUrl) : base.sealUrl,
+      incoming.signatureUrl !== undefined ? sanitizeBrandingUrl(incoming.signatureUrl) : base.signatureUrl,
+    sealUrl: incoming.sealUrl !== undefined ? sanitizeBrandingUrl(incoming.sealUrl) : base.sealUrl,
     showPrintedTimestamp: incoming.showPrintedTimestamp ?? base.showPrintedTimestamp,
+    visualLayoutEnabled: incoming.visualLayoutEnabled ?? base.visualLayoutEnabled,
+    elements,
   };
 }
 
@@ -379,7 +463,7 @@ export function validatePrintSettingsPayload(payload: unknown): {
       return { valid: false, error: `Invalid language for ${docType}. Allowed: EN, KN, EN_KN.` };
     }
     for (const urlField of [layout.signatureUrl, layout.sealUrl]) {
-      if (urlField && /^(javascript|data|vbscript):/i.test(urlField.trim())) {
+      if (urlField && !isValidBrandingUrl(urlField)) {
         return { valid: false, error: `Unsafe URL scheme detected in ${docType} branding.` };
       }
     }
@@ -398,7 +482,30 @@ export function validatePrintSettingsPayload(payload: unknown): {
         }
       }
     }
+    if (layout.elements && typeof layout.elements === 'object') {
+      const elKeys: VisualElementKey[] = [
+        'logo',
+        'seal',
+        'signature',
+        'companyHeader',
+        'documentTitle',
+        'footer',
+      ];
+      for (const k of elKeys) {
+        const el = layout.elements[k];
+        if (!el) continue;
+        for (const numField of [el.xMm, el.yMm, el.widthMm, el.heightMm]) {
+          if (numField !== undefined && (!Number.isFinite(Number(numField)) || Number(numField) < 0 || Number(numField) > 500)) {
+            return {
+              valid: false,
+              error: `Invalid visual coordinate or dimension on ${k} in ${docType}.`,
+            };
+          }
+        }
+      }
+    }
   }
 
   return { valid: true };
 }
+

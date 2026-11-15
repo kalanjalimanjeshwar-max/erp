@@ -10,6 +10,7 @@ import { JournalService } from './journal.service.js';
 import { AuditService } from './audit.service.js';
 import { CompanyService } from './company.service.js';
 import { DocumentSequenceService } from './document-sequence.service.js';
+import { BrandingAssetService } from './branding-asset.service.js';
 
 export class ReceiptService {
   /**
@@ -148,6 +149,12 @@ export class ReceiptService {
       throw err;
     }
 
+    const brandingSnapshot = await BrandingAssetService.getDocumentSnapshot(
+      companyId,
+      'RECEIPT',
+      id
+    );
+
     return {
       id: r.id,
       companyId: r.companyId,
@@ -174,6 +181,7 @@ export class ReceiptService {
       voidReason: r.voidReason,
       createdByUserName: r.createdByUser?.fullName || null,
       createdAt: r.createdAt.toISOString(),
+      brandingSnapshot,
       allocations: r.allocations.map((a) => ({
         id: a.id,
         receiptId: a.receiptId,
@@ -423,6 +431,13 @@ export class ReceiptService {
           },
         });
       }
+
+      await BrandingAssetService.captureDocumentSnapshot(
+        actor.companyId,
+        'RECEIPT',
+        receipt.id,
+        tx
+      );
 
       return receipt;
     });

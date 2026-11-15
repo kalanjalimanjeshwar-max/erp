@@ -116,8 +116,120 @@ import {
   ExpenseCapabilitiesResponse,
   CustomerDuplicateMatch,
   DocumentPrintLayoutConfig,
+  BrandingAssetType,
+  CompanyBrandingAssetItem,
+  CompanyBrandingAssetsState,
+  BrandingAssetMutationResponse,
 } from '../../shared/types.ts';
+import {
+  MAX_BRANDING_FILE_SIZE_BYTES,
+  MIN_BRANDING_IMAGE_DIM_PX,
+  MAX_BRANDING_IMAGE_DIM_PX,
+  formatFileSizeLabel,
+} from '../../shared/branding.ts';
 import type { ExportableDocumentPayload } from '../../shared/export/docx-builder.ts';
+
+export interface BrandingUploadPayload {
+  fileName: string;
+  mimeType: string;
+  dataBase64: string;
+  fallbackPngBase64?: string | null;
+  widthPx: number;
+  heightPx: number;
+}
+
+export async function fileToBrandingUploadPayload(file: File): Promise<BrandingUploadPayload> {
+  const lowerName = (file.name || '').toLowerCase();
+  const validExt =
+    lowerName.endsWith('.png') ||
+    lowerName.endsWith('.jpg') ||
+    lowerName.endsWith('.jpeg') ||
+    lowerName.endsWith('.webp');
+  if (!validExt) {
+    throw new Error('Unsupported file format. Please choose a PNG, JPG, JPEG, or WebP image.');
+  }
+  if (file.size <= 0) {
+    throw new Error('Selected file is empty.');
+  }
+  if (file.size > MAX_BRANDING_FILE_SIZE_BYTES) {
+    throw new Error(
+      `File size (${formatFileSizeLabel(file.size)}) exceeds the maximum limit of 2 MB.`
+    );
+  }
+
+  const dataUri = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(new Error('Failed to read image file from disk.'));
+    reader.readAsDataURL(file);
+  });
+
+  const dimsAndFallback = await new Promise<{
+    widthPx: number;
+    heightPx: number;
+    fallbackPngBase64: string | null;
+  }>((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const widthPx = img.naturalWidth;
+      const heightPx = img.naturalHeight;
+      if (
+        widthPx < MIN_BRANDING_IMAGE_DIM_PX ||
+        heightPx < MIN_BRANDING_IMAGE_DIM_PX ||
+        widthPx > MAX_BRANDING_IMAGE_DIM_PX ||
+        heightPx > MAX_BRANDING_IMAGE_DIM_PX
+      ) {
+        reject(
+          new Error(
+            `Image dimensions (${widthPx}x${heightPx}px) must be between ${MIN_BRANDING_IMAGE_DIM_PX}px and ${MAX_BRANDING_IMAGE_DIM_PX}px.`
+          )
+        );
+        return;
+      }
+
+      let fallbackPngBase64: string | null = null;
+      const isWebp =
+        file.type === 'image/webp' || lowerName.endsWith('.webp');
+      if (isWebp && typeof document !== 'undefined') {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = widthPx;
+          canvas.height = heightPx;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(img, 0, 0);
+            fallbackPngBase64 = canvas.toDataURL('image/png');
+          }
+        } catch {
+          fallbackPngBase64 = null;
+        }
+      }
+
+      resolve({ widthPx, heightPx, fallbackPngBase64 });
+    };
+    img.onerror = () => reject(new Error('Selected file could not be decoded as a valid image.'));
+    img.src = dataUri;
+  });
+
+  const normalizedMime =
+    file.type === 'image/jpg'
+      ? 'image/jpeg'
+      : file.type ||
+        (lowerName.endsWith('.png')
+          ? 'image/png'
+          : lowerName.endsWith('.webp')
+          ? 'image/webp'
+          : 'image/jpeg');
+
+  return {
+    fileName: file.name,
+    mimeType: normalizedMime,
+    dataBase64: dataUri,
+    fallbackPngBase64: dimsAndFallback.fallbackPngBase64,
+    widthPx: dimsAndFallback.widthPx,
+    heightPx: dimsAndFallback.heightPx,
+  };
+}
 
 export class ApiError extends Error {
   code: string;
@@ -221,6 +333,21 @@ export const api = {
     request<InitialSetupResult>('/api/setup/bootstrap', {
       method: 'POST',
       body: JSON.stringify(data),
+    }),
+  stageSetupBrandingAsset: (data: {
+    assetType: BrandingAssetType;
+    fileName: string;
+    mimeType: string;
+    dataBase64: string;
+    fallbackPngBase64?: string | null;
+  }) =>
+    request<CompanyBrandingAssetItem>('/api/setup/branding/upload', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  deleteStagedSetupBrandingAsset: (id: string) =>
+    request<{ success: boolean }>(`/api/setup/branding/assets/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
     }),
 
   // Authentication
@@ -1092,5 +1219,33 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
+
+  // ==========================================
+  // Company Branding Asset Management
+  // ==========================================
+  getBrandingAssets: () => request<CompanyBrandingAssetsState>('/api/company/branding'),
+  uploadCompanyBrandingAsset: (
+    assetType: BrandingAssetType,
+    data: {
+      fileName: string;
+      mimeType: string;
+      dataBase64: string;
+      fallbackPngBase64?: string | null;
+    }
+  ) =>
+    request<BrandingAssetMutationResponse & { profile?: CompanyProfile }>(
+      `/api/company/branding/${encodeURIComponent(assetType)}`,
+      {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }
+    ),
+  removeCompanyBrandingAsset: (assetType: BrandingAssetType) =>
+    request<BrandingAssetMutationResponse & { profile?: CompanyProfile }>(
+      `/api/company/branding/${encodeURIComponent(assetType)}`,
+      {
+        method: 'DELETE',
+      }
+    ),
 };
 

@@ -10,15 +10,18 @@ import {
   DocumentPrintType,
 } from '../../shared/types.js';
 import { PAPER_DIMENSIONS_MM } from '../../shared/print-settings.js';
+import { createDefaultVisualElements } from '../../shared/branding.js';
 import { DocumentPrintLabelKey, getDocumentLabel } from '../../shared/print-translations.js';
 import { formatMoney, normalizeCurrencyCode } from '../../shared/currency.js';
 import { formatDateTimeInTimezone, getEffectiveTimeZone } from '../../shared/timezone.js';
 import {
+  DocumentExportBrandingImages,
   ExportableDocumentPayload,
   buildExportFileName,
   generateDocxBuffer,
   resolveEffectivePrintLayout,
 } from '../../shared/export/docx-builder.js';
+import { BrandingAssetService } from './branding-asset.service.js';
 import { CompanyService } from './company.service.js';
 import { CompanyBankAccountService } from './company-bank-account.service.js';
 import { PermissionService } from './permission.service.js';
@@ -200,6 +203,13 @@ function resolveSafeLocalImagePath(url?: string | null): string | null {
   return null;
 }
 
+function isSupportedPdfImageBuffer(buf?: Buffer | null): buf is Buffer {
+  if (!buf || buf.length < 8) return false;
+  const isPng = buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47;
+  const isJpeg = buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff;
+  return isPng || isJpeg;
+}
+
 export class DocumentExportService {
   /**
    * Verifies module VIEW permission for the requested document type.
@@ -281,13 +291,62 @@ export class DocumentExportService {
     const docPayload = request.document;
     await this.assertCanExportDocument(actor, docPayload.type);
 
-    const companyProfile = await this.resolveCompanyProfile(actor.companyId);
-    const layout = resolveEffectivePrintLayout(
-      docPayload.type,
-      companyProfile,
-      request.layoutOverride
-    );
+    const rawCompanyProfile = await this.resolveCompanyProfile(actor.companyId);
+
+    const snapshot =
+      !request.isDraftPreview && docPayload.data.status !== 'DRAFT'
+        ? docPayload.data.brandingSnapshot ||
+          (docPayload.data.id
+            ? await BrandingAssetService.getDocumentSnapshot(
+                actor.companyId,
+                docPayload.type,
+                docPayload.data.id
+              )
+            : null)
+        : null;
+
+    const { effectiveProfile: companyProfile, effectiveLayout: snapshotLayout } =
+      BrandingAssetService.applySnapshotToCompanyProfile(
+        rawCompanyProfile,
+        snapshot,
+        docPayload.type
+      );
+
+    const layout =
+      request.layoutOverride ||
+      snapshotLayout ||
+      resolveEffectivePrintLayout(docPayload.type, companyProfile, undefined);
+
     const bankAccount = await this.resolveAuthorizedBankAccount(actor, docPayload.type, layout);
+
+    const resolvedLogoUrl =
+      snapshot?.logoUrl ?? companyProfile?.brandingAssets?.logo?.url ?? companyProfile?.logoUrl ?? null;
+    const resolvedSealUrl =
+      snapshot?.sealUrl ??
+      (layout.sealUrl ||
+        companyProfile?.documentBranding?.sealUrl ||
+        companyProfile?.sealUrl ||
+        companyProfile?.brandingAssets?.seal?.url ||
+        null);
+    const resolvedSignatureUrl =
+      snapshot?.signatureUrl ??
+      (layout.signatureUrl ||
+        companyProfile?.documentBranding?.signatureUrl ||
+        companyProfile?.signatureUrl ||
+        companyProfile?.brandingAssets?.signature?.url ||
+        null);
+
+    const [logoBuf, sealBuf, signatureBuf] = await Promise.all([
+      BrandingAssetService.resolveExportImageBuffer(actor.companyId, resolvedLogoUrl),
+      BrandingAssetService.resolveExportImageBuffer(actor.companyId, resolvedSealUrl),
+      BrandingAssetService.resolveExportImageBuffer(actor.companyId, resolvedSignatureUrl),
+    ]);
+
+    const brandingImages: DocumentExportBrandingImages = {
+      logo: logoBuf,
+      seal: sealBuf,
+      signature: signatureBuf,
+    };
 
     const fileName = buildExportFileName(docPayload, format, request.isDraftPreview);
 
@@ -296,11 +355,12 @@ export class DocumentExportService {
 
     if (format === 'docx') {
       buffer = await generateDocxBuffer({
-        document: docPayload,
+        document: snapshot ? { ...docPayload, data: { ...docPayload.data, brandingSnapshot: snapshot } } as ExportableDocumentPayload : docPayload,
         companyProfile,
         layoutOverride: layout,
         bankAccount,
         isDraftPreview: request.isDraftPreview,
+        brandingImages,
       });
       mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
     } else {
@@ -310,6 +370,7 @@ export class DocumentExportService {
         layout,
         bankAccount,
         isDraftPreview: request.isDraftPreview,
+        brandingImages,
       });
       mimeType = 'application/pdf';
     }
@@ -337,6 +398,7 @@ export class DocumentExportService {
         language: layout.language,
         isDraftPreview: Boolean(request.isDraftPreview),
         includedBankDetails: Boolean(bankAccount),
+        usedHistoricalSnapshot: Boolean(snapshot),
       },
     });
 
@@ -352,10 +414,21 @@ export class DocumentExportService {
     layout: DocumentPrintLayoutConfig;
     bankAccount: CompanyBankAccountItem | null;
     isDraftPreview?: boolean;
+    brandingImages?: DocumentExportBrandingImages;
   }): Promise<Buffer> {
-    const { document: docPayload, companyProfile, layout, bankAccount, isDraftPreview } = params;
+    const {
+      document: docPayload,
+      companyProfile,
+      layout,
+      bankAccount,
+      isDraftPreview,
+      brandingImages,
+    } = params;
     const docType = docPayload.type;
     const fonts = loadFontAssets();
+    const visualElements =
+      layout.elements ||
+      createDefaultVisualElements(layout.paperSize, layout.orientation, layout.margins);
 
     const dimsMm = PAPER_DIMENSIONS_MM[layout.paperSize] || PAPER_DIMENSIONS_MM.A4;
     const portraitWidthPt = mmToPt(dimsMm.width);
@@ -559,106 +632,169 @@ export class DocumentExportService {
       cursorY += 8;
     }
 
-    // Header: Company Info (Left) + Title/DocNo (Right)
+    // Header: Company Logo, Company Header Block, Document Title/Number using Visual Elements
     const headerStartY = cursorY;
-    const leftColW = contentWidth * 0.56;
-    const rightColX = contentLeft + contentWidth * 0.58;
-    const rightColW = contentWidth * 0.42;
+    const headerBannerShift = Math.max(0, headerStartY - margins.top);
 
-    let leftY = headerStartY;
-    if (layout.showLogo && companyProfile?.logoUrl) {
-      const logoPath = resolveSafeLocalImagePath(companyProfile.logoUrl);
-      if (logoPath) {
+    const logoEl = visualElements.logo;
+    const headerEl = visualElements.companyHeader;
+    const titleEl = visualElements.documentTitle;
+
+    const useVisual = Boolean(layout.visualLayoutEnabled);
+
+    const logoX = useVisual ? Math.max(contentLeft, mmToPt(logoEl.xMm)) : contentLeft;
+    const logoY = useVisual ? Math.max(headerStartY, mmToPt(logoEl.yMm) + headerBannerShift) : headerStartY;
+    const logoW = useVisual ? Math.max(24, mmToPt(logoEl.widthMm)) : 102;
+    const logoH = useVisual
+      ? Math.max(16, mmToPt(logoEl.heightMm))
+      : layout.logoSize === 'sm'
+      ? 28
+      : layout.logoSize === 'lg'
+      ? 48
+      : 36;
+
+    let logoBottomY = headerStartY;
+    const logoVisible = layout.showLogo && (!useVisual || logoEl.visible);
+    if (logoVisible) {
+      const logoImgSource = isSupportedPdfImageBuffer(brandingImages?.logo as Buffer | null | undefined)
+        ? (brandingImages?.logo as Buffer)
+        : resolveSafeLocalImagePath(companyProfile?.logoUrl);
+
+      if (logoImgSource) {
         try {
-          const logoH = layout.logoSize === 'sm' ? 28 : layout.logoSize === 'lg' ? 48 : 36;
-          doc.image(logoPath, contentLeft, leftY, { height: logoH });
-          leftY += logoH + 6;
+          const logoAlign = logoEl.align || layout.logoPosition;
+          doc.image(logoImgSource, logoX, logoY, {
+            fit: [logoW, logoH],
+            ...(logoAlign === 'center' || logoAlign === 'right' ? { align: logoAlign } : {}),
+          });
+          logoBottomY = logoY + logoH + mmToPt(logoEl.spacingMm || 3);
         } catch {
           // ignore unreadable image
         }
       }
     }
 
-    if (layout.showCompanyName) {
-      leftY = writeMixedText(companyName, contentLeft, leftY, {
-        width: leftColW,
+    const headerX = useVisual ? Math.max(contentLeft, mmToPt(headerEl.xMm)) : contentLeft;
+    const headerW = useVisual
+      ? Math.max(80, Math.min(contentRight - headerX, mmToPt(headerEl.widthMm)))
+      : contentWidth * 0.56;
+    let leftY = useVisual
+      ? Math.max(headerStartY, mmToPt(headerEl.yMm) + headerBannerShift)
+      : logoBottomY;
+
+    // Prevent vertical overlap if logo and company header sit in the same horizontal span
+    const horizontalOverlap =
+      logoVisible &&
+      logoBottomY > headerStartY &&
+      headerX < logoX + logoW &&
+      headerX + headerW > logoX;
+    if (horizontalOverlap && leftY < logoBottomY) {
+      leftY = logoBottomY;
+    }
+
+    const headerAlign = useVisual ? headerEl.align : 'left';
+    const headerVisible = !useVisual || headerEl.visible;
+
+    if (headerVisible) {
+      if (layout.showCompanyName) {
+        leftY = writeMixedText(companyName, headerX, leftY, {
+          width: headerW,
+          align: headerAlign,
+          fontSize: 15,
+          bold: true,
+          color: '#0f172a',
+        });
+        if (companyProfile?.legalName && companyProfile.legalName !== companyName) {
+          leftY = writeMixedText(companyProfile.legalName, headerX, leftY + 1, {
+            width: headerW,
+            align: headerAlign,
+            fontSize: 8.5,
+            color: '#475569',
+          });
+        }
+      }
+
+      if (layout.showCompanyContact) {
+        if (companyProfile?.address) {
+          leftY = writeMixedText(companyProfile.address, headerX, leftY + 2, {
+            width: headerW,
+            align: headerAlign,
+            fontSize: 8.5,
+            color: '#475569',
+          });
+        }
+        const contactLine = [companyProfile?.phone, companyProfile?.email, companyProfile?.website]
+          .filter(Boolean)
+          .join('  •  ');
+        if (contactLine) {
+          leftY = writeMixedText(contactLine, headerX, leftY + 1, {
+            width: headerW,
+            align: headerAlign,
+            fontSize: 8.5,
+            color: '#475569',
+          });
+        }
+      }
+
+      if (layout.showCompanyTaxId && companyProfile?.taxId) {
+        leftY = writeMixedText(
+          `${formatLabelText('taxId', layout.language)}: ${companyProfile.taxId}`,
+          headerX,
+          leftY + 2,
+          {
+            width: headerW,
+            align: headerAlign,
+            fontSize: 8.5,
+            bold: true,
+            color: '#334155',
+          }
+        );
+      }
+      leftY += mmToPt(headerEl.spacingMm || 2);
+    }
+
+    const titleX = useVisual
+      ? Math.max(contentLeft, mmToPt(titleEl.xMm))
+      : contentLeft + contentWidth * 0.58;
+    const titleW = useVisual
+      ? Math.max(70, Math.min(contentRight - titleX, mmToPt(titleEl.widthMm)))
+      : contentWidth * 0.42;
+    let rightY = useVisual
+      ? Math.max(headerStartY, mmToPt(titleEl.yMm) + headerBannerShift)
+      : headerStartY;
+    const titleAlign: 'left' | 'center' | 'right' = useVisual
+      ? titleEl.align
+      : layout.titlePlacement === 'left'
+      ? 'left'
+      : layout.titlePlacement === 'center'
+      ? 'center'
+      : 'right';
+
+    if (!useVisual || titleEl.visible) {
+      rightY = writeMixedText(resolvedTitle.toUpperCase(), titleX, rightY, {
+        width: titleW,
+        align: titleAlign,
         fontSize: 15,
         bold: true,
         color: '#0f172a',
       });
-      if (companyProfile?.legalName && companyProfile.legalName !== companyName) {
-        leftY = writeMixedText(companyProfile.legalName, contentLeft, leftY + 1, {
-          width: leftColW,
-          fontSize: 8.5,
-          color: '#475569',
-        });
-      }
-    }
 
-    if (layout.showCompanyContact) {
-      if (companyProfile?.address) {
-        leftY = writeMixedText(companyProfile.address, contentLeft, leftY + 2, {
-          width: leftColW,
-          fontSize: 8.5,
-          color: '#475569',
-        });
-      }
-      const contactLine = [companyProfile?.phone, companyProfile?.email, companyProfile?.website]
-        .filter(Boolean)
-        .join('  •  ');
-      if (contactLine) {
-        leftY = writeMixedText(contactLine, contentLeft, leftY + 1, {
-          width: leftColW,
-          fontSize: 8.5,
-          color: '#475569',
-        });
-      }
-    }
-
-    if (layout.showCompanyTaxId && companyProfile?.taxId) {
-      leftY = writeMixedText(
-        `${formatLabelText('taxId', layout.language)}: ${companyProfile.taxId}`,
-        contentLeft,
-        leftY + 2,
+      rightY = writeMixedText(
+        `${formatLabelText(docNumberLabelKey, layout.language)}: ${docNumber || 'DRAFT PREVIEW'}`,
+        titleX,
+        rightY + 4,
         {
-          width: leftColW,
-          fontSize: 8.5,
+          width: titleW,
+          align: titleAlign,
+          fontSize: 9.5,
           bold: true,
-          color: '#334155',
+          color: '#1e293b',
         }
       );
+      rightY += mmToPt(titleEl.spacingMm || 2);
     }
 
-    let rightY = headerStartY;
-    const titleAlign: 'left' | 'center' | 'right' =
-      layout.titlePlacement === 'left'
-        ? 'left'
-        : layout.titlePlacement === 'center'
-        ? 'center'
-        : 'right';
-
-    rightY = writeMixedText(resolvedTitle.toUpperCase(), rightColX, rightY, {
-      width: rightColW,
-      align: titleAlign,
-      fontSize: 15,
-      bold: true,
-      color: '#0f172a',
-    });
-
-    rightY = writeMixedText(
-      `${formatLabelText(docNumberLabelKey, layout.language)}: ${docNumber || 'DRAFT PREVIEW'}`,
-      rightColX,
-      rightY + 4,
-      {
-        width: rightColW,
-        align: titleAlign,
-        fontSize: 9.5,
-        bold: true,
-        color: '#1e293b',
-      }
-    );
-
-    cursorY = Math.max(leftY, rightY) + 10;
+    cursorY = Math.max(logoBottomY, leftY, rightY) + 8;
     doc
       .moveTo(contentLeft, cursorY)
       .lineTo(contentRight, cursorY)
@@ -1139,73 +1275,112 @@ export class DocumentExportService {
       doc.y = cursorY;
     }
 
-    // Authorized Signature
+    // Authorized Signature & Seal
     if (layout.showSignatureSection) {
-      ensurePageSpace(65);
-      cursorY = Math.max(doc.y + 12, cursorY + 12);
-      const sigW = 160;
-      const sigX = contentRight - sigW;
+      const sealEl = visualElements.seal;
+      const sigEl = visualElements.signature;
+      const useVisualSig = Boolean(layout.visualLayoutEnabled);
 
-      const sealPath = resolveSafeLocalImagePath(
-        layout.sealUrl || companyProfile?.documentBranding?.sealUrl || companyProfile?.sealUrl
-      );
-      if (sealPath) {
+      const sealW = useVisualSig ? Math.max(24, mmToPt(sealEl.widthMm)) : 48;
+      const sealH = useVisualSig ? Math.max(24, mmToPt(sealEl.heightMm)) : 42;
+      const sigImgW = useVisualSig ? Math.max(40, mmToPt(sigEl.widthMm)) : 120;
+      const sigImgH = useVisualSig ? Math.max(18, mmToPt(sigEl.heightMm)) : 32;
+      const blockNeeded = Math.max(sealH, sigImgH) + 34;
+
+      ensurePageSpace(blockNeeded);
+      cursorY = Math.max(doc.y + 10, cursorY + 10);
+
+      const sealX = useVisualSig
+        ? Math.max(contentLeft, Math.min(contentRight - sealW, mmToPt(sealEl.xMm)))
+        : contentRight - 220;
+      const sigW = Math.max(130, sigImgW);
+      const sigX = useVisualSig
+        ? Math.max(contentLeft, Math.min(contentRight - sigW, mmToPt(sigEl.xMm)))
+        : contentRight - 160;
+
+      const sealImgSource = isSupportedPdfImageBuffer(brandingImages?.seal as Buffer | null | undefined)
+        ? (brandingImages?.seal as Buffer)
+        : resolveSafeLocalImagePath(
+            layout.sealUrl || companyProfile?.documentBranding?.sealUrl || companyProfile?.sealUrl
+          );
+
+      if ((!useVisualSig || sealEl.visible) && sealImgSource) {
         try {
-          doc.image(sealPath, sigX - 60, cursorY, { height: 42 });
+          const sealAlign = sealEl.align || 'center';
+          doc.image(sealImgSource, sealX, cursorY, {
+            fit: [sealW, sealH],
+            ...(sealAlign === 'center' || sealAlign === 'right' ? { align: sealAlign } : {}),
+          });
         } catch {
           // ignore
         }
       }
 
-      const sigPath = resolveSafeLocalImagePath(
-        layout.signatureUrl ||
-          companyProfile?.documentBranding?.signatureUrl ||
-          companyProfile?.signatureUrl
-      );
-      if (sigPath) {
+      const sigImgSource = isSupportedPdfImageBuffer(
+        brandingImages?.signature as Buffer | null | undefined
+      )
+        ? (brandingImages?.signature as Buffer)
+        : resolveSafeLocalImagePath(
+            layout.signatureUrl ||
+              companyProfile?.documentBranding?.signatureUrl ||
+              companyProfile?.signatureUrl
+          );
+
+      const sigVisible = !useVisualSig || sigEl.visible;
+      if (sigVisible && sigImgSource) {
         try {
-          doc.image(sigPath, sigX + 20, cursorY, { height: 28 });
+          const sigAlign = sigEl.align || 'center';
+          doc.image(sigImgSource, sigX, cursorY, {
+            fit: [sigImgW, sigImgH],
+            ...(sigAlign === 'center' || sigAlign === 'right' ? { align: sigAlign } : {}),
+          });
         } catch {
           // ignore
         }
       }
 
-      const lineY = cursorY + 34;
-      doc
-        .moveTo(sigX, lineY)
-        .lineTo(sigX + sigW, lineY)
-        .strokeColor('#94a3b8')
-        .lineWidth(0.75)
-        .stroke();
+      if (sigVisible) {
+        const lineY = cursorY + Math.max(28, sigImgH + 4);
+        doc
+          .moveTo(sigX, lineY)
+          .lineTo(sigX + sigW, lineY)
+          .strokeColor('#94a3b8')
+          .lineWidth(0.75)
+          .stroke();
 
-      const signatoryName =
-        layout.signatoryName ||
-        companyProfile?.documentBranding?.signatoryName ||
-        layout.signatureLabel ||
-        formatLabelText('authorizedSignature', layout.language);
-      const signatoryTitle =
-        layout.signatoryTitle || companyProfile?.documentBranding?.signatureTitle || '';
+        const signatoryName =
+          layout.signatoryName ||
+          companyProfile?.documentBranding?.signatoryName ||
+          layout.signatureLabel ||
+          formatLabelText('authorizedSignature', layout.language);
+        const signatoryTitle =
+          layout.signatoryTitle || companyProfile?.documentBranding?.signatureTitle || '';
 
-      let sy = writeMixedText(signatoryName, sigX, lineY + 4, {
-        width: sigW,
-        align: 'center',
-        fontSize: 8.5,
-        bold: true,
-        color: '#0f172a',
-      });
-      if (signatoryTitle) {
-        sy = writeMixedText(signatoryTitle, sigX, sy + 1, {
+        let sy = writeMixedText(signatoryName, sigX, lineY + 4, {
           width: sigW,
-          align: 'center',
-          fontSize: 7.5,
-          color: '#64748b',
+          align: sigEl.align || 'center',
+          fontSize: 8.5,
+          bold: true,
+          color: '#0f172a',
         });
+        if (signatoryTitle) {
+          sy = writeMixedText(signatoryTitle, sigX, sy + 1, {
+            width: sigW,
+            align: sigEl.align || 'center',
+            fontSize: 7.5,
+            color: '#64748b',
+          });
+        }
+        cursorY = Math.max(sy + 10, cursorY + Math.max(sealH, sigImgH + 26));
+      } else if (sealImgSource && (!useVisualSig || sealEl.visible)) {
+        cursorY += sealH + 10;
       }
-      cursorY = sy + 10;
     }
 
     // Footer & Timestamp
-    if (layout.footerText || layout.showPrintedTimestamp) {
+    const footerEl = visualElements.footer;
+    const footerVisible = !layout.visualLayoutEnabled || footerEl.visible;
+    if (footerVisible && (layout.footerText || layout.showPrintedTimestamp)) {
       const printedAtLabel = formatDateTimeInTimezone(new Date(), timezone, {
         includeZoneAbbr: true,
       });
@@ -1216,7 +1391,16 @@ export class DocumentExportService {
           : '',
       ].filter(Boolean);
 
-      const footerY = Math.max(cursorY + 8, pageH - margins.bottom - 14);
+      const footerX = layout.visualLayoutEnabled
+        ? Math.max(contentLeft, mmToPt(footerEl.xMm))
+        : contentLeft;
+      const footerW = layout.visualLayoutEnabled
+        ? Math.max(80, Math.min(contentRight - footerX, mmToPt(footerEl.widthMm)))
+        : contentWidth;
+      const footerY = Math.min(
+        pageH - margins.bottom - 10,
+        Math.max(cursorY + 8, pageH - margins.bottom - 14)
+      );
       doc
         .moveTo(contentLeft, footerY - 4)
         .lineTo(contentRight, footerY - 4)
@@ -1224,8 +1408,9 @@ export class DocumentExportService {
         .lineWidth(0.5)
         .stroke();
 
-      writeMixedText(footerParts.join('  |  '), contentLeft, footerY, {
-        width: contentWidth,
+      writeMixedText(footerParts.join('  |  '), footerX, footerY, {
+        width: footerW,
+        align: layout.visualLayoutEnabled ? footerEl.align : 'left',
         fontSize: 7.5,
         color: '#64748b',
       });

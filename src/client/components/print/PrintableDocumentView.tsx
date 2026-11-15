@@ -22,6 +22,9 @@ import {
   QuotationItem,
 } from '../../../shared/types.ts';
 import {
+  createDefaultVisualElements,
+} from '../../../shared/branding.ts';
+import {
   createDefaultPrintSettings,
   PAPER_DIMENSIONS_MM,
 } from '../../../shared/print-settings.ts';
@@ -33,7 +36,9 @@ import { formatMoney, normalizeCurrencyCode } from '../../../shared/currency.ts'
 import { formatDateTimeInTimezone, getEffectiveTimeZone } from '../../../shared/timezone.ts';
 import {
   buildExportFileName,
+  DocumentExportBrandingImages,
   generateDocxBlob,
+  resolveDocumentEffectiveBranding,
 } from '../../../shared/export/docx-builder.ts';
 import { api, ApiError } from '../../services/api.ts';
 
@@ -100,12 +105,19 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
   const [exportingFormat, setExportingFormat] = useState<'pdf' | 'docx' | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
-  const resolvedSavedLayout = useMemo(() => {
-    if (layoutOverride) return layoutOverride;
-    const saved = companyProfile?.printSettings?.layouts?.[docType];
-    if (saved) return saved;
-    return createDefaultPrintSettings(companyProfile || undefined).layouts[docType];
-  }, [layoutOverride, companyProfile, docType]);
+  const resolvedBranding = useMemo(
+    () =>
+      resolveDocumentEffectiveBranding(
+        document,
+        companyProfile,
+        layoutOverride,
+        isDraftPreview
+      ),
+    [document, companyProfile, layoutOverride, isDraftPreview]
+  );
+
+  const effectiveProfile = resolvedBranding.effectiveProfile;
+  const resolvedSavedLayout = resolvedBranding.layout;
 
   // Allow temporary interactive language toggle in modal preview without mutating saved DB config
   const [previewLanguage, setPreviewLanguage] = useState<DocumentLanguage | null>(null);
@@ -117,6 +129,14 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
     [resolvedSavedLayout, previewLanguage]
   );
 
+  const visualElements = useMemo(
+    () =>
+      layout.elements ||
+      createDefaultVisualElements(layout.paperSize, layout.orientation, layout.margins),
+    [layout]
+  );
+  const useVisual = Boolean(layout.visualLayoutEnabled);
+
   const canDisplayBankDetails = Boolean(
     layout.showBankDetails && bankAccount && currentUser?.role !== 'EMPLOYEE'
   );
@@ -125,15 +145,13 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
   const sheetWidthMm = layout.orientation === 'landscape' ? paperDims.height : paperDims.width;
   const sheetMinHeightMm = layout.orientation === 'landscape' ? paperDims.width : paperDims.height;
 
-  const companyName = companyProfile?.name || 'CoreERP Enterprise';
-  const timezone = getEffectiveTimeZone(companyProfile?.timezone);
-  const roundingPrecision = companyProfile?.roundingPrecision ?? 2;
+  const companyName = effectiveProfile?.name || 'CoreERP Enterprise';
+  const timezone = getEffectiveTimeZone(effectiveProfile?.timezone);
+  const roundingPrecision = effectiveProfile?.roundingPrecision ?? 2;
 
   const documentCurrency = normalizeCurrencyCode(
-    document.type === 'RECEIPT'
-      ? document.data.currency || companyProfile?.currency
-      : document.data.currency || companyProfile?.currency,
-    companyProfile?.currency || 'INR'
+    document.data.currency || effectiveProfile?.currency,
+    effectiveProfile?.currency || 'INR'
   );
 
   const fmt = (amount: string | number | null | undefined) =>
@@ -194,14 +212,24 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
   const logoSizeClass =
     layout.logoSize === 'sm' ? 'h-9' : layout.logoSize === 'lg' ? 'h-16' : 'h-12';
 
+  const resolvedLogoUrl =
+    effectiveProfile?.brandingAssets?.logo?.url || effectiveProfile?.logoUrl || '';
   const resolvedSignatureUrl =
-    layout.signatureUrl || companyProfile?.documentBranding?.signatureUrl || companyProfile?.signatureUrl || '';
+    layout.signatureUrl ||
+    effectiveProfile?.documentBranding?.signatureUrl ||
+    effectiveProfile?.signatureUrl ||
+    effectiveProfile?.brandingAssets?.signature?.url ||
+    '';
   const resolvedSealUrl =
-    layout.sealUrl || companyProfile?.documentBranding?.sealUrl || companyProfile?.sealUrl || '';
+    layout.sealUrl ||
+    effectiveProfile?.documentBranding?.sealUrl ||
+    effectiveProfile?.sealUrl ||
+    effectiveProfile?.brandingAssets?.seal?.url ||
+    '';
   const resolvedSignatoryName =
-    layout.signatoryName || companyProfile?.documentBranding?.signatoryName || '';
+    layout.signatoryName || effectiveProfile?.documentBranding?.signatoryName || '';
   const resolvedSignatoryTitle =
-    layout.signatoryTitle || companyProfile?.documentBranding?.signatureTitle || '';
+    layout.signatoryTitle || effectiveProfile?.documentBranding?.signatureTitle || '';
 
   const termsText =
     (document.type !== 'RECEIPT' ? document.data.terms : null) || layout.defaultTermsText;
@@ -249,17 +277,40 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
     }
   };
 
+  const fetchPreviewRasterBytes = async (url?: string | null): Promise<Uint8Array | null> => {
+    if (!url || !url.startsWith('/')) return null;
+    try {
+      const resp = await fetch(url, { credentials: 'include' });
+      if (!resp.ok) return null;
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      return buf;
+    } catch {
+      return null;
+    }
+  };
+
   const handleExportDocx = async () => {
     setExportError(null);
     try {
       setExportingFormat('docx');
       if (currentUser?.isPreview) {
+        const [logoBytes, sealBytes, signatureBytes] = await Promise.all([
+          fetchPreviewRasterBytes(resolvedLogoUrl),
+          fetchPreviewRasterBytes(resolvedSealUrl),
+          fetchPreviewRasterBytes(resolvedSignatureUrl),
+        ]);
+        const brandingImages: DocumentExportBrandingImages = {
+          logo: logoBytes,
+          seal: sealBytes,
+          signature: signatureBytes,
+        };
         const blob = await generateDocxBlob({
           document,
-          companyProfile,
+          companyProfile: effectiveProfile,
           layoutOverride: layout,
           bankAccount: canDisplayBankDetails ? bankAccount : null,
           isDraftPreview,
+          brandingImages,
         });
         triggerBlobDownload(blob, buildExportFileName(document, 'docx', isDraftPreview));
         return;
@@ -331,94 +382,124 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
           {/* Company Info Block */}
           <div
             className={`space-y-1 max-w-md ${
-              layout.logoPosition === 'center' ? 'text-center mx-auto' : ''
+              (useVisual ? visualElements.companyHeader.align : layout.logoPosition) === 'center'
+                ? 'text-center mx-auto'
+                : (useVisual ? visualElements.companyHeader.align : 'left') === 'right'
+                ? 'text-right'
+                : 'text-left'
             }`}
           >
-            {layout.showLogo && companyProfile?.logoUrl && (
+            {layout.showLogo && (!useVisual || visualElements.logo.visible) && resolvedLogoUrl && (
               <div
-                className={`mb-2 flex ${
-                  layout.logoPosition === 'center'
+                className={`flex ${
+                  (useVisual ? visualElements.logo.align : layout.logoPosition) === 'center'
                     ? 'justify-center'
-                    : layout.logoPosition === 'right'
+                    : (useVisual ? visualElements.logo.align : layout.logoPosition) === 'right'
                     ? 'justify-end'
                     : 'justify-start'
                 }`}
+                style={{
+                  marginBottom: `${visualElements.logo.spacingMm || 3}mm`,
+                }}
               >
                 <img
-                  src={companyProfile.logoUrl}
+                  src={resolvedLogoUrl}
                   alt={companyName}
-                  className={`${logoSizeClass} w-auto object-contain`}
+                  className={useVisual ? 'object-contain' : `${logoSizeClass} w-auto object-contain`}
+                  style={
+                    useVisual
+                      ? {
+                          width: `${visualElements.logo.widthMm}mm`,
+                          height: `${visualElements.logo.heightMm}mm`,
+                        }
+                      : undefined
+                  }
                 />
               </div>
             )}
 
-            {layout.showCompanyName && (
-              <div>
-                <div className="text-lg font-bold tracking-tight text-slate-900 leading-tight">
-                  {companyName}
-                </div>
-                {companyProfile?.legalName && companyProfile.legalName !== companyName && (
-                  <div className="text-[11px] text-slate-600">{companyProfile.legalName}</div>
-                )}
-              </div>
-            )}
-
-            {layout.showCompanyContact && (
-              <div className="text-[11px] text-slate-600 leading-relaxed space-y-0.5">
-                {companyProfile?.address && <div>{companyProfile.address}</div>}
-                {(companyProfile?.phone || companyProfile?.email || companyProfile?.website) && (
-                  <div className="flex flex-wrap gap-x-3 gap-y-0.5">
-                    {companyProfile.phone && <span>{companyProfile.phone}</span>}
-                    {companyProfile.email && <span>{companyProfile.email}</span>}
-                    {companyProfile.website && <span>{companyProfile.website}</span>}
+            {(!useVisual || visualElements.companyHeader.visible) && (
+              <div style={{ marginBottom: `${visualElements.companyHeader.spacingMm || 2}mm` }}>
+                {layout.showCompanyName && (
+                  <div>
+                    <div className="text-lg font-bold tracking-tight text-slate-900 leading-tight">
+                      {companyName}
+                    </div>
+                    {effectiveProfile?.legalName && effectiveProfile.legalName !== companyName && (
+                      <div className="text-[11px] text-slate-600">{effectiveProfile.legalName}</div>
+                    )}
                   </div>
                 )}
-              </div>
-            )}
 
-            {layout.showCompanyTaxId && companyProfile?.taxId && (
-              <div className="text-[11px] text-slate-700 font-medium">
-                <BilingualText labelKey="taxId" language={layout.language} inline />:{' '}
-                <span className="font-mono">{companyProfile.taxId}</span>
+                {layout.showCompanyContact && (
+                  <div className="text-[11px] text-slate-600 leading-relaxed space-y-0.5 mt-0.5">
+                    {effectiveProfile?.address && <div>{effectiveProfile.address}</div>}
+                    {(effectiveProfile?.phone || effectiveProfile?.email || effectiveProfile?.website) && (
+                      <div
+                        className={`flex flex-wrap gap-x-3 gap-y-0.5 ${
+                          visualElements.companyHeader.align === 'center'
+                            ? 'justify-center'
+                            : visualElements.companyHeader.align === 'right'
+                            ? 'justify-end'
+                            : 'justify-start'
+                        }`}
+                      >
+                        {effectiveProfile.phone && <span>{effectiveProfile.phone}</span>}
+                        {effectiveProfile.email && <span>{effectiveProfile.email}</span>}
+                        {effectiveProfile.website && <span>{effectiveProfile.website}</span>}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {layout.showCompanyTaxId && effectiveProfile?.taxId && (
+                  <div className="text-[11px] text-slate-700 font-medium mt-0.5">
+                    <BilingualText labelKey="taxId" language={layout.language} inline />:{' '}
+                    <span className="font-mono">{effectiveProfile.taxId}</span>
+                  </div>
+                )}
               </div>
             )}
           </div>
 
           {/* Document Title & Document Number */}
-          <div
-            className={`${
-              layout.titlePlacement === 'center'
-                ? 'text-center'
-                : layout.titlePlacement === 'left'
-                ? 'text-left'
-                : 'text-right'
-            }`}
-          >
-            <h1 className="text-xl font-bold uppercase tracking-wide text-slate-900">
-              {documentSpecificTitle || effectiveCustomTitle || defaultTitleEntry.primary}
-            </h1>
-            {defaultTitleEntry.secondary && !documentSpecificTitle && !effectiveCustomTitle && (
-              <div className="font-kannada text-sm font-semibold text-slate-700">
-                {defaultTitleEntry.secondary}
-              </div>
-            )}
-
-            {layout.numberPlacement === 'header-right' && (
-              <div className="mt-2 inline-block bg-slate-100 border border-slate-300 rounded px-3 py-1.5 text-left">
-                <div className="text-[10px] uppercase tracking-wider text-slate-500">
-                  <BilingualText labelKey={docNumberLabelKey} language={layout.language} inline />
+          {(!useVisual || visualElements.documentTitle.visible) && (
+            <div
+              className={`${
+                (useVisual ? visualElements.documentTitle.align : layout.titlePlacement) === 'center'
+                  ? 'text-center'
+                  : (useVisual ? visualElements.documentTitle.align : layout.titlePlacement) === 'left'
+                  ? 'text-left'
+                  : 'text-right'
+              }`}
+              style={{ marginBottom: `${visualElements.documentTitle.spacingMm || 2}mm` }}
+            >
+              <h1 className="text-xl font-bold uppercase tracking-wide text-slate-900">
+                {documentSpecificTitle || effectiveCustomTitle || defaultTitleEntry.primary}
+              </h1>
+              {defaultTitleEntry.secondary && !documentSpecificTitle && !effectiveCustomTitle && (
+                <div className="font-kannada text-sm font-semibold text-slate-700">
+                  {defaultTitleEntry.secondary}
                 </div>
-                <div className="text-sm font-mono font-bold text-slate-900">{docNumber}</div>
-              </div>
-            )}
+              )}
 
-            {layout.numberPlacement === 'below-title' && (
-              <div className="mt-1.5 text-xs font-mono font-bold text-slate-800">
-                <BilingualText labelKey={docNumberLabelKey} language={layout.language} inline />:{' '}
-                {docNumber}
-              </div>
-            )}
-          </div>
+              {layout.numberPlacement === 'header-right' && (
+                <div className="mt-2 inline-block bg-slate-100 border border-slate-300 rounded px-3 py-1.5 text-left">
+                  <div className="text-[10px] uppercase tracking-wider text-slate-500">
+                    <BilingualText labelKey={docNumberLabelKey} language={layout.language} inline />
+                  </div>
+                  <div className="text-sm font-mono font-bold text-slate-900">{docNumber}</div>
+                </div>
+              )}
+
+              {layout.numberPlacement === 'below-title' && (
+                <div className="mt-1.5 text-xs font-mono font-bold text-slate-800">
+                  <BilingualText labelKey={docNumberLabelKey} language={layout.language} inline />:{' '}
+                  {docNumber}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {/* Party Details & Document Metadata Grid */}
@@ -840,57 +921,92 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
 
         {/* Authorized Signature & Seal */}
         {layout.showSignatureSection && (
-          <div className="flex justify-end items-end gap-6 pt-4 pb-3">
-            {resolvedSealUrl && (
+          <div
+            className={`flex items-end gap-6 pt-4 pb-3 ${
+              visualElements.signature.align === 'left'
+                ? 'justify-start'
+                : visualElements.signature.align === 'center'
+                ? 'justify-center'
+                : 'justify-end'
+            }`}
+          >
+            {(!useVisual || visualElements.seal.visible) && resolvedSealUrl && (
               <img
                 src={resolvedSealUrl}
                 alt="Company Seal"
-                className="h-16 w-16 object-contain opacity-85"
+                className={useVisual ? 'object-contain opacity-90' : 'h-16 w-16 object-contain opacity-85'}
+                style={
+                  useVisual
+                    ? {
+                        width: `${visualElements.seal.widthMm}mm`,
+                        height: `${visualElements.seal.heightMm}mm`,
+                      }
+                    : undefined
+                }
               />
             )}
-            <div className="text-center min-w-[180px]">
-              {resolvedSignatureUrl ? (
-                <img
-                  src={resolvedSignatureUrl}
-                  alt="Authorized Signature"
-                  className="h-12 mx-auto object-contain mb-1"
-                />
-              ) : (
-                <div className="h-10" />
-              )}
-              <div className="border-t border-slate-400 pt-1 text-[11px] font-semibold text-slate-800">
-                {resolvedSignatoryName || (
-                  <span>
-                    {layout.signatureLabel ||
+            {(!useVisual || visualElements.signature.visible) && (
+              <div className="text-center min-w-[180px]">
+                {resolvedSignatureUrl ? (
+                  <img
+                    src={resolvedSignatureUrl}
+                    alt="Authorized Signature"
+                    className={useVisual ? 'mx-auto object-contain mb-1' : 'h-12 mx-auto object-contain mb-1'}
+                    style={
+                      useVisual
+                        ? {
+                            width: `${visualElements.signature.widthMm}mm`,
+                            height: `${visualElements.signature.heightMm}mm`,
+                          }
+                        : undefined
+                    }
+                  />
+                ) : (
+                  <div className="h-10" />
+                )}
+                <div className="border-t border-slate-400 pt-1 text-[11px] font-semibold text-slate-800">
+                  {resolvedSignatoryName || (
+                    <span>
+                      {layout.signatureLabel ||
+                        getDocumentLabel('authorizedSignature', layout.language).primary}
+                    </span>
+                  )}
+                </div>
+                {layout.language !== 'EN' && (
+                  <div className="font-kannada text-[10px] text-slate-500">
+                    {getDocumentLabel('authorizedSignature', layout.language).secondary ||
                       getDocumentLabel('authorizedSignature', layout.language).primary}
-                  </span>
+                  </div>
+                )}
+                {resolvedSignatoryTitle && (
+                  <div className="text-[10px] text-slate-500">{resolvedSignatoryTitle}</div>
                 )}
               </div>
-              {layout.language !== 'EN' && (
-                <div className="font-kannada text-[10px] text-slate-500">
-                  {getDocumentLabel('authorizedSignature', layout.language).secondary ||
-                    getDocumentLabel('authorizedSignature', layout.language).primary}
-                </div>
-              )}
-              {resolvedSignatoryTitle && (
-                <div className="text-[10px] text-slate-500">{resolvedSignatoryTitle}</div>
-              )}
-            </div>
+            )}
           </div>
         )}
 
         {/* Footer */}
-        {(layout.footerText || layout.showPrintedTimestamp) && (
-          <div className="border-t border-slate-200 pt-2.5 mt-4 flex flex-wrap justify-between items-center gap-2 text-[10px] text-slate-500">
-            <span>{layout.footerText}</span>
-            {layout.showPrintedTimestamp && (
-              <span className="font-mono">
-                <BilingualText labelKey="generatedOn" language={layout.language} inline />:{' '}
-                {printedAtLabel} ({timezone})
-              </span>
-            )}
-          </div>
-        )}
+        {(!useVisual || visualElements.footer.visible) &&
+          (layout.footerText || layout.showPrintedTimestamp) && (
+            <div
+              className={`border-t border-slate-200 pt-2.5 mt-4 flex flex-wrap items-center gap-2 text-[10px] text-slate-500 ${
+                visualElements.footer.align === 'center'
+                  ? 'justify-center text-center'
+                  : visualElements.footer.align === 'right'
+                  ? 'justify-end text-right'
+                  : 'justify-between text-left'
+              }`}
+            >
+              <span>{layout.footerText}</span>
+              {layout.showPrintedTimestamp && (
+                <span className="font-mono">
+                  <BilingualText labelKey="generatedOn" language={layout.language} inline />:{' '}
+                  {printedAtLabel} ({timezone})
+                </span>
+              )}
+            </div>
+          )}
       </div>
     </>
   );

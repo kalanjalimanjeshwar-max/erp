@@ -4,6 +4,11 @@
  */
 
 import type { DocumentPrintSettings } from './print-settings.js';
+import type {
+  BrandingAssetType,
+  CompanyBrandingAssetItem,
+  CompanyBrandingAssetsState,
+} from './branding.js';
 export type {
   DocumentPrintType,
   PaperSize,
@@ -16,6 +21,15 @@ export type {
   DocumentPrintLayoutConfig,
   DocumentPrintSettings,
 } from './print-settings.js';
+export type {
+  BrandingAssetType,
+  VisualElementKey,
+  ResizeCornerHandle,
+  VisualElementConfig,
+  DocumentVisualElements,
+  CompanyBrandingAssetItem,
+  CompanyBrandingAssetsState,
+} from './branding.js';
 export type { DocumentLanguage } from './print-translations.js';
 export type { CurrencyDisplayMode } from './currency.js';
 
@@ -118,6 +132,11 @@ export interface InitialSetupRequest {
     email?: string;
     website?: string;
     appHeaderTitle?: string;
+    brandingAssetIds?: {
+      logoAssetId?: string | null;
+      sealAssetId?: string | null;
+      signatureAssetId?: string | null;
+    };
   };
   superAdmin: {
     email: string;
@@ -179,6 +198,34 @@ export interface DocumentBrandingSettings {
   sealUrl?: string | null;
 }
 
+export interface DocumentBrandingSnapshot {
+  capturedAt: string;
+  companyName: string;
+  legalName?: string | null;
+  taxId?: string | null;
+  address?: string | null;
+  phone?: string | null;
+  email?: string | null;
+  website?: string | null;
+  logoUrl?: string | null;
+  sealUrl?: string | null;
+  signatureUrl?: string | null;
+  logoAssetId?: string | null;
+  sealAssetId?: string | null;
+  signatureAssetId?: string | null;
+  signatoryName?: string | null;
+  signatoryTitle?: string | null;
+  layout?: import('./print-settings.js').DocumentPrintLayoutConfig;
+}
+
+export interface BrandingAssetMutationResponse {
+  asset: CompanyBrandingAssetItem | null;
+  assets: CompanyBrandingAssetsState;
+  profile?: CompanyProfile;
+  pendingApproval: boolean;
+  changeRequest?: CompanySettingsChangeRequestItem;
+}
+
 export interface BrandingAssetUploadResponse {
   assetUrl: string;
   assetType: 'logo' | 'signature' | 'seal';
@@ -203,6 +250,7 @@ export interface CompanyProfile {
   appHeaderTitle?: string | null;
   bankDetails?: CompanyBankDetails | null;
   documentBranding?: DocumentBrandingSettings | null;
+  brandingAssets?: CompanyBrandingAssetsState | null;
   signatureUrl?: string | null;
   sealUrl?: string | null;
   salesInvoiceEnabled?: boolean;
@@ -835,6 +883,7 @@ export interface QuotationItem {
   convertedToInvoiceId: string | null;
   createdByUserName?: string | null;
   createdAt: string;
+  brandingSnapshot?: DocumentBrandingSnapshot | null;
   lines: QuotationLineItem[];
 }
 
@@ -927,6 +976,7 @@ export interface InvoiceItem {
   voidReason: string | null;
   createdByUserName?: string | null;
   createdAt: string;
+  brandingSnapshot?: DocumentBrandingSnapshot | null;
   lines: InvoiceLineItem[];
   allocations?: Array<{
     receiptId: string;
@@ -1024,6 +1074,7 @@ export interface CustomerReceiptItem {
   voidReason: string | null;
   createdByUserName?: string | null;
   createdAt: string;
+  brandingSnapshot?: DocumentBrandingSnapshot | null;
   allocations: ReceiptAllocationItem[];
 }
 

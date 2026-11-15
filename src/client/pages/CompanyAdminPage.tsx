@@ -14,11 +14,20 @@ import {
   Layout,
   FileText,
   Printer,
+  Image as ImageIcon,
+  ShieldCheck,
+  XCircle,
 } from 'lucide-react';
-import { api, ApiError } from '../services/api.ts';
-import { CompanyProfile, AuthUser } from '../../shared/types.ts';
+import { api, ApiError, BrandingUploadPayload } from '../services/api.ts';
+import {
+  AuthUser,
+  BrandingAssetType,
+  CompanyProfile,
+  CompanySettingsChangeRequestItem,
+} from '../../shared/types.ts';
 import { SUPPORTED_CURRENCIES, COMMON_TIMEZONES } from '../../shared/constants.ts';
 import { DocumentPrintSettingsSection } from '../components/company/DocumentPrintSettingsSection.tsx';
+import { BrandingAssetCard } from '../components/company/BrandingAssetCard.tsx';
 
 interface CompanyAdminPageProps {
   currentUser?: AuthUser | null;
@@ -47,26 +56,38 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
   const [website, setWebsite] = useState('');
   const [appHeaderTitle, setAppHeaderTitle] = useState('');
   const [salesInvoiceEnabled, setSalesInvoiceEnabled] = useState(false);
+  const [changeRequests, setChangeRequests] = useState<CompanySettingsChangeRequestItem[]>([]);
+
+  const isSuperAdmin = currentUser?.role === 'SUPER_ADMIN';
+  const canEditBranding = currentUser?.role === 'SUPER_ADMIN' || currentUser?.role === 'ADMIN';
+
+  const applyLoadedProfile = (data: CompanyProfile) => {
+    setProfile(data);
+    setName(data.name || '');
+    setLegalName(data.legalName || '');
+    setTaxId(data.taxId || '');
+    setCurrency(data.currency || 'USD');
+    setTimezone(data.timezone || 'UTC');
+    setLogoUrl(data.logoUrl || '');
+    setAddress(data.address || '');
+    setPhone(data.phone || '');
+    setEmail(data.email || '');
+    setWebsite(data.website || '');
+    setAppHeaderTitle(data.appHeaderTitle || '');
+    setSalesInvoiceEnabled(Boolean(data.salesInvoiceEnabled));
+  };
 
   useEffect(() => {
     const loadProfile = async () => {
       setIsLoading(true);
       setErrorMessage(null);
       try {
-        const data = await api.getCompanyProfile();
-        setProfile(data);
-        setName(data.name || '');
-        setLegalName(data.legalName || '');
-        setTaxId(data.taxId || '');
-        setCurrency(data.currency || 'USD');
-        setTimezone(data.timezone || 'UTC');
-        setLogoUrl(data.logoUrl || '');
-        setAddress(data.address || '');
-        setPhone(data.phone || '');
-        setEmail(data.email || '');
-        setWebsite(data.website || '');
-        setAppHeaderTitle(data.appHeaderTitle || '');
-        setSalesInvoiceEnabled(Boolean(data.salesInvoiceEnabled));
+        const [data, pendingReqs] = await Promise.all([
+          api.getCompanyProfile(),
+          api.getCompanySettingsChangeRequests('PENDING').catch(() => []),
+        ]);
+        applyLoadedProfile(data);
+        setChangeRequests(pendingReqs);
       } catch (err: unknown) {
         if (currentUser?.isPreview) {
           setName('CoreERP Preview Sandbox');
@@ -87,6 +108,151 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
 
     loadProfile();
   }, []);
+
+  const handleUploadBrandingAsset = async (
+    assetType: BrandingAssetType,
+    payload: BrandingUploadPayload
+  ) => {
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setPendingMessage(null);
+
+    if (currentUser?.isPreview) {
+      const slot = assetType === 'LOGO' ? 'logo' : assetType === 'SEAL' ? 'seal' : 'signature';
+      const previewAsset = {
+        id: `preview-${slot}`,
+        companyId: profile?.id || 'preview-company-id',
+        assetType,
+        fileName: payload.fileName,
+        mimeType: payload.mimeType,
+        fileSizeBytes: payload.dataBase64.length,
+        widthPx: payload.widthPx,
+        heightPx: payload.heightPx,
+        aspectRatio: Number((payload.widthPx / Math.max(1, payload.heightPx)).toFixed(4)),
+        sha256Hash: 'preview',
+        url: payload.dataBase64,
+        status: 'ACTIVE' as const,
+        createdAt: new Date().toISOString(),
+      };
+      const base = profile || {
+        id: 'preview-company-id',
+        code: 'PREVIEW',
+        name: name || 'CoreERP Preview Sandbox',
+        currency,
+        timezone,
+      };
+      const nextProfile: CompanyProfile = {
+        ...base,
+        logoUrl: assetType === 'LOGO' ? payload.dataBase64 : base.logoUrl,
+        sealUrl: assetType === 'SEAL' ? payload.dataBase64 : base.sealUrl,
+        signatureUrl: assetType === 'SIGNATURE' ? payload.dataBase64 : base.signatureUrl,
+        brandingAssets: {
+          version: 1,
+          logo: assetType === 'LOGO' ? previewAsset : base.brandingAssets?.logo || null,
+          seal: assetType === 'SEAL' ? previewAsset : base.brandingAssets?.seal || null,
+          signature:
+            assetType === 'SIGNATURE' ? previewAsset : base.brandingAssets?.signature || null,
+        },
+      };
+      applyLoadedProfile(nextProfile);
+      setSuccessMessage(`Preview Mode: ${assetType} branding updated in-memory.`);
+      onProfileUpdated?.(nextProfile);
+      return;
+    }
+
+    const res = await api.uploadCompanyBrandingAsset(assetType, {
+      fileName: payload.fileName,
+      mimeType: payload.mimeType,
+      dataBase64: payload.dataBase64,
+      fallbackPngBase64: payload.fallbackPngBase64,
+    });
+
+    if (res.pendingApproval) {
+      setPendingMessage(
+        `${assetType} branding upload submitted for Super Admin maker-checker approval.`
+      );
+      const reqs = await api.getCompanySettingsChangeRequests('PENDING').catch(() => []);
+      setChangeRequests(reqs);
+    } else if (res.profile) {
+      applyLoadedProfile(res.profile);
+      setSuccessMessage(`${assetType} branding asset uploaded and activated.`);
+      onProfileUpdated?.(res.profile);
+    }
+  };
+
+  const handleRemoveBrandingAsset = async (assetType: BrandingAssetType) => {
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    setPendingMessage(null);
+
+    if (currentUser?.isPreview) {
+      const slot = assetType === 'LOGO' ? 'logo' : assetType === 'SEAL' ? 'seal' : 'signature';
+      const base = profile || {
+        id: 'preview-company-id',
+        code: 'PREVIEW',
+        name: name || 'CoreERP Preview Sandbox',
+        currency,
+        timezone,
+      };
+      const nextProfile: CompanyProfile = {
+        ...base,
+        logoUrl: assetType === 'LOGO' ? null : base.logoUrl,
+        sealUrl: assetType === 'SEAL' ? null : base.sealUrl,
+        signatureUrl: assetType === 'SIGNATURE' ? null : base.signatureUrl,
+        brandingAssets: {
+          version: 1,
+          logo: slot === 'logo' ? null : base.brandingAssets?.logo || null,
+          seal: slot === 'seal' ? null : base.brandingAssets?.seal || null,
+          signature: slot === 'signature' ? null : base.brandingAssets?.signature || null,
+        },
+      };
+      applyLoadedProfile(nextProfile);
+      setSuccessMessage(`Preview Mode: ${assetType} removed.`);
+      onProfileUpdated?.(nextProfile);
+      return;
+    }
+
+    const res = await api.removeCompanyBrandingAsset(assetType);
+    if (res.pendingApproval) {
+      setPendingMessage(
+        `${assetType} removal request submitted for Super Admin maker-checker approval.`
+      );
+      const reqs = await api.getCompanySettingsChangeRequests('PENDING').catch(() => []);
+      setChangeRequests(reqs);
+    } else if (res.profile) {
+      applyLoadedProfile(res.profile);
+      setSuccessMessage(`${assetType} removed from active company branding.`);
+      onProfileUpdated?.(res.profile);
+    }
+  };
+
+  const handleApproveChangeRequest = async (reqId: string) => {
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      const res = await api.approveCompanySettingsChangeRequest(reqId);
+      applyLoadedProfile(res.profile);
+      onProfileUpdated?.(res.profile);
+      setSuccessMessage('Settings change request approved and applied.');
+      const reqs = await api.getCompanySettingsChangeRequests('PENDING').catch(() => []);
+      setChangeRequests(reqs);
+    } catch (err) {
+      setErrorMessage(err instanceof ApiError ? err.message : 'Approval failed.');
+    }
+  };
+
+  const handleRejectChangeRequest = async (reqId: string) => {
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      await api.rejectCompanySettingsChangeRequest(reqId, 'Rejected during admin review.');
+      setSuccessMessage('Settings change request rejected.');
+      const reqs = await api.getCompanySettingsChangeRequests('PENDING').catch(() => []);
+      setChangeRequests(reqs);
+    } catch (err) {
+      setErrorMessage(err instanceof ApiError ? err.message : 'Rejection failed.');
+    }
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -242,6 +408,68 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
             <div className="bg-amber-950/60 border border-amber-700/60 rounded-xl p-3.5 text-xs text-amber-200 flex items-center gap-2">
               <Clock className="w-4 h-4 text-amber-400 shrink-0" />
               <span>{pendingMessage}</span>
+            </div>
+          )}
+
+          {changeRequests.length > 0 && (
+            <div className="bg-slate-900 border border-amber-800/50 rounded-xl p-4 space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-xs font-semibold text-amber-300">
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>Pending Governance Approvals ({changeRequests.length})</span>
+                </div>
+                {!isSuperAdmin && (
+                  <span className="text-[11px] text-slate-400">
+                    Maker-checker review by Super Admin required
+                  </span>
+                )}
+              </div>
+              <div className="space-y-2">
+                {changeRequests.map((req) => {
+                  const payloadObj = req.payload as {
+                    type?: string;
+                    operation?: string;
+                    assetType?: string;
+                  };
+                  const label =
+                    payloadObj?.type === 'COMPANY_BRANDING_ASSET'
+                      ? `Branding ${payloadObj.operation || 'UPDATE'} (${payloadObj.assetType || 'ASSET'})`
+                      : String(payloadObj?.type || 'COMPANY_PROFILE').replace(/_/g, ' ');
+                  return (
+                    <div
+                      key={req.id}
+                      className="flex flex-wrap items-center justify-between gap-3 bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-xs"
+                    >
+                      <div>
+                        <span className="font-semibold text-slate-100">{label}</span>
+                        <span className="text-slate-400 ml-2">
+                          requested by {req.requestedByName || req.requestedByEmail || 'Admin'}
+                        </span>
+                      </div>
+                      {isSuperAdmin && (
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => handleApproveChangeRequest(req.id)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white text-[11px] font-semibold cursor-pointer whitespace-nowrap shrink-0"
+                          >
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            <span>Approve</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleRejectChangeRequest(req.id)}
+                            className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-red-900/70 hover:bg-red-800 text-red-100 text-[11px] font-semibold cursor-pointer whitespace-nowrap shrink-0"
+                          >
+                            <XCircle className="w-3.5 h-3.5" />
+                            <span>Reject</span>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           )}
 
@@ -430,19 +658,102 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
 
             <div>
               <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                Secure Logo Asset URL
+                Logo Asset Reference URL
               </label>
               <input
                 type="text"
                 value={logoUrl}
                 onChange={(e) => setLogoUrl(e.target.value)}
-                placeholder="https://yourdomain.com/assets/logo.png"
+                placeholder="/api/company/branding/assets/.../file or https://..."
                 className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
               />
               <p className="text-[10px] text-slate-400 mt-1">
-                Must be a secure HTTP/HTTPS URL or safe static asset path. Executable scripts rejected.
+                Updated automatically when you upload a Company Logo file below, or specify a safe HTTPS/relative asset path.
               </p>
             </div>
+          </div>
+        </div>
+
+        {/* Section 3b: Branding & Document Identity Asset Manager */}
+        <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-800">
+            <div className="text-sm font-semibold text-slate-200 flex items-center gap-2">
+              <ImageIcon className="w-4 h-4 text-indigo-400" />
+              <span>Branding &amp; Document Identity Assets</span>
+            </div>
+            <span className="text-[11px] text-slate-400">
+              {isSuperAdmin
+                ? 'Super Admin changes activate immediately · Past issued documents stay immutable'
+                : 'Admin uploads require Super Admin maker-checker approval'}
+            </span>
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <BrandingAssetCard
+              assetType="LOGO"
+              title="Company Logo"
+              description="Appears in print headers, PDF exports, Word exports, and ERP branding."
+              recommendedHint="PNG, JPG, or WebP · preserves aspect ratio"
+              asset={profile?.brandingAssets?.logo || null}
+              fallbackUrl={profile?.logoUrl}
+              pendingNote={
+                changeRequests.some(
+                  (r) =>
+                    (r.payload as { type?: string; assetType?: string })?.type ===
+                      'COMPANY_BRANDING_ASSET' &&
+                    (r.payload as { assetType?: string })?.assetType === 'LOGO'
+                )
+                  ? 'A logo update is currently awaiting Super Admin approval.'
+                  : null
+              }
+              disabled={!canEditBranding}
+              onUpload={handleUploadBrandingAsset}
+              onRemove={handleRemoveBrandingAsset}
+            />
+
+            <BrandingAssetCard
+              assetType="SEAL"
+              title="Official Company Seal / Stamp"
+              description="Rendered near authorized signatory on official quotations, invoices, and receipts."
+              recommendedHint="Square transparent PNG or WebP stamp"
+              asset={profile?.brandingAssets?.seal || null}
+              fallbackUrl={profile?.sealUrl || profile?.documentBranding?.sealUrl}
+              pendingNote={
+                changeRequests.some(
+                  (r) =>
+                    (r.payload as { type?: string; assetType?: string })?.type ===
+                      'COMPANY_BRANDING_ASSET' &&
+                    (r.payload as { assetType?: string })?.assetType === 'SEAL'
+                )
+                  ? 'A company seal update is currently awaiting Super Admin approval.'
+                  : null
+              }
+              disabled={!canEditBranding}
+              onUpload={handleUploadBrandingAsset}
+              onRemove={handleRemoveBrandingAsset}
+            />
+
+            <BrandingAssetCard
+              assetType="SIGNATURE"
+              title="Authorized Signature"
+              description="Embedded cleanly above the Authorized Signatory block on documents."
+              recommendedHint="Horizontal transparent PNG signature"
+              asset={profile?.brandingAssets?.signature || null}
+              fallbackUrl={profile?.signatureUrl || profile?.documentBranding?.signatureUrl}
+              pendingNote={
+                changeRequests.some(
+                  (r) =>
+                    (r.payload as { type?: string; assetType?: string })?.type ===
+                      'COMPANY_BRANDING_ASSET' &&
+                    (r.payload as { assetType?: string })?.assetType === 'SIGNATURE'
+                )
+                  ? 'A signature update is currently awaiting Super Admin approval.'
+                  : null
+              }
+              disabled={!canEditBranding}
+              onUpload={handleUploadBrandingAsset}
+              onRemove={handleRemoveBrandingAsset}
+            />
           </div>
         </div>
 

@@ -16,6 +16,17 @@ export function createApp(): Express {
   );
   app.use(cookieParser());
   app.use('/api/expenses/attachments', express.json({ limit: '15mb' }));
+  app.use(
+    ['/api/company/branding', '/api/setup/branding', '/api/documents/export'],
+    express.json({ limit: '5mb' })
+  );
+  app.use(
+    ['/api/company/branding', '/api/setup/branding'],
+    express.raw({
+      type: ['image/png', 'image/jpeg', 'image/webp', 'application/octet-stream'],
+      limit: '2.2mb',
+    })
+  );
   app.use(express.json());
 
   // Mount API endpoints

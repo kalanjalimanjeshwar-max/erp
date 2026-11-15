@@ -12,6 +12,7 @@ import { JournalService } from './journal.service.js';
 import { AuditService } from './audit.service.js';
 import { CompanyService } from './company.service.js';
 import { DocumentSequenceService } from './document-sequence.service.js';
+import { BrandingAssetService } from './branding-asset.service.js';
 
 export class BillingService {
   /**
@@ -170,6 +171,11 @@ export class BillingService {
       throw err;
     }
 
+    const brandingSnapshot =
+      inv.status !== 'DRAFT'
+        ? await BrandingAssetService.getDocumentSnapshot(companyId, 'INVOICE', id)
+        : null;
+
     return {
       id: inv.id,
       companyId: inv.companyId,
@@ -203,6 +209,7 @@ export class BillingService {
       voidReason: inv.voidReason,
       createdByUserName: inv.createdByUser?.fullName || null,
       createdAt: inv.createdAt.toISOString(),
+      brandingSnapshot,
       lines: inv.lines.map((l) => ({
         id: l.id,
         lineNumber: l.lineNumber,
@@ -704,7 +711,7 @@ export class BillingService {
       correlationId
     );
 
-    // Link quotation to invoice
+    // Link quotation to invoice and freeze quotation branding snapshot
     await prisma.quotation.update({
       where: { id: quotation.id },
       data: {
@@ -712,6 +719,7 @@ export class BillingService {
         status: 'ACCEPTED',
       },
     });
+    await BrandingAssetService.captureDocumentSnapshot(actor.companyId, 'QUOTATION', quotation.id);
 
     await AuditService.log({
       companyId: actor.companyId,
@@ -963,6 +971,9 @@ export class BillingService {
           issuedByUserId: actor.userId,
         },
       });
+
+      // 3. Capture immutable branding & print-layout snapshot at moment of issuance
+      await BrandingAssetService.captureDocumentSnapshot(actor.companyId, 'INVOICE', id, tx);
 
       return updated;
     });

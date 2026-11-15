@@ -9,6 +9,12 @@ import {
   RefreshCw,
   ShieldCheck,
   XCircle,
+  Undo2,
+  Redo2,
+  Eye,
+  FileEdit,
+  LayoutGrid,
+  FileText,
 } from 'lucide-react';
 import {
   AuthUser,
@@ -26,13 +32,21 @@ import {
   PaperSize,
   ServiceDescriptionLayout,
   TitlePlacement,
+  VisualElementConfig,
+  VisualElementKey,
 } from '../../../shared/types.ts';
 import {
   createDefaultPrintSettings,
   mergeDocumentPrintSettings,
 } from '../../../shared/print-settings.ts';
+import {
+  clampVisualElementBounds,
+  createDefaultVisualElements,
+  getEffectivePaperDimensionsMm,
+} from '../../../shared/branding.ts';
 import { api, ApiError } from '../../services/api.ts';
 import { PrintableDocumentPayload, PrintableDocumentView } from '../print/PrintableDocumentView.tsx';
+import { VisualLayoutCanvas } from './VisualLayoutCanvas.tsx';
 
 interface DocumentPrintSettingsSectionProps {
   companyProfile: CompanyProfile | null;
@@ -55,6 +69,16 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
   const [settings, setSettings] = useState<DocumentPrintSettings>(() =>
     mergeDocumentPrintSettings(companyProfile?.printSettings, companyProfile || undefined)
   );
+  const [savedSnapshotJson, setSavedSnapshotJson] = useState<string>(() =>
+    JSON.stringify(mergeDocumentPrintSettings(companyProfile?.printSettings, companyProfile || undefined))
+  );
+  const [historyPast, setHistoryPast] = useState<DocumentPrintSettings[]>([]);
+  const [historyFuture, setHistoryFuture] = useState<DocumentPrintSettings[]>([]);
+  const [selectedElementKey, setSelectedElementKey] = useState<VisualElementKey>('logo');
+  const [designerMode, setDesignerMode] = useState<'CANVAS' | 'SHEET'>('CANVAS');
+  const [isFullPreviewOpen, setIsFullPreviewOpen] = useState(false);
+  const [hasSavedLocalDraft, setHasSavedLocalDraft] = useState(false);
+
   const [defaultBank, setDefaultBank] = useState<CompanyBankAccountItem | null>(null);
   const [changeRequests, setChangeRequests] = useState<CompanySettingsChangeRequestItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -65,15 +89,52 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
 
   const isSuperAdmin = currentUser?.role === 'SUPER_ADMIN';
   const canEdit = currentUser?.role === 'SUPER_ADMIN' || currentUser?.role === 'ADMIN';
+  const draftStorageKey = `coreerp_print_designer_draft_${companyProfile?.id || 'default'}`;
+
+  const cloneSettings = (s: DocumentPrintSettings): DocumentPrintSettings =>
+    JSON.parse(JSON.stringify(s)) as DocumentPrintSettings;
+
+  const commitSettingsChange = (
+    updater: (prev: DocumentPrintSettings) => DocumentPrintSettings,
+    recordHistory = true
+  ) => {
+    setSettings((prev) => {
+      const next = updater(prev);
+      if (recordHistory) {
+        setHistoryPast((past) => [...past.slice(-24), cloneSettings(prev)]);
+        setHistoryFuture([]);
+      }
+      return next;
+    });
+  };
+
+  const hasUnsavedChanges = useMemo(
+    () => JSON.stringify(settings) !== savedSnapshotJson,
+    [settings, savedSnapshotJson]
+  );
+
+  const checkLocalDraftExists = () => {
+    try {
+      setHasSavedLocalDraft(Boolean(window.localStorage.getItem(draftStorageKey)));
+    } catch {
+      setHasSavedLocalDraft(false);
+    }
+  };
 
   const loadData = async () => {
     setIsLoading(true);
     setErrorMsg(null);
     try {
       if (currentUser?.isPreview) {
-        setSettings(
-          mergeDocumentPrintSettings(companyProfile?.printSettings, companyProfile || undefined)
+        const merged = mergeDocumentPrintSettings(
+          companyProfile?.printSettings,
+          companyProfile || undefined
         );
+        setSettings(merged);
+        setSavedSnapshotJson(JSON.stringify(merged));
+        setHistoryPast([]);
+        setHistoryFuture([]);
+        checkLocalDraftExists();
         setIsLoading(false);
         return;
       }
@@ -84,9 +145,14 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
         api.getCompanySettingsChangeRequests('PENDING').catch(() => []),
       ]);
 
-      setSettings(mergeDocumentPrintSettings(loadedPrint, companyProfile || undefined));
+      const merged = mergeDocumentPrintSettings(loadedPrint, companyProfile || undefined);
+      setSettings(merged);
+      setSavedSnapshotJson(JSON.stringify(merged));
+      setHistoryPast([]);
+      setHistoryFuture([]);
       setDefaultBank(banks.find((b) => b.isDefault) || banks[0] || null);
       setChangeRequests(requests);
+      checkLocalDraftExists();
     } catch (err) {
       if (err instanceof ApiError) {
         setErrorMsg(err.message);
@@ -104,17 +170,115 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
 
   const currentLayout = settings.layouts[activeDocType];
 
-  const updateLayout = (patch: Partial<DocumentPrintLayoutConfig>) => {
-    setSettings((prev) => ({
-      ...prev,
-      layouts: {
-        ...prev.layouts,
-        [activeDocType]: {
-          ...prev.layouts[activeDocType],
+  const updateLayout = (patch: Partial<DocumentPrintLayoutConfig>, recordHistory = true) => {
+    commitSettingsChange(
+      (prev) => {
+        const current = prev.layouts[activeDocType];
+        const nextLayout: DocumentPrintLayoutConfig = {
+          ...current,
           ...patch,
-        },
+        };
+        if (patch.paperSize !== undefined || patch.orientation !== undefined) {
+          const dims = getEffectivePaperDimensionsMm(
+            nextLayout.paperSize,
+            nextLayout.orientation
+          );
+          const base =
+            nextLayout.elements ||
+            createDefaultVisualElements(
+              nextLayout.paperSize,
+              nextLayout.orientation,
+              nextLayout.margins
+            );
+          const keys: VisualElementKey[] = [
+            'logo',
+            'seal',
+            'signature',
+            'companyHeader',
+            'documentTitle',
+            'footer',
+          ];
+          const clamped = { ...base };
+          for (const k of keys) {
+            clamped[k] = clampVisualElementBounds(base[k], dims.widthMm, dims.heightMm);
+          }
+          nextLayout.elements = clamped;
+        }
+        return {
+          ...prev,
+          layouts: {
+            ...prev.layouts,
+            [activeDocType]: nextLayout,
+          },
+        };
       },
-    }));
+      recordHistory
+    );
+  };
+
+  const handleUpdateVisualElement = (
+    key: VisualElementKey,
+    nextEl: VisualElementConfig,
+    commitHistory = false
+  ) => {
+    commitSettingsChange((prev) => {
+      const target = prev.layouts[activeDocType];
+      const baseElements =
+        target.elements ||
+        createDefaultVisualElements(target.paperSize, target.orientation, target.margins);
+      return {
+        ...prev,
+        layouts: {
+          ...prev.layouts,
+          [activeDocType]: {
+            ...target,
+            visualLayoutEnabled: true,
+            elements: {
+              ...baseElements,
+              [key]: nextEl,
+            },
+          },
+        },
+      };
+    }, commitHistory);
+  };
+
+  const handleUndo = () => {
+    if (historyPast.length === 0) return;
+    const previous = historyPast[historyPast.length - 1];
+    setHistoryPast((p) => p.slice(0, -1));
+    setHistoryFuture((f) => [cloneSettings(settings), ...f.slice(0, 24)]);
+    setSettings(previous);
+  };
+
+  const handleRedo = () => {
+    if (historyFuture.length === 0) return;
+    const next = historyFuture[0];
+    setHistoryFuture((f) => f.slice(1));
+    setHistoryPast((p) => [...p.slice(-24), cloneSettings(settings)]);
+    setSettings(next);
+  };
+
+  const handleSaveDraftLocal = () => {
+    try {
+      window.localStorage.setItem(draftStorageKey, JSON.stringify(settings));
+      setHasSavedLocalDraft(true);
+      setSuccessMsg('Local layout draft saved in your browser. Click Save Print Settings when ready to publish.');
+    } catch {
+      setErrorMsg('Unable to save local draft in browser storage.');
+    }
+  };
+
+  const handleRestoreDraftLocal = () => {
+    try {
+      const raw = window.localStorage.getItem(draftStorageKey);
+      if (!raw) return;
+      const merged = mergeDocumentPrintSettings(JSON.parse(raw), companyProfile || undefined);
+      commitSettingsChange(() => merged, true);
+      setSuccessMsg('Restored saved layout draft.');
+    } catch {
+      setErrorMsg('Saved browser draft could not be parsed.');
+    }
   };
 
   const updateMargin = (side: keyof DocumentPrintLayoutConfig['margins'], val: number) => {
@@ -133,6 +297,7 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
     setPendingMsg(null);
 
     if (currentUser?.isPreview) {
+      setSavedSnapshotJson(JSON.stringify(settings));
       setSuccessMsg('Preview Mode: Print layout updated in-memory for live preview.');
       if (onProfileUpdated && companyProfile) {
         onProfileUpdated({ ...companyProfile, printSettings: settings });
@@ -148,10 +313,20 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
           'Print configuration submitted for Super Admin maker-checker approval. Changes will take effect once approved.'
         );
       } else {
-        setSettings(mergeDocumentPrintSettings(res.printSettings, companyProfile || undefined));
-        setSuccessMsg('Document print settings saved to PostgreSQL.');
+        const merged = mergeDocumentPrintSettings(res.printSettings, companyProfile || undefined);
+        setSettings(merged);
+        setSavedSnapshotJson(JSON.stringify(merged));
+        setHistoryPast([]);
+        setHistoryFuture([]);
+        try {
+          window.localStorage.removeItem(draftStorageKey);
+          setHasSavedLocalDraft(false);
+        } catch {
+          // ignore
+        }
+        setSuccessMsg('Document print settings and visual layout saved to PostgreSQL.');
         if (onProfileUpdated && companyProfile) {
-          onProfileUpdated({ ...companyProfile, printSettings: res.printSettings });
+          onProfileUpdated({ ...companyProfile, printSettings: merged });
         }
       }
       const updatedRequests = await api
@@ -171,13 +346,16 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
 
   const handleResetDefaults = () => {
     const defaults = createDefaultPrintSettings(companyProfile || undefined);
-    setSettings((prev) => ({
-      ...prev,
-      layouts: {
-        ...prev.layouts,
-        [activeDocType]: defaults.layouts[activeDocType],
-      },
-    }));
+    commitSettingsChange(
+      (prev) => ({
+        ...prev,
+        layouts: {
+          ...prev.layouts,
+          [activeDocType]: defaults.layouts[activeDocType],
+        },
+      }),
+      true
+    );
   };
 
   const handleApproveRequest = async (reqId: string) => {
@@ -379,35 +557,143 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
 
   return (
     <div className="space-y-6">
-      {/* Header & Document Type Tabs */}
-      <div className="flex flex-wrap items-center justify-between gap-4 bg-slate-900 border border-slate-800 rounded-xl p-4">
-        <div className="flex items-center gap-2.5">
-          <Printer className="w-5 h-5 text-indigo-400" />
-          <div>
-            <h3 className="text-sm font-bold text-slate-100">
-              Document Print Layouts &amp; Bilingual Templates
-            </h3>
-            <p className="text-[11px] text-slate-400">
-              Configure independent paper size, margins, branding, Kannada typography, and signatures per document type
-            </p>
+      {/* Header, Document Type Tabs & Designer Toolbar */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+        <div className="flex flex-wrap items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
+            <Printer className="w-5 h-5 text-indigo-400 shrink-0" />
+            <div>
+              <div className="flex items-center gap-2.5 flex-wrap">
+                <h3 className="text-sm font-bold text-slate-100">
+                  Visual Document Layout Designer &amp; Bilingual Templates
+                </h3>
+                {hasUnsavedChanges && (
+                  <span className="text-[11px] font-semibold text-amber-300">
+                    Unsaved Changes
+                  </span>
+                )}
+              </div>
+              <p className="text-[11px] text-slate-400">
+                Position &amp; resize Logo, Seal, Signature, Header, Title, and Footer across A4/A5/Letter layouts
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 rounded-lg p-1">
+            {DOC_TYPE_TABS.map((tab) => (
+              <button
+                key={tab.id}
+                type="button"
+                onClick={() => setActiveDocType(tab.id)}
+                className={`px-3 py-1.5 rounded-md text-xs font-semibold transition cursor-pointer whitespace-nowrap shrink-0 ${
+                  activeDocType === tab.id
+                    ? 'bg-indigo-600 text-white shadow'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {tab.label}
+              </button>
+            ))}
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5 bg-slate-950 border border-slate-800 rounded-lg p-1">
-          {DOC_TYPE_TABS.map((tab) => (
+        {/* Designer Toolbar: Undo / Redo / Reset Layout / Save Draft / Preview */}
+        <div className="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-slate-800">
+          <div className="flex flex-wrap items-center gap-2">
             <button
-              key={tab.id}
               type="button"
-              onClick={() => setActiveDocType(tab.id)}
-              className={`px-3 py-1.5 rounded-md text-xs font-semibold transition cursor-pointer ${
-                activeDocType === tab.id
-                  ? 'bg-indigo-600 text-white shadow'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
+              disabled={!canEdit || historyPast.length === 0}
+              onClick={handleUndo}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-200 rounded-lg text-[11px] font-semibold transition cursor-pointer disabled:opacity-40 whitespace-nowrap shrink-0"
             >
-              {tab.label}
+              <Undo2 className="w-3.5 h-3.5" />
+              <span>Undo</span>
             </button>
-          ))}
+
+            <button
+              type="button"
+              disabled={!canEdit || historyFuture.length === 0}
+              onClick={handleRedo}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-200 rounded-lg text-[11px] font-semibold transition cursor-pointer disabled:opacity-40 whitespace-nowrap shrink-0"
+            >
+              <Redo2 className="w-3.5 h-3.5" />
+              <span>Redo</span>
+            </button>
+
+            {canEdit && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleResetDefaults}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-300 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Reset Layout</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleSaveDraftLocal}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-slate-950 hover:bg-slate-800 border border-slate-800 text-slate-200 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap shrink-0"
+                >
+                  <FileEdit className="w-3.5 h-3.5" />
+                  <span>Save Draft</span>
+                </button>
+
+                {hasSavedLocalDraft && (
+                  <button
+                    type="button"
+                    onClick={handleRestoreDraftLocal}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 bg-amber-950/50 hover:bg-amber-900/50 border border-amber-800/60 text-amber-200 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <span>Restore Draft</span>
+                  </button>
+                )}
+              </>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            {/* Language Switcher Shortcut */}
+            <div className="inline-flex items-center bg-slate-950 border border-slate-800 rounded-lg p-0.5 text-[11px]">
+              {(['EN', 'KN', 'EN_KN'] as DocumentLanguage[]).map((lang) => (
+                <button
+                  key={lang}
+                  type="button"
+                  disabled={!canEdit}
+                  onClick={() => updateLayout({ language: lang })}
+                  className={`px-2 py-1 rounded-md font-semibold transition cursor-pointer whitespace-nowrap shrink-0 ${
+                    currentLayout.language === lang
+                      ? 'bg-indigo-600 text-white'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {lang === 'EN' ? 'EN' : lang === 'KN' ? 'KN' : 'EN+KN'}
+                </button>
+              ))}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setIsFullPreviewOpen(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-100 rounded-lg text-[11px] font-semibold transition cursor-pointer whitespace-nowrap shrink-0"
+            >
+              <Eye className="w-3.5 h-3.5" />
+              <span>Preview</span>
+            </button>
+
+            {canEdit && (
+              <button
+                type="button"
+                disabled={isSaving}
+                onClick={handleSave}
+                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-[11px] font-semibold shadow transition cursor-pointer disabled:opacity-50 whitespace-nowrap shrink-0"
+              >
+                <Save className="w-3.5 h-3.5" />
+                <span>{isSaving ? 'Saving...' : isSuperAdmin ? 'Save Layout' : 'Submit Approval'}</span>
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -878,28 +1164,77 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
           )}
         </div>
 
-        {/* Live Print Preview Column */}
+        {/* Live Visual Designer & Document Sheet Column */}
         <div className="xl:col-span-7 bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
-          <div className="flex items-center justify-between text-xs border-b border-slate-800 pb-2.5">
-            <span className="font-semibold text-slate-200">
-              Live Interactive Print Preview ({activeDocType})
-            </span>
-            <span className="font-mono text-[11px] text-slate-400">
-              {currentLayout.paperSize} • {currentLayout.orientation} • {currentLayout.language}
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs border-b border-slate-800 pb-2.5">
+            <div className="inline-flex items-center gap-1 bg-slate-950 border border-slate-800 rounded-lg p-0.5">
+              <button
+                type="button"
+                onClick={() => setDesignerMode('CANVAS')}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition cursor-pointer whitespace-nowrap shrink-0 ${
+                  designerMode === 'CANVAS'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <LayoutGrid className="w-3.5 h-3.5" />
+                <span>Visual Canvas</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setDesignerMode('SHEET')}
+                className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold transition cursor-pointer whitespace-nowrap shrink-0 ${
+                  designerMode === 'SHEET'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                <FileText className="w-3.5 h-3.5" />
+                <span>Live Print Sheet</span>
+              </button>
+            </div>
+
+            <span className="font-mono text-[11px] text-slate-400 tabular-nums">
+              {activeDocType} · {currentLayout.paperSize} · {currentLayout.orientation} · {currentLayout.language}
             </span>
           </div>
 
-          <div className="bg-slate-800/50 rounded-lg p-3 max-h-[840px] overflow-auto">
-            <PrintableDocumentView
-              document={sampleDocument}
+          {designerMode === 'CANVAS' ? (
+            <VisualLayoutCanvas
+              docType={activeDocType}
+              layout={currentLayout}
               companyProfile={companyProfile}
-              layoutOverride={currentLayout}
-              bankAccount={defaultBank}
-              embedded
+              selectedKey={selectedElementKey}
+              disabled={!canEdit}
+              onSelectElement={setSelectedElementKey}
+              onUpdateElement={handleUpdateVisualElement}
             />
-          </div>
+          ) : (
+            <div className="bg-slate-800/50 rounded-lg p-3 max-h-[840px] overflow-auto">
+              <PrintableDocumentView
+                document={sampleDocument}
+                companyProfile={companyProfile}
+                layoutOverride={currentLayout}
+                bankAccount={defaultBank}
+                embedded
+              />
+            </div>
+          )}
         </div>
       </div>
+
+      {/* Full Modal Print / PDF / Word Preview */}
+      {isFullPreviewOpen && (
+        <PrintableDocumentView
+          document={sampleDocument}
+          companyProfile={companyProfile}
+          layoutOverride={currentLayout}
+          bankAccount={defaultBank}
+          currentUser={currentUser}
+          isDraftPreview={hasUnsavedChanges}
+          onClose={() => setIsFullPreviewOpen(false)}
+        />
+      )}
     </div>
   );
 };

@@ -11,6 +11,7 @@ import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
 import { AuditService } from './audit.service.js';
 import { CompanyService } from './company.service.js';
 import { DocumentSequenceService } from './document-sequence.service.js';
+import { BrandingAssetService } from './branding-asset.service.js';
 
 export class QuotationService {
   /**
@@ -132,6 +133,11 @@ export class QuotationService {
       throw err;
     }
 
+    const brandingSnapshot =
+      q.status !== 'DRAFT'
+        ? await BrandingAssetService.getDocumentSnapshot(companyId, 'QUOTATION', id)
+        : null;
+
     return {
       id: q.id,
       companyId: q.companyId,
@@ -156,6 +162,7 @@ export class QuotationService {
       convertedToInvoiceId: q.convertedToInvoiceId,
       createdByUserName: q.createdByUser?.fullName || null,
       createdAt: q.createdAt.toISOString(),
+      brandingSnapshot,
       lines: q.lines.map((l) => ({
         id: l.id,
         lineNumber: l.lineNumber,
@@ -495,6 +502,10 @@ export class QuotationService {
       where: { id },
       data: { status: newStatus },
     });
+
+    if (newStatus !== 'DRAFT') {
+      await BrandingAssetService.captureDocumentSnapshot(actor.companyId, 'QUOTATION', id);
+    }
 
     await AuditService.log({
       companyId: actor.companyId,

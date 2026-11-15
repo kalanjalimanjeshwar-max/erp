@@ -10,10 +10,17 @@ import {
   Eye,
   EyeOff,
   LogIn,
+  Image as ImageIcon,
 } from 'lucide-react';
-import { api, ApiError } from '../services/api.ts';
-import { SetupStatusResponse, DatabaseReadiness } from '../../shared/types.ts';
+import { api, ApiError, BrandingUploadPayload } from '../services/api.ts';
+import {
+  BrandingAssetType,
+  CompanyBrandingAssetItem,
+  SetupStatusResponse,
+  DatabaseReadiness,
+} from '../../shared/types.ts';
 import { SUPPORTED_CURRENCIES, COMMON_TIMEZONES } from '../../shared/constants.ts';
+import { BrandingAssetCard } from '../components/company/BrandingAssetCard.tsx';
 
 interface SetupWizardProps {
   setupStatus: SetupStatusResponse | null;
@@ -40,6 +47,9 @@ export const SetupWizardPage: React.FC<SetupWizardProps> = ({
   const [currency, setCurrency] = useState('USD');
   const [timezone, setTimezone] = useState('UTC');
   const [logoUrl, setLogoUrl] = useState('');
+  const [stagedLogo, setStagedLogo] = useState<CompanyBrandingAssetItem | null>(null);
+  const [stagedSeal, setStagedSeal] = useState<CompanyBrandingAssetItem | null>(null);
+  const [stagedSignature, setStagedSignature] = useState<CompanyBrandingAssetItem | null>(null);
 
   const [fullName, setFullName] = useState('');
   const [email, setEmail] = useState('');
@@ -52,6 +62,62 @@ export const SetupWizardPage: React.FC<SetupWizardProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [fieldErrors, setFieldErrors] = useState<Record<string, string>>({});
   const [successInfo, setSuccessInfo] = useState<{ companyName: string; adminEmail: string } | null>(null);
+
+  const handleStageAsset = async (
+    assetType: BrandingAssetType,
+    payload: BrandingUploadPayload
+  ) => {
+    const previous =
+      assetType === 'LOGO'
+        ? stagedLogo
+        : assetType === 'SEAL'
+        ? stagedSeal
+        : stagedSignature;
+
+    const uploaded = await api.stageSetupBrandingAsset({
+      assetType,
+      fileName: payload.fileName,
+      mimeType: payload.mimeType,
+      dataBase64: payload.dataBase64,
+      fallbackPngBase64: payload.fallbackPngBase64,
+    });
+
+    if (previous?.id) {
+      api.deleteStagedSetupBrandingAsset(previous.id).catch(() => undefined);
+    }
+
+    if (assetType === 'LOGO') {
+      setStagedLogo(uploaded);
+      setLogoUrl(uploaded.url);
+    } else if (assetType === 'SEAL') {
+      setStagedSeal(uploaded);
+    } else {
+      setStagedSignature(uploaded);
+    }
+  };
+
+  const handleRemoveStagedAsset = async (assetType: BrandingAssetType) => {
+    const target =
+      assetType === 'LOGO'
+        ? stagedLogo
+        : assetType === 'SEAL'
+        ? stagedSeal
+        : stagedSignature;
+
+    if (target?.id) {
+      await api.deleteStagedSetupBrandingAsset(target.id);
+    }
+    if (assetType === 'LOGO') {
+      setStagedLogo(null);
+      if (logoUrl.startsWith('/api/setup/branding/')) {
+        setLogoUrl('');
+      }
+    } else if (assetType === 'SEAL') {
+      setStagedSeal(null);
+    } else {
+      setStagedSignature(null);
+    }
+  };
 
   if (isAlreadySetup) {
     return (
@@ -128,7 +194,15 @@ export const SetupWizardPage: React.FC<SetupWizardProps> = ({
           taxId: taxId.trim() || undefined,
           currency,
           timezone,
-          logoUrl: logoUrl.trim() || undefined,
+          logoUrl: stagedLogo ? undefined : logoUrl.trim() || undefined,
+          brandingAssetIds:
+            stagedLogo || stagedSeal || stagedSignature
+              ? {
+                  logoAssetId: stagedLogo?.id,
+                  sealAssetId: stagedSeal?.id,
+                  signatureAssetId: stagedSignature?.id,
+                }
+              : undefined,
         },
         superAdmin: {
           fullName: fullName.trim(),
@@ -331,13 +405,63 @@ export const SetupWizardPage: React.FC<SetupWizardProps> = ({
             </div>
 
             <div className="md:col-span-2">
-              <label className="block text-xs font-medium text-slate-300 mb-1.5">Company Logo URL (Optional)</label>
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                External Logo URL (Optional — or upload files directly below)
+              </label>
               <input
-                type="url"
-                value={logoUrl}
+                type="text"
+                value={stagedLogo ? '' : logoUrl}
+                disabled={Boolean(stagedLogo)}
                 onChange={(e) => setLogoUrl(e.target.value)}
-                placeholder="https://example.com/logo.png"
-                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+                placeholder={
+                  stagedLogo
+                    ? `Uploaded file selected: ${stagedLogo.fileName}`
+                    : 'https://example.com/logo.png'
+                }
+                className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500 disabled:opacity-60"
+              />
+            </div>
+          </div>
+
+          {/* Direct File Branding Upload */}
+          <div className="pt-3 border-t border-slate-800 space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-xs font-semibold text-slate-200">
+                <ImageIcon className="w-4 h-4 text-indigo-400" />
+                <span>Company Branding Assets (Logo, Official Seal &amp; Authorized Signature)</span>
+              </div>
+              <span className="text-[10px] text-slate-400 font-mono">
+                Stored securely on server · Promoted on provisioning
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <BrandingAssetCard
+                assetType="LOGO"
+                title="Company Logo"
+                description="Displayed in app chrome and quotation/invoice/receipt headers."
+                recommendedHint="Transparent PNG or crisp SVG-raster export"
+                asset={stagedLogo}
+                onUpload={handleStageAsset}
+                onRemove={handleRemoveStagedAsset}
+              />
+              <BrandingAssetCard
+                assetType="SEAL"
+                title="Official Seal / Stamp"
+                description="Placed alongside authorized signature on issued documents."
+                recommendedHint="Square PNG with transparent background"
+                asset={stagedSeal}
+                onUpload={handleStageAsset}
+                onRemove={handleRemoveStagedAsset}
+              />
+              <BrandingAssetCard
+                assetType="SIGNATURE"
+                title="Authorized Signature"
+                description="Embedded directly above the signatory block on exports."
+                recommendedHint="Wide horizontal PNG stroke"
+                asset={stagedSignature}
+                onUpload={handleStageAsset}
+                onRemove={handleRemoveStagedAsset}
               />
             </div>
           </div>

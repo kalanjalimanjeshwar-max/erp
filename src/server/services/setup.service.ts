@@ -3,6 +3,7 @@ import { prisma } from '../db/client.js';
 import { checkPostgresHealth } from '../db/health.js';
 import { InitialSetupInput } from '../validation/setup.schema.js';
 import { InitialSetupResult, SetupStatusResponse } from '../../shared/types.js';
+import { BrandingAssetService } from './branding-asset.service.js';
 
 export class SetupService {
   /**
@@ -164,6 +165,16 @@ export class SetupService {
         },
       });
 
+      // 3b. Promote staged Company Branding Assets (Logo, Seal, Signature) if uploaded
+      if (input.company.brandingAssetIds) {
+        await BrandingAssetService.promoteSetupAssetsToCompany(
+          tx,
+          company.id,
+          superAdmin.id,
+          input.company.brandingAssetIds
+        );
+      }
+
       // 4. Record Audit Log for system bootstrap
       await tx.auditLog.create({
         data: {
@@ -180,6 +191,7 @@ export class SetupService {
             message: 'First company and Super Admin initialized successfully',
             companyCode: company.code,
             adminEmail: superAdmin.email,
+            brandingAssetsPromoted: Boolean(input.company.brandingAssetIds),
           }),
         },
       });

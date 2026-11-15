@@ -2,6 +2,7 @@ import {
   AlignmentType,
   BorderStyle,
   Document,
+  ImageRun,
   Packer,
   PageOrientation,
   Paragraph,
@@ -22,6 +23,7 @@ import {
   InvoiceItem,
   QuotationItem,
 } from '../types.ts';
+import { createDefaultVisualElements } from '../branding.ts';
 import { createDefaultPrintSettings, PAPER_DIMENSIONS_MM } from '../print-settings.ts';
 import { DocumentPrintLabelKey, getDocumentLabel } from '../print-translations.ts';
 import { formatMoney, normalizeCurrencyCode } from '../currency.ts';
@@ -32,12 +34,19 @@ export type ExportableDocumentPayload =
   | { type: 'INVOICE'; data: InvoiceItem }
   | { type: 'RECEIPT'; data: CustomerReceiptItem };
 
+export interface DocumentExportBrandingImages {
+  logo?: Uint8Array | Buffer | null;
+  seal?: Uint8Array | Buffer | null;
+  signature?: Uint8Array | Buffer | null;
+}
+
 export interface DocumentExportContext {
   document: ExportableDocumentPayload;
   companyProfile?: CompanyProfile | null;
   layoutOverride?: DocumentPrintLayoutConfig;
   bankAccount?: CompanyBankAccountItem | null;
   isDraftPreview?: boolean;
+  brandingImages?: DocumentExportBrandingImages;
 }
 
 const MM_TO_TWIPS = 56.6929133858;
@@ -101,6 +110,45 @@ function noBorders() {
   };
 }
 
+function toDocxAlignment(align?: 'left' | 'center' | 'right'): (typeof AlignmentType)[keyof typeof AlignmentType] {
+  if (align === 'center') return AlignmentType.CENTER;
+  if (align === 'right') return AlignmentType.RIGHT;
+  return AlignmentType.LEFT;
+}
+
+function detectRasterImageType(data?: Uint8Array | Buffer | null): 'png' | 'jpg' | null {
+  if (!data || data.length < 8) return null;
+  if (data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4e && data[3] === 0x47) {
+    return 'png';
+  }
+  if (data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff) {
+    return 'jpg';
+  }
+  return null;
+}
+
+function createRasterImageRun(
+  data: Uint8Array | Buffer | null | undefined,
+  widthMm: number,
+  heightMm: number,
+  altName: string
+): ImageRun | null {
+  const type = detectRasterImageType(data);
+  if (!type || !data) return null;
+  const width = Math.max(16, Math.round((Math.max(6, widthMm) * 96) / 25.4));
+  const height = Math.max(12, Math.round((Math.max(6, heightMm) * 96) / 25.4));
+  return new ImageRun({
+    type,
+    data,
+    transformation: { width, height },
+    altText: {
+      title: altName,
+      description: altName,
+      name: altName,
+    },
+  });
+}
+
 export function resolveEffectivePrintLayout(
   docType: DocumentPrintType,
   companyProfile?: CompanyProfile | null,
@@ -110,6 +158,70 @@ export function resolveEffectivePrintLayout(
   const saved = companyProfile?.printSettings?.layouts?.[docType];
   if (saved) return saved;
   return createDefaultPrintSettings(companyProfile || undefined).layouts[docType];
+}
+
+export function resolveDocumentEffectiveBranding(
+  docPayload: ExportableDocumentPayload,
+  companyProfile?: CompanyProfile | null,
+  layoutOverride?: DocumentPrintLayoutConfig,
+  isDraftPreview?: boolean
+): {
+  effectiveProfile: CompanyProfile | null;
+  layout: DocumentPrintLayoutConfig;
+} {
+  const snapshot =
+    !isDraftPreview && docPayload.data.status !== 'DRAFT'
+      ? docPayload.data.brandingSnapshot || null
+      : null;
+
+  if (!snapshot) {
+    return {
+      effectiveProfile: companyProfile || null,
+      layout: resolveEffectivePrintLayout(docPayload.type, companyProfile, layoutOverride),
+    };
+  }
+
+  const baseProfile: CompanyProfile = companyProfile || {
+    id: 'snapshot-company',
+    code: 'SNAPSHOT',
+    name: snapshot.companyName,
+    currency: 'INR',
+    timezone: 'Asia/Kolkata',
+  };
+
+  const effectiveProfile: CompanyProfile = {
+    ...baseProfile,
+    name: snapshot.companyName || baseProfile.name,
+    legalName: snapshot.legalName !== undefined ? snapshot.legalName : baseProfile.legalName,
+    taxId: snapshot.taxId !== undefined ? snapshot.taxId : baseProfile.taxId,
+    address: snapshot.address !== undefined ? snapshot.address : baseProfile.address,
+    phone: snapshot.phone !== undefined ? snapshot.phone : baseProfile.phone,
+    email: snapshot.email !== undefined ? snapshot.email : baseProfile.email,
+    website: snapshot.website !== undefined ? snapshot.website : baseProfile.website,
+    logoUrl: snapshot.logoUrl !== undefined ? snapshot.logoUrl : baseProfile.logoUrl,
+    sealUrl: snapshot.sealUrl !== undefined ? snapshot.sealUrl : baseProfile.sealUrl,
+    signatureUrl:
+      snapshot.signatureUrl !== undefined ? snapshot.signatureUrl : baseProfile.signatureUrl,
+    documentBranding: {
+      logoSize: snapshot.layout?.logoSize || baseProfile.documentBranding?.logoSize || 'md',
+      logoAlignment:
+        snapshot.layout?.logoPosition || baseProfile.documentBranding?.logoAlignment || 'left',
+      sealUrl: snapshot.sealUrl ?? baseProfile.sealUrl ?? null,
+      signatureUrl: snapshot.signatureUrl ?? baseProfile.signatureUrl ?? null,
+      signatoryName: snapshot.signatoryName ?? baseProfile.documentBranding?.signatoryName ?? null,
+      signatureTitle: snapshot.signatoryTitle ?? baseProfile.documentBranding?.signatureTitle ?? null,
+    },
+  };
+
+  const layout =
+    layoutOverride ||
+    snapshot.layout ||
+    resolveEffectivePrintLayout(docPayload.type, effectiveProfile, undefined);
+
+  return {
+    effectiveProfile,
+    layout,
+  };
 }
 
 export function buildExportFileName(
@@ -133,10 +245,18 @@ export function buildExportFileName(
 }
 
 export function createWordDocument(context: DocumentExportContext): Document {
-  const { document: docPayload, companyProfile, layoutOverride, bankAccount, isDraftPreview } =
+  const { document: docPayload, layoutOverride, bankAccount, isDraftPreview, brandingImages } =
     context;
   const docType = docPayload.type;
-  const layout = resolveEffectivePrintLayout(docType, companyProfile, layoutOverride);
+  const { effectiveProfile: companyProfile, layout } = resolveDocumentEffectiveBranding(
+    docPayload,
+    context.companyProfile,
+    layoutOverride,
+    isDraftPreview
+  );
+  const visualElements =
+    layout.elements ||
+    createDefaultVisualElements(layout.paperSize, layout.orientation, layout.margins);
 
   const paperDims = PAPER_DIMENSIONS_MM[layout.paperSize] || PAPER_DIMENSIONS_MM.A4;
   const isLandscape = layout.orientation === 'landscape';
@@ -230,88 +350,123 @@ export function createWordDocument(context: DocumentExportContext): Document {
 
   // Header table: Company Details (left) + Document Title & Number (right)
   const companyLines: Paragraph[] = [];
-  if (layout.showCompanyName) {
+  const logoVisual = visualElements.logo;
+  const headerVisual = visualElements.companyHeader;
+  const titleVisual = visualElements.documentTitle;
+
+  const logoVisible = layout.showLogo && (!layout.visualLayoutEnabled || logoVisual.visible);
+  const logoImageRun = logoVisible
+    ? createRasterImageRun(
+        brandingImages?.logo,
+        logoVisual.widthMm,
+        logoVisual.heightMm,
+        `${companyName} Logo`
+      )
+    : null;
+  if (logoImageRun) {
     companyLines.push(
       new Paragraph({
-        spacing: { after: 40 },
-        children: makeTextRuns(companyName, { bold: true, size: 28, color: '0F172A' }),
+        alignment: toDocxAlignment(logoVisual.align || layout.logoPosition),
+        spacing: { after: Math.max(40, Math.round((logoVisual.spacingMm || 3) * 20)) },
+        children: [logoImageRun],
       })
     );
-    if (companyProfile?.legalName && companyProfile.legalName !== companyName) {
-      companyLines.push(
-        new Paragraph({
-          spacing: { after: 30 },
-          children: makeTextRuns(companyProfile.legalName, { size: 18, color: '475569' }),
-        })
-      );
-    }
   }
-  if (layout.showCompanyContact) {
-    if (companyProfile?.address) {
+
+  const companyHeaderVisible = !layout.visualLayoutEnabled || headerVisual.visible;
+  const headerAlign = toDocxAlignment(headerVisual.align);
+
+  if (companyHeaderVisible) {
+    if (layout.showCompanyName) {
       companyLines.push(
         new Paragraph({
+          alignment: headerAlign,
+          spacing: { after: 40 },
+          children: makeTextRuns(companyName, { bold: true, size: 28, color: '0F172A' }),
+        })
+      );
+      if (companyProfile?.legalName && companyProfile.legalName !== companyName) {
+        companyLines.push(
+          new Paragraph({
+            alignment: headerAlign,
+            spacing: { after: 30 },
+            children: makeTextRuns(companyProfile.legalName, { size: 18, color: '475569' }),
+          })
+        );
+      }
+    }
+    if (layout.showCompanyContact) {
+      if (companyProfile?.address) {
+        companyLines.push(
+          new Paragraph({
+            alignment: headerAlign,
+            spacing: { after: 20 },
+            children: makeTextRuns(companyProfile.address, { size: 18, color: '475569' }),
+          })
+        );
+      }
+      const contactParts = [
+        companyProfile?.phone,
+        companyProfile?.email,
+        companyProfile?.website,
+      ].filter(Boolean);
+      if (contactParts.length > 0) {
+        companyLines.push(
+          new Paragraph({
+            alignment: headerAlign,
+            spacing: { after: 20 },
+            children: makeTextRuns(contactParts.join('  •  '), { size: 18, color: '475569' }),
+          })
+        );
+      }
+    }
+    if (layout.showCompanyTaxId && companyProfile?.taxId) {
+      companyLines.push(
+        new Paragraph({
+          alignment: headerAlign,
           spacing: { after: 20 },
-          children: makeTextRuns(companyProfile.address, { size: 18, color: '475569' }),
+          children: makeTextRuns(
+            `${formatLabelText('taxId', layout.language)}: ${companyProfile.taxId}`,
+            { bold: true, size: 18, color: '334155' }
+          ),
         })
       );
     }
-    const contactParts = [
-      companyProfile?.phone,
-      companyProfile?.email,
-      companyProfile?.website,
-    ].filter(Boolean);
-    if (contactParts.length > 0) {
-      companyLines.push(
-        new Paragraph({
-          spacing: { after: 20 },
-          children: makeTextRuns(contactParts.join('  •  '), { size: 18, color: '475569' }),
-        })
-      );
-    }
-  }
-  if (layout.showCompanyTaxId && companyProfile?.taxId) {
-    companyLines.push(
-      new Paragraph({
-        spacing: { after: 20 },
-        children: makeTextRuns(
-          `${formatLabelText('taxId', layout.language)}: ${companyProfile.taxId}`,
-          { bold: true, size: 18, color: '334155' }
-        ),
-      })
-    );
   }
   if (companyLines.length === 0) {
     companyLines.push(new Paragraph({ children: [] }));
   }
 
-  const titleCellParagraphs: Paragraph[] = [
-    new Paragraph({
-      alignment:
-        layout.titlePlacement === 'left'
-          ? AlignmentType.LEFT
-          : layout.titlePlacement === 'center'
-          ? AlignmentType.CENTER
-          : AlignmentType.RIGHT,
-      spacing: { after: 60 },
-      children: makeTextRuns(resolvedTitle.toUpperCase(), {
-        bold: true,
-        size: 30,
-        color: '0F172A',
-      }),
-    }),
-    new Paragraph({
-      alignment:
-        layout.titlePlacement === 'left'
-          ? AlignmentType.LEFT
-          : layout.titlePlacement === 'center'
-          ? AlignmentType.CENTER
-          : AlignmentType.RIGHT,
-      children: makeTextRuns(
-        `${formatLabelText(docNumberLabelKey, layout.language)}: ${docNumber || 'DRAFT PREVIEW'}`,
-        { bold: true, size: 20, color: '1E293B' }
-      ),
-    }),
-  ];
+  const resolvedTitleAlign =
+    layout.visualLayoutEnabled && titleVisual.align
+      ? toDocxAlignment(titleVisual.align)
+      : layout.titlePlacement === 'left'
+      ? AlignmentType.LEFT
+      : layout.titlePlacement === 'center'
+      ? AlignmentType.CENTER
+      : AlignmentType.RIGHT;
+
+  const titleVisible = !layout.visualLayoutEnabled || titleVisual.visible;
+  const titleCellParagraphs: Paragraph[] = titleVisible
+    ? [
+        new Paragraph({
+          alignment: resolvedTitleAlign,
+          spacing: { after: 60 },
+          children: makeTextRuns(resolvedTitle.toUpperCase(), {
+            bold: true,
+            size: 30,
+            color: '0F172A',
+          }),
+        }),
+        new Paragraph({
+          alignment: resolvedTitleAlign,
+          children: makeTextRuns(
+            `${formatLabelText(docNumberLabelKey, layout.language)}: ${docNumber || 'DRAFT PREVIEW'}`,
+            { bold: true, size: 20, color: '1E293B' }
+          ),
+        }),
+      ]
+    : [new Paragraph({ children: [] })];
 
   children.push(
     new Table({
@@ -963,7 +1118,7 @@ export function createWordDocument(context: DocumentExportContext): Document {
     );
   }
 
-  // Signature Section
+  // Signature & Seal Section
   if (layout.showSignatureSection) {
     const signatoryName =
       layout.signatoryName ||
@@ -973,31 +1128,142 @@ export function createWordDocument(context: DocumentExportContext): Document {
     const signatoryTitle =
       layout.signatoryTitle || companyProfile?.documentBranding?.signatureTitle || '';
 
-    children.push(
-      new Paragraph({
-        alignment: AlignmentType.RIGHT,
-        spacing: { before: 280, after: 40 },
-        children: makeTextRuns(`__________________________`, { size: 18, color: '64748B' }),
-      }),
-      new Paragraph({
-        alignment: AlignmentType.RIGHT,
-        spacing: { after: 20 },
-        children: makeTextRuns(signatoryName, { bold: true, size: 19, color: '0F172A' }),
-      })
-    );
-    if (signatoryTitle) {
+    const sealVisual = visualElements.seal;
+    const sigVisual = visualElements.signature;
+    const sealVisible = !layout.visualLayoutEnabled || sealVisual.visible;
+    const sigVisible = !layout.visualLayoutEnabled || sigVisual.visible;
+
+    const sealImgRun = sealVisible
+      ? createRasterImageRun(
+          brandingImages?.seal,
+          sealVisual.widthMm,
+          sealVisual.heightMm,
+          'Company Seal'
+        )
+      : null;
+    const sigImgRun = sigVisible
+      ? createRasterImageRun(
+          brandingImages?.signature,
+          sigVisual.widthMm,
+          sigVisual.heightMm,
+          'Authorized Signature'
+        )
+      : null;
+
+    const sigAlign = toDocxAlignment(sigVisual.align || 'right');
+    const sealAlign = toDocxAlignment(sealVisual.align || 'center');
+
+    if (sealImgRun || sigImgRun) {
       children.push(
-        new Paragraph({
-          alignment: AlignmentType.RIGHT,
-          spacing: { after: 80 },
-          children: makeTextRuns(signatoryTitle, { size: 17, color: '64748B' }),
+        new Table({
+          width: { size: 100, type: WidthType.PERCENTAGE },
+          borders: noBorders(),
+          rows: [
+            new TableRow({
+              children: [
+                new TableCell({
+                  width: { size: 50, type: WidthType.PERCENTAGE },
+                  borders: noBorders(),
+                  children: [new Paragraph({ children: [] })],
+                }),
+                new TableCell({
+                  width: { size: 22, type: WidthType.PERCENTAGE },
+                  borders: noBorders(),
+                  margins: { top: 120, bottom: 40, right: 80 },
+                  children: sealImgRun
+                    ? [
+                        new Paragraph({
+                          alignment: sealAlign,
+                          children: [sealImgRun],
+                        }),
+                      ]
+                    : [new Paragraph({ children: [] })],
+                }),
+                new TableCell({
+                  width: { size: 28, type: WidthType.PERCENTAGE },
+                  borders: noBorders(),
+                  margins: { top: 120, bottom: 40 },
+                  children: sigVisible
+                    ? [
+                        ...(sigImgRun
+                          ? [
+                              new Paragraph({
+                                alignment: sigAlign,
+                                spacing: { after: 30 },
+                                children: [sigImgRun],
+                              }),
+                            ]
+                          : [
+                              new Paragraph({
+                                alignment: sigAlign,
+                                spacing: { before: 140, after: 30 },
+                                children: [],
+                              }),
+                            ]),
+                        new Paragraph({
+                          alignment: sigAlign,
+                          spacing: { after: 30 },
+                          children: makeTextRuns('__________________________', {
+                            size: 18,
+                            color: '64748B',
+                          }),
+                        }),
+                        new Paragraph({
+                          alignment: sigAlign,
+                          spacing: { after: 20 },
+                          children: makeTextRuns(signatoryName, {
+                            bold: true,
+                            size: 19,
+                            color: '0F172A',
+                          }),
+                        }),
+                        ...(signatoryTitle
+                          ? [
+                              new Paragraph({
+                                alignment: sigAlign,
+                                children: makeTextRuns(signatoryTitle, {
+                                  size: 17,
+                                  color: '64748B',
+                                }),
+                              }),
+                            ]
+                          : []),
+                      ]
+                    : [new Paragraph({ children: [] })],
+                }),
+              ],
+            }),
+          ],
         })
       );
+    } else if (sigVisible) {
+      children.push(
+        new Paragraph({
+          alignment: sigAlign,
+          spacing: { before: 280, after: 40 },
+          children: makeTextRuns(`__________________________`, { size: 18, color: '64748B' }),
+        }),
+        new Paragraph({
+          alignment: sigAlign,
+          spacing: { after: 20 },
+          children: makeTextRuns(signatoryName, { bold: true, size: 19, color: '0F172A' }),
+        })
+      );
+      if (signatoryTitle) {
+        children.push(
+          new Paragraph({
+            alignment: sigAlign,
+            spacing: { after: 80 },
+            children: makeTextRuns(signatoryTitle, { size: 17, color: '64748B' }),
+          })
+        );
+      }
     }
   }
 
   // Footer & Timestamp
-  if (layout.footerText || layout.showPrintedTimestamp) {
+  const footerVisible = !layout.visualLayoutEnabled || visualElements.footer.visible;
+  if (footerVisible && (layout.footerText || layout.showPrintedTimestamp)) {
     const footerParts = [
       layout.footerText || '',
       layout.showPrintedTimestamp
@@ -1006,6 +1272,7 @@ export function createWordDocument(context: DocumentExportContext): Document {
     ].filter(Boolean);
     children.push(
       new Paragraph({
+        alignment: toDocxAlignment(visualElements.footer.align),
         spacing: { before: 200 },
         children: makeTextRuns(footerParts.join('  |  '), { size: 16, color: '64748B' }),
       })

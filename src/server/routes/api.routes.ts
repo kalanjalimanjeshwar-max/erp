@@ -36,6 +36,9 @@ apiRouter.get('/ready', HealthController.getReadiness);
 // 2. Initial Setup & Bootstrap Endpoints
 apiRouter.get('/setup/status', SetupController.getStatus);
 apiRouter.post('/setup/bootstrap', SetupController.bootstrap);
+apiRouter.post('/setup/branding/upload', SetupController.uploadBrandingAsset);
+apiRouter.get('/setup/branding/assets/:id/file', SetupController.getStagedBrandingAssetFile);
+apiRouter.delete('/setup/branding/assets/:id', SetupController.deleteStagedBrandingAsset);
 
 // 3. Authentication Endpoints
 apiRouter.post('/auth/login', AuthController.login);
@@ -60,6 +63,11 @@ apiRouter.get('/company/change-requests', requireAuth, requirePermission('COMPAN
 apiRouter.post('/company/change-requests/:id/approve', requireAuth, requirePermission('COMPANY', 'APPROVE'), CompanyController.approveChangeRequest);
 apiRouter.post('/company/change-requests/:id/reject', requireAuth, requirePermission('COMPANY', 'APPROVE'), CompanyController.rejectChangeRequest);
 apiRouter.get('/company/sequences', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyController.getSequences);
+apiRouter.get('/company/branding', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyController.getBrandingAssets);
+apiRouter.post('/company/branding/upload', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyController.uploadBrandingAsset);
+apiRouter.post('/company/branding/:assetType', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyController.uploadBrandingAsset);
+apiRouter.delete('/company/branding/:assetType', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyController.removeBrandingAsset);
+apiRouter.get('/company/branding/assets/:id/file', requireAuth, CompanyController.getBrandingAssetFile);
 apiRouter.get('/company/bank-accounts', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyBankAccountController.list);
 apiRouter.get('/company/bank-accounts/:id', requireAuth, requirePermission('COMPANY', 'VIEW'), CompanyBankAccountController.getById);
 apiRouter.post('/company/bank-accounts', requireAuth, requirePermission('COMPANY', 'EDIT'), CompanyBankAccountController.create);

@@ -15,7 +15,22 @@ export const initialSetupSchema = z.object({
     taxId: z.string().trim().max(64).optional(),
     currency: z.enum(SUPPORTED_CURRENCIES as unknown as [string, ...string[]]).default('USD'),
     timezone: z.string().min(1).default('UTC'),
-    logoUrl: z.string().url('Logo must be a valid URL').optional().or(z.literal('')),
+    logoUrl: z
+      .string()
+      .trim()
+      .refine(
+        (val) => !val || /^https?:\/\//i.test(val) || /^\/[a-zA-Z0-9_\-./]+$/i.test(val),
+        'Logo must be a valid HTTP/HTTPS URL or safe server asset path'
+      )
+      .optional()
+      .or(z.literal('')),
+    brandingAssetIds: z
+      .object({
+        logoAssetId: z.string().max(128).nullable().optional(),
+        sealAssetId: z.string().max(128).nullable().optional(),
+        signatureAssetId: z.string().max(128).nullable().optional(),
+      })
+      .optional(),
   }),
   superAdmin: z
     .object({
