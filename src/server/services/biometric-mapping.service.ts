@@ -37,6 +37,31 @@ interface StoredDeviceUserEntry {
 }
 
 export class BiometricMappingService {
+  private static companyWriteQueues = new Map<string, Promise<void>>();
+
+  private static async withCompanyWriteLock<T>(
+    companyId: string,
+    work: () => Promise<T>
+  ): Promise<T> {
+    const previous = this.companyWriteQueues.get(companyId) ?? Promise.resolve();
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.catch(() => undefined).then(() => current);
+    this.companyWriteQueues.set(companyId, tail);
+
+    await previous.catch(() => undefined);
+    try {
+      return await work();
+    } finally {
+      release();
+      if (this.companyWriteQueues.get(companyId) === tail) {
+        this.companyWriteQueues.delete(companyId);
+      }
+    }
+  }
+
   private static normalizeEnrollmentId(raw: string): string {
     return String(raw || '').trim();
   }
@@ -501,13 +526,12 @@ export class BiometricMappingService {
     }
 
     const execute = async (tx: any): Promise<EmployeeBiometricMappingItem[]> => {
-      // Acquire row-level lock on Company when running on real PostgreSQL to prevent concurrent duplicate mapping races
-      if (typeof tx.$queryRaw === 'function') {
-        try {
-          await tx.$queryRaw`SELECT id FROM "Company" WHERE id = ${actor.companyId}::uuid FOR UPDATE`;
-        } catch {
-          // Non-fatal in unit mocks
-        }
+      // Acquire row-level lock on Company inside an interactive PostgreSQL transaction (or mocked tx/$queryRaw)
+      // Avoid invoking an un-mocked root PrismaClient.$queryRaw when a unit test forwards `prisma` directly as `tx`.
+      const hasQueryRaw = typeof tx.$queryRaw === 'function';
+      const isMockedQueryRaw = hasQueryRaw && typeof (tx.$queryRaw as { mock?: unknown }).mock === 'object';
+      if (hasQueryRaw && (tx !== prisma || isMockedQueryRaw)) {
+        await tx.$queryRaw`SELECT id FROM "Company" WHERE id = ${actor.companyId}::uuid FOR UPDATE`;
       }
 
       const employee = await tx.employee.findUnique({ where: { id: employeeId } });
@@ -680,7 +704,7 @@ export class BiometricMappingService {
     if (options?.tx) {
       return execute(options.tx);
     }
-    return prisma.$transaction(execute);
+    return this.withCompanyWriteLock(actor.companyId, () => prisma.$transaction(execute));
   }
 
   /**

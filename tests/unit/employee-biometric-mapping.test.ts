@@ -127,6 +127,7 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.spyOn(AuditService, 'log').mockResolvedValue(undefined);
+    vi.spyOn(prisma, '$queryRaw').mockResolvedValue([] as any);
     vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
       if (typeof cb === 'function') {
         return cb(prisma);
@@ -296,6 +297,63 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
       ]);
       expect(reassigned).toHaveLength(1);
       expect(reassigned[0].enrollmentId).toBe('101');
+    });
+
+    it('serializes concurrent mapping attempts atomically, rejects duplicate with 409, and acquires FOR UPDATE lock on real tx', async () => {
+      createInMemorySettingStore();
+
+      const empA = { id: 'emp-a', companyId: companyAlphaId, employeeCode: '101', fullName: 'Asha' };
+      const empB = { id: 'emp-b', companyId: companyAlphaId, employeeCode: '102', fullName: 'Bala' };
+
+      const txQueryRawSpy = vi.fn().mockResolvedValue([]);
+      vi.spyOn(prisma, '$transaction').mockImplementation(async (cb: any) => {
+        if (typeof cb === 'function') {
+          const txClient = {
+            $queryRaw: txQueryRawSpy,
+            employee: prisma.employee,
+            biometricTerminal: prisma.biometricTerminal,
+            companySetting: prisma.companySetting,
+          };
+          return cb(txClient);
+        }
+        return cb;
+      });
+
+      vi.spyOn(prisma.employee, 'findUnique').mockImplementation((async (args: any) => {
+        if (args.where.id === 'emp-a') return empA as any;
+        if (args.where.id === 'emp-b') return empB as any;
+        return null;
+      }) as any);
+      vi.spyOn(prisma.employee, 'update').mockResolvedValue(empA as any);
+      vi.spyOn(prisma.biometricTerminal, 'findMany').mockResolvedValue([esslTerminal] as any);
+
+      // Fire two concurrent mapping requests for the exact same (terminalId, enrollmentId)
+      const [resA, resB] = await Promise.allSettled([
+        BiometricMappingService.replaceEmployeeMappings(adminActor, 'emp-a', [
+          { terminalId: esslTerminal.id, enrollmentId: '101', source: 'EXPLICIT' },
+        ]),
+        BiometricMappingService.replaceEmployeeMappings(adminActor, 'emp-b', [
+          { terminalId: esslTerminal.id, enrollmentId: '101', source: 'EXPLICIT' },
+        ]),
+      ]);
+
+      expect(resA.status).toBe('fulfilled');
+      expect(resB.status).toBe('rejected');
+      if (resB.status === 'rejected') {
+        expect(resB.reason).toMatchObject({
+          statusCode: 409,
+          message: expect.stringContaining("Enrollment ID '101'"),
+        });
+      }
+      // Verify interactive tx acquired Company FOR UPDATE row lock for each transaction
+      expect(txQueryRawSpy).toHaveBeenCalledTimes(2);
+
+      // Verify lock queue released cleanly after 409 rejection: another non-conflicting call succeeds immediately
+      const resBValid = await BiometricMappingService.replaceEmployeeMappings(adminActor, 'emp-b', [
+        { terminalId: esslTerminal.id, enrollmentId: '102', source: 'EXPLICIT' },
+      ]);
+      expect(resBValid).toHaveLength(1);
+      expect(resBValid[0].enrollmentId).toBe('102');
     });
 
     it('enforces cross-tenant boundaries for terminals (400) and employees (404)', async () => {
