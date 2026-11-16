@@ -2,6 +2,7 @@ import net from 'net';
 import {
   BiometricVerifyType,
   DeviceAttendanceRecord,
+  DeviceEnrolledUser,
   DeviceInfo,
   IBiometricProtocolAdapter,
   ProtocolConnectOptions,
@@ -16,6 +17,7 @@ export const ZK_CMD = {
   ENABLE_DEVICE: 1002,
   DISABLE_DEVICE: 1003,
   AUTH: 1102,
+  USERTEMP_RRQ: 9,
   OPTIONS_RRQ: 11,
   ATTLOG_RRQ: 13,
   GET_VERSION: 1100,
@@ -336,6 +338,78 @@ export function decodeAttendancePayload(rawPayload: Buffer): DeviceAttendanceRec
 }
 
 /**
+ * Decodes raw CMD_USERTEMP_RRQ (type=5) enrolled user records.
+ * Supports 72-byte (ZLM60_TFT / eSSL X2008) and 28-byte legacy ZK user records.
+ */
+export function decodeUserTablePayload(rawPayload: Buffer): DeviceEnrolledUser[] {
+  if (!rawPayload || rawPayload.length === 0) return [];
+
+  let recordBuffer = rawPayload;
+  if (rawPayload.length >= 4) {
+    const declaredSize = rawPayload.readUInt32LE(0);
+    if (declaredSize === 0 && rawPayload.length === 4) {
+      return [];
+    }
+    if (declaredSize > 0 && rawPayload.length - 4 >= declaredSize) {
+      recordBuffer = rawPayload.subarray(4, 4 + declaredSize);
+    } else if (rawPayload.length > 4 && (rawPayload.length - 4) % 72 === 0) {
+      recordBuffer = rawPayload.subarray(4);
+    } else if (rawPayload.length > 4 && (rawPayload.length - 4) % 28 === 0) {
+      recordBuffer = rawPayload.subarray(4);
+    }
+  }
+
+  if (recordBuffer.length === 0) return [];
+
+  let recordSize = 0;
+  if (recordBuffer.length % 72 === 0) {
+    recordSize = 72;
+  } else if (recordBuffer.length % 28 === 0) {
+    recordSize = 28;
+  } else {
+    return [];
+  }
+
+  const users: DeviceEnrolledUser[] = [];
+  const count = Math.floor(recordBuffer.length / recordSize);
+
+  for (let i = 0; i < count; i++) {
+    const offset = i * recordSize;
+    const rec = recordBuffer.subarray(offset, offset + recordSize);
+    if (recordSize === 72) {
+      const uid = rec.readUInt16LE(0);
+      const name = readNullTerminatedAscii(rec.subarray(11, 35)) || null;
+      const cardNum = rec.readUInt32LE(35);
+      const userId = readNullTerminatedAscii(rec.subarray(48, 72)) || String(uid);
+      if (userId) {
+        users.push({
+          uid,
+          enrollmentId: userId,
+          name,
+          cardNo: cardNum > 0 ? String(cardNum) : null,
+        });
+      }
+    } else {
+      const uid = rec.readUInt16LE(0);
+      const name = readNullTerminatedAscii(rec.subarray(8, 16)) || null;
+      const cardNum = rec.readUInt32LE(16);
+      const numericUserId = rec.readUInt32LE(24);
+      const enrollmentId = numericUserId > 0 ? String(numericUserId) : String(uid);
+      if (enrollmentId) {
+        users.push({
+          uid,
+          enrollmentId,
+          name,
+          cardNo: cardNum > 0 ? String(cardNum) : null,
+        });
+      }
+    }
+  }
+
+  return users;
+}
+
+/**
  * Pure Node.js ZKTeco Standalone Pull TCP Protocol Adapter (Port 4370).
  * Compatible with eSSL X2008 (Platform ZLM60_TFT, Fingerprint Algorithm VX10.0).
  * Strictly read-only: NEVER sends CMD_CLEAR_ATTLOG.
@@ -510,6 +584,47 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
     }
 
     throw new Error(`Unexpected response command ${firstReply.command} for CMD_ATTLOG_RRQ.`);
+  }
+
+  async getUsers(): Promise<DeviceEnrolledUser[]> {
+    this.ensureConnected();
+
+    const firstReply = await this.sendCommand(ZK_CMD.USERTEMP_RRQ, Buffer.from([0x05]));
+    if (firstReply.command === ZK_CMD.ACK_OK || firstReply.command === ZK_CMD.ACK_DATA) {
+      return firstReply.payload.length > 0 ? decodeUserTablePayload(firstReply.payload) : [];
+    }
+
+    if (firstReply.command === ZK_CMD.PREPARE_DATA) {
+      const expectedBytes = firstReply.payload.length >= 4 ? firstReply.payload.readUInt32LE(0) : 0;
+      const chunks: Buffer[] = [];
+      let receivedBytes = 0;
+
+      while (receivedBytes < expectedBytes) {
+        const frame = await this.waitForNextFrame(this.timeoutMs * 3);
+        if (frame.command === ZK_CMD.DATA) {
+          chunks.push(frame.payload);
+          receivedBytes += frame.payload.length;
+        } else if (frame.command === ZK_CMD.ACK_OK) {
+          break;
+        } else if (frame.command === ZK_CMD.ACK_ERROR) {
+          return [];
+        }
+      }
+
+      if (this.frameQueue.length > 0 && this.frameQueue[0].command === ZK_CMD.ACK_OK) {
+        this.frameQueue.shift();
+      }
+
+      try {
+        await this.sendCommand(ZK_CMD.FREE_DATA);
+      } catch {
+        // Non-fatal cleanup
+      }
+
+      return decodeUserTablePayload(Buffer.concat(chunks));
+    }
+
+    return [];
   }
 
   async disconnect(): Promise<void> {

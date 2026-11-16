@@ -172,10 +172,13 @@ apiRouter.post('/designations/:id/deactivate', requireAuth, requirePermission('D
 
 // 15. Employee Management & Salary Structure Endpoints (Phase 6)
 apiRouter.get('/employees', requireAuth, requirePermission('EMPLOYEE', 'VIEW'), EmployeeController.list);
+apiRouter.get('/employees/biometric-options', requireAuth, requirePermission('EMPLOYEE', 'VIEW'), EmployeeController.getBiometricOptions);
 apiRouter.get('/employees/self', requireAuth, EmployeeController.getSelf);
 apiRouter.get('/employees/:id', requireAuth, EmployeeController.getById);
 apiRouter.post('/employees', requireAuth, requirePermission('EMPLOYEE', 'CREATE'), EmployeeController.create);
 apiRouter.patch('/employees/:id', requireAuth, requirePermission('EMPLOYEE', 'EDIT'), EmployeeController.update);
+apiRouter.post('/employees/:id/activate', requireAuth, requirePermission('EMPLOYEE', 'EDIT'), EmployeeController.activate);
+apiRouter.put('/employees/:id/biometric-mappings', requireAuth, requirePermission('EMPLOYEE', 'EDIT'), EmployeeController.updateBiometricMappings);
 apiRouter.post('/employees/:id/deactivate', requireAuth, requirePermission('EMPLOYEE', 'DEACTIVATE'), EmployeeController.deactivate);
 apiRouter.post('/employees/:id/login', requireAuth, requirePermission('USER', 'CREATE'), EmployeeController.createLogin);
 apiRouter.patch('/employees/:id/login/status', requireAuth, requirePermission('USER', 'EDIT'), EmployeeController.toggleLogin);
@@ -239,6 +242,7 @@ apiRouter.post('/biometric/heartbeat', requireDeviceAuth, BiometricController.he
 apiRouter.post('/biometric/punches', requireDeviceAuth, BiometricController.ingestPunches);
 
 // 22. Biometric Punch Reconciliation & Sync Endpoints (Phase 8.2)
+apiRouter.get('/biometric/enrollments', requireAuth, requirePermission('BIOMETRIC', 'VIEW'), BiometricController.listEnrollments);
 apiRouter.get('/biometric/punches', requireAuth, requirePermission('BIOMETRIC', 'VIEW'), BiometricController.listPunches);
 apiRouter.post('/biometric/sync', requireAuth, requirePermission('BIOMETRIC', 'EDIT'), BiometricController.triggerSync);
 apiRouter.get('/biometric/sync/summary', requireAuth, requirePermission('BIOMETRIC', 'VIEW'), BiometricController.getSummary);

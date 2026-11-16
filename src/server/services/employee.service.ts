@@ -11,11 +11,17 @@ import {
   CreateSalaryRevisionRequest,
   EmployeeStatus,
   EmploymentType,
+  EmployeeBiometricMappingInput,
+  PunchReconciliationResponse,
 } from '../../shared/types.js';
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
 import { AuditService } from './audit.service.js';
+import { BiometricMappingService } from './biometric-mapping.service.js';
 import { PermissionService } from './permission.service.js';
+import { PunchReconciliationService } from './punch-reconciliation.service.js';
 import { getDefaultAccountNature } from '../../shared/account-nature.js';
+
+const VALID_EMPLOYEE_STATUSES: EmployeeStatus[] = ['ACTIVE', 'INACTIVE', 'EXITED'];
 
 export function calculateShiftDurationHours(shift: {
   startTime: string;
@@ -124,6 +130,11 @@ export class EmployeeService {
       }),
     ]);
 
+    const mappingsMap = await BiometricMappingService.getMappingsMapForEmployees(
+      companyId,
+      records.map((r) => r.id)
+    );
+
     const items: EmployeeItem[] = records.map((e) => ({
       id: e.id,
       companyId: e.companyId,
@@ -143,6 +154,7 @@ export class EmployeeService {
       status: e.status,
       notes: e.notes,
       biometricDeviceId: e.biometricDeviceId,
+      biometricMappings: mappingsMap.get(e.id) || [],
       userId: e.userId,
       userEmail: e.user?.email || null,
       userActive: e.user?.isActive ?? false,
@@ -193,6 +205,8 @@ export class EmployeeService {
       throw err;
     }
 
+    const biometricMappings = await BiometricMappingService.listMappingsForEmployee(companyId, e.id);
+
     return {
       id: e.id,
       companyId: e.companyId,
@@ -212,6 +226,7 @@ export class EmployeeService {
       status: e.status,
       notes: e.notes,
       biometricDeviceId: e.biometricDeviceId,
+      biometricMappings,
       userId: e.userId,
       userEmail: e.user?.email || null,
       userActive: e.user?.isActive ?? false,
@@ -260,6 +275,8 @@ export class EmployeeService {
       throw err;
     }
 
+    const biometricMappings = await BiometricMappingService.listMappingsForEmployee(companyId, e.id);
+
     return {
       id: e.id,
       companyId: e.companyId,
@@ -279,6 +296,7 @@ export class EmployeeService {
       status: e.status,
       notes: e.notes,
       biometricDeviceId: e.biometricDeviceId,
+      biometricMappings,
       userId: e.userId,
       userEmail: e.user?.email || null,
       userActive: e.user?.isActive ?? false,
@@ -407,6 +425,14 @@ export class EmployeeService {
       }
     }
 
+    // Validate initial status if provided (default ACTIVE)
+    const initialStatus: EmployeeStatus = input.status || 'ACTIVE';
+    if (!VALID_EMPLOYEE_STATUSES.includes(initialStatus)) {
+      const err = new Error(`Invalid employee status '${input.status}'. Must be ACTIVE, INACTIVE, or EXITED.`);
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
     // Single database transaction
     const created = await prisma.$transaction(async (tx) => {
       const emp = await tx.employee.create({
@@ -424,7 +450,7 @@ export class EmployeeService {
           designationId: input.designationId || null,
           shiftId: shiftIdToAssign,
           employmentType: input.employmentType || 'FULL_TIME',
-          status: 'ACTIVE',
+          status: initialStatus,
           notes: input.notes?.trim() || null,
           biometricDeviceId: input.biometricDeviceId?.trim() || null,
         },
@@ -445,6 +471,20 @@ export class EmployeeService {
         });
       }
 
+      if (Array.isArray(input.biometricMappings) && input.biometricMappings.length > 0) {
+        await BiometricMappingService.replaceEmployeeMappings(
+          actor,
+          emp.id,
+          input.biometricMappings,
+          {
+            tx,
+            correlationId,
+            skipAudit: true,
+            syncEmployeeBiometricField: true,
+          }
+        );
+      }
+
       return emp;
     });
 
@@ -458,11 +498,20 @@ export class EmployeeService {
       details: {
         employeeCode: created.employeeCode,
         fullName: created.fullName,
+        status: created.status,
         hasInitialSalary: !!initialSalaryDecimal,
+        biometricMappingsCount: Array.isArray(input.biometricMappings) ? input.biometricMappings.length : 0,
       },
     });
 
-    return this.getEmployeeById(actor.companyId, created.id);
+    const employeeItem = await this.getEmployeeById(actor.companyId, created.id);
+
+    // Trigger targeted punch reconciliation only for the newly mapped (terminalId, enrollmentId) pairs if ACTIVE
+    if (employeeItem.status === 'ACTIVE' && employeeItem.biometricMappings?.length) {
+      await this.reconcileMappingsForEmployee(actor, employeeItem, correlationId);
+    }
+
+    return employeeItem;
   }
 
   /**
@@ -608,6 +657,11 @@ export class EmployeeService {
     }
 
     if (input.status !== undefined) {
+      if (!VALID_EMPLOYEE_STATUSES.includes(input.status)) {
+        const err = new Error(`Invalid employee status '${input.status}'. Must be ACTIVE, INACTIVE, or EXITED.`);
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
       updateData.status = input.status;
     }
 
@@ -634,22 +688,155 @@ export class EmployeeService {
       }
     }
 
-    await prisma.employee.update({
-      where: { id },
-      data: updateData,
-    });
+    if (input.biometricMappings !== undefined) {
+      await prisma.$transaction(async (tx) => {
+        if (Object.keys(updateData).length > 0) {
+          await tx.employee.update({
+            where: { id },
+            data: updateData,
+          });
+        }
+        await BiometricMappingService.replaceEmployeeMappings(
+          actor,
+          id,
+          input.biometricMappings!,
+          {
+            tx,
+            correlationId,
+            skipAudit: true,
+            syncEmployeeBiometricField: true,
+          }
+        );
+      });
+    } else if (Object.keys(updateData).length > 0) {
+      await prisma.employee.update({
+        where: { id },
+        data: updateData,
+      });
+    }
+
+    const statusChanged = input.status !== undefined && input.status !== existing.status;
+    const actionName = statusChanged && input.status === 'ACTIVE'
+      ? 'EMPLOYEE_ACTIVATE'
+      : statusChanged && (input.status === 'INACTIVE' || input.status === 'EXITED')
+      ? 'EMPLOYEE_DEACTIVATE'
+      : 'EMPLOYEE_UPDATE';
 
     await AuditService.log({
       companyId: actor.companyId,
       userId: actor.userId || actor.id,
-      action: 'EMPLOYEE_UPDATE',
+      action: actionName,
       entity: 'Employee',
       entityId: id,
       correlationId,
-      details: updateData,
+      details: {
+        ...updateData,
+        previousStatus: existing.status,
+        biometricMappingsUpdated: input.biometricMappings !== undefined,
+      },
     });
 
-    return this.getEmployeeById(actor.companyId, id);
+    const updatedEmployee = await this.getEmployeeById(actor.companyId, id);
+
+    // If employee is ACTIVE and either newly activated OR biometric mappings were updated,
+    // reconcile eligible punches ONLY for this employee's exact mapped (terminalId, enrollmentId) pairs.
+    const activatedNow = existing.status !== 'ACTIVE' && updatedEmployee.status === 'ACTIVE';
+    if (
+      updatedEmployee.status === 'ACTIVE' &&
+      (activatedNow || input.biometricMappings !== undefined) &&
+      updatedEmployee.biometricMappings?.length
+    ) {
+      await this.reconcileMappingsForEmployee(actor, updatedEmployee, correlationId);
+    }
+
+    return updatedEmployee;
+  }
+
+  /**
+   * Reconciles pending/error punches strictly for each (terminalId, enrollmentId) mapped to an ACTIVE employee.
+   */
+  private static async reconcileMappingsForEmployee(
+    actor: AuthUser,
+    employee: EmployeeItem,
+    correlationId?: string
+  ): Promise<PunchReconciliationResponse> {
+    const aggregate: PunchReconciliationResponse = {
+      success: true,
+      totalEvaluated: 0,
+      processed: 0,
+      pending: 0,
+      ignored: 0,
+      errors: 0,
+      results: [],
+    };
+
+    if (employee.status !== 'ACTIVE' || !employee.biometricMappings?.length) {
+      return aggregate;
+    }
+
+    if (typeof prisma.rawPunchLog?.findMany !== 'function') {
+      return aggregate;
+    }
+
+    for (const mapping of employee.biometricMappings) {
+      if (!mapping.isActive || !mapping.terminalId || !mapping.enrollmentId) continue;
+      try {
+        const res = await PunchReconciliationService.reconcileForEmployeeMapping(
+          actor.companyId,
+          mapping.terminalId,
+          mapping.enrollmentId,
+          actor.userId || actor.id,
+          correlationId
+        );
+        aggregate.totalEvaluated += res.totalEvaluated;
+        aggregate.processed += res.processed;
+        aggregate.pending = (aggregate.pending || 0) + (res.pending || 0);
+        aggregate.ignored += res.ignored;
+        aggregate.errors += res.errors;
+        aggregate.results.push(...res.results);
+      } catch {
+        // Non-fatal: reconciliation can be re-triggered safely without corrupting employee save
+      }
+    }
+
+    return aggregate;
+  }
+
+  /**
+   * Explicitly updates biometric terminal enrollment mappings for an employee and runs
+   * targeted punch reconciliation if the employee is ACTIVE.
+   */
+  static async updateEmployeeBiometricMappings(
+    actor: AuthUser,
+    id: string,
+    mappings: EmployeeBiometricMappingInput[],
+    correlationId?: string
+  ): Promise<{ employee: EmployeeItem; reconciliation: PunchReconciliationResponse }> {
+    if (actor.role === 'EMPLOYEE') {
+      const err = new Error('Employees are not authorized to modify biometric terminal mappings.');
+      (err as { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
+    await BiometricMappingService.replaceEmployeeMappings(actor, id, mappings, {
+      correlationId,
+      syncEmployeeBiometricField: true,
+    });
+
+    const employee = await this.getEmployeeById(actor.companyId, id);
+    const reconciliation = await this.reconcileMappingsForEmployee(actor, employee, correlationId);
+    return { employee, reconciliation };
+  }
+
+  /**
+   * Safe activation of employee (transitions status to ACTIVE and reconciles mapped pending punches)
+   */
+  static async activateEmployee(
+    actor: AuthUser,
+    id: string,
+    correlationId?: string
+  ): Promise<EmployeeItem> {
+    return this.updateEmployee(actor, id, { status: 'ACTIVE' }, correlationId);
   }
 
   /**

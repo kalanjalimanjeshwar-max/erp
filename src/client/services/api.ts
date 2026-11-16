@@ -106,6 +106,9 @@ import {
   PunchReconciliationOptions,
   PunchReconciliationResponse,
   PunchSyncSummaryResponse,
+  EmployeeBiometricMappingInput,
+  EmployeeBiometricMappingItem,
+  BiometricTerminalEnrollmentOptionsResponse,
   ExpenseClaimItem,
   ExpenseClaimStatus,
   ExpenseClaimAttachmentItem,
@@ -851,6 +854,8 @@ export const api = {
   },
   getEmployee: (id: string) => request<EmployeeItem>(`/api/employees/${id}`),
   getEmployeeSelf: () => request<EmployeeItem>('/api/employees/self'),
+  getEmployeeBiometricOptions: () =>
+    request<BiometricTerminalEnrollmentOptionsResponse>('/api/employees/biometric-options'),
   createEmployee: (data: CreateEmployeeRequest) =>
     request<EmployeeItem>('/api/employees', {
       method: 'POST',
@@ -861,6 +866,18 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
+  activateEmployee: (id: string) =>
+    request<EmployeeItem>(`/api/employees/${id}/activate`, {
+      method: 'POST',
+    }),
+  saveEmployeeBiometricMappings: (id: string, mappings: EmployeeBiometricMappingInput[]) =>
+    request<{ employee: EmployeeItem; reconciliation: PunchReconciliationResponse }>(
+      `/api/employees/${id}/biometric-mappings`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({ mappings }),
+      }
+    ),
   deactivateEmployee: (id: string) =>
     request<EmployeeItem>(`/api/employees/${id}/deactivate`, {
       method: 'POST',
@@ -1132,6 +1149,21 @@ export const api = {
     return request<{ items: RawPunchLogItem[]; total: number; page: number; limit: number }>(
       `/api/biometric/punches${qs ? `?${qs}` : ''}`
     );
+  },
+  getBiometricEnrollments: (params?: { terminalId?: string; employeeId?: string }) => {
+    const searchParams = new URLSearchParams();
+    if (params?.terminalId) searchParams.append('terminalId', params.terminalId);
+    if (params?.employeeId) searchParams.append('employeeId', params.employeeId);
+    const qs = searchParams.toString();
+    return request<
+      Array<
+        EmployeeBiometricMappingItem & {
+          employeeCode?: string | null;
+          employeeName?: string | null;
+          employeeStatus?: EmployeeStatus | null;
+        }
+      >
+    >(`/api/biometric/enrollments${qs ? `?${qs}` : ''}`);
   },
   triggerBiometricSync: (data?: PunchReconciliationOptions) =>
     request<PunchReconciliationResponse>('/api/biometric/sync', {

@@ -13,6 +13,12 @@ export interface HeartbeatPayload {
   lastProcessedPunchCount?: number;
   lastSyncAttemptAt?: string;
   lastSyncAt?: string;
+  deviceUsers?: Array<{
+    uid?: number;
+    enrollmentId: string;
+    name?: string | null;
+    cardNo?: string | null;
+  }>;
 }
 
 export interface HeartbeatResult {

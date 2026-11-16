@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { BiometricService } from '../services/biometric.service.js';
+import { BiometricMappingService } from '../services/biometric-mapping.service.js';
 import { PunchReconciliationService } from '../services/punch-reconciliation.service.js';
 import { AuthUser, BiometricTerminalStatus } from '../../shared/types.js';
 import { AuthenticatedDeviceRequest } from '../middleware/device-auth.middleware.js';
@@ -228,20 +229,46 @@ export class BiometricController {
   }
 
   /**
+   * GET /api/biometric/enrollments
+   * Lists active employee-to-terminal enrollment mappings for the authenticated company (requires BIOMETRIC:VIEW)
+   */
+  static async listEnrollments(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const { terminalId, employeeId } = req.query;
+      const enrollments = await BiometricMappingService.listCompanyMappings(actor.companyId, {
+        terminalId: typeof terminalId === 'string' ? terminalId : undefined,
+        employeeId: typeof employeeId === 'string' ? employeeId : undefined,
+      });
+      res.json(enrollments);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: 'BIOMETRIC_ENROLLMENTS_LIST_FAILED',
+          message: (err as Error).message,
+        },
+      });
+    }
+  }
+
+  /**
    * POST /api/biometric/sync
    * Triggers bounded, idempotent punch reconciliation (requires BIOMETRIC:EDIT)
    */
   static async triggerSync(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;
-      const { batchSize, terminalId, retryErrors } = req.body || {};
+      const { batchSize, terminalId, userEnrollmentId, retryErrors, keepUnmappedPending } = req.body || {};
 
       const result = await PunchReconciliationService.reconcilePendingPunches(
         actor.companyId,
         {
           batchSize: typeof batchSize === 'number' ? batchSize : undefined,
           terminalId: typeof terminalId === 'string' ? terminalId : undefined,
+          userEnrollmentId: typeof userEnrollmentId === 'string' ? userEnrollmentId : undefined,
           retryErrors: retryErrors === true,
+          keepUnmappedPending: typeof keepUnmappedPending === 'boolean' ? keepUnmappedPending : undefined,
         },
         actor.userId || actor.id,
         req.correlationId

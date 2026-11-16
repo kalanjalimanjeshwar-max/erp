@@ -1,0 +1,17 @@
+{
+  "id": "ac70dd8c-23ae-4483-b156-9534153b6471",
+  "companyId": "test-co-gov-1794832155882",
+  "assetType": "LOGO",
+  "fileName": "logo-v1.png",
+  "storageKey": "ac70dd8c-23ae-4483-b156-9534153b6471.png",
+  "fallbackPngKey": null,
+  "mimeType": "image/png",
+  "fileSizeBytes": 284,
+  "widthPx": 160,
+  "heightPx": 80,
+  "aspectRatio": 2,
+  "sha256Hash": "286c264c6659e3241461c397cbbc686cab35530d0ed57a915182b71778d6978c",
+  "status": "ARCHIVED",
+  "uploadedByUserId": "usr-sa-1",
+  "createdAt": "2026-11-16T12:29:15.886Z"
+}

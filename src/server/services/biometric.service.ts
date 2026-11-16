@@ -21,6 +21,7 @@ import {
 } from '../../shared/types.js';
 import { isValidLanHost, redactSensitiveText } from '../../shared/biometric.js';
 import { AuditService } from './audit.service.js';
+import { BiometricMappingService } from './biometric-mapping.service.js';
 import { PunchReconciliationService } from './punch-reconciliation.service.js';
 
 const VALID_VERIFY_TYPES: BiometricVerifyType[] = ['FINGERPRINT', 'CARD', 'PASSWORD', 'FACE'];
@@ -434,6 +435,14 @@ export class BiometricService {
     }
 
     const updatedTelemetry = await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, telemetryPatch);
+
+    if (Array.isArray(payload.deviceUsers)) {
+      await BiometricMappingService.saveDeviceUsersSnapshot(
+        terminal.companyId,
+        terminal.id,
+        payload.deviceUsers
+      );
+    }
 
     // Check if an admin requested an out-of-band bridge sync after the last sync attempt
     let syncRequested = false;
@@ -938,21 +947,13 @@ export class BiometricService {
     });
     const existingKeySet = new Set(existingLogs.map((l) => l.idempotencyKey));
 
-    // 3. Batch resolve active employees by biometricDeviceId
+    // 3. Batch resolve active employees via terminal-scoped biometric mappings (+ legacy fallback)
     const enrollmentIds = [...new Set(validatedPunches.map((vp) => vp.input.userEnrollmentId))];
-    const employees = await prisma.employee.findMany({
-      where: {
-        companyId: terminal.companyId,
-        biometricDeviceId: { in: enrollmentIds },
-      },
-      select: { id: true, biometricDeviceId: true },
-    });
-    const employeeMap = new Map<string, string>();
-    for (const emp of employees) {
-      if (emp.biometricDeviceId) {
-        employeeMap.set(emp.biometricDeviceId, emp.id);
-      }
-    }
+    const employeeMap = await BiometricMappingService.resolveBatchForTerminal(
+      terminal.companyId,
+      terminal.id,
+      enrollmentIds
+    );
 
     // 4. Ingest new punches
     let insertedCount = 0;

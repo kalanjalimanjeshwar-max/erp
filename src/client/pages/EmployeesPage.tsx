@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import {
   Users,
   Plus,
@@ -9,23 +9,16 @@ import {
   Edit2,
   Eye,
   EyeOff,
-  Building,
-  Briefcase,
   DollarSign,
-  Calendar,
   Lock,
   BookOpen,
   Ban,
   UserCheck,
-  UserX,
-  ShieldCheck,
-  ShieldAlert,
-  Clock,
-  Mail,
-  Phone,
-  MapPin,
-  Camera,
   History,
+  Fingerprint,
+  Server,
+  Trash2,
+  ChevronDown,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
 import {
@@ -42,6 +35,8 @@ import {
   CreateEmployeeLoginRequest,
   CreateSalaryRevisionRequest,
   CompanyProfile,
+  BiometricTerminalEnrollmentOptionsResponse,
+  EmployeeBiometricMappingInput,
 } from '../../shared/types.ts';
 import { formatMoney, getCurrencySymbol } from '../../shared/currency.ts';
 
@@ -68,6 +63,8 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
   const [departments, setDepartments] = useState<DepartmentItem[]>([]);
   const [designations, setDesignations] = useState<DesignationItem[]>([]);
   const [ledgers, setLedgers] = useState<AccountLedgerItem[]>([]);
+  const [biometricOptions, setBiometricOptions] =
+    useState<BiometricTerminalEnrollmentOptionsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -102,10 +99,22 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
   const [formDeptId, setFormDeptId] = useState('');
   const [formDesigId, setFormDesigId] = useState('');
   const [formEmpType, setFormEmpType] = useState<EmploymentType>('FULL_TIME');
+  const [formStatus, setFormStatus] = useState<EmployeeStatus>('ACTIVE');
   const [formNotes, setFormNotes] = useState('');
-  const [formBioId, setFormBioId] = useState('');
   const [formInitialSalary, setFormInitialSalary] = useState('');
+  const [formMappings, setFormMappings] = useState<EmployeeBiometricMappingInput[]>([]);
+  const [terminalSearch, setTerminalSearch] = useState('');
+  const [isTerminalDropdownOpen, setIsTerminalDropdownOpen] = useState(false);
+  const [selectedTerminalId, setSelectedTerminalId] = useState('');
+  const [enrollmentInput, setEnrollmentInput] = useState('');
+  const [mappingError, setMappingError] = useState<string | null>(null);
+  const [modalError, setModalError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Activate / Deactivate State
+  const [deactivateTarget, setDeactivateTarget] = useState<EmployeeItem | null>(null);
+  const [isDeactivating, setIsDeactivating] = useState(false);
+  const [activatingEmployeeId, setActivatingEmployeeId] = useState<string | null>(null);
 
   // New Salary Revision Form State
   const [newSalary, setNewSalary] = useState('');
@@ -139,8 +148,8 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
         const salList = await api.getEmployeeSalaries(self.id);
         setSalaries(salList);
       } else {
-        // Load full administrative employee directory and masters
-        const [empRes, deptList, desigList, ledgerList] = await Promise.all([
+        // Load full administrative employee directory, masters, and active biometric terminal options
+        const [empRes, deptList, desigList, ledgerList, bioOpts] = await Promise.all([
           api.getEmployees({
             departmentId: departmentFilter || undefined,
             designationId: designationFilter || undefined,
@@ -152,6 +161,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
           api.getDepartments(),
           api.getDesignations(),
           api.getLedgers(),
+          api.getEmployeeBiometricOptions().catch(() => null),
         ]);
 
         setEmployees(empRes.items);
@@ -159,6 +169,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
         setDepartments(deptList);
         setDesignations(desigList);
         setLedgers(ledgerList);
+        setBiometricOptions(bioOpts);
       }
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -198,18 +209,139 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     loadSalariesForEmployee(emp.id);
   };
 
+  const activeTerminals = useMemo(
+    () => biometricOptions?.terminals || [],
+    [biometricOptions]
+  );
+
+  const filteredTerminals = useMemo(() => {
+    const q = terminalSearch.trim().toLowerCase();
+    if (!q) return activeTerminals;
+    return activeTerminals.filter(
+      (t) =>
+        t.name.toLowerCase().includes(q) ||
+        t.terminalModel.toLowerCase().includes(q) ||
+        t.deviceSerialNumber.toLowerCase().includes(q) ||
+        (t.ipAddress && t.ipAddress.toLowerCase().includes(q)) ||
+        (t.location && t.location.toLowerCase().includes(q))
+    );
+  }, [activeTerminals, terminalSearch]);
+
+  const selectedTerminal = useMemo(
+    () => activeTerminals.find((t) => t.id === selectedTerminalId) || null,
+    [activeTerminals, selectedTerminalId]
+  );
+
+  const syncedDeviceUsersForSelected = useMemo(() => {
+    if (!selectedTerminalId || !biometricOptions?.deviceUsersByTerminal) return [];
+    const users = biometricOptions.deviceUsersByTerminal[selectedTerminalId] || [];
+    const q = enrollmentInput.trim().toLowerCase();
+    if (!q) return users;
+    return users.filter(
+      (u) =>
+        u.enrollmentId.toLowerCase().includes(q) ||
+        (u.name && u.name.toLowerCase().includes(q)) ||
+        (u.cardNo && u.cardNo.toLowerCase().includes(q))
+    );
+  }, [biometricOptions, selectedTerminalId, enrollmentInput]);
+
+  const findExternalMappingConflict = useCallback(
+    (terminalId: string, enrollmentId: string) => {
+      const normalized = enrollmentId.trim();
+      if (!terminalId || !normalized || !biometricOptions?.activeMappings) return null;
+      return (
+        biometricOptions.activeMappings.find(
+          (m) =>
+            m.terminalId === terminalId &&
+            m.enrollmentId === normalized &&
+            m.employeeId !== editingEmployee?.id
+        ) || null
+      );
+    },
+    [biometricOptions, editingEmployee]
+  );
+
+  const validateAndStageMapping = (
+    terminalId: string,
+    rawEnrollmentId: string,
+    source: 'EXPLICIT' | 'DEVICE_SYNC' = 'EXPLICIT'
+  ): EmployeeBiometricMappingInput | null => {
+    const enrollmentId = rawEnrollmentId.trim();
+    if (!terminalId) {
+      setMappingError('Please select a registered biometric terminal first.');
+      return null;
+    }
+    if (!enrollmentId) {
+      setMappingError('Please enter or select a Biometric Enrollment ID.');
+      return null;
+    }
+    if (formMappings.some((m) => m.terminalId === terminalId && m.enrollmentId === enrollmentId)) {
+      setMappingError(`Enrollment ID '${enrollmentId}' is already added for this terminal.`);
+      return null;
+    }
+    const conflict = findExternalMappingConflict(terminalId, enrollmentId);
+    if (conflict) {
+      setMappingError(
+        `Enrollment ID '${enrollmentId}' on this terminal is already mapped to ${conflict.employeeName} (${conflict.employeeCode}).`
+      );
+      return null;
+    }
+    setMappingError(null);
+    return {
+      terminalId,
+      enrollmentId,
+      isActive: true,
+      source,
+    };
+  };
+
+  const handleAddMapping = (
+    overrideEnrollmentId?: string,
+    source: 'EXPLICIT' | 'DEVICE_SYNC' = 'EXPLICIT'
+  ) => {
+    const candidate = overrideEnrollmentId !== undefined ? overrideEnrollmentId : enrollmentInput;
+    const staged = validateAndStageMapping(selectedTerminalId, candidate, source);
+    if (!staged) return;
+    setFormMappings((prev) => [...prev, staged]);
+    setEnrollmentInput('');
+    setMappingError(null);
+  };
+
+  const handleRemoveMapping = (terminalId: string, enrollmentId: string) => {
+    setFormMappings((prev) =>
+      prev.filter((m) => !(m.terminalId === terminalId && m.enrollmentId === enrollmentId))
+    );
+    setMappingError(null);
+  };
+
   // Create / Update Employee submit
   const handleEmployeeSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!formCode.trim() || !formName.trim() || !formDoj) {
-      setErrorMessage('Employee code, full name, and date of joining are required.');
+      setModalError('Employee code, full name, and date of joining are required.');
       return;
+    }
+
+    // If user typed an enrollment ID and selected a terminal without clicking "+ Add Mapping",
+    // validate and include it cleanly so there is no silent data loss.
+    let nextMappings = [...formMappings];
+    if (selectedTerminalId && enrollmentInput.trim()) {
+      const staged = validateAndStageMapping(selectedTerminalId, enrollmentInput, 'EXPLICIT');
+      if (!staged) {
+        return;
+      }
+      nextMappings = [...nextMappings, staged];
+      setFormMappings(nextMappings);
+      setEnrollmentInput('');
     }
 
     setIsSubmitting(true);
     setErrorMessage(null);
+    setModalError(null);
 
     try {
+      const primaryBioId = nextMappings[0]?.enrollmentId || null;
+
       if (editingEmployee) {
         const updatePayload: UpdateEmployeeRequest = {
           employeeCode: formCode.trim(),
@@ -223,11 +355,15 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
           departmentId: formDeptId || null,
           designationId: formDesigId || null,
           employmentType: formEmpType,
+          status: formStatus,
           notes: formNotes.trim() || null,
-          biometricDeviceId: formBioId.trim() || null,
+          biometricDeviceId: primaryBioId,
+          biometricMappings: nextMappings,
         };
         const updated = await api.updateEmployee(editingEmployee.id, updatePayload);
-        setSuccessMessage(`Employee '${updated.fullName}' updated successfully.`);
+        setSuccessMessage(
+          `Employee '${updated.fullName}' updated (${updated.status === 'ACTIVE' ? 'Active' : updated.status}).`
+        );
         if (selectedEmployee?.id === updated.id) {
           setSelectedEmployee(updated);
         }
@@ -244,8 +380,10 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
           departmentId: formDeptId || null,
           designationId: formDesigId || null,
           employmentType: formEmpType,
+          status: formStatus,
           notes: formNotes.trim() || null,
-          biometricDeviceId: formBioId.trim() || null,
+          biometricDeviceId: primaryBioId,
+          biometricMappings: nextMappings,
           initialSalary: formInitialSalary ? formInitialSalary : undefined,
         };
         const created = await api.createEmployee(createPayload);
@@ -257,9 +395,9 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
       loadData();
     } catch (err: unknown) {
       if (err instanceof ApiError) {
-        setErrorMessage(err.message);
+        setModalError(err.message);
       } else {
-        setErrorMessage('Failed to save employee record.');
+        setModalError('Failed to save employee record.');
       }
     } finally {
       setIsSubmitting(false);
@@ -279,9 +417,16 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     setFormDeptId('');
     setFormDesigId('');
     setFormEmpType('FULL_TIME');
+    setFormStatus('ACTIVE');
     setFormNotes('');
-    setFormBioId('');
     setFormInitialSalary('');
+    setFormMappings([]);
+    setTerminalSearch('');
+    setIsTerminalDropdownOpen(false);
+    setSelectedTerminalId('');
+    setEnrollmentInput('');
+    setMappingError(null);
+    setModalError(null);
   };
 
   const openEditEmployee = (emp: EmployeeItem) => {
@@ -297,20 +442,62 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     setFormDeptId(emp.departmentId || '');
     setFormDesigId(emp.designationId || '');
     setFormEmpType(emp.employmentType);
+    setFormStatus(emp.status);
     setFormNotes(emp.notes || '');
-    setFormBioId(emp.biometricDeviceId || '');
     setFormInitialSalary('');
+    setFormMappings(
+      (emp.biometricMappings || []).map((m) => ({
+        terminalId: m.terminalId,
+        enrollmentId: m.enrollmentId,
+        isActive: m.isActive,
+        source: m.source,
+      }))
+    );
+    setTerminalSearch('');
+    setIsTerminalDropdownOpen(false);
+    setSelectedTerminalId(activeTerminals.length === 1 ? activeTerminals[0].id : '');
+    setEnrollmentInput('');
+    setMappingError(null);
+    setModalError(null);
     setIsEmployeeModalOpen(true);
   };
 
-  const handleDeactivateEmployee = async (emp: EmployeeItem) => {
-    if (!confirm(`Are you sure you want to deactivate employee '${emp.fullName}'? Historical accounting, salary, and attendance data will be safely preserved.`)) {
-      return;
-    }
-
+  const handleActivateEmployee = async (emp: EmployeeItem) => {
+    setActivatingEmployeeId(emp.id);
+    setErrorMessage(null);
     try {
-      await api.deactivateEmployee(emp.id);
-      setSuccessMessage(`Employee '${emp.fullName}' set to Inactive.`);
+      const updated = await api.activateEmployee(emp.id);
+      setSuccessMessage(
+        `Employee '${updated.fullName}' (${updated.employeeCode}) activated. Any mapped pending biometric punches are queued for reconciliation.`
+      );
+      if (selectedEmployee?.id === updated.id) {
+        setSelectedEmployee(updated);
+      }
+      loadData();
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        setErrorMessage(err.message);
+      } else {
+        setErrorMessage('Failed to activate employee.');
+      }
+    } finally {
+      setActivatingEmployeeId(null);
+    }
+  };
+
+  const handleConfirmDeactivateEmployee = async () => {
+    if (!deactivateTarget) return;
+    setIsDeactivating(true);
+    setErrorMessage(null);
+    try {
+      const updated = await api.deactivateEmployee(deactivateTarget.id);
+      setSuccessMessage(
+        `Employee '${updated.fullName}' (${updated.employeeCode}) set to Inactive. Historical records preserved.`
+      );
+      if (selectedEmployee?.id === updated.id) {
+        setSelectedEmployee(updated);
+      }
+      setDeactivateTarget(null);
       loadData();
     } catch (err: unknown) {
       if (err instanceof ApiError) {
@@ -318,6 +505,8 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
       } else {
         setErrorMessage('Failed to deactivate employee.');
       }
+    } finally {
+      setIsDeactivating(false);
     }
   };
 
@@ -444,19 +633,19 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     switch (status) {
       case 'ACTIVE':
         return (
-          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-950/60 text-emerald-300 border border-emerald-800">
+          <span className="text-[11px] font-semibold text-emerald-400 whitespace-nowrap">
             Active
           </span>
         );
       case 'INACTIVE':
         return (
-          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-slate-800 text-slate-400 border border-slate-700">
+          <span className="text-[11px] font-medium text-slate-400 whitespace-nowrap">
             Inactive
           </span>
         );
       case 'EXITED':
         return (
-          <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-rose-950/60 text-rose-300 border border-rose-800">
+          <span className="text-[11px] font-semibold text-rose-400 whitespace-nowrap">
             Exited
           </span>
         );
@@ -689,6 +878,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                       <th className="py-3 px-4">Code</th>
                       <th className="py-3 px-4">Employee</th>
                       <th className="py-3 px-4">Department & Designation</th>
+                      <th className="py-3 px-4">Biometric Mapping</th>
                       <th className="py-3 px-4">Joining Date</th>
                       <th className="py-3 px-4 text-right">Fixed Salary</th>
                       <th className="py-3 px-4 text-center">Ledger Link</th>
@@ -698,9 +888,12 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800">
-                    {employees.map((emp) => (
+                    {employees.map((emp) => {
+                      const primaryMapping = emp.biometricMappings?.[0];
+                      const extraCount = (emp.biometricMappings?.length || 0) - 1;
+                      return (
                       <tr key={emp.id} className="hover:bg-slate-800/40 transition">
-                        <td className="py-3 px-4 font-mono font-semibold text-indigo-300">
+                        <td className="py-3 px-4 font-mono tabular-nums font-semibold text-indigo-300">
                           {emp.employeeCode}
                         </td>
                         <td className="py-3 px-4">
@@ -717,8 +910,27 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                             {emp.departmentName || <span className="text-slate-500 italic">No Dept</span>}
                           </div>
                         </td>
-                        <td className="py-3 px-4 text-slate-400">{emp.dateOfJoining}</td>
-                        <td className="py-3 px-4 text-right font-mono font-semibold text-emerald-400">
+                        <td className="py-3 px-4">
+                          {primaryMapping ? (
+                            <div className="space-y-0.5">
+                              <div className="text-slate-200 font-medium truncate max-w-[170px]" title={primaryMapping.terminalName || primaryMapping.terminalId}>
+                                {primaryMapping.terminalName || 'Biometric Terminal'}
+                              </div>
+                              <div className="text-[11px] font-mono tabular-nums text-indigo-300">
+                                ID {primaryMapping.enrollmentId}
+                                {extraCount > 0 ? ` · +${extraCount} more` : ''}
+                              </div>
+                            </div>
+                          ) : emp.biometricDeviceId ? (
+                            <div className="text-[11px] font-mono tabular-nums text-amber-300">
+                              Legacy ID {emp.biometricDeviceId}
+                            </div>
+                          ) : (
+                            <span className="text-[11px] text-slate-500">Unmapped</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-4 text-slate-400 font-mono tabular-nums">{emp.dateOfJoining}</td>
+                        <td className="py-3 px-4 text-right font-mono tabular-nums font-semibold text-emerald-400">
                           {emp.currentSalary ? (
                             formatMoney(emp.currentSalary, baseCurrency, { decimals: roundingPrecision })
                           ) : (
@@ -727,20 +939,20 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                         </td>
                         <td className="py-3 px-4 text-center">
                           {emp.ledgerId ? (
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-mono bg-indigo-950/80 text-indigo-300 border border-indigo-800">
+                            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-indigo-300">
                               <BookOpen className="w-3 h-3 text-indigo-400" /> Linked
                             </span>
                           ) : (
-                            <span className="text-[10px] text-slate-500">Unlinked</span>
+                            <span className="text-[11px] text-slate-500">Unlinked</span>
                           )}
                         </td>
                         <td className="py-3 px-4 text-center">
                           {emp.userId ? (
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold bg-emerald-950/60 text-emerald-300 border border-emerald-800">
+                            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-300">
                               <UserCheck className="w-3 h-3" /> Enabled
                             </span>
                           ) : (
-                            <span className="text-[10px] text-slate-500">No Login</span>
+                            <span className="text-[11px] text-slate-500">No Login</span>
                           )}
                         </td>
                         <td className="py-3 px-4 text-center">{getStatusBadge(emp.status)}</td>
@@ -759,9 +971,19 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                           >
                             <Edit2 className="w-4 h-4" />
                           </button>
-                          {emp.status === 'ACTIVE' && (
+                          {emp.status !== 'ACTIVE' ? (
                             <button
-                              onClick={() => handleDeactivateEmployee(emp)}
+                              onClick={() => handleActivateEmployee(emp)}
+                              disabled={activatingEmployeeId === emp.id}
+                              className="inline-flex items-center gap-1 px-2 py-1 hover:bg-emerald-950/60 rounded text-emerald-400 hover:text-emerald-300 text-[11px] font-semibold transition cursor-pointer disabled:opacity-50"
+                              title="Activate Employee"
+                            >
+                              <UserCheck className="w-3.5 h-3.5" />
+                              <span>{activatingEmployeeId === emp.id ? 'Activating...' : 'Activate'}</span>
+                            </button>
+                          ) : (
+                            <button
+                              onClick={() => setDeactivateTarget(emp)}
                               className="p-1 hover:bg-slate-800 rounded text-rose-400 hover:text-rose-300 transition cursor-pointer"
                               title="Deactivate Employee"
                             >
@@ -770,12 +992,38 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                           )}
                         </td>
                       </tr>
-                    ))}
+                    );})}
                   </tbody>
                 </table>
               </div>
             )}
           </div>
+          {totalEmployees > employees.length && (
+            <div className="flex items-center justify-between text-xs text-slate-400 pt-1">
+              <span className="tabular-nums">
+                Showing {employees.length} of {totalEmployees} employees
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={currentPage <= 1}
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 rounded text-slate-200 cursor-pointer"
+                >
+                  Previous
+                </button>
+                <span className="font-mono tabular-nums text-slate-300">Page {currentPage}</span>
+                <button
+                  type="button"
+                  disabled={currentPage * 20 >= totalEmployees}
+                  onClick={() => setCurrentPage((p) => p + 1)}
+                  className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 rounded text-slate-200 cursor-pointer"
+                >
+                  Next
+                </button>
+              </div>
+            </div>
+          )}
         </>
       )}
 
@@ -876,8 +1124,21 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                     <div className="font-semibold text-slate-200">{selectedEmployee.dateOfBirth || '—'}</div>
                   </div>
                   <div className="p-3 bg-slate-800/40 border border-slate-800 rounded-xl space-y-1">
-                    <span className="text-slate-400 text-[10px] uppercase font-semibold">Biometric User ID</span>
-                    <div className="font-mono text-slate-200">{selectedEmployee.biometricDeviceId || '—'}</div>
+                    <span className="text-slate-400 text-[10px] uppercase font-semibold">Biometric Enrollment Mappings</span>
+                    {selectedEmployee.biometricMappings && selectedEmployee.biometricMappings.length > 0 ? (
+                      <div className="space-y-1 pt-0.5">
+                        {selectedEmployee.biometricMappings.map((m) => (
+                          <div key={m.id} className="font-mono tabular-nums text-indigo-300 text-[11px]">
+                            {m.terminalName || m.terminalId}
+                            {m.deviceSerialNumber ? ` (${m.deviceSerialNumber})` : ''} · ID {m.enrollmentId}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="font-mono tabular-nums text-slate-200">
+                        {selectedEmployee.biometricDeviceId ? `Legacy ID ${selectedEmployee.biometricDeviceId}` : '—'}
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -1025,7 +1286,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                         Code: {selectedEmployee.ledgerCode || '—'}
                       </div>
                     </div>
-                    <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-900/60 text-emerald-300 border border-emerald-700">
+                    <span className="text-xs font-semibold text-emerald-300">
                       Connected
                     </span>
                   </div>
@@ -1100,10 +1361,10 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                         <div className="text-sm font-bold text-white mt-0.5">{selectedEmployee.userEmail}</div>
                       </div>
                       <span
-                        className={`px-2.5 py-1 rounded-full text-xs font-semibold ${
+                        className={`text-xs font-semibold ${
                           selectedEmployee.userActive
-                            ? 'bg-emerald-950 text-emerald-300 border border-emerald-800'
-                            : 'bg-rose-950 text-rose-300 border border-rose-800'
+                            ? 'text-emerald-300'
+                            : 'text-rose-300'
                         }`}
                       >
                         {selectedEmployee.userActive ? 'Active Login' : 'Disabled'}
@@ -1210,7 +1471,14 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
             </div>
 
             <form onSubmit={handleEmployeeSubmit} className="space-y-4 text-xs">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+              {modalError && (
+                <div className="p-3 rounded-lg bg-rose-950/60 border border-rose-800 text-rose-200 flex items-start gap-2">
+                  <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                  <span>{modalError}</span>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
                 <div>
                   <label className="block text-slate-400 mb-1">
                     Employee Code <span className="text-rose-400">*</span>
@@ -1237,6 +1505,21 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                     onChange={(e) => setFormName(e.target.value)}
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
                   />
+                </div>
+
+                <div>
+                  <label className="block text-slate-400 mb-1">
+                    Employment Status <span className="text-rose-400">*</span>
+                  </label>
+                  <select
+                    value={formStatus}
+                    onChange={(e) => setFormStatus(e.target.value as EmployeeStatus)}
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                  >
+                    <option value="ACTIVE">Active</option>
+                    <option value="INACTIVE">Inactive</option>
+                    <option value="EXITED">Exited</option>
+                  </select>
                 </div>
               </div>
 
@@ -1329,7 +1612,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                   <label className="block text-slate-400 mb-1">Phone Number</label>
                   <input
                     type="text"
-                    placeholder="+1 555-0199"
+                    placeholder="+91 98765 43210"
                     value={formPhone}
                     onChange={(e) => setFormPhone(e.target.value)}
                     className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
@@ -1338,33 +1621,268 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
               </div>
 
               {!editingEmployee && (
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3 p-3 rounded-xl bg-slate-800/40 border border-slate-800">
-                  <div>
-                    <label className="block text-emerald-400 font-semibold mb-1">
-                      Initial Monthly Fixed Salary ({currencySymbol})
-                    </label>
-                    <input
-                      type="number"
-                      step="0.01"
-                      min="0"
-                      placeholder="e.g. 5000.00 (Optional)"
-                      value={formInitialSalary}
-                      onChange={(e) => setFormInitialSalary(e.target.value)}
-                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono focus:outline-none focus:border-emerald-500"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-slate-400 mb-1">Biometric Device ID</label>
-                    <input
-                      type="text"
-                      placeholder="e.g. BIO-101"
-                      value={formBioId}
-                      onChange={(e) => setFormBioId(e.target.value)}
-                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
-                    />
-                  </div>
+                <div>
+                  <label className="block text-emerald-400 font-semibold mb-1">
+                    Initial Monthly Fixed Salary ({currencySymbol})
+                  </label>
+                  <input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    placeholder="e.g. 25000.00 (Optional)"
+                    value={formInitialSalary}
+                    onChange={(e) => setFormInitialSalary(e.target.value)}
+                    className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono tabular-nums focus:outline-none focus:border-emerald-500"
+                  />
                 </div>
               )}
+
+              {/* Searchable Biometric Terminal & Enrollment Mappings */}
+              <div className="p-3.5 rounded-xl bg-slate-800/40 border border-slate-800 space-y-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-slate-200 font-semibold">
+                    <Fingerprint className="w-4 h-4 text-indigo-400" />
+                    <span>Biometric Terminal &amp; Enrollment Mappings</span>
+                  </div>
+                  <span className="text-[11px] text-slate-400 tabular-nums">
+                    {formMappings.length} mapped
+                  </span>
+                </div>
+
+                {editingEmployee?.biometricDeviceId && formMappings.length === 0 && (
+                  <div className="p-2.5 rounded-lg bg-amber-950/30 border border-amber-800/50 text-[11px] text-amber-200">
+                    Legacy Biometric Device ID <span className="font-mono">{editingEmployee.biometricDeviceId}</span> is recorded without a terminal binding. Select the terminal below and add Enrollment ID <span className="font-mono">{editingEmployee.biometricDeviceId}</span> to bind it explicitly.
+                  </div>
+                )}
+
+                {activeTerminals.length === 0 ? (
+                  <div className="p-3 rounded-lg bg-slate-900/70 border border-slate-800 text-[11px] text-slate-400 flex items-center gap-2">
+                    <Server className="w-4 h-4 text-slate-500 shrink-0" />
+                    <span>
+                      No active biometric terminals are registered for this company. Register a terminal under Attendance &rarr; Biometric Devices first.
+                    </span>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                      {/* Searchable Biometric Terminal Selector */}
+                      <div className="relative">
+                        <label className="block text-slate-400 mb-1">Biometric Terminal</label>
+                        <button
+                          type="button"
+                          onClick={() => setIsTerminalDropdownOpen((prev) => !prev)}
+                          className="w-full flex items-center justify-between bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
+                        >
+                          <span className="truncate">
+                            {selectedTerminal
+                              ? `${selectedTerminal.name} · ${selectedTerminal.deviceSerialNumber}`
+                              : 'Select registered terminal...'}
+                          </span>
+                          <ChevronDown className="w-3.5 h-3.5 text-slate-400 shrink-0 ml-2" />
+                        </button>
+
+                        {isTerminalDropdownOpen && (
+                          <div className="absolute z-20 mt-1 w-full bg-slate-900 border border-slate-700 rounded-xl shadow-xl overflow-hidden">
+                            <div className="p-2 border-b border-slate-800">
+                              <div className="relative">
+                                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+                                <input
+                                  type="text"
+                                  autoFocus
+                                  placeholder="Search terminal name, model, serial, IP..."
+                                  value={terminalSearch}
+                                  onChange={(e) => setTerminalSearch(e.target.value)}
+                                  className="w-full bg-slate-800 border border-slate-700 rounded-md pl-8 pr-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                                />
+                              </div>
+                            </div>
+                            <div className="max-h-44 overflow-y-auto divide-y divide-slate-800/70">
+                              {filteredTerminals.length === 0 ? (
+                                <div className="p-3 text-[11px] text-slate-500 text-center">
+                                  No active biometric terminals match &ldquo;{terminalSearch}&rdquo;.
+                                </div>
+                              ) : (
+                                filteredTerminals.map((term) => (
+                                  <button
+                                    key={term.id}
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedTerminalId(term.id);
+                                      setIsTerminalDropdownOpen(false);
+                                      setMappingError(null);
+                                    }}
+                                    className={`w-full text-left px-3 py-2 hover:bg-slate-800/80 transition cursor-pointer ${
+                                      selectedTerminalId === term.id ? 'bg-indigo-950/50' : ''
+                                    }`}
+                                  >
+                                    <div className="flex items-center justify-between gap-2">
+                                      <span className="font-semibold text-slate-100 truncate">
+                                        {term.name}
+                                      </span>
+                                      <span
+                                        className={`text-[10px] font-semibold shrink-0 ${
+                                          term.status === 'ONLINE'
+                                            ? 'text-emerald-400'
+                                            : term.status === 'ERROR'
+                                            ? 'text-rose-400'
+                                            : 'text-slate-400'
+                                        }`}
+                                      >
+                                        {term.status}
+                                      </span>
+                                    </div>
+                                    <div className="text-[11px] text-slate-400 font-mono tabular-nums truncate">
+                                      {term.terminalModel} · {term.deviceSerialNumber}
+                                      {term.ipAddress ? ` · ${term.ipAddress}:${term.port}` : ''}
+                                    </div>
+                                  </button>
+                                ))
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Searchable / Direct Enrollment ID Input */}
+                      <div>
+                        <label className="block text-slate-400 mb-1">Device Enrollment ID</label>
+                        <div className="flex items-center gap-2">
+                          <input
+                            type="text"
+                            placeholder={
+                              selectedTerminal
+                                ? 'Search hardware user or enter ID (e.g. 101)'
+                                : 'Select a terminal first'
+                            }
+                            disabled={!selectedTerminalId}
+                            value={enrollmentInput}
+                            onChange={(e) => {
+                              setEnrollmentInput(e.target.value);
+                              setMappingError(null);
+                            }}
+                            className="flex-1 bg-slate-800 border border-slate-700 disabled:opacity-50 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono tabular-nums focus:outline-none focus:border-indigo-500"
+                          />
+                          <button
+                            type="button"
+                            disabled={!selectedTerminalId || !enrollmentInput.trim()}
+                            onClick={() => handleAddMapping()}
+                            className="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                          >
+                            + Add Mapping
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Real-time duplicate conflict check indicator */}
+                    {selectedTerminalId &&
+                      enrollmentInput.trim() &&
+                      (() => {
+                        const liveConflict = findExternalMappingConflict(
+                          selectedTerminalId,
+                          enrollmentInput
+                        );
+                        if (!liveConflict) return null;
+                        return (
+                          <div className="p-2 rounded-lg bg-rose-950/50 border border-rose-800 text-[11px] text-rose-200">
+                            Enrollment ID <span className="font-mono">{enrollmentInput.trim()}</span> on this terminal is already mapped to {liveConflict.employeeName} ({liveConflict.employeeCode}).
+                          </div>
+                        );
+                      })()}
+
+                    {/* Real hardware-synced user suggestions (only when synced from device) */}
+                    {selectedTerminalId && syncedDeviceUsersForSelected.length > 0 && (
+                      <div className="space-y-1">
+                        <div className="text-[11px] text-slate-400">
+                          Synced Hardware Users on {selectedTerminal?.name}:
+                        </div>
+                        <div className="max-h-28 overflow-y-auto border border-slate-800 rounded-lg divide-y divide-slate-800/70 bg-slate-900/60">
+                          {syncedDeviceUsersForSelected.map((u) => {
+                            const conflict = findExternalMappingConflict(
+                              selectedTerminalId,
+                              u.enrollmentId
+                            );
+                            const alreadyStaged = formMappings.some(
+                              (m) =>
+                                m.terminalId === selectedTerminalId &&
+                                m.enrollmentId === u.enrollmentId
+                            );
+                            return (
+                              <button
+                                key={u.enrollmentId}
+                                type="button"
+                                disabled={Boolean(conflict) || alreadyStaged}
+                                onClick={() => handleAddMapping(u.enrollmentId, 'DEVICE_SYNC')}
+                                className="w-full text-left px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-slate-800/70 disabled:opacity-50 text-[11px] cursor-pointer"
+                              >
+                                <span className="font-mono tabular-nums text-slate-200">
+                                  ID {u.enrollmentId}
+                                  {u.name ? ` · ${u.name}` : ''}
+                                </span>
+                                <span className="text-slate-400">
+                                  {alreadyStaged
+                                    ? 'Added'
+                                    : conflict
+                                    ? `Mapped to ${conflict.employeeCode}`
+                                    : 'Select'}
+                                </span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {mappingError && (
+                      <div className="p-2 rounded-lg bg-rose-950/50 border border-rose-800 text-[11px] text-rose-200">
+                        {mappingError}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Mapped Terminal List */}
+                {formMappings.length > 0 && (
+                  <div className="border border-slate-800 rounded-lg divide-y divide-slate-800 bg-slate-900/50">
+                    {formMappings.map((m) => {
+                      const term = activeTerminals.find((t) => t.id === m.terminalId);
+                      return (
+                        <div
+                          key={`${m.terminalId}::${m.enrollmentId}`}
+                          className="px-3 py-2 flex items-center justify-between gap-3 text-[11px]"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-semibold text-slate-200 truncate">
+                              {term ? term.name : m.terminalId}
+                              {term ? (
+                                <span className="font-mono text-slate-400 font-normal">
+                                  {' '}
+                                  · {term.terminalModel} · {term.deviceSerialNumber}
+                                </span>
+                              ) : null}
+                            </div>
+                            <div className="font-mono tabular-nums text-indigo-300">
+                              Enrollment ID: {m.enrollmentId}
+                              <span className="font-sans text-slate-400">
+                                {' '}
+                                · {m.source === 'DEVICE_SYNC' ? 'Hardware Synced' : 'Manual Entry'}
+                              </span>
+                            </div>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveMapping(m.terminalId, m.enrollmentId)}
+                            className="p-1 text-slate-400 hover:text-rose-400 cursor-pointer shrink-0"
+                            title="Remove biometric mapping"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
 
               <div>
                 <label className="block text-slate-400 mb-1">Residential Address</label>
@@ -1405,6 +1923,57 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* In-App Employee Deactivation Confirmation Modal */}
+      {deactivateTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-1">
+                <h3 className="text-base font-bold text-white">Deactivate Employee</h3>
+                <p className="text-xs text-slate-400">
+                  {deactivateTarget.fullName} ({deactivateTarget.employeeCode})
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDeactivateTarget(null)}
+                className="text-slate-400 hover:text-white cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-3.5 rounded-xl bg-slate-800/50 border border-slate-700 text-xs text-slate-300 leading-relaxed space-y-1.5">
+              <p>
+                Deactivating this employee preserves all historical attendance, salary revisions, payroll records, and audit logs.
+              </p>
+              <p className="text-slate-400">
+                New biometric punches received while the employee is Inactive will be recorded in the punch log as <span className="font-mono text-slate-200">IGNORED</span> and will not create attendance entries. You can re-activate this employee anytime.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2">
+              <button
+                type="button"
+                onClick={() => setDeactivateTarget(null)}
+                disabled={isDeactivating}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs rounded-lg cursor-pointer"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmDeactivateEmployee}
+                disabled={isDeactivating}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-500 text-white text-xs font-semibold rounded-lg cursor-pointer disabled:opacity-50"
+              >
+                {isDeactivating ? 'Deactivating...' : 'Confirm Deactivate'}
+              </button>
+            </div>
           </div>
         </div>
       )}

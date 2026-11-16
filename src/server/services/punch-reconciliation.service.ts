@@ -9,6 +9,7 @@ import {
   AttendanceStatus,
 } from '../../shared/types.js';
 import { AuditService } from './audit.service.js';
+import { BiometricMappingService } from './biometric-mapping.service.js';
 
 const DEBOUNCE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
 
@@ -205,7 +206,8 @@ export class PunchReconciliationService {
    */
   static async reconcilePunch(
     punchId: string,
-    correlationId?: string
+    correlationId?: string,
+    options?: { keepUnmappedPending?: boolean }
   ): Promise<PunchReconciliationItemResult> {
     return prisma.$transaction(async (tx) => {
       const punch = await tx.rawPunchLog.findUnique({
@@ -244,20 +246,38 @@ export class PunchReconciliationService {
         };
       }
 
-      // A. Employee Mapping Resolution
+      // A. Employee Mapping Resolution (Terminal-scoped mapping -> legacy fallback)
       let employee = punch.matchedEmployee;
       if (!employee) {
-        // Strictly resolve active employee in the same tenant by biometricDeviceId
-        const foundEmployee = await tx.employee.findFirst({
-          where: {
-            companyId: punch.companyId,
-            biometricDeviceId: punch.userEnrollmentId.trim(),
-            status: 'ACTIVE',
-          },
-          include: { shift: true },
-        });
+        const resolution = await BiometricMappingService.resolveEmployeeForPunch(
+          punch.companyId,
+          punch.terminalId,
+          punch.userEnrollmentId,
+          tx
+        );
+        const foundEmployee = resolution.employee;
 
         if (!foundEmployee) {
+          if (options?.keepUnmappedPending) {
+            const pendingReason = `Pending enrollment mapping: No employee mapped for enrollment ID '${punch.userEnrollmentId}' on this terminal.`;
+            await tx.rawPunchLog.update({
+              where: { id: punch.id },
+              data: {
+                syncStatus: 'PENDING',
+                errorMessage: pendingReason,
+              },
+            });
+
+            return {
+              punchId: punch.id,
+              userEnrollmentId: punch.userEnrollmentId,
+              matchedEmployeeId: null,
+              workDate: null,
+              status: 'PENDING',
+              message: pendingReason,
+            };
+          }
+
           const reason = `Unmapped biometric enrollment ID: No active employee found with biometricDeviceId '${punch.userEnrollmentId}' in company.`;
           await tx.rawPunchLog.update({
             where: { id: punch.id },
@@ -277,7 +297,24 @@ export class PunchReconciliationService {
           };
         }
 
-        // Link matched employee
+        // Cross-tenant guard
+        if (foundEmployee.companyId !== punch.companyId) {
+          const reason = 'Security violation: Employee company ID does not match punch company ID.';
+          await tx.rawPunchLog.update({
+            where: { id: punch.id },
+            data: { syncStatus: 'ERROR', errorMessage: reason },
+          });
+          return {
+            punchId: punch.id,
+            userEnrollmentId: punch.userEnrollmentId,
+            matchedEmployeeId: null,
+            workDate: null,
+            status: 'ERROR',
+            message: reason,
+          };
+        }
+
+        // Link matched employee for audit traceability
         await tx.rawPunchLog.update({
           where: { id: punch.id },
           data: { matchedEmployeeId: foundEmployee.id },
@@ -297,6 +334,28 @@ export class PunchReconciliationService {
           matchedEmployeeId: null,
           workDate: null,
           status: 'ERROR',
+          message: reason,
+        };
+      }
+
+      // A2. Inactive Employee Policy Enforcement
+      // Preserves RawPunchLog audit trail as IGNORED without creating or mutating Attendance records
+      if (employee.status !== undefined && employee.status !== 'ACTIVE') {
+        const reason = `Inactive employee policy: Employee '${employee.fullName || employee.employeeCode || employee.id}' has status '${employee.status}'. Attendance records are only generated for ACTIVE employees.`;
+        await tx.rawPunchLog.update({
+          where: { id: punch.id },
+          data: {
+            matchedEmployeeId: employee.id,
+            syncStatus: 'IGNORED',
+            errorMessage: reason,
+          },
+        });
+        return {
+          punchId: punch.id,
+          userEnrollmentId: punch.userEnrollmentId,
+          matchedEmployeeId: employee.id,
+          workDate: null,
+          status: 'IGNORED',
           message: reason,
         };
       }
@@ -710,11 +769,13 @@ export class PunchReconciliationService {
     correlationId?: string
   ): Promise<PunchReconciliationResponse> {
     const batchLimit = Math.min(500, Math.max(1, options?.batchSize || 100));
+    const keepUnmappedPending = options?.keepUnmappedPending !== false;
 
     const where: {
       companyId: string;
       syncStatus: PunchSyncStatus | { in: PunchSyncStatus[] };
       terminalId?: string;
+      userEnrollmentId?: string;
     } = {
       companyId,
       syncStatus: options?.retryErrors
@@ -724,6 +785,9 @@ export class PunchReconciliationService {
 
     if (options?.terminalId) {
       where.terminalId = options.terminalId;
+    }
+    if (options?.userEnrollmentId && options.userEnrollmentId.trim()) {
+      where.userEnrollmentId = options.userEnrollmentId.trim();
     }
 
     const pendingPunches = await prisma.rawPunchLog.findMany({
@@ -735,15 +799,19 @@ export class PunchReconciliationService {
 
     const results: PunchReconciliationItemResult[] = [];
     let processedCount = 0;
+    let pendingCount = 0;
     let ignoredCount = 0;
     let errorCount = 0;
 
     for (const punch of pendingPunches) {
       try {
-        const itemResult = await this.reconcilePunch(punch.id, correlationId);
+        const itemResult = await this.reconcilePunch(punch.id, correlationId, {
+          keepUnmappedPending,
+        });
         results.push(itemResult);
 
         if (itemResult.status === 'PROCESSED') processedCount++;
+        else if (itemResult.status === 'PENDING') pendingCount++;
         else if (itemResult.status === 'IGNORED') ignoredCount++;
         else errorCount++;
       } catch (err: unknown) {
@@ -776,8 +844,11 @@ export class PunchReconciliationService {
         entityId: companyId,
         correlationId,
         details: {
+          terminalId: options?.terminalId || null,
+          userEnrollmentId: options?.userEnrollmentId || null,
           totalEvaluated: pendingPunches.length,
           processed: processedCount,
+          pending: pendingCount,
           ignored: ignoredCount,
           errors: errorCount,
         },
@@ -788,10 +859,49 @@ export class PunchReconciliationService {
       success: true,
       totalEvaluated: pendingPunches.length,
       processed: processedCount,
+      pending: pendingCount,
       ignored: ignoredCount,
       errors: errorCount,
       results,
     };
+  }
+
+  /**
+   * Reconciles eligible pending (and previously unmapped error) punches strictly for an exact
+   * (terminalId, userEnrollmentId) mapping without touching other unmapped enrollment IDs.
+   */
+  static async reconcileForEmployeeMapping(
+    companyId: string,
+    terminalId: string,
+    userEnrollmentId: string,
+    actorUserId?: string,
+    correlationId?: string
+  ): Promise<PunchReconciliationResponse> {
+    const trimmedEnrollmentId = userEnrollmentId.trim();
+    if (!terminalId || !trimmedEnrollmentId) {
+      return {
+        success: true,
+        totalEvaluated: 0,
+        processed: 0,
+        pending: 0,
+        ignored: 0,
+        errors: 0,
+        results: [],
+      };
+    }
+
+    return this.reconcilePendingPunches(
+      companyId,
+      {
+        terminalId,
+        userEnrollmentId: trimmedEnrollmentId,
+        batchSize: 500,
+        retryErrors: true,
+        keepUnmappedPending: true,
+      },
+      actorUserId,
+      correlationId
+    );
   }
 
   /**

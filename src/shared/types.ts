@@ -1175,6 +1175,54 @@ export interface CreateSalaryRevisionRequest {
   notes?: string | null;
 }
 
+export type BiometricEnrollmentMappingSource = 'EXPLICIT' | 'DEVICE_SYNC';
+
+export interface EmployeeBiometricMappingItem {
+  id: string;
+  companyId: string;
+  employeeId: string;
+  terminalId: string;
+  terminalName?: string | null;
+  terminalModel?: string | null;
+  deviceSerialNumber?: string | null;
+  terminalIsActive?: boolean;
+  enrollmentId: string;
+  isActive: boolean;
+  source: BiometricEnrollmentMappingSource;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface EmployeeBiometricMappingInput {
+  terminalId: string;
+  enrollmentId: string;
+  isActive?: boolean;
+  source?: BiometricEnrollmentMappingSource;
+}
+
+export interface DeviceEnrolledUserItem {
+  uid?: number;
+  enrollmentId: string;
+  name?: string | null;
+  cardNo?: string | null;
+  terminalId: string;
+  syncedAt?: string | null;
+}
+
+export interface BiometricTerminalEnrollmentOptionsResponse {
+  terminals: BiometricTerminalItem[];
+  deviceUsersByTerminal: Record<string, DeviceEnrolledUserItem[]>;
+  activeMappings: Array<{
+    id: string;
+    employeeId: string;
+    employeeCode: string;
+    employeeName: string;
+    employeeStatus: EmployeeStatus;
+    terminalId: string;
+    enrollmentId: string;
+  }>;
+}
+
 export interface EmployeeItem {
   id: string;
   companyId: string;
@@ -1194,6 +1242,7 @@ export interface EmployeeItem {
   status: EmployeeStatus;
   notes: string | null;
   biometricDeviceId: string | null;
+  biometricMappings?: EmployeeBiometricMappingItem[];
   userId: string | null;
   userEmail?: string | null;
   userActive?: boolean;
@@ -1224,8 +1273,10 @@ export interface CreateEmployeeRequest {
   departmentId?: string | null;
   designationId?: string | null;
   employmentType?: EmploymentType;
+  status?: EmployeeStatus;
   notes?: string | null;
   biometricDeviceId?: string | null;
+  biometricMappings?: EmployeeBiometricMappingInput[];
   initialSalary?: string | number;
   shiftId?: string | null;
 }
@@ -1245,6 +1296,7 @@ export interface UpdateEmployeeRequest {
   status?: EmployeeStatus;
   notes?: string | null;
   biometricDeviceId?: string | null;
+  biometricMappings?: EmployeeBiometricMappingInput[];
   shiftId?: string | null;
 }
 
@@ -1667,6 +1719,12 @@ export interface TerminalHeartbeatRequest {
   lastProcessedPunchCount?: number;
   lastSyncAttemptAt?: string;
   lastSyncAt?: string;
+  deviceUsers?: Array<{
+    uid?: number;
+    enrollmentId: string;
+    name?: string | null;
+    cardNo?: string | null;
+  }>;
 }
 
 export interface TerminalHeartbeatResponse {
@@ -1724,8 +1782,10 @@ export interface RawPunchLogItem {
 
 export interface PunchReconciliationOptions {
   terminalId?: string;
+  userEnrollmentId?: string;
   batchSize?: number;
   retryErrors?: boolean;
+  keepUnmappedPending?: boolean;
 }
 
 export interface PunchReconciliationItemResult {
@@ -1741,6 +1801,7 @@ export interface PunchReconciliationResponse {
   success: boolean;
   totalEvaluated: number;
   processed: number;
+  pending?: number;
   ignored: number;
   errors: number;
   results: PunchReconciliationItemResult[];

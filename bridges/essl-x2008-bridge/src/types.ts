@@ -73,6 +73,13 @@ export interface DeviceAttendanceRecord {
   recordSequence: number;
 }
 
+export interface DeviceEnrolledUser {
+  uid: number;
+  enrollmentId: string;
+  name: string | null;
+  cardNo: string | null;
+}
+
 /**
  * Isolated Hardware Protocol Adapter Contract.
  * Implementations MUST strictly read logs without deleting device attendance data.
@@ -82,6 +89,7 @@ export interface IBiometricProtocolAdapter {
   connect(options: ProtocolConnectOptions): Promise<void>;
   getDeviceInfo(): Promise<DeviceInfo>;
   getAttendanceLogs(): Promise<DeviceAttendanceRecord[]>;
+  getUsers?(): Promise<DeviceEnrolledUser[]>;
   disconnect(): Promise<void>;
 }
 

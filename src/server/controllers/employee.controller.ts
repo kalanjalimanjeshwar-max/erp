@@ -1,5 +1,6 @@
 import { Request, Response } from 'express';
 import { EmployeeService } from '../services/employee.service.js';
+import { BiometricMappingService } from '../services/biometric-mapping.service.js';
 import { AuthUser, EmployeeStatus } from '../../shared/types.js';
 
 export class EmployeeController {
@@ -39,6 +40,22 @@ export class EmployeeController {
       res.status(status).json({
         error: {
           code: 'EMPLOYEE_LIST_FAILED',
+          message: (err as Error).message,
+        },
+      });
+    }
+  }
+
+  static async getBiometricOptions(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const options = await BiometricMappingService.getEnrollmentOptionsForCompany(actor.companyId);
+      res.json(options);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: 'EMPLOYEE_BIOMETRIC_OPTIONS_FAILED',
           message: (err as Error).message,
         },
       });
@@ -102,7 +119,7 @@ export class EmployeeController {
       const employee = await EmployeeService.createEmployee(
         actor,
         req.body,
-        req.headers['x-correlation-id'] as string
+        req.correlationId || (req.headers['x-correlation-id'] as string)
       );
       res.status(201).json(employee);
     } catch (err: unknown) {
@@ -123,7 +140,7 @@ export class EmployeeController {
         actor,
         req.params.id,
         req.body,
-        req.headers['x-correlation-id'] as string
+        req.correlationId || (req.headers['x-correlation-id'] as string)
       );
       res.json(employee);
     } catch (err: unknown) {
@@ -137,13 +154,55 @@ export class EmployeeController {
     }
   }
 
+  static async activate(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const employee = await EmployeeService.activateEmployee(
+        actor,
+        req.params.id,
+        req.correlationId || (req.headers['x-correlation-id'] as string)
+      );
+      res.json(employee);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: 'EMPLOYEE_ACTIVATE_FAILED',
+          message: (err as Error).message,
+        },
+      });
+    }
+  }
+
+  static async updateBiometricMappings(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const mappings = Array.isArray(req.body) ? req.body : req.body?.mappings;
+      const result = await EmployeeService.updateEmployeeBiometricMappings(
+        actor,
+        req.params.id,
+        mappings,
+        req.correlationId || (req.headers['x-correlation-id'] as string)
+      );
+      res.json(result);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: status === 409 ? 'BIOMETRIC_MAPPING_CONFLICT' : 'EMPLOYEE_BIOMETRIC_MAPPING_FAILED',
+          message: (err as Error).message,
+        },
+      });
+    }
+  }
+
   static async deactivate(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;
       const employee = await EmployeeService.deactivateEmployee(
         actor,
         req.params.id,
-        req.headers['x-correlation-id'] as string
+        req.correlationId || (req.headers['x-correlation-id'] as string)
       );
       res.json(employee);
     } catch (err: unknown) {

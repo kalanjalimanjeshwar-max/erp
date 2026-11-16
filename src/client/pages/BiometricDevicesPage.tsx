@@ -1232,11 +1232,17 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                     <div>Evaluated {syncOutcome.totalEvaluated} raw punch records in company isolation.</div>
                   </div>
 
-                  <div className="grid grid-cols-3 gap-2 text-center text-xs">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-xs">
                     <div className="p-3 bg-slate-800/60 rounded-lg border border-slate-700/60">
                       <div className="text-[11px] text-slate-400 uppercase">Processed</div>
                       <div className="text-lg font-bold text-emerald-400 font-mono tabular-nums mt-0.5">
                         {syncOutcome.processed}
+                      </div>
+                    </div>
+                    <div className="p-3 bg-slate-800/60 rounded-lg border border-slate-700/60">
+                      <div className="text-[11px] text-slate-400 uppercase">Pending</div>
+                      <div className="text-lg font-bold text-amber-400 font-mono tabular-nums mt-0.5">
+                        {syncOutcome.pending ?? 0}
                       </div>
                     </div>
                     <div className="p-3 bg-slate-800/60 rounded-lg border border-slate-700/60">
@@ -1597,11 +1603,17 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                   <div>Evaluated {syncOutcome.totalEvaluated} records.</div>
                 </div>
 
-                <div className="grid grid-cols-3 gap-2 text-center text-xs">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-center text-xs">
                   <div className="p-2.5 bg-slate-800/60 rounded-lg">
                     <div className="text-[10px] text-slate-400 uppercase">Processed</div>
                     <div className="text-base font-bold text-emerald-400 font-mono tabular-nums">
                       {syncOutcome.processed}
+                    </div>
+                  </div>
+                  <div className="p-2.5 bg-slate-800/60 rounded-lg">
+                    <div className="text-[10px] text-slate-400 uppercase">Pending</div>
+                    <div className="text-base font-bold text-amber-400 font-mono tabular-nums">
+                      {syncOutcome.pending ?? 0}
                     </div>
                   </div>
                   <div className="p-2.5 bg-slate-800/60 rounded-lg">

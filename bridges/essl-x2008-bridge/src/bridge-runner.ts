@@ -2,6 +2,7 @@ import {
   BridgeConfig,
   BridgeStatusSnapshot,
   DeviceAttendanceRecord,
+  DeviceEnrolledUser,
   DeviceInfo,
   IBiometricProtocolAdapter,
   NormalizedPunchEvent,
@@ -39,6 +40,7 @@ interface TerminalController {
   heartbeatTimer: NodeJS.Timeout | null;
   inFlightSync: boolean;
   inFlightHeartbeat: boolean;
+  deviceUsers?: DeviceEnrolledUser[];
 }
 
 export class BiometricBridgeRunner {
@@ -256,6 +258,16 @@ export class BiometricBridgeRunner {
       }
 
       pulledRecords = await adapter.getAttendanceLogs();
+      if (typeof adapter.getUsers === 'function') {
+        try {
+          const users = await adapter.getUsers();
+          if (Array.isArray(users) && users.length > 0) {
+            ctrl.deviceUsers = users;
+          }
+        } catch {
+          // Optional hardware user query failure must never block punch polling
+        }
+      }
       ctrl.runtime.deviceReachable = true;
       this.checkpointStore.updateStatus(term.id, term.serialNumber, { deviceInfo });
     } catch (err: unknown) {
@@ -360,6 +372,9 @@ export class BiometricBridgeRunner {
         lastProcessedPunchCount: ctrl.runtime.lastProcessedPunchCount,
         lastSyncAttemptAt: ctrl.runtime.lastSyncAttemptAt || undefined,
         lastSyncAt: ctrl.runtime.lastSuccessfulSyncAt || undefined,
+        ...(ctrl.deviceUsers && ctrl.deviceUsers.length > 0
+          ? { deviceUsers: ctrl.deviceUsers }
+          : {}),
       });
 
       const nowIso = new Date().toISOString();
