@@ -1,26 +1,125 @@
 import crypto from 'crypto';
+import net from 'net';
 import { prisma } from '../db/client.js';
 import {
   AuthUser,
   BiometricTerminalItem,
+  BiometricConnectionTestStatus,
   CreateBiometricTerminalRequest,
   CreateBiometricTerminalResponse,
   BatchPunchSubmissionRequest,
   BatchPunchSubmissionResponse,
   TerminalHeartbeatRequest,
   TerminalHeartbeatResponse,
+  TestBiometricConnectionResponse,
+  TriggerTerminalSyncResponse,
   BiometricTerminalStatus,
   BiometricVerifyType,
   PunchInOutMode,
+  PunchReconciliationOptions,
   RawPunchEventInput,
 } from '../../shared/types.js';
+import { isValidLanHost, redactSensitiveText } from '../../shared/biometric.js';
 import { AuditService } from './audit.service.js';
+import { PunchReconciliationService } from './punch-reconciliation.service.js';
 
 const VALID_VERIFY_TYPES: BiometricVerifyType[] = ['FINGERPRINT', 'CARD', 'PASSWORD', 'FACE'];
 const VALID_IN_OUT_MODES: PunchInOutMode[] = ['CHECK_IN', 'CHECK_OUT', 'BREAK_OUT', 'BREAK_IN'];
 const MAX_BATCH_PUNCHES = 500;
+const BRIDGE_TELEMETRY_SETTING_KEY = 'BIOMETRIC_BRIDGE_TELEMETRY_V1';
+const HEARTBEAT_FRESHNESS_WINDOW_MS = 5 * 60 * 1000;
+
+export interface TerminalBridgeTelemetry {
+  bridgeConnected?: boolean;
+  bridgeHost?: string | null;
+  bridgeVersion?: string | null;
+  lastBridgeHeartbeatAt?: string | null;
+  lastSyncAttemptAt?: string | null;
+  lastConnectionError?: string | null;
+  lastProcessedPunchCount?: number;
+  lastTestConnectionAt?: string | null;
+  lastTestConnectionStatus?: BiometricConnectionTestStatus | null;
+  lastTestConnectionMessage?: string | null;
+  syncRequestedAt?: string | null;
+  platform?: string | null;
+  fingerprintAlgorithm?: string | null;
+}
 
 export class BiometricService {
+  /**
+   * Non-destructively reads per-terminal bridge telemetry stored in CompanySetting
+   */
+  private static async readBridgeTelemetryMap(companyId: string): Promise<Record<string, TerminalBridgeTelemetry>> {
+    try {
+      if (typeof prisma.companySetting?.findUnique !== 'function') {
+        return {};
+      }
+      const row = await prisma.companySetting.findUnique({
+        where: {
+          companyId_key: {
+            companyId,
+            key: BRIDGE_TELEMETRY_SETTING_KEY,
+          },
+        },
+      });
+      if (!row?.value) return {};
+      const parsed = JSON.parse(row.value);
+      return parsed && typeof parsed === 'object' ? (parsed as Record<string, TerminalBridgeTelemetry>) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Non-destructively updates bridge telemetry for a single terminal inside CompanySetting
+   */
+  private static async upsertTerminalTelemetry(
+    companyId: string,
+    terminalId: string,
+    patch: Partial<TerminalBridgeTelemetry>
+  ): Promise<TerminalBridgeTelemetry> {
+    const existingMap = await this.readBridgeTelemetryMap(companyId);
+    const prev = existingMap[terminalId] || {};
+    const nextEntry: TerminalBridgeTelemetry = {
+      ...prev,
+      ...patch,
+    };
+
+    if (typeof nextEntry.lastConnectionError === 'string') {
+      nextEntry.lastConnectionError = redactSensitiveText(nextEntry.lastConnectionError).slice(0, 500);
+    }
+    if (typeof nextEntry.lastTestConnectionMessage === 'string') {
+      nextEntry.lastTestConnectionMessage = redactSensitiveText(nextEntry.lastTestConnectionMessage).slice(0, 500);
+    }
+
+    existingMap[terminalId] = nextEntry;
+
+    try {
+      if (typeof prisma.companySetting?.upsert === 'function') {
+        await prisma.companySetting.upsert({
+          where: {
+            companyId_key: {
+              companyId,
+              key: BRIDGE_TELEMETRY_SETTING_KEY,
+            },
+          },
+          update: {
+            value: JSON.stringify(existingMap),
+          },
+          create: {
+            companyId,
+            key: BRIDGE_TELEMETRY_SETTING_KEY,
+            value: JSON.stringify(existingMap),
+          },
+        });
+      }
+    } catch {
+      // Non-fatal: mocked tests or transient telemetry write failure must not abort punch ingestion
+    }
+
+    return nextEntry;
+  }
+
   /**
    * Lists registered biometric terminals scoped strictly to actor company
    */
@@ -42,21 +141,24 @@ export class BiometricService {
       where.isActive = true;
     }
 
-    const terminals = await prisma.biometricTerminal.findMany({
-      where,
-      orderBy: [{ createdAt: 'desc' }],
-      include: {
-        registeredByUser: {
-          select: { fullName: true },
+    const [terminals, telemetryMap] = await Promise.all([
+      prisma.biometricTerminal.findMany({
+        where,
+        orderBy: [{ createdAt: 'desc' }],
+        include: {
+          registeredByUser: {
+            select: { fullName: true },
+          },
         },
-      },
-    });
+      }),
+      this.readBridgeTelemetryMap(companyId),
+    ]);
 
-    return terminals.map((t) => this.mapToTerminalItem(t));
+    return terminals.map((t) => this.mapToTerminalItem(t, telemetryMap[t.id]));
   }
 
   /**
-   * Derives effective terminal ONLINE/OFFLINE status using heartbeat freshness.
+   * Derives effective terminal ONLINE/OFFLINE/ERROR/DEACTIVATED status using heartbeat freshness.
    * Documented fixed freshness window of 5 minutes (300,000 ms).
    */
   static getEffectiveStatus(terminal: {
@@ -64,7 +166,6 @@ export class BiometricService {
     isActive: boolean;
     lastHeartbeatAt: Date | null;
   }): BiometricTerminalStatus {
-    const HEARTBEAT_FRESHNESS_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
     const now = Date.now();
 
     if (!terminal.isActive || terminal.status === 'DEACTIVATED') {
@@ -80,9 +181,32 @@ export class BiometricService {
   }
 
   /**
-   * Maps a Prisma biometric terminal record to a client-safe BiometricTerminalItem
+   * Derives whether the Windows LAN Bridge daemon itself has sent a fresh heartbeat.
    */
-  static mapToTerminalItem(t: any): BiometricTerminalItem {
+  private static isBridgeFresh(
+    terminal: { isActive: boolean; status: string; lastHeartbeatAt: Date | null },
+    telemetry?: TerminalBridgeTelemetry
+  ): boolean {
+    if (!terminal.isActive || terminal.status === 'DEACTIVATED') {
+      return false;
+    }
+    const bridgeBeatIso =
+      telemetry?.lastBridgeHeartbeatAt ||
+      (terminal.lastHeartbeatAt ? new Date(terminal.lastHeartbeatAt).toISOString() : null);
+    if (!bridgeBeatIso) return false;
+    const bridgeBeatMs = new Date(bridgeBeatIso).getTime();
+    if (Number.isNaN(bridgeBeatMs)) return false;
+    const isFresh = Date.now() - bridgeBeatMs <= HEARTBEAT_FRESHNESS_WINDOW_MS;
+    if (!isFresh) return false;
+    return telemetry?.bridgeConnected !== false;
+  }
+
+  /**
+   * Maps a Prisma biometric terminal record + bridge telemetry to a client-safe BiometricTerminalItem
+   */
+  static mapToTerminalItem(t: any, telemetry?: TerminalBridgeTelemetry): BiometricTerminalItem {
+    const bridgeConnected = this.isBridgeFresh(t, telemetry);
+
     return {
       id: t.id,
       companyId: t.companyId,
@@ -107,6 +231,19 @@ export class BiometricService {
       notes: t.notes,
       createdAt: t.createdAt instanceof Date ? t.createdAt.toISOString() : new Date(t.createdAt).toISOString(),
       updatedAt: t.updatedAt instanceof Date ? t.updatedAt.toISOString() : new Date(t.updatedAt).toISOString(),
+      bridgeConnected,
+      bridgeHost: telemetry?.bridgeHost ?? null,
+      bridgeVersion: telemetry?.bridgeVersion ?? null,
+      lastBridgeHeartbeatAt: telemetry?.lastBridgeHeartbeatAt ?? null,
+      lastSyncAttemptAt: telemetry?.lastSyncAttemptAt ?? null,
+      lastConnectionError: telemetry?.lastConnectionError ?? null,
+      lastProcessedPunchCount: telemetry?.lastProcessedPunchCount ?? 0,
+      lastTestConnectionAt: telemetry?.lastTestConnectionAt ?? null,
+      lastTestConnectionStatus: telemetry?.lastTestConnectionStatus ?? null,
+      lastTestConnectionMessage: telemetry?.lastTestConnectionMessage ?? null,
+      syncRequestedAt: telemetry?.syncRequestedAt ?? null,
+      platform: telemetry?.platform ?? null,
+      fingerprintAlgorithm: telemetry?.fingerprintAlgorithm ?? null,
     };
   }
 
@@ -129,6 +266,20 @@ export class BiometricService {
     const name = (input.name || '').trim();
     if (!name) {
       const err = new Error('Terminal name is mandatory.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    const rawIp = input.ipAddress?.trim() || null;
+    if (rawIp && !isValidLanHost(rawIp)) {
+      const err = new Error('Invalid LAN IP address or hostname format.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    const resolvedPort = input.port === undefined ? 4370 : Number(input.port);
+    if (!Number.isInteger(resolvedPort) || resolvedPort < 1 || resolvedPort > 65535) {
+      const err = new Error('Hardware TCP port must be an integer between 1 and 65535.');
       (err as { statusCode?: number }).statusCode = 400;
       throw err;
     }
@@ -163,8 +314,8 @@ export class BiometricService {
         deviceSerialNumber,
         name,
         terminalModel: (input.terminalModel || 'ZKTeco-F22').trim(),
-        ipAddress: input.ipAddress?.trim() || null,
-        port: input.port && input.port > 0 ? input.port : 4370,
+        ipAddress: rawIp,
+        port: resolvedPort,
         location: input.location?.trim() || null,
         apiKeyHash,
         apiKeyPrefix,
@@ -196,53 +347,66 @@ export class BiometricService {
       },
     });
 
-    const terminalItem: BiometricTerminalItem = {
-      id: terminal.id,
-      companyId: terminal.companyId,
-      deviceSerialNumber: terminal.deviceSerialNumber,
-      name: terminal.name,
-      terminalModel: terminal.terminalModel,
-      ipAddress: terminal.ipAddress,
-      port: terminal.port,
-      location: terminal.location,
-      apiKeyPrefix: terminal.apiKeyPrefix,
-      status: terminal.status as BiometricTerminalStatus,
-      lastHeartbeatAt: terminal.lastHeartbeatAt ? terminal.lastHeartbeatAt.toISOString() : null,
-      lastSyncAt: terminal.lastSyncAt ? terminal.lastSyncAt.toISOString() : null,
-      firmwareVersion: terminal.firmwareVersion,
-      registeredByUserId: terminal.registeredByUserId,
-      registeredByUserName: terminal.registeredByUser?.fullName || null,
-      isActive: terminal.isActive,
-      notes: terminal.notes,
-      createdAt: terminal.createdAt.toISOString(),
-      updatedAt: terminal.updatedAt.toISOString(),
-    };
-
     return {
-      terminal: terminalItem,
+      terminal: this.mapToTerminalItem(terminal),
       apiKey: plainApiKey,
     };
   }
 
   /**
-   * Processes a keepalive heartbeat from an authenticated physical terminal or edge daemon
+   * Processes a keepalive heartbeat from an authenticated physical terminal or LAN bridge daemon
    */
   static async recordHeartbeat(
     terminal: any,
     payload: TerminalHeartbeatRequest,
     correlationId?: string
   ): Promise<TerminalHeartbeatResponse> {
+    if (
+      payload.deviceSerialNumber &&
+      payload.deviceSerialNumber.trim() &&
+      terminal.deviceSerialNumber &&
+      payload.deviceSerialNumber.trim() !== terminal.deviceSerialNumber
+    ) {
+      const mismatchMsg = `Serial number mismatch reported by bridge: expected '${terminal.deviceSerialNumber}', received '${payload.deviceSerialNumber.trim()}'.`;
+      await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, {
+        bridgeConnected: false,
+        lastBridgeHeartbeatAt: new Date().toISOString(),
+        lastConnectionError: mismatchMsg,
+      });
+      const err = new Error(mismatchMsg);
+      (err as { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
+    const now = new Date();
+    const hasConnectionError =
+      typeof payload.lastConnectionError === 'string' && payload.lastConnectionError.trim().length > 0;
+    const isDeviceOnline = payload.bridgeConnected !== false && !hasConnectionError;
+    const derivedStatus: BiometricTerminalStatus = hasConnectionError
+      ? 'ERROR'
+      : isDeviceOnline
+      ? 'ONLINE'
+      : 'OFFLINE';
+
     const dataToUpdate: {
       lastHeartbeatAt: Date;
       status: BiometricTerminalStatus;
       firmwareVersion?: string;
+      lastSyncAt?: Date;
     } = {
-      lastHeartbeatAt: new Date(),
-      status: 'ONLINE',
+      lastHeartbeatAt: now,
+      status: derivedStatus,
     };
 
     if (payload.firmwareVersion && payload.firmwareVersion.trim()) {
       dataToUpdate.firmwareVersion = payload.firmwareVersion.trim();
+    }
+
+    if (payload.lastSyncAt) {
+      const parsedLastSync = new Date(payload.lastSyncAt);
+      if (!Number.isNaN(parsedLastSync.getTime())) {
+        dataToUpdate.lastSyncAt = parsedLastSync;
+      }
     }
 
     await prisma.biometricTerminal.update({
@@ -250,12 +414,45 @@ export class BiometricService {
       data: dataToUpdate,
     });
 
+    const telemetryPatch: Partial<TerminalBridgeTelemetry> = {
+      bridgeConnected: payload.bridgeConnected !== false,
+      lastBridgeHeartbeatAt: now.toISOString(),
+      lastConnectionError: hasConnectionError ? redactSensitiveText(payload.lastConnectionError!.trim()) : null,
+    };
+
+    if (payload.bridgeHost) telemetryPatch.bridgeHost = payload.bridgeHost.trim().slice(0, 128);
+    if (payload.bridgeVersion) telemetryPatch.bridgeVersion = payload.bridgeVersion.trim().slice(0, 64);
+    if (payload.platform) telemetryPatch.platform = payload.platform.trim().slice(0, 64);
+    if (payload.fingerprintAlgorithm) {
+      telemetryPatch.fingerprintAlgorithm = payload.fingerprintAlgorithm.trim().slice(0, 64);
+    }
+    if (typeof payload.lastProcessedPunchCount === 'number' && payload.lastProcessedPunchCount >= 0) {
+      telemetryPatch.lastProcessedPunchCount = payload.lastProcessedPunchCount;
+    }
+    if (payload.lastSyncAttemptAt) {
+      telemetryPatch.lastSyncAttemptAt = payload.lastSyncAttemptAt;
+    }
+
+    const updatedTelemetry = await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, telemetryPatch);
+
+    // Check if an admin requested an out-of-band bridge sync after the last sync attempt
+    let syncRequested = false;
+    if (updatedTelemetry.syncRequestedAt) {
+      const reqMs = new Date(updatedTelemetry.syncRequestedAt).getTime();
+      const attemptMs = updatedTelemetry.lastSyncAttemptAt
+        ? new Date(updatedTelemetry.lastSyncAttemptAt).getTime()
+        : 0;
+      syncRequested = !Number.isNaN(reqMs) && reqMs > attemptMs;
+    }
+
     return {
       success: true,
-      serverTime: new Date().toISOString(),
+      serverTime: now.toISOString(),
       terminalId: terminal.id,
       terminalName: terminal.name,
-      status: 'ONLINE',
+      status: derivedStatus,
+      syncRequested,
+      syncRequestedAt: syncRequested ? updatedTelemetry.syncRequestedAt || null : null,
     };
   }
 
@@ -308,6 +505,11 @@ export class BiometricService {
           select: { fullName: true },
         },
       },
+    });
+
+    await this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
+      bridgeConnected: false,
+      syncRequestedAt: null,
     });
 
     await AuditService.log({
@@ -402,6 +604,218 @@ export class BiometricService {
   }
 
   /**
+   * Probes direct TCP reachability from the CoreERP server and cross-checks LAN Bridge telemetry.
+   * Never fakes hardware connectivity when the terminal sits behind a private customer LAN.
+   */
+  static async testTerminalConnection(
+    actor: AuthUser,
+    terminalId: string,
+    correlationId?: string
+  ): Promise<TestBiometricConnectionResponse> {
+    const terminal = await prisma.biometricTerminal.findFirst({
+      where: {
+        id: terminalId,
+        companyId: actor.companyId,
+      },
+      include: {
+        registeredByUser: {
+          select: { fullName: true },
+        },
+      },
+    });
+
+    if (!terminal) {
+      const err = new Error('Biometric terminal not found.');
+      (err as { statusCode?: number }).statusCode = 404;
+      throw err;
+    }
+
+    const checkedAt = new Date().toISOString();
+    const telemetryMap = await this.readBridgeTelemetryMap(actor.companyId);
+    const prevTelemetry = telemetryMap[terminal.id];
+
+    if (!terminal.isActive || terminal.status === 'DEACTIVATED') {
+      const message = 'Terminal is deactivated. Re-register or activate a device before testing.';
+      const updatedTel = await this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
+        lastTestConnectionAt: checkedAt,
+        lastTestConnectionStatus: 'DEACTIVATED',
+        lastTestConnectionMessage: message,
+      });
+      return {
+        success: false,
+        status: 'DEACTIVATED',
+        checkedAt,
+        latencyMs: null,
+        message,
+        terminal: this.mapToTerminalItem(terminal, updatedTel),
+      };
+    }
+
+    if (!terminal.ipAddress || !isValidLanHost(terminal.ipAddress)) {
+      const message = 'Terminal LAN IP address is not configured. Set a valid LAN IP (e.g. 192.168.1.201) and port 4370.';
+      const updatedTel = await this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
+        lastTestConnectionAt: checkedAt,
+        lastTestConnectionStatus: 'INVALID_CONFIG',
+        lastTestConnectionMessage: message,
+      });
+      return {
+        success: false,
+        status: 'INVALID_CONFIG',
+        checkedAt,
+        latencyMs: null,
+        message,
+        terminal: this.mapToTerminalItem(terminal, updatedTel),
+      };
+    }
+
+    // Attempt short TCP connect probe from CoreERP backend host
+    const tcpProbe = await this.probeTcpPort(terminal.ipAddress, terminal.port || 4370, 2000);
+    const bridgeFresh = this.isBridgeFresh(terminal, prevTelemetry);
+
+    let status: BiometricConnectionTestStatus;
+    let success: boolean;
+    let message: string;
+
+    if (tcpProbe.reachable) {
+      status = 'TCP_REACHABLE';
+      success = true;
+      message = `Direct TCP port ${terminal.port} on ${terminal.ipAddress} is reachable (${tcpProbe.latencyMs}ms). Ensure Windows LAN Bridge is running for ZK protocol handshake & punch polling.`;
+    } else if (bridgeFresh) {
+      status = 'BRIDGE_MANAGED';
+      success = true;
+      message = `Windows LAN Bridge (${prevTelemetry?.bridgeHost || 'LAN host'}) is connected and reporting fresh heartbeats; CoreERP server cannot reach private LAN ${terminal.ipAddress}:${terminal.port} directly (${tcpProbe.errorCode || 'LAN isolated'}).`;
+    } else {
+      status = 'UNREACHABLE';
+      success = false;
+      message = `Cannot reach ${terminal.ipAddress}:${terminal.port} directly (${tcpProbe.errorCode || 'timeout'}) and no active Windows LAN Bridge heartbeat was received in the last 5 minutes.`;
+    }
+
+    const updatedTel = await this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
+      lastTestConnectionAt: checkedAt,
+      lastTestConnectionStatus: status,
+      lastTestConnectionMessage: message,
+    });
+
+    await AuditService.log({
+      companyId: actor.companyId,
+      userId: actor.userId || actor.id,
+      action: 'BIOMETRIC_TEST_CONNECTION',
+      entity: 'BiometricTerminal',
+      entityId: terminal.id,
+      correlationId,
+      details: {
+        deviceSerialNumber: terminal.deviceSerialNumber,
+        ipAddress: terminal.ipAddress,
+        port: terminal.port,
+        status,
+        latencyMs: tcpProbe.latencyMs,
+      },
+    });
+
+    return {
+      success,
+      status,
+      checkedAt,
+      latencyMs: tcpProbe.latencyMs,
+      message,
+      terminal: this.mapToTerminalItem(terminal, updatedTel),
+    };
+  }
+
+  /**
+   * Queues an immediate bridge poll request for this terminal AND runs server-side reconciliation
+   * for any already ingested raw punches on this terminal.
+   */
+  static async triggerTerminalSync(
+    actor: AuthUser,
+    terminalId: string,
+    options?: Omit<PunchReconciliationOptions, 'terminalId'>,
+    correlationId?: string
+  ): Promise<TriggerTerminalSyncResponse> {
+    const terminal = await prisma.biometricTerminal.findFirst({
+      where: {
+        id: terminalId,
+        companyId: actor.companyId,
+      },
+      include: {
+        registeredByUser: {
+          select: { fullName: true },
+        },
+      },
+    });
+
+    if (!terminal) {
+      const err = new Error('Biometric terminal not found.');
+      (err as { statusCode?: number }).statusCode = 404;
+      throw err;
+    }
+
+    if (!terminal.isActive || terminal.status === 'DEACTIVATED') {
+      const err = new Error('Cannot sync a deactivated biometric terminal.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    const syncRequestedAt = new Date().toISOString();
+    const updatedTel = await this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
+      syncRequestedAt,
+    });
+
+    const reconciliation = await PunchReconciliationService.reconcilePendingPunches(
+      actor.companyId,
+      {
+        terminalId: terminal.id,
+        batchSize: options?.batchSize,
+        retryErrors: options?.retryErrors,
+      },
+      actor.userId || actor.id,
+      correlationId
+    );
+
+    const bridgeFresh = this.isBridgeFresh(terminal, updatedTel);
+    const message = bridgeFresh
+      ? `Queued immediate LAN poll for Windows Bridge and reconciled ${reconciliation.totalEvaluated} pending raw punches.`
+      : `Reconciled ${reconciliation.totalEvaluated} pending raw punches. Bridge pull is queued for when the Windows LAN Bridge reconnects.`;
+
+    return {
+      success: true,
+      bridgeSyncQueued: true,
+      syncRequestedAt,
+      message,
+      terminal: this.mapToTerminalItem(terminal, updatedTel),
+      reconciliation,
+    };
+  }
+
+  private static probeTcpPort(
+    host: string,
+    port: number,
+    timeoutMs: number
+  ): Promise<{ reachable: boolean; latencyMs: number | null; errorCode?: string }> {
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      let settled = false;
+      const socket = net.createConnection({ host, port });
+
+      const finish = (reachable: boolean, errorCode?: string) => {
+        if (settled) return;
+        settled = true;
+        socket.destroy();
+        resolve({
+          reachable,
+          latencyMs: reachable ? Date.now() - startedAt : null,
+          errorCode,
+        });
+      };
+
+      socket.setTimeout(timeoutMs);
+      socket.once('connect', () => finish(true));
+      socket.once('timeout', () => finish(false, 'ETIMEDOUT'));
+      socket.once('error', (err: NodeJS.ErrnoException) => finish(false, err.code || err.message));
+    });
+  }
+
+  /**
    * Ingests a batch of raw punch logs from an authenticated biometric terminal.
    * Guarantees strict idempotency and auditability without modifying finalized attendance.
    */
@@ -413,6 +827,21 @@ export class BiometricService {
     if (!payload || !Array.isArray(payload.punches)) {
       const err = new Error('Payload must contain a "punches" array of biometric events.');
       (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (
+      payload.deviceSerialNumber &&
+      payload.deviceSerialNumber.trim() &&
+      terminal.deviceSerialNumber &&
+      payload.deviceSerialNumber.trim() !== terminal.deviceSerialNumber
+    ) {
+      const mismatchMsg = `Device serial number mismatch during punch ingestion: expected '${terminal.deviceSerialNumber}', received '${payload.deviceSerialNumber.trim()}'.`;
+      await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, {
+        lastConnectionError: mismatchMsg,
+      });
+      const err = new Error(mismatchMsg);
+      (err as { statusCode?: number }).statusCode = 403;
       throw err;
     }
 
@@ -601,6 +1030,18 @@ export class BiometricService {
         },
       });
     }
+
+    const nowIso = new Date().toISOString();
+    await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, {
+      bridgeConnected: true,
+      bridgeHost: payload.bridgeHost?.trim() || undefined,
+      bridgeVersion: payload.bridgeVersion?.trim() || undefined,
+      lastBridgeHeartbeatAt: nowIso,
+      lastSyncAttemptAt: nowIso,
+      lastProcessedPunchCount: punches.length,
+      lastConnectionError: null,
+      syncRequestedAt: null,
+    });
 
     await AuditService.log({
       companyId: terminal.companyId,

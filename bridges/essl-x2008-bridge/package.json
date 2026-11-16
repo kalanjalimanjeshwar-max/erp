@@ -1,0 +1,19 @@
+{
+  "name": "@coreerp/essl-x2008-bridge",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Permanent Windows-compatible LAN Bridge for eSSL X2008 (ZLM60_TFT / VX10.0) ZKTeco TCP 4370 biometric terminals to CoreERP",
+  "type": "module",
+  "main": "dist/index.js",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "test-connection": "node dist/index.js --test-connection",
+    "sync-once": "node dist/index.js --sync-once",
+    "status": "node dist/index.js --status",
+    "diagnose": "node dist/index.js --diagnose"
+  }
+}

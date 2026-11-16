@@ -101,6 +101,57 @@ export class BiometricController {
   }
 
   /**
+   * POST /api/biometric/devices/:id/test-connection
+   * Probes TCP connectivity and evaluates LAN Bridge heartbeat state (requires BIOMETRIC:VIEW)
+   */
+  static async testConnection(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const { id } = req.params;
+      const result = await BiometricService.testTerminalConnection(actor, id, req.correlationId);
+      res.status(200).json(result);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: status === 404 ? 'TERMINAL_NOT_FOUND' : 'BIOMETRIC_TEST_CONNECTION_FAILED',
+          message: (err as Error).message || 'Failed to test terminal connectivity.',
+        },
+      });
+    }
+  }
+
+  /**
+   * POST /api/biometric/devices/:id/sync
+   * Queues immediate bridge pull and reconciles pending raw punches for this terminal (requires BIOMETRIC:EDIT)
+   */
+  static async syncTerminal(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const { id } = req.params;
+      const { batchSize, retryErrors } = req.body || {};
+      const result = await BiometricService.triggerTerminalSync(
+        actor,
+        id,
+        {
+          batchSize: typeof batchSize === 'number' ? batchSize : undefined,
+          retryErrors: retryErrors === true,
+        },
+        req.correlationId
+      );
+      res.status(200).json(result);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: status === 404 ? 'TERMINAL_NOT_FOUND' : 'BIOMETRIC_TERMINAL_SYNC_FAILED',
+          message: (err as Error).message || 'Failed to sync biometric terminal.',
+        },
+      });
+    }
+  }
+
+  /**
    * POST /api/biometric/heartbeat
    * Authenticated device heartbeat ping (authenticated via device API key)
    */

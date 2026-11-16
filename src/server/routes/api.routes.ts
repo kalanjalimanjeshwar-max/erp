@@ -233,6 +233,8 @@ apiRouter.get('/biometric/devices', requireAuth, requirePermission('BIOMETRIC', 
 apiRouter.post('/biometric/devices', requireAuth, requirePermission('BIOMETRIC', 'CREATE'), BiometricController.create);
 apiRouter.post('/biometric/devices/:id/deactivate', requireAuth, requirePermission('BIOMETRIC', 'DEACTIVATE'), BiometricController.deactivate);
 apiRouter.post('/biometric/devices/:id/rotate-key', requireAuth, requirePermission('BIOMETRIC', 'EDIT'), BiometricController.rotateKey);
+apiRouter.post('/biometric/devices/:id/test-connection', requireAuth, requirePermission('BIOMETRIC', 'VIEW'), BiometricController.testConnection);
+apiRouter.post('/biometric/devices/:id/sync', requireAuth, requirePermission('BIOMETRIC', 'EDIT'), BiometricController.syncTerminal);
 apiRouter.post('/biometric/heartbeat', requireDeviceAuth, BiometricController.heartbeat);
 apiRouter.post('/biometric/punches', requireDeviceAuth, BiometricController.ingestPunches);
 

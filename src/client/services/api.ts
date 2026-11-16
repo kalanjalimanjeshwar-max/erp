@@ -95,6 +95,8 @@ import {
   BiometricTerminalStatus,
   CreateBiometricTerminalRequest,
   CreateBiometricTerminalResponse,
+  TestBiometricConnectionResponse,
+  TriggerTerminalSyncResponse,
   BatchPunchSubmissionRequest,
   BatchPunchSubmissionResponse,
   TerminalHeartbeatRequest,
@@ -1081,6 +1083,15 @@ export const api = {
   rotateBiometricDeviceKey: (id: string) =>
     request<{ success: boolean; terminal: BiometricTerminalItem; apiKey: string }>(`/api/biometric/devices/${id}/rotate-key`, {
       method: 'POST',
+    }),
+  testBiometricDeviceConnection: (id: string) =>
+    request<TestBiometricConnectionResponse>(`/api/biometric/devices/${id}/test-connection`, {
+      method: 'POST',
+    }),
+  triggerBiometricDeviceSync: (id: string, data?: { batchSize?: number; retryErrors?: boolean }) =>
+    request<TriggerTerminalSyncResponse>(`/api/biometric/devices/${id}/sync`, {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
     }),
   sendTerminalHeartbeat: (apiKey: string, data?: TerminalHeartbeatRequest) =>
     request<TerminalHeartbeatResponse>('/api/biometric/heartbeat', {

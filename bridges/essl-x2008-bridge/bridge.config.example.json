@@ -1,0 +1,30 @@
+{
+  "coreErpBaseUrl": "https://your-coreerp-domain.example.com",
+  "allowInsecureHttp": false,
+  "bridgeHost": "WIN-BIOMETRIC-BRIDGE-01",
+  "healthHost": "127.0.0.1",
+  "healthPort": 4379,
+  "dataDir": "./data",
+  "logDir": "./logs",
+  "logLevel": "info",
+  "batchSize": 200,
+  "pollIntervalMs": 15000,
+  "heartbeatIntervalMs": 60000,
+  "connectTimeoutMs": 5000,
+  "maxBackoffMs": 300000,
+  "dpapiStorePath": "./data/credentials.dpapi.json",
+  "terminals": [
+    {
+      "id": "essl-x2008-main",
+      "name": "Main Entrance eSSL X2008",
+      "serialNumber": "NFZ8252800275",
+      "ipAddress": "192.168.1.201",
+      "port": 4370,
+      "commKey": 0,
+      "deviceTimezone": "Asia/Kolkata",
+      "dpapiCredentialName": "coreerp-essl-x2008-main",
+      "apiKeyEnv": "COREERP_DEVICE_API_KEY_MAIN",
+      "enabled": true
+    }
+  ]
+}

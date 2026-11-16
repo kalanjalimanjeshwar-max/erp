@@ -1558,6 +1558,13 @@ export type BiometricVerifyType = 'FINGERPRINT' | 'CARD' | 'PASSWORD' | 'FACE';
 export type PunchInOutMode = 'CHECK_IN' | 'CHECK_OUT' | 'BREAK_OUT' | 'BREAK_IN';
 export type PunchSyncStatus = 'PENDING' | 'PROCESSED' | 'IGNORED' | 'ERROR';
 
+export type BiometricConnectionTestStatus =
+  | 'TCP_REACHABLE'
+  | 'BRIDGE_MANAGED'
+  | 'UNREACHABLE'
+  | 'INVALID_CONFIG'
+  | 'DEACTIVATED';
+
 export interface BiometricTerminalItem {
   id: string;
   companyId: string;
@@ -1578,6 +1585,20 @@ export interface BiometricTerminalItem {
   notes: string | null;
   createdAt: string;
   updatedAt: string;
+  // Bridge telemetry (persisted non-destructively via CompanySetting)
+  bridgeConnected?: boolean;
+  bridgeHost?: string | null;
+  bridgeVersion?: string | null;
+  lastBridgeHeartbeatAt?: string | null;
+  lastSyncAttemptAt?: string | null;
+  lastConnectionError?: string | null;
+  lastProcessedPunchCount?: number;
+  lastTestConnectionAt?: string | null;
+  lastTestConnectionStatus?: BiometricConnectionTestStatus | null;
+  lastTestConnectionMessage?: string | null;
+  syncRequestedAt?: string | null;
+  platform?: string | null;
+  fingerprintAlgorithm?: string | null;
 }
 
 export interface CreateBiometricTerminalRequest {
@@ -1616,6 +1637,9 @@ export interface RawPunchEventInput {
 
 export interface BatchPunchSubmissionRequest {
   punches: RawPunchEventInput[];
+  deviceSerialNumber?: string;
+  bridgeHost?: string;
+  bridgeVersion?: string;
 }
 
 export interface BatchPunchSubmissionResponse {
@@ -1633,6 +1657,16 @@ export interface TerminalHeartbeatRequest {
   monitoredDevicesCount?: number;
   onlineDevicesCount?: number;
   timestamp?: string;
+  bridgeConnected?: boolean;
+  bridgeHost?: string;
+  bridgeVersion?: string;
+  deviceSerialNumber?: string;
+  platform?: string;
+  fingerprintAlgorithm?: string;
+  lastConnectionError?: string | null;
+  lastProcessedPunchCount?: number;
+  lastSyncAttemptAt?: string;
+  lastSyncAt?: string;
 }
 
 export interface TerminalHeartbeatResponse {
@@ -1641,6 +1675,26 @@ export interface TerminalHeartbeatResponse {
   terminalId: string;
   terminalName: string;
   status: BiometricTerminalStatus;
+  syncRequested?: boolean;
+  syncRequestedAt?: string | null;
+}
+
+export interface TestBiometricConnectionResponse {
+  success: boolean;
+  status: BiometricConnectionTestStatus;
+  checkedAt: string;
+  latencyMs: number | null;
+  message: string;
+  terminal: BiometricTerminalItem;
+}
+
+export interface TriggerTerminalSyncResponse {
+  success: boolean;
+  bridgeSyncQueued: boolean;
+  syncRequestedAt: string;
+  message: string;
+  terminal: BiometricTerminalItem;
+  reconciliation: PunchReconciliationResponse;
 }
 
 // ============================================================================

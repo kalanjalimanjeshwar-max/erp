@@ -114,6 +114,20 @@ export async function requireDeviceAuth(
       return;
     }
 
+    // 6. Optional X-Device-Serial verification (prevents credential reuse across different hardware)
+    const headerSerial = req.headers['x-device-serial'];
+    if (typeof headerSerial === 'string' && headerSerial.trim()) {
+      if (headerSerial.trim() !== terminal.deviceSerialNumber) {
+        res.status(403).json({
+          error: {
+            code: 'DEVICE_SERIAL_MISMATCH',
+            message: 'Provided X-Device-Serial header does not match registered terminal serial number.',
+          },
+        });
+        return;
+      }
+    }
+
     // Success: reset failures for this IP and attach terminal
     deviceAuthFailures.delete(clientIp);
     req.terminal = terminal;

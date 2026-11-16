@@ -22,6 +22,12 @@ import {
   RotateCw,
   Ban,
   Key,
+  Wifi,
+  WifiOff,
+  PlugZap,
+  Terminal,
+  BookOpen,
+  Play,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
 import { LoadingSpinner } from '../components/common/LoadingSpinner.tsx';
@@ -37,6 +43,10 @@ import {
   CreateBiometricTerminalRequest,
   CompanyProfile,
 } from '../../shared/types.ts';
+import {
+  BIOMETRIC_MODEL_PRESETS,
+  ESSL_X2008_HARDWARE_PROFILE,
+} from '../../shared/biometric.ts';
 import {
   formatDateTimeInTimezone,
   formatUtcTimestamp,
@@ -83,12 +93,13 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   const [isSubmittingDevice, setIsSubmittingDevice] = useState<boolean>(false);
   const [registerFormError, setRegisterFormError] = useState<string | null>(null);
 
-  // Registration Form Fields
+  // Registration Form Fields (Defaulting to eSSL X2008 profile)
+  const [formPresetId, setFormPresetId] = useState<string>('essl-x2008');
   const [formDeviceName, setFormDeviceName] = useState<string>('');
   const [formSerialNumber, setFormSerialNumber] = useState<string>('');
-  const [formTerminalModel, setFormTerminalModel] = useState<string>('ZKTeco-F22');
+  const [formTerminalModel, setFormTerminalModel] = useState<string>(ESSL_X2008_HARDWARE_PROFILE.terminalModel);
   const [formIpAddress, setFormIpAddress] = useState<string>('');
-  const [formPort, setFormPort] = useState<number>(4370);
+  const [formPort, setFormPort] = useState<number>(ESSL_X2008_HARDWARE_PROFILE.defaultPort);
   const [formLocation, setFormLocation] = useState<string>('');
   const [formNotes, setFormNotes] = useState<string>('');
 
@@ -109,11 +120,14 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   // Permission feedback
   const [permissionDeniedMessage, setPermissionDeniedMessage] = useState<string | null>(null);
 
-  // Terminal Action States (Deactivation & Key Rotation)
+  // Terminal Action States (Deactivation, Key Rotation, Connection Probe, Per-Terminal Sync, Setup Guide)
   const [deactivatingTerminal, setDeactivatingTerminal] = useState<BiometricTerminalItem | null>(null);
   const [isDeactivating, setIsDeactivating] = useState<boolean>(false);
   const [rotatingTerminal, setRotatingTerminal] = useState<BiometricTerminalItem | null>(null);
   const [isRotating, setIsRotating] = useState<boolean>(false);
+  const [testingTerminalId, setTestingTerminalId] = useState<string | null>(null);
+  const [syncingTerminalId, setSyncingTerminalId] = useState<string | null>(null);
+  const [showBridgeGuide, setShowBridgeGuide] = useState<boolean>(false);
   const [actionSuccessMessage, setActionSuccessMessage] = useState<string | null>(null);
   const [actionErrorMessage, setActionErrorMessage] = useState<string | null>(null);
 
@@ -204,7 +218,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
       const payload: CreateBiometricTerminalRequest = {
         name,
         deviceSerialNumber: serial,
-        terminalModel: formTerminalModel.trim() || 'ZKTeco-F22',
+        terminalModel: formTerminalModel.trim() || ESSL_X2008_HARDWARE_PROFILE.terminalModel,
         ipAddress: formIpAddress.trim() || null,
         port: formPort || 4370,
         location: formLocation.trim() || null,
@@ -219,6 +233,8 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
       setIsRegisterModalOpen(false);
 
       // Reset form fields
+      setFormPresetId('essl-x2008');
+      setFormTerminalModel(ESSL_X2008_HARDWARE_PROFILE.terminalModel);
       setFormDeviceName('');
       setFormSerialNumber('');
       setFormIpAddress('');
@@ -327,6 +343,46 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     }
   };
 
+  // Handle Per-Terminal Connection Probe
+  const handleTestConnection = async (terminal: BiometricTerminalItem) => {
+    setTestingTerminalId(terminal.id);
+    setActionErrorMessage(null);
+    setActionSuccessMessage(null);
+    try {
+      const res = await api.testBiometricDeviceConnection(terminal.id);
+      setTerminals((prev) => prev.map((t) => (t.id === terminal.id ? res.terminal : t)));
+      if (res.success) {
+        setActionSuccessMessage(`${terminal.name}: ${res.message}`);
+      } else {
+        setActionErrorMessage(`${terminal.name}: ${res.message}`);
+      }
+    } catch (err: unknown) {
+      const apiErr = err as ApiError;
+      setActionErrorMessage(apiErr.message || 'Failed to test terminal connectivity.');
+    } finally {
+      setTestingTerminalId(null);
+    }
+  };
+
+  // Handle Per-Terminal Sync & Reconciliation Trigger
+  const handleSyncTerminal = async (terminal: BiometricTerminalItem) => {
+    setSyncingTerminalId(terminal.id);
+    setActionErrorMessage(null);
+    setActionSuccessMessage(null);
+    try {
+      const res = await api.triggerBiometricDeviceSync(terminal.id, { batchSize: 100 });
+      setTerminals((prev) => prev.map((t) => (t.id === terminal.id ? res.terminal : t)));
+      setActionSuccessMessage(`${terminal.name}: ${res.message}`);
+      loadSyncSummary();
+      if (activeTab === 'punches') loadPunches();
+    } catch (err: unknown) {
+      const apiErr = err as ApiError;
+      setActionErrorMessage(apiErr.message || 'Failed to queue terminal sync.');
+    } finally {
+      setSyncingTerminalId(null);
+    }
+  };
+
   const totalPages = Math.max(1, Math.ceil(punchTotal / punchLimit));
 
   return (
@@ -343,7 +399,19 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
           </h1>
         </div>
 
-        <div className="flex items-center gap-2.5 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
+          <button
+            onClick={() => setShowBridgeGuide((prev) => !prev)}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition cursor-pointer whitespace-nowrap shrink-0 ${
+              showBridgeGuide
+                ? 'bg-indigo-950/90 text-indigo-200 border-indigo-700/70'
+                : 'bg-slate-800/80 hover:bg-slate-700/80 text-slate-300 border-slate-700/60'
+            }`}
+          >
+            <BookOpen className="w-3.5 h-3.5 text-indigo-400" />
+            <span>eSSL X2008 Setup Guide</span>
+          </button>
+
           <button
             onClick={() => {
               loadTerminals();
@@ -523,6 +591,59 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
       {/* ==================================================================== */}
       {activeTab === 'terminals' && (
         <div className="space-y-4">
+          {showBridgeGuide && (
+            <div className="p-5 bg-slate-900/70 border border-slate-800 rounded-xl space-y-4">
+              <div className="flex items-start justify-between gap-4 pb-3 border-b border-slate-800">
+                <div className="flex items-center gap-2.5">
+                  <Terminal className="w-4 h-4 text-indigo-400 shrink-0" />
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-100">
+                      eSSL X2008 Windows LAN Bridge Deployment Guide
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Platform <span className="font-mono text-slate-300">ZLM60_TFT</span> · Algorithm{' '}
+                      <span className="font-mono text-slate-300">VX10.0</span> · Read-only TCP{' '}
+                      <span className="font-mono text-slate-300">4370</span> polling (never deletes device logs)
+                    </p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowBridgeGuide(false)}
+                  className="text-xs text-slate-400 hover:text-slate-200 cursor-pointer"
+                >
+                  Close
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs text-slate-300">
+                <div className="space-y-1.5">
+                  <div className="font-semibold text-slate-100">1. Register Terminal &amp; Save One-Time Key</div>
+                  <p className="text-slate-400 leading-relaxed">
+                    Register the X2008 serial number (e.g. <code className="font-mono text-indigo-300">NFZ8252800275</code>) and LAN endpoint{' '}
+                    <code className="font-mono text-indigo-300">192.168.1.201:4370</code>. Copy the <code className="font-mono text-indigo-300">bio_live_...</code> key once—CoreERP stores only its SHA-256 hash.
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="font-semibold text-slate-100">2. Configure Windows Bridge PC (192.168.1.16)</div>
+                  <p className="text-slate-400 leading-relaxed">
+                    On the Windows host inside <code className="font-mono text-slate-300">bridges/essl-x2008-bridge</code>, run{' '}
+                    <code className="font-mono text-indigo-300">npm run build</code>, configure <code className="font-mono text-slate-300">bridge.config.json</code> with timezone{' '}
+                    <code className="font-mono text-slate-300">{timezone}</code>, and encrypt the API key using Windows DPAPI (<code className="font-mono text-slate-300">scripts/protect-credentials.ps1</code>).
+                  </p>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="font-semibold text-slate-100">3. Verify &amp; Install Service</div>
+                  <p className="text-slate-400 leading-relaxed">
+                    Run <code className="font-mono text-indigo-300">npm run test-connection</code> to verify TCP 4370 handshake + serial match, then install persistently with{' '}
+                    <code className="font-mono text-slate-300">scripts/install-nssm-service.ps1</code>. Local diagnostics run on <code className="font-mono text-slate-300">127.0.0.1:4379/health</code>.
+                  </p>
+                </div>
+              </div>
+            </div>
+          )}
+
           {isLoadingTerminals ? (
             <div className="py-12 flex justify-center">
               <LoadingSpinner message="Loading registered biometric terminals..." size="md" />
@@ -541,7 +662,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
             <EmptyState
               icon={<Fingerprint className="w-8 h-8 text-indigo-400" />}
               title="No Biometric Terminals Registered"
-              description="Register physical ZKTeco or compatible biometric terminals to enable real-time LAN bridge communication and punch log ingestion."
+              description="Register physical eSSL X2008 or compatible ZKTeco biometric terminals to enable LAN bridge polling and idempotent punch synchronization."
               action={
                 <button
                   onClick={() => setIsRegisterModalOpen(true)}
@@ -558,14 +679,11 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                 <table className="w-full text-left border-collapse">
                   <thead>
                     <tr className="border-b border-slate-800 bg-slate-900/90 text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-                      <th className="py-3 px-4">Terminal Name</th>
-                      <th className="py-3 px-4">Serial Number</th>
-                      <th className="py-3 px-4">Model &amp; LAN Endpoint</th>
-                      <th className="py-3 px-4">Location</th>
-                      <th className="py-3 px-4">Status</th>
+                      <th className="py-3 px-4">Terminal &amp; LAN Endpoint</th>
+                      <th className="py-3 px-4">Serial &amp; Key</th>
+                      <th className="py-3 px-4">Device &amp; Bridge State</th>
                       <th className="py-3 px-4">Last Heartbeat</th>
-                      <th className="py-3 px-4">Last Sync</th>
-                      <th className="py-3 px-4">API Key Prefix</th>
+                      <th className="py-3 px-4">Last Sync &amp; Punches</th>
                       <th className="py-3 px-4 text-right">Actions</th>
                     </tr>
                   </thead>
@@ -574,76 +692,159 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                       const isOnline = terminal.status === 'ONLINE';
                       const isOffline = terminal.status === 'OFFLINE';
                       const isDeactivated = terminal.status === 'DEACTIVATED';
+                      const isBridgeOnline = terminal.bridgeConnected === true;
+                      const isTesting = testingTerminalId === terminal.id;
+                      const isSyncing = syncingTerminalId === terminal.id;
 
                       return (
-                        <tr key={terminal.id} className="hover:bg-slate-800/30 transition-colors">
-                          <td className="py-3 px-4 font-medium text-slate-100">
-                            <div className="flex items-center gap-2">
+                        <tr key={terminal.id} className="hover:bg-slate-800/30 transition-colors align-top">
+                          <td className="py-3.5 px-4">
+                            <div className="flex items-center gap-2 font-medium text-slate-100">
                               <Server className="w-4 h-4 text-indigo-400 shrink-0" />
                               <span>{terminal.name}</span>
                             </div>
-                            {terminal.notes && (
-                              <div className="text-[11px] text-slate-400 truncate max-w-xs mt-0.5">
-                                {terminal.notes}
+                            <div className="text-[11px] font-mono text-slate-400 mt-1">
+                              {terminal.terminalModel}
+                              {terminal.platform ? ` · ${terminal.platform}` : ''} ·{' '}
+                              {terminal.ipAddress ? `${terminal.ipAddress}:${terminal.port}` : 'Static IP unset'}
+                            </div>
+                            {terminal.location && (
+                              <div className="text-[11px] text-slate-400 mt-0.5">{terminal.location}</div>
+                            )}
+                            {terminal.lastConnectionError && (
+                              <div
+                                className="mt-1.5 text-[11px] font-mono text-rose-300 flex items-start gap-1 max-w-sm"
+                                title={terminal.lastConnectionError}
+                              >
+                                <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0 mt-0.5" />
+                                <span className="line-clamp-2">{terminal.lastConnectionError}</span>
                               </div>
                             )}
                           </td>
-                          <td className="py-3 px-4 font-mono tabular-nums text-slate-300">
-                            {terminal.deviceSerialNumber}
+
+                          <td className="py-3.5 px-4 font-mono tabular-nums text-slate-300">
+                            <div>{terminal.deviceSerialNumber}</div>
+                            <div className="text-[11px] text-slate-400 mt-1">
+                              <code>{terminal.apiKeyPrefix}...</code>
+                            </div>
+                            {terminal.firmwareVersion && (
+                              <div className="text-[11px] text-slate-500 mt-0.5">FW {terminal.firmwareVersion}</div>
+                            )}
                           </td>
-                          <td className="py-3 px-4 font-mono text-slate-300">
-                            <div>{terminal.terminalModel}</div>
-                            <div className="text-[11px] text-slate-400">
-                              {terminal.ipAddress ? `${terminal.ipAddress}:${terminal.port}` : 'Static IP not configured'}
+
+                          <td className="py-3.5 px-4">
+                            <div className="space-y-1.5">
+                              <div
+                                className={`inline-flex items-center gap-1.5 font-mono text-[11px] font-semibold ${
+                                  isOnline
+                                    ? 'text-emerald-400'
+                                    : isOffline
+                                    ? 'text-amber-400'
+                                    : isDeactivated
+                                    ? 'text-slate-400'
+                                    : 'text-rose-400'
+                                }`}
+                              >
+                                {isOnline && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
+                                {isOffline && <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />}
+                                {isDeactivated && <XCircle className="w-3.5 h-3.5 text-slate-400 shrink-0" />}
+                                {!isOnline && !isOffline && !isDeactivated && (
+                                  <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                                )}
+                                <span>Device: {terminal.status}</span>
+                              </div>
+
+                              <div
+                                className={`flex items-center gap-1.5 font-mono text-[11px] ${
+                                  isBridgeOnline ? 'text-indigo-300' : 'text-slate-400'
+                                }`}
+                              >
+                                {isBridgeOnline ? (
+                                  <Wifi className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                                ) : (
+                                  <WifiOff className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                                )}
+                                <span>
+                                  Bridge: {isBridgeOnline ? `Connected (${terminal.bridgeHost || 'LAN'})` : 'Disconnected'}
+                                </span>
+                              </div>
+
+                              {terminal.lastTestConnectionStatus && (
+                                <div
+                                  className="text-[11px] text-slate-400 font-mono"
+                                  title={terminal.lastTestConnectionMessage || undefined}
+                                >
+                                  Probe: {terminal.lastTestConnectionStatus}
+                                </div>
+                              )}
                             </div>
                           </td>
-                          <td className="py-3 px-4 text-slate-300">
-                            {terminal.location || '—'}
-                          </td>
-                          <td className="py-3 px-4">
-                            <span
-                              className={`inline-flex items-center gap-1 font-mono text-[11px] font-semibold ${
-                                isOnline
-                                  ? 'text-emerald-400'
-                                  : isOffline
-                                  ? 'text-amber-400'
-                                  : isDeactivated
-                                  ? 'text-slate-400'
-                                  : 'text-rose-400'
-                              }`}
-                            >
-                              {isOnline && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
-                              {isOffline && <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />}
-                              {isDeactivated && <XCircle className="w-3.5 h-3.5 text-slate-400 shrink-0" />}
-                              {!isOnline && !isOffline && !isDeactivated && (
-                                <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                              )}
-                              <span>{terminal.status}</span>
-                            </span>
-                          </td>
+
                           <td
-                            className="py-3 px-4 text-slate-400 font-mono tabular-nums"
-                            title={terminal.lastHeartbeatAt ? `UTC: ${formatUtcTimestamp(terminal.lastHeartbeatAt)}` : undefined}
+                            className="py-3.5 px-4 text-slate-300 font-mono tabular-nums whitespace-nowrap"
+                            title={
+                              terminal.lastHeartbeatAt
+                                ? `UTC: ${formatUtcTimestamp(terminal.lastHeartbeatAt)}`
+                                : undefined
+                            }
                           >
-                            {terminal.lastHeartbeatAt
-                              ? formatDateTimeInTimezone(terminal.lastHeartbeatAt, timezone, { includeZoneAbbr: true })
-                              : 'Never'}
+                            <div>
+                              {terminal.lastHeartbeatAt
+                                ? formatDateTimeInTimezone(terminal.lastHeartbeatAt, timezone, {
+                                    includeZoneAbbr: true,
+                                  })
+                                : 'Never'}
+                            </div>
+                            {terminal.bridgeVersion && (
+                              <div className="text-[11px] text-slate-500 mt-1">
+                                Bridge v{terminal.bridgeVersion}
+                              </div>
+                            )}
                           </td>
+
                           <td
-                            className="py-3 px-4 text-slate-400 font-mono tabular-nums"
+                            className="py-3.5 px-4 text-slate-300 font-mono tabular-nums whitespace-nowrap"
                             title={terminal.lastSyncAt ? `UTC: ${formatUtcTimestamp(terminal.lastSyncAt)}` : undefined}
                           >
-                            {terminal.lastSyncAt
-                              ? formatDateTimeInTimezone(terminal.lastSyncAt, timezone, { includeZoneAbbr: true })
-                              : 'Never'}
+                            <div>
+                              {terminal.lastSyncAt
+                                ? formatDateTimeInTimezone(terminal.lastSyncAt, timezone, { includeZoneAbbr: true })
+                                : 'Never'}
+                            </div>
+                            <div className="text-[11px] text-slate-400 mt-1">
+                              Last batch: {terminal.lastProcessedPunchCount ?? 0} punches
+                            </div>
+                            {terminal.syncRequestedAt && (
+                              <div className="text-[11px] text-indigo-300 mt-0.5">Bridge poll queued</div>
+                            )}
                           </td>
-                          <td className="py-3 px-4 font-mono text-slate-400">
-                            <code>{terminal.apiKeyPrefix}...</code>
-                          </td>
-                          <td className="py-3 px-4 text-right">
-                            <div className="flex items-center justify-end gap-1.5">
+
+                          <td className="py-3.5 px-4 text-right">
+                            <div className="flex flex-wrap items-center justify-end gap-1.5">
                               {terminal.isActive ? (
                                 <>
+                                  <button
+                                    onClick={() => handleTestConnection(terminal)}
+                                    disabled={isTesting}
+                                    title="Test connectivity and LAN Bridge heartbeat"
+                                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-slate-200 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md transition cursor-pointer disabled:opacity-50"
+                                  >
+                                    <PlugZap className={`w-3 h-3 text-indigo-400 ${isTesting ? 'animate-spin' : ''}`} />
+                                    <span>{isTesting ? 'Testing...' : 'Test'}</span>
+                                  </button>
+                                  <button
+                                    onClick={() => handleSyncTerminal(terminal)}
+                                    disabled={isSyncing}
+                                    title="Queue bridge poll & reconcile pending punches"
+                                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-emerald-300 hover:text-emerald-100 bg-emerald-950/60 hover:bg-emerald-900/80 border border-emerald-800/60 rounded-md transition cursor-pointer disabled:opacity-50"
+                                  >
+                                    {isSyncing ? (
+                                      <RefreshCw className="w-3 h-3 text-emerald-400 animate-spin" />
+                                    ) : (
+                                      <Play className="w-3 h-3 text-emerald-400" />
+                                    )}
+                                    <span>{isSyncing ? 'Syncing...' : 'Sync'}</span>
+                                  </button>
                                   <button
                                     onClick={() => {
                                       setActionErrorMessage(null);
@@ -1156,12 +1357,40 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
               <div className="grid grid-cols-2 gap-3">
                 <div className="col-span-2">
                   <label className="block text-xs font-medium text-slate-300 mb-1">
+                    Hardware Profile Preset
+                  </label>
+                  <select
+                    value={formPresetId}
+                    onChange={(e) => {
+                      const nextId = e.target.value;
+                      setFormPresetId(nextId);
+                      const preset = BIOMETRIC_MODEL_PRESETS.find((p) => p.id === nextId);
+                      if (preset) {
+                        setFormTerminalModel(preset.terminalModel);
+                        setFormPort(preset.defaultPort);
+                      }
+                    }}
+                    className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
+                  >
+                    {BIOMETRIC_MODEL_PRESETS.map((preset) => (
+                      <option key={preset.id} value={preset.id}>
+                        {preset.label}
+                      </option>
+                    ))}
+                  </select>
+                  <div className="text-[11px] text-slate-400 mt-1">
+                    {BIOMETRIC_MODEL_PRESETS.find((p) => p.id === formPresetId)?.notes}
+                  </div>
+                </div>
+
+                <div className="col-span-2">
+                  <label className="block text-xs font-medium text-slate-300 mb-1">
                     Terminal Display Name <span className="text-rose-400">*</span>
                   </label>
                   <input
                     type="text"
                     required
-                    placeholder="e.g. Main Lobby Gate A"
+                    placeholder="e.g. Main Office eSSL X2008"
                     value={formDeviceName}
                     onChange={(e) => setFormDeviceName(e.target.value)}
                     className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
@@ -1175,7 +1404,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                   <input
                     type="text"
                     required
-                    placeholder="e.g. F22-SN-998822"
+                    placeholder="e.g. NFZ8252800275"
                     value={formSerialNumber}
                     onChange={(e) => setFormSerialNumber(e.target.value)}
                     className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 font-mono focus:outline-none focus:border-indigo-500"
@@ -1184,11 +1413,11 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
 
                 <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Terminal Model
+                    Terminal Model Code
                   </label>
                   <input
                     type="text"
-                    placeholder="ZKTeco-F22"
+                    placeholder="eSSL-X2008"
                     value={formTerminalModel}
                     onChange={(e) => setFormTerminalModel(e.target.value)}
                     className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 font-mono focus:outline-none focus:border-indigo-500"
@@ -1210,10 +1439,12 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
 
                 <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Hardware Port
+                    TCP Port
                   </label>
                   <input
                     type="number"
+                    min={1}
+                    max={65535}
                     value={formPort}
                     onChange={(e) => setFormPort(parseInt(e.target.value, 10) || 4370)}
                     className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 font-mono tabular-nums focus:outline-none focus:border-indigo-500"
