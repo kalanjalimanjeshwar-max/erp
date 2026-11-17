@@ -1,13 +1,13 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import crypto from 'crypto';
 import { createApp } from '../../src/server/app.js';
 import { prisma } from '../../src/server/db/client.js';
 import { BiometricService } from '../../src/server/services/biometric.service.js';
 import { AuditService } from '../../src/server/services/audit.service.js';
-import { AuthUser } from '../../src/shared/types.ts';
-
+import { AuthUser } from '../../src/shared/types.js';
 import { AuthService } from '../../src/server/services/auth.service.js';
+import { installUnitPrismaGuard } from '../helpers/unit-prisma-guard.js';
 
 // Mock AuditService
 vi.mock('../../src/server/services/audit.service.js', () => ({
@@ -63,8 +63,17 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
     tokenVersion: 1,
   };
 
+  let companySettingStore: Map<string, string>;
+
   beforeEach(() => {
+    vi.restoreAllMocks();
     vi.clearAllMocks();
+    vi.spyOn(AuditService, 'log').mockResolvedValue(undefined);
+    ({ companySettingStore } = installUnitPrismaGuard());
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   describe('1. Endpoint Security & Unauthenticated Access Guards', () => {
@@ -89,14 +98,16 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
         tokenVersion: employeeUser.tokenVersion,
       });
 
+      vi.spyOn(prisma.user, 'findUnique')
+        .mockResolvedValueOnce(employeeUser as any)
+        .mockResolvedValueOnce(employeeUser as any);
+
       const listRes = await request(app)
         .get('/api/biometric/devices')
         .set('Authorization', `Bearer ${employeeToken}`);
 
-      expect([401, 403]).toContain(listRes.status);
-      if (listRes.status === 403) {
-        expect(listRes.body.error.code).toBe('FORBIDDEN_PERMISSION_DENIED');
-      }
+      expect(listRes.status).toBe(403);
+      expect(listRes.body.error.code).toBe('FORBIDDEN_PERMISSION_DENIED');
 
       const createRes = await request(app)
         .post('/api/biometric/devices')
@@ -106,10 +117,8 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
           name: 'Unauthorized Gate',
         });
 
-      expect([401, 403]).toContain(createRes.status);
-      if (createRes.status === 403) {
-        expect(createRes.body.error.code).toBe('FORBIDDEN_PERMISSION_DENIED');
-      }
+      expect(createRes.status).toBe(403);
+      expect(createRes.body.error.code).toBe('FORBIDDEN_PERMISSION_DENIED');
     });
 
     it('should reject device-originated heartbeat without credentials with 401', async () => {
@@ -130,7 +139,7 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
 
     it('should reject device calls with invalid/unknown API key with 401', async () => {
       // Mock prisma findFirst returning null for unknown hash
-      const findFirstSpy = vi.spyOn(prisma.biometricTerminal, 'findFirst').mockResolvedValueOnce(null as any);
+      vi.spyOn(prisma.biometricTerminal, 'findFirst').mockResolvedValueOnce(null as any);
 
       const res = await request(app)
         .post('/api/biometric/heartbeat')
@@ -139,12 +148,11 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
 
       expect(res.status).toBe(401);
       expect(res.body.error.code).toBe('INVALID_DEVICE_CREDENTIALS');
-      findFirstSpy.mockRestore();
     });
 
     it('should reject deactivated/inactive terminal credentials with 401', async () => {
       // When terminal is found but inactive, findFirst query filters isActive: true, thus returning null
-      const findFirstSpy = vi.spyOn(prisma.biometricTerminal, 'findFirst').mockResolvedValueOnce(null as any);
+      vi.spyOn(prisma.biometricTerminal, 'findFirst').mockResolvedValueOnce(null as any);
 
       const res = await request(app)
         .post('/api/biometric/heartbeat')
@@ -154,7 +162,6 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       expect(res.status).toBe(401);
       expect(res.body.error.code).toBe('INVALID_DEVICE_CREDENTIALS');
       expect(res.body.error.message).toContain('inactive, or revoked');
-      findFirstSpy.mockRestore();
     });
   });
 
@@ -269,7 +276,6 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
           }),
         })
       );
-      findManySpy.mockRestore();
     });
   });
 
@@ -302,7 +308,6 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
           }),
         })
       );
-      updateSpy.mockRestore();
     });
   });
 
@@ -314,12 +319,24 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       registeredByUserId: 'user-sa-uuid',
     };
 
+    function mockInteractivePunchTx(insertedCount: number) {
+      const createMany = vi.fn().mockResolvedValue({ count: insertedCount });
+      const update = vi.fn().mockResolvedValue({});
+      const txSpy = vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) => {
+        return cb({
+          rawPunchLog: { createMany },
+          biometricTerminal: { update },
+        });
+      });
+      return { txSpy, createMany, update };
+    }
+
     it('should ingest valid punches, map employees by biometricDeviceId, and record logs', async () => {
       vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]); // No duplicates
       vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([
         { id: 'emp-uuid-101', biometricDeviceId: '1001' } as any,
       ]);
-      const txSpy = vi.spyOn(prisma, '$transaction').mockResolvedValueOnce([{} as any, {} as any]);
+      const { txSpy, createMany, update } = mockInteractivePunchTx(1);
 
       const result = await BiometricService.ingestPunches(mockTerminal, {
         punches: [
@@ -338,14 +355,29 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       expect(result.inserted).toBe(1);
       expect(result.duplicates).toBe(0);
       expect(result.unmappedEmployees).toBe(0);
-      expect(txSpy).toHaveBeenCalled();
-      txSpy.mockRestore();
+      expect(txSpy).toHaveBeenCalledTimes(1);
+      expect(createMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          skipDuplicates: true,
+          data: expect.arrayContaining([
+            expect.objectContaining({
+              userEnrollmentId: '1001',
+              matchedEmployeeId: 'emp-uuid-101',
+            }),
+          ]),
+        })
+      );
+      expect(update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: mockTerminal.id },
+        })
+      );
     });
 
     it('should generate deterministic SHA-256 idempotency key when devicePunchId is omitted', async () => {
       vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]);
       vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]);
-      const txSpy = vi.spyOn(prisma, '$transaction').mockResolvedValueOnce([{} as any, {} as any]);
+      const { createMany } = mockInteractivePunchTx(1);
 
       const result = await BiometricService.ingestPunches(mockTerminal, {
         punches: [
@@ -361,13 +393,13 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       expect(result.success).toBe(true);
       expect(result.totalReceived).toBe(1);
       expect(result.inserted).toBe(1);
-      txSpy.mockRestore();
+      expect(createMany.mock.calls[0][0].data[0].idempotencyKey).toMatch(/^[0-9a-f]{64}$/);
     });
 
     it('should deduplicate multiple identical punches within the same batch', async () => {
       vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]);
       vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]);
-      const txSpy = vi.spyOn(prisma, '$transaction').mockResolvedValueOnce([{} as any, {} as any]);
+      const { createMany } = mockInteractivePunchTx(1);
 
       const punch = {
         devicePunchId: 'p-batch-dup-1',
@@ -382,7 +414,7 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       expect(result.totalReceived).toBe(2);
       expect(result.inserted).toBe(1);
       expect(result.duplicates).toBe(1);
-      txSpy.mockRestore();
+      expect(createMany.mock.calls[0][0].data).toHaveLength(1);
     });
 
     it('should never mutate attendance or payroll records during raw punch ingestion', async () => {
@@ -392,7 +424,7 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
 
       vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]);
       vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]);
-      const txSpy = vi.spyOn(prisma, '$transaction').mockResolvedValueOnce([{} as any, {} as any]);
+      mockInteractivePunchTx(1);
 
       await BiometricService.ingestPunches(mockTerminal, {
         punches: [
@@ -407,17 +439,12 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       expect(attendanceCreateSpy).not.toHaveBeenCalled();
       expect(payrollUpdateSpy).not.toHaveBeenCalled();
       expect(payslipCreateSpy).not.toHaveBeenCalled();
-
-      attendanceCreateSpy.mockRestore();
-      payrollUpdateSpy.mockRestore();
-      payslipCreateSpy.mockRestore();
-      txSpy.mockRestore();
     });
 
     it('should handle unmapped employees without failing the punch batch', async () => {
       vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]);
       vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]); // No matching employee
-      const txSpy = vi.spyOn(prisma, '$transaction').mockResolvedValueOnce([{} as any, {} as any]);
+      const { createMany } = mockInteractivePunchTx(1);
 
       const result = await BiometricService.ingestPunches(mockTerminal, {
         punches: [
@@ -432,7 +459,7 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       expect(result.totalReceived).toBe(1);
       expect(result.inserted).toBe(1);
       expect(result.unmappedEmployees).toBe(1);
-      txSpy.mockRestore();
+      expect(createMany.mock.calls[0][0].data[0].matchedEmployeeId).toBeNull();
     });
 
     it('should ensure repeated punch submissions are handled idempotently without duplicate records', async () => {
@@ -450,7 +477,7 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
         { idempotencyKey: expectedIdempotencyKey } as any,
       ]);
       vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]);
-      const updateSpy = vi.spyOn(prisma.biometricTerminal, 'update').mockResolvedValueOnce({} as any);
+      vi.spyOn(prisma.biometricTerminal, 'update').mockResolvedValueOnce({} as any);
 
       const result = await BiometricService.ingestPunches(mockTerminal, {
         punches: [punchItem],
@@ -460,7 +487,6 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       expect(result.totalReceived).toBe(1);
       expect(result.inserted).toBe(0);
       expect(result.duplicates).toBe(1);
-      updateSpy.mockRestore();
     });
 
     it('should reject batch exceeding maximum allowed limit (500 items)', async () => {
@@ -555,7 +581,13 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
           }),
         })
       );
-      updateSpy.mockRestore();
+
+      const rawTelemetry = companySettingStore.get(
+        `${superAdminUser.companyId}::BIOMETRIC_BRIDGE_TELEMETRY_V1`
+      );
+      expect(rawTelemetry).toBeDefined();
+      const parsedTelemetry = JSON.parse(rawTelemetry!);
+      expect(parsedTelemetry['term-active-1'].bridgeConnected).toBe(false);
     });
 
     it('should reject deactivation across company/tenant boundaries with 404', async () => {
@@ -580,7 +612,7 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
         role: 'ADMIN',
       } as any);
 
-      const deactivateSpy = vi.spyOn(BiometricService, 'deactivateTerminal').mockResolvedValueOnce({
+      vi.spyOn(BiometricService, 'deactivateTerminal').mockResolvedValueOnce({
         id: 'term-to-deactivate',
         companyId: adminUser.companyId,
         deviceSerialNumber: 'SN-01',
@@ -608,7 +640,6 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(res.body.terminal.status).toBe('DEACTIVATED');
-      deactivateSpy.mockRestore();
     });
 
     it('should block EMPLOYEE and VICE_ADMIN from deactivating devices with 403 Forbidden', async () => {
@@ -697,9 +728,6 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
           }),
         })
       );
-
-      updateSpy.mockRestore();
-      auditSpy.mockRestore();
     });
 
     it('should reject rotating key for deactivated/inactive terminal with 400 Bad Request', async () => {
@@ -731,7 +759,7 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
         role: 'ADMIN',
       } as any);
 
-      const rotateSpy = vi.spyOn(BiometricService, 'rotateTerminalKey').mockResolvedValueOnce({
+      vi.spyOn(BiometricService, 'rotateTerminalKey').mockResolvedValueOnce({
         terminal: {
           id: 'term-rotated',
           companyId: adminUser.companyId,
@@ -762,7 +790,6 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       expect(res.status).toBe(200);
       expect(res.body.success).toBe(true);
       expect(res.body.apiKey).toBe('bio_live_new_plaintext_key_sample_123');
-      rotateSpy.mockRestore();
     });
 
     it('should block EMPLOYEE and VICE_ADMIN from rotating device keys with 403 Forbidden', async () => {
@@ -810,13 +837,16 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]);
       vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]);
 
+      const createManyMock = vi.fn().mockResolvedValue({ count: 1 });
+      const terminalUpdateMock = vi.fn().mockResolvedValue({});
+
       vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) => {
         const mockTx = {
           rawPunchLog: {
-            createMany: vi.fn().mockResolvedValue({ count: 1 }),
+            createMany: createManyMock,
           },
           biometricTerminal: {
-            update: vi.fn().mockResolvedValue({}),
+            update: terminalUpdateMock,
           },
         };
         return cb(mockTx);
@@ -839,6 +869,22 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       expect(result.totalReceived).toBe(2);
       expect(result.inserted).toBe(1);
       expect(result.duplicates).toBe(1);
+      expect(createManyMock).toHaveBeenCalledTimes(1);
+      expect(createManyMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          skipDuplicates: true,
+        })
+      );
+      expect(createManyMock.mock.calls[0][0].data).toHaveLength(2);
+      expect(terminalUpdateMock).toHaveBeenCalledTimes(1);
+      expect(terminalUpdateMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: mockTerminal.id },
+          data: expect.objectContaining({
+            status: 'ONLINE',
+          }),
+        })
+      );
     });
 
     it('should propagate database failures without masking as false success', async () => {
@@ -909,6 +955,19 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
           lastHeartbeatAt: freshHeartbeat,
         })
       ).toBe('ERROR');
+    });
+
+    it('should fail fast with a clear isolation error if an unmocked Prisma operation is invoked in unit mode', async () => {
+      await expect(
+        BiometricService.ingestPunches(mockTerminal, {
+          punches: [
+            {
+              userEnrollmentId: '9999',
+              punchTime: '2026-10-19T08:00:00.000Z',
+            },
+          ],
+        })
+      ).rejects.toThrowError(/\[UNIT TEST DB ISOLATION ERROR\] Unexpected unmocked Prisma call/);
     });
   });
 });

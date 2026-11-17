@@ -187,7 +187,7 @@ if (!process.env.SESSION_SECRET) {
 // in tests that do not connect to a live postgres database.
 import fs from 'fs';
 import path from 'path';
-import { beforeAll, vi } from 'vitest';
+import { beforeAll, beforeEach, afterEach, vi } from 'vitest';
 
 export function isPrismaClientInitialized(): boolean {
   try {
@@ -201,7 +201,7 @@ export function isPrismaClientInitialized(): boolean {
   }
 }
 
-beforeAll(async () => {
+async function ensureRolePermissionStub(): Promise<void> {
   if (process.env.COREERP_INTEGRATION_TEST_MODE === 'true') {
     return;
   }
@@ -215,10 +215,10 @@ beforeAll(async () => {
   try {
     const { prisma } = await import('../src/server/db/client.js');
     if (prisma?.rolePermission) {
-      if ('findUnique' in prisma.rolePermission) {
+      if ('findUnique' in prisma.rolePermission && !vi.isMockFunction(prisma.rolePermission.findUnique)) {
         vi.spyOn(prisma.rolePermission, 'findUnique').mockResolvedValue(null);
       }
-      if ('findMany' in prisma.rolePermission) {
+      if ('findMany' in prisma.rolePermission && !vi.isMockFunction(prisma.rolePermission.findMany)) {
         vi.spyOn(prisma.rolePermission, 'findMany').mockResolvedValue([]);
       }
     }
@@ -228,7 +228,11 @@ beforeAll(async () => {
     }
     throw err;
   }
-});
+}
+
+beforeAll(ensureRolePermissionStub);
+beforeEach(ensureRolePermissionStub);
+afterEach(ensureRolePermissionStub);
 
 
 

@@ -87,7 +87,7 @@ export function createPrismaClient(databaseUrl?: string): PrismaClient {
       process.env.DATABASE_URL ||
       (process.env.NODE_ENV === 'test'
         ? process.env.TEST_DATABASE_URL ||
-          'postgresql://erp_test_user:test_pass@localhost:5432/core_erp_test?schema=public'
+          'postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public'
         : undefined);
   }
 
@@ -337,17 +337,21 @@ export const prisma: PrismaClient = new Proxy({} as PrismaClient, {
     (target as unknown as Record<string, unknown>)[prop as string] = value;
     return true;
   },
+  deleteProperty(target, prop) {
+    return Reflect.deleteProperty(target, prop);
+  },
   getOwnPropertyDescriptor(target, prop) {
     if (prop in target) {
       return Object.getOwnPropertyDescriptor(target, prop);
     }
     const client = getPrismaClient();
     if (prop in client) {
+      const value = (client as unknown as Record<string, unknown>)[prop as string];
       return {
         configurable: true,
         enumerable: true,
         writable: true,
-        value: (client as unknown as Record<string, unknown>)[prop as string],
+        value: typeof value === 'function' ? value.bind(client) : value,
       };
     }
     return undefined;

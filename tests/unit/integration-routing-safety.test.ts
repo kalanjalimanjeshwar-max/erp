@@ -84,10 +84,16 @@ describe('Integration Test Database Routing and Isolation Safety', () => {
     );
   });
 
-  it('Test 5: Normal test mode preserves standard port-5433 fallback', () => {
+  it('Test 5: Normal test mode preserves standard port-5433 fallback and never targets port 5432', () => {
     delete process.env.COREERP_INTEGRATION_TEST_MODE;
     delete process.env.DATABASE_URL;
     delete process.env.TEST_DATABASE_URL;
+
+    const fallbackClient = createPrismaClient();
+    const fallbackUrl = (fallbackClient as any)._engineConfig?.overrideDatasources?.db?.url;
+    expect(fallbackUrl).toContain(':5433/');
+    expect(fallbackUrl).toContain('/core_erp_test');
+    expect(fallbackUrl).not.toContain(':5432');
 
     process.env.DATABASE_URL = APPROVED_STANDARD_TEST_DB_URL;
 
