@@ -1046,11 +1046,17 @@ export class BiometricService {
     return new Promise((resolve) => {
       const startedAt = Date.now();
       let settled = false;
+      let hardTimer: ReturnType<typeof setTimeout> | null = null;
       const socket = net.createConnection({ host, port });
 
       const finish = (reachable: boolean, errorCode?: string) => {
         if (settled) return;
         settled = true;
+        if (hardTimer) {
+          clearTimeout(hardTimer);
+          hardTimer = null;
+        }
+        socket.setTimeout(0);
         socket.destroy();
         resolve({
           reachable,
@@ -1059,10 +1065,15 @@ export class BiometricService {
         });
       };
 
+      hardTimer = setTimeout(() => finish(false, 'ETIMEDOUT'), timeoutMs + 50);
+      if (typeof hardTimer.unref === 'function') {
+        hardTimer.unref();
+      }
+
       socket.setTimeout(timeoutMs);
       socket.once('connect', () => finish(true));
       socket.once('timeout', () => finish(false, 'ETIMEDOUT'));
-      socket.once('error', (err: NodeJS.ErrnoException) => finish(false, err.code || err.message));
+      socket.on('error', (err: NodeJS.ErrnoException) => finish(false, err.code || err.message));
     });
   }
 

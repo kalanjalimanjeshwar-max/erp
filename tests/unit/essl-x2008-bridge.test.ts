@@ -236,6 +236,42 @@ function makeTempDirs() {
   };
 }
 
+function createInMemoryCompanySettingStore() {
+  const store = new Map<string, string>();
+  const makeKey = (companyId: string, key: string) => `${companyId}::${key}`;
+
+  const findUniqueSpy = vi
+    .spyOn(prisma.companySetting, 'findUnique')
+    .mockImplementation((async (args: any) => {
+      const k = makeKey(args.where.companyId_key.companyId, args.where.companyId_key.key);
+      const val = store.get(k);
+      return val === undefined
+        ? null
+        : ({
+            id: k,
+            companyId: args.where.companyId_key.companyId,
+            key: args.where.companyId_key.key,
+            value: val,
+          } as any);
+    }) as any);
+
+  const upsertSpy = vi
+    .spyOn(prisma.companySetting, 'upsert')
+    .mockImplementation((async (args: any) => {
+      const k = makeKey(args.where.companyId_key.companyId, args.where.companyId_key.key);
+      const val = args.update?.value ?? args.create?.value ?? '{}';
+      store.set(k, val);
+      return {
+        id: k,
+        companyId: args.where.companyId_key.companyId,
+        key: args.where.companyId_key.key,
+        value: val,
+      } as any;
+    }) as any);
+
+  return { store, findUniqueSpy, upsertSpy };
+}
+
 describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
   const app = createApp();
   const tempCleanups: Array<() => void> = [];
@@ -457,6 +493,7 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
 
   describe('3. Heartbeat Authentication, Serial Guard & Backend Telemetry', () => {
     it('should enforce X-Device-Serial matching in requireDeviceAuth and reject mismatched serial with 403', async () => {
+      const { store, upsertSpy } = createInMemoryCompanySettingStore();
       const plainKey = 'bio_live_valid_secret_key_000111222333444';
       const keyHash = crypto.createHash('sha256').update(plainKey).digest('hex');
 
@@ -496,9 +533,13 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       expect(okRes.status).toBe(200);
       expect(okRes.body.success).toBe(true);
       expect(okRes.body.status).toBe('ONLINE');
+      expect(upsertSpy).toHaveBeenCalledTimes(1);
+      const savedTelemetry = JSON.parse(store.get('company-1::BIOMETRIC_BRIDGE_TELEMETRY_V1') || '{}');
+      expect(savedTelemetry['term-x2008-id']?.bridgeHost).toBe('192.168.1.16');
     });
 
     it('should test terminal connection honestly and queue per-terminal sync via authenticated admin endpoints', async () => {
+      const { store } = createInMemoryCompanySettingStore();
       const adminUser: AuthUser = {
         id: 'u-admin',
         userId: 'u-admin',
@@ -546,14 +587,19 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       expect(testRes.body.success).toBe(false);
       expect(testRes.body.status).toBe('UNREACHABLE');
 
-      vi.spyOn(PunchReconciliationService, 'reconcilePendingPunches').mockResolvedValueOnce({
-        success: true,
-        totalEvaluated: 0,
-        processed: 0,
-        ignored: 0,
-        errors: 0,
-        results: [],
-      });
+      const telemetryAfterTest = JSON.parse(store.get('comp-1::BIOMETRIC_BRIDGE_TELEMETRY_V1') || '{}');
+      expect(telemetryAfterTest['term-x2008-1']?.lastTestConnectionStatus).toBe('UNREACHABLE');
+
+      const reconcileSpy = vi
+        .spyOn(PunchReconciliationService, 'reconcilePendingPunches')
+        .mockResolvedValueOnce({
+          success: true,
+          totalEvaluated: 0,
+          processed: 0,
+          ignored: 0,
+          errors: 0,
+          results: [],
+        });
 
       const syncRes = await request(app)
         .post('/api/biometric/devices/term-x2008-1/sync')
@@ -563,6 +609,80 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       expect(syncRes.status).toBe(200);
       expect(syncRes.body.success).toBe(true);
       expect(syncRes.body.bridgeSyncQueued).toBe(true);
+      expect(syncRes.body.syncRequestedAt).toBeTruthy();
+      expect(reconcileSpy).toHaveBeenCalledWith(
+        'comp-1',
+        expect.objectContaining({ terminalId: 'term-x2008-1' }),
+        'u-admin',
+        expect.any(String)
+      );
+
+      const telemetryAfterSync = JSON.parse(store.get('comp-1::BIOMETRIC_BRIDGE_TELEMETRY_V1') || '{}');
+      expect(telemetryAfterSync['term-x2008-1']?.syncRequestedAt).toBe(syncRes.body.syncRequestedAt);
+    });
+
+    it('reports BRIDGE_MANAGED (without faking TCP_REACHABLE) only when fresh bridge telemetry exists for an unreachable LAN terminal', async () => {
+      const { store } = createInMemoryCompanySettingStore();
+      const adminUser: AuthUser = {
+        id: 'u-admin',
+        userId: 'u-admin',
+        companyId: 'comp-1',
+        email: 'admin@namma.local',
+        fullName: 'Admin User',
+        role: 'ADMIN',
+        isActive: true,
+        tokenVersion: 1,
+      };
+      const token = AuthService.generateSessionToken({
+        userId: adminUser.userId,
+        companyId: adminUser.companyId,
+        email: adminUser.email,
+        role: adminUser.role,
+        tokenVersion: adminUser.tokenVersion,
+      });
+
+      const freshHeartbeatAt = new Date().toISOString();
+      store.set(
+        'comp-1::BIOMETRIC_BRIDGE_TELEMETRY_V1',
+        JSON.stringify({
+          'term-x2008-lan': {
+            bridgeConnected: true,
+            bridgeHost: 'WIN-RECEPTION-PC',
+            lastBridgeHeartbeatAt: freshHeartbeatAt,
+          },
+        })
+      );
+
+      vi.spyOn(prisma.user, 'findUnique').mockResolvedValue({ ...adminUser } as any);
+      vi.spyOn(prisma.rolePermission, 'findUnique').mockResolvedValue(null as any);
+      vi.spyOn(prisma.biometricTerminal, 'findFirst').mockResolvedValue({
+        id: 'term-x2008-lan',
+        companyId: 'comp-1',
+        deviceSerialNumber: 'NFZ8252800275',
+        name: 'LAN Gate X2008',
+        terminalModel: 'eSSL-X2008',
+        ipAddress: '127.0.0.1',
+        port: 1, // Direct TCP from server unreachable; bridge telemetry is fresh
+        isActive: true,
+        status: 'ONLINE',
+        lastHeartbeatAt: new Date(),
+        lastSyncAt: null,
+        firmwareVersion: 'Ver 6.60',
+        apiKeyPrefix: 'bio_live_123',
+        registeredByUserId: 'u-admin',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      } as any);
+
+      const res = await request(app)
+        .post('/api/biometric/devices/term-x2008-lan/test-connection')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.success).toBe(true);
+      expect(res.body.status).toBe('BRIDGE_MANAGED');
+      expect(res.body.latencyMs).toBeNull();
+      expect(res.body.message).toMatch(/WIN-RECEPTION-PC/);
     });
   });
 
@@ -959,9 +1079,19 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
 
   describe('5. Unmapped Employee Handling & Attendance Safety', () => {
     it('should ingest unmapped employee punch and mark ERROR during reconciliation without corrupting attendance', async () => {
+      const { store, findUniqueSpy } = createInMemoryCompanySettingStore();
+
       vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]);
       vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]);
-      vi.spyOn(prisma, '$transaction').mockResolvedValueOnce([{ count: 1 }, {}]);
+
+      const createManySpy = vi.fn().mockResolvedValue({ count: 1 });
+      const terminalUpdateSpy = vi.fn().mockResolvedValue({});
+      vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) =>
+        cb({
+          rawPunchLog: { createMany: createManySpy },
+          biometricTerminal: { update: terminalUpdateSpy },
+        })
+      );
 
       const ingestRes = await BiometricService.ingestPunches(
         {
@@ -987,15 +1117,22 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
 
       expect(ingestRes.inserted).toBe(1);
       expect(ingestRes.unmappedEmployees).toBe(1);
+      expect(createManySpy).toHaveBeenCalledTimes(1);
+      expect(terminalUpdateSpy).toHaveBeenCalledTimes(1);
+
+      const savedTelemetry = JSON.parse(store.get('comp-1::BIOMETRIC_BRIDGE_TELEMETRY_V1') || '{}');
+      expect(savedTelemetry['term-1']?.lastProcessedPunchCount).toBe(1);
 
       const rawPunchUpdate = vi.fn().mockResolvedValue({});
       const attendanceCreate = vi.fn();
       vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) =>
         cb({
+          companySetting: { findUnique: findUniqueSpy },
           rawPunchLog: {
             findUnique: vi.fn().mockResolvedValue({
               id: 'raw-1',
               companyId: 'comp-1',
+              terminalId: 'term-1',
               userEnrollmentId: 'UNMAPPED99',
               punchTime: new Date('2026-11-15T03:30:00.000Z'),
               inOutMode: 'CHECK_IN',
@@ -1006,7 +1143,10 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
             }),
             update: rawPunchUpdate,
           },
-          employee: { findFirst: vi.fn().mockResolvedValue(null) },
+          employee: {
+            findUnique: vi.fn().mockResolvedValue(null),
+            findFirst: vi.fn().mockResolvedValue(null),
+          },
           attendance: { create: attendanceCreate },
         })
       );
@@ -1014,7 +1154,108 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       const recRes = await PunchReconciliationService.reconcilePunch('raw-1');
       expect(recRes.status).toBe('ERROR');
       expect(recRes.message).toMatch(/Unmapped biometric enrollment ID/);
+      expect(rawPunchUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'raw-1' },
+          data: expect.objectContaining({ syncStatus: 'ERROR' }),
+        })
+      );
       expect(attendanceCreate).not.toHaveBeenCalled();
+    });
+
+    it('keeps terminal & tenant isolation when reconciling unmapped punch alongside mappings on other terminals or companies', async () => {
+      const { store, findUniqueSpy } = createInMemoryCompanySettingStore();
+
+      // Seed active mappings in comp-1 on a DIFFERENT terminal ('term-other') and inactive mapping on 'term-1',
+      // plus an active mapping on 'term-1' belonging to a DIFFERENT company ('comp-2').
+      store.set(
+        'comp-1::BIOMETRIC_EMPLOYEE_MAPPINGS_V1',
+        JSON.stringify([
+          {
+            id: 'map-other-term',
+            companyId: 'comp-1',
+            employeeId: 'emp-1',
+            terminalId: 'term-other',
+            enrollmentId: 'UNMAPPED99',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-11-01T00:00:00.000Z',
+            updatedAt: '2026-11-01T00:00:00.000Z',
+          },
+          {
+            id: 'map-inactive',
+            companyId: 'comp-1',
+            employeeId: 'emp-2',
+            terminalId: 'term-1',
+            enrollmentId: 'UNMAPPED99',
+            isActive: false,
+            source: 'EXPLICIT',
+            createdAt: '2026-11-01T00:00:00.000Z',
+            updatedAt: '2026-11-01T00:00:00.000Z',
+          },
+        ])
+      );
+      store.set(
+        'comp-2::BIOMETRIC_EMPLOYEE_MAPPINGS_V1',
+        JSON.stringify([
+          {
+            id: 'map-comp-2',
+            companyId: 'comp-2',
+            employeeId: 'emp-comp2',
+            terminalId: 'term-1',
+            enrollmentId: 'UNMAPPED99',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-11-01T00:00:00.000Z',
+            updatedAt: '2026-11-01T00:00:00.000Z',
+          },
+        ])
+      );
+
+      const rawPunchUpdate = vi.fn().mockResolvedValue({});
+      const attendanceCreate = vi.fn();
+      const employeeFindUnique = vi.fn();
+
+      vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) =>
+        cb({
+          companySetting: { findUnique: findUniqueSpy },
+          rawPunchLog: {
+            findUnique: vi.fn().mockResolvedValue({
+              id: 'raw-isolated-1',
+              companyId: 'comp-1',
+              terminalId: 'term-1',
+              userEnrollmentId: 'UNMAPPED99',
+              punchTime: new Date('2026-11-15T03:30:00.000Z'),
+              inOutMode: 'CHECK_IN',
+              syncStatus: 'PENDING',
+              matchedEmployee: null,
+              company: { id: 'comp-1', timezone: 'Asia/Kolkata' },
+              terminal: { id: 'term-1', name: 'eSSL X2008', location: 'Main' },
+            }),
+            update: rawPunchUpdate,
+          },
+          employee: {
+            findUnique: employeeFindUnique,
+            findFirst: vi.fn().mockResolvedValue(null),
+          },
+          attendance: { create: attendanceCreate },
+        })
+      );
+
+      const recRes = await PunchReconciliationService.reconcilePunch('raw-isolated-1');
+      expect(recRes.status).toBe('ERROR');
+      expect(recRes.matchedEmployeeId).toBeNull();
+      expect(employeeFindUnique).not.toHaveBeenCalled();
+      expect(attendanceCreate).not.toHaveBeenCalled();
+      expect(rawPunchUpdate).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'raw-isolated-1' },
+          data: expect.objectContaining({
+            syncStatus: 'ERROR',
+            errorMessage: expect.stringContaining('UNMAPPED99'),
+          }),
+        })
+      );
     });
   });
 
@@ -1243,20 +1484,7 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
     });
 
     it('persists dedicated POST /api/biometric/users per terminal, isolates multiple terminals, and queues POST /api/biometric/devices/:id/sync-users without running PunchReconciliationService', async () => {
-      const store = new Map<string, string>();
-      vi.spyOn(prisma.companySetting, 'findUnique').mockImplementation((async (args: any) => {
-        const key = `${args.where.companyId_key.companyId}::${args.where.companyId_key.key}`;
-        const val = store.get(key);
-        return val === undefined
-          ? null
-          : ({ id: key, companyId: args.where.companyId_key.companyId, key: args.where.companyId_key.key, value: val } as any);
-      }) as any);
-      vi.spyOn(prisma.companySetting, 'upsert').mockImplementation((async (args: any) => {
-        const key = `${args.where.companyId_key.companyId}::${args.where.companyId_key.key}`;
-        const val = args.update?.value ?? args.create?.value ?? '{}';
-        store.set(key, val);
-        return { id: key, companyId: args.where.companyId_key.companyId, key: args.where.companyId_key.key, value: val } as any;
-      }) as any);
+      createInMemoryCompanySettingStore();
 
       const keyA = 'bio_live_term_a_secret_0000111122223333';
       const keyB = 'bio_live_term_b_secret_0000111122223333';
