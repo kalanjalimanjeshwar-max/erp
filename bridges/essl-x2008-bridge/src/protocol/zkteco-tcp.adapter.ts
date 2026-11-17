@@ -435,6 +435,16 @@ export function decodeUserTablePayloadDetailed(rawPayload: Buffer): DecodedUserT
       recordBuffer = rawPayload.subarray(4);
     } else if (
       !rawIsAligned &&
+      candidateDeclared > remaining &&
+      candidateDeclared <= 16 * 1024 * 1024 &&
+      (candidateDeclared % 72 === 0 || candidateDeclared % 28 === 0)
+    ) {
+      throw new ZkProtocolError(
+        'MALFORMED_RESPONSE',
+        `Truncated ZK user table payload: 4-byte header declared ${candidateDeclared} bytes, received ${remaining} bytes.`
+      );
+    } else if (
+      !rawIsAligned &&
       candidateDeclared > 0 &&
       remaining >= candidateDeclared &&
       (candidateDeclared % 72 === 0 || candidateDeclared % 28 === 0)
@@ -679,7 +689,13 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
     }
 
     if (firstReply.command === ZK_CMD.PREPARE_DATA) {
-      const fullPayload = await this.receiveStreamedData(firstReply.payload, 'attendance logs');
+      const fullPayload = await this.receiveStreamedData(
+        firstReply.payload,
+        'attendance logs',
+        0,
+        true,
+        firstReply.replyId
+      );
       return decodeAttendancePayload(fullPayload);
     }
 
@@ -773,6 +789,8 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
       commandName: zkCmdName(ZK_CMD.PREPARE_BUFFER),
       replyCommand: prepReply.command,
       replyCommandName: zkCmdName(prepReply.command),
+      expectedReplyId: this.replyId,
+      receivedReplyId: prepReply.replyId,
       payloadBytes: prepReply.payload.length,
     });
 
@@ -789,11 +807,23 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
     }
 
     if (prepReply.command === ZK_CMD.PREPARE_DATA) {
-      return this.receiveStreamedData(prepReply.payload, `buffered command ${command}`);
+      return this.receiveStreamedData(
+        prepReply.payload,
+        `buffered command ${command}`,
+        0,
+        true,
+        prepReply.replyId
+      );
     }
 
     if (prepReply.command === ZK_CMD.ACK_DATA) {
       return prepReply.payload;
+    }
+
+    // ZLM60_TFT / Ver 6.60 returns CMD_DATA (1501) directly to CMD_PREPARE_BUFFER (1503) when the
+    // dataset fits inside the firmware's single/small-buffer threshold (e.g. 13 users = 940 bytes <= 1024).
+    if (prepReply.command === ZK_CMD.DATA) {
+      return this.assembleDirectDataReply(prepReply, `buffered command ${command}`);
     }
 
     if (prepReply.command !== ZK_CMD.ACK_OK) {
@@ -844,9 +874,14 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
             chunkReply.payload.length >= 4 ? chunkReply.payload : Buffer.alloc(0),
             `buffer chunk offset=${offset}`,
             requestSize,
-            false
+            false,
+            chunkReply.replyId
           );
-        } else if (chunkReply.command === ZK_CMD.ACK_DATA || chunkReply.command === ZK_CMD.ACK_OK) {
+        } else if (
+          chunkReply.command === ZK_CMD.ACK_DATA ||
+          chunkReply.command === ZK_CMD.ACK_OK ||
+          chunkReply.command === ZK_CMD.DATA
+        ) {
           chunkBytes = chunkReply.payload;
         } else if (chunkReply.command === ZK_CMD.ACK_ERROR) {
           throw new ZkProtocolError(
@@ -897,6 +932,91 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
     return Buffer.concat(chunks);
   }
 
+  private async assembleDirectDataReply(firstFrame: ParsedZkFrame, label: string): Promise<Buffer> {
+    const firstPayload = firstFrame.payload;
+    if (firstPayload.length < 4) {
+      return firstPayload;
+    }
+
+    const declaredSize = firstPayload.readUInt32LE(0);
+    const remainingFirst = firstPayload.length - 4;
+
+    // Complete single-frame CMD_DATA response (with 4-byte LE size prefix)
+    if (declaredSize === 0 && firstPayload.length === 4) {
+      return firstPayload;
+    }
+    if (declaredSize > 0 && remainingFirst >= declaredSize) {
+      return firstPayload.subarray(0, 4 + declaredSize);
+    }
+
+    // Headerless single-frame CMD_DATA response aligned to 72-byte or 28-byte user records
+    const firstIsAligned = firstPayload.length % 72 === 0 || firstPayload.length % 28 === 0;
+    const isPlausibleSplitTable =
+      !firstIsAligned &&
+      declaredSize > remainingFirst &&
+      declaredSize <= 16 * 1024 * 1024 &&
+      (declaredSize % 72 === 0 || declaredSize % 28 === 0);
+
+    if (!isPlausibleSplitTable) {
+      return firstPayload;
+    }
+
+    // Multi-frame CMD_DATA (1501) continuation: collect frames matching expected replyId until 4 + declaredSize bytes arrive
+    const expectedReplyId = firstFrame.replyId;
+    const targetBytes = 4 + declaredSize;
+    const chunks: Buffer[] = [firstPayload];
+    let totalBytes = firstPayload.length;
+    const deadlineAt = Date.now() + this.timeoutMs * 3;
+
+    while (totalBytes < targetBytes) {
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        throw new ZkProtocolError(
+          'COMMUNICATION_FAILURE',
+          `Timed out waiting for continuation CMD_DATA frames for ${label} (${totalBytes}/${targetBytes} bytes received).`,
+          { commandId: ZK_CMD.DATA }
+        );
+      }
+
+      const nextFrame = await this.waitForNextFrame(remainingMs);
+      if (expectedReplyId > 0 && nextFrame.replyId !== 0 && nextFrame.replyId !== expectedReplyId) {
+        this.emitDiagnostic({
+          operation: 'send_command',
+          commandId: ZK_CMD.DATA,
+          commandName: zkCmdName(ZK_CMD.DATA),
+          replyCommand: nextFrame.command,
+          replyCommandName: zkCmdName(nextFrame.command),
+          expectedReplyId,
+          receivedReplyId: nextFrame.replyId,
+          payloadBytes: nextFrame.payload.length,
+          message: `Skipped stale frame replyId=${nextFrame.replyId} while assembling ${label} (expected replyId=${expectedReplyId}).`,
+        });
+        continue;
+      }
+
+      if (nextFrame.command === ZK_CMD.DATA || nextFrame.command === ZK_CMD.ACK_DATA) {
+        chunks.push(nextFrame.payload);
+        totalBytes += nextFrame.payload.length;
+      } else if (nextFrame.command === ZK_CMD.ACK_OK) {
+        break;
+      } else if (nextFrame.command === ZK_CMD.ACK_ERROR) {
+        throw new ZkProtocolError(
+          'COMMUNICATION_FAILURE',
+          `Biometric device returned CMD_ACK_ERROR during CMD_DATA transfer for ${label}.`,
+          { commandId: ZK_CMD.DATA, replyCommand: nextFrame.command }
+        );
+      } else {
+        throw new ZkProtocolError(
+          'MALFORMED_RESPONSE',
+          `Unexpected response command ${nextFrame.command} during CMD_DATA transfer for ${label}.`,
+          { commandId: ZK_CMD.DATA, replyCommand: nextFrame.command }
+        );
+      }
+    }
+
+    return Buffer.concat(chunks);
+  }
+
   private async readUsersDirectCommand(command: number, payload: Buffer): Promise<Buffer> {
     const firstReply = await this.sendCommand(command, payload);
     this.emitDiagnostic({
@@ -905,6 +1025,8 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
       commandName: zkCmdName(command),
       replyCommand: firstReply.command,
       replyCommandName: zkCmdName(firstReply.command),
+      expectedReplyId: this.replyId,
+      receivedReplyId: firstReply.replyId,
       payloadBytes: firstReply.payload.length,
     });
 
@@ -912,8 +1034,12 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
       return firstReply.payload;
     }
 
+    if (firstReply.command === ZK_CMD.DATA) {
+      return this.assembleDirectDataReply(firstReply, zkCmdName(command));
+    }
+
     if (firstReply.command === ZK_CMD.PREPARE_DATA) {
-      return this.receiveStreamedData(firstReply.payload, 'enrolled users');
+      return this.receiveStreamedData(firstReply.payload, 'enrolled users', 0, true, firstReply.replyId);
     }
 
     if (firstReply.command === ZK_CMD.ACK_ERROR || firstReply.command === ZK_CMD.ACK_UNKNOWN) {
@@ -1068,14 +1194,39 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
     prepPayload: Buffer,
     label: string,
     fallbackExpectedBytes = 0,
-    freeBufferAfterStream = true
+    freeBufferAfterStream = true,
+    expectedReplyId = 0
   ): Promise<Buffer> {
     const expectedBytes = prepPayload.length >= 4 ? prepPayload.readUInt32LE(0) : fallbackExpectedBytes;
     const chunks: Buffer[] = [];
     let receivedBytes = 0;
+    const deadlineAt = Date.now() + this.timeoutMs * 3;
 
     while (receivedBytes < expectedBytes) {
-      const frame = await this.waitForNextFrame(this.timeoutMs * 3);
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        throw new ZkProtocolError(
+          'COMMUNICATION_FAILURE',
+          `Timed out while streaming ${label} (${receivedBytes}/${expectedBytes} bytes received).`
+        );
+      }
+
+      const frame = await this.waitForNextFrame(remainingMs);
+      if (expectedReplyId > 0 && frame.replyId !== 0 && frame.replyId !== expectedReplyId) {
+        this.emitDiagnostic({
+          operation: 'send_command',
+          commandId: ZK_CMD.PREPARE_DATA,
+          commandName: zkCmdName(ZK_CMD.PREPARE_DATA),
+          replyCommand: frame.command,
+          replyCommandName: zkCmdName(frame.command),
+          expectedReplyId,
+          receivedReplyId: frame.replyId,
+          payloadBytes: frame.payload.length,
+          message: `Skipped stale frame replyId=${frame.replyId} while streaming ${label} (expected replyId=${expectedReplyId}).`,
+        });
+        continue;
+      }
+
       if (frame.command === ZK_CMD.DATA) {
         chunks.push(frame.payload);
         receivedBytes += frame.payload.length;
@@ -1163,10 +1314,44 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
 
     const deadlineAt = Date.now() + this.timeoutMs;
     while (true) {
-      const remainingMs = Math.max(50, deadlineAt - Date.now());
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) {
+        throw new ZkProtocolError(
+          'COMMUNICATION_FAILURE',
+          `Timed out after ${this.timeoutMs}ms waiting for ZK TCP response to ${zkCmdName(command)} (replyId=${expectedReplyId}).`,
+          { commandId: command }
+        );
+      }
+
       const reply = await this.waitForNextFrame(remainingMs);
-      // Match replyId when non-zero to prevent stale trailing ACK_OK frames from previous transfers from colliding
+      // Reject/skip frames belonging to another session or an older replyId (stale/unsolicited frames)
+      if (this.sessionId !== 0 && reply.sessionId !== 0 && reply.sessionId !== this.sessionId) {
+        this.emitDiagnostic({
+          operation: 'send_command',
+          commandId: command,
+          commandName: zkCmdName(command),
+          replyCommand: reply.command,
+          replyCommandName: zkCmdName(reply.command),
+          expectedReplyId,
+          receivedReplyId: reply.replyId,
+          payloadBytes: reply.payload.length,
+          message: `Skipped foreign-session frame sessionId=${reply.sessionId} while waiting for ${zkCmdName(command)}.`,
+        });
+        continue;
+      }
+
       if (expectedReplyId > 0 && reply.replyId !== 0 && reply.replyId !== expectedReplyId) {
+        this.emitDiagnostic({
+          operation: 'send_command',
+          commandId: command,
+          commandName: zkCmdName(command),
+          replyCommand: reply.command,
+          replyCommandName: zkCmdName(reply.command),
+          expectedReplyId,
+          receivedReplyId: reply.replyId,
+          payloadBytes: reply.payload.length,
+          message: `Skipped stale frame replyId=${reply.replyId} while waiting for ${zkCmdName(command)} (expected replyId=${expectedReplyId}).`,
+        });
         continue;
       }
       return reply;

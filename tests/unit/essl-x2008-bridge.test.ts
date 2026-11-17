@@ -126,6 +126,10 @@ async function startMockX2008Server(options: {
   forceEmptyUserResponses?: boolean;
   rawMalformedUserPayload?: Buffer;
   lateTrailingAckOnAttlog?: boolean;
+  prepareBufferDirectDataReply?: boolean;
+  splitDirectDataReply?: boolean;
+  truncateDirectDataReply?: boolean;
+  injectStaleFrameBeforePrepareBufferReply?: boolean;
 }): Promise<{
   port: number;
   receivedCommands: number[];
@@ -228,6 +232,38 @@ async function startMockX2008Server(options: {
         } else if (frame.command === ZK_CMD.PREPARE_BUFFER) {
           if (options.failGetUsers) {
             socket.write(buildZkTcpFrame(ZK_CMD.ACK_ERROR, sessionId, frame.replyId));
+          } else if (options.prepareBufferDirectDataReply && frame.payload.length >= 11) {
+            const subCmd = frame.payload.readInt16LE(1);
+            const fct = frame.payload.readInt32LE(3);
+            const ext = frame.payload.readInt32LE(7);
+            prepareBufferRequests.push({ command: subCmd, fct, ext });
+
+            if (subCmd === ZK_CMD.USERTEMP_RRQ && fct === ZK_FCT.USER) {
+              if (options.injectStaleFrameBeforePrepareBufferReply) {
+                const staleReplyId = frame.replyId > 1 ? frame.replyId - 1 : 999;
+                socket.write(buildZkTcpFrame(ZK_CMD.DATA, sessionId, staleReplyId, Buffer.from('stale-data')));
+                socket.write(buildZkTcpFrame(ZK_CMD.DATA, 0x9999, frame.replyId, Buffer.from('wrong-session')));
+              }
+
+              let payload = buildUserBufferPayload();
+              if (options.truncateDirectDataReply && payload.length > 76) {
+                // Keep header declaring full size (e.g. 936 bytes) but truncate body to 72 bytes
+                payload = payload.subarray(0, 76);
+              }
+
+              if (options.splitDirectDataReply && payload.length > 200) {
+                const splitAt = Math.floor(payload.length / 2);
+                socket.write(buildZkTcpFrame(ZK_CMD.DATA, sessionId, frame.replyId, payload.subarray(0, splitAt)));
+                if (options.injectStaleFrameBeforePrepareBufferReply) {
+                  socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId + 50, Buffer.alloc(0)));
+                }
+                socket.write(buildZkTcpFrame(ZK_CMD.DATA, sessionId, frame.replyId, payload.subarray(splitAt)));
+              } else {
+                socket.write(buildZkTcpFrame(ZK_CMD.DATA, sessionId, frame.replyId, payload));
+              }
+            } else {
+              socket.write(buildZkTcpFrame(ZK_CMD.ACK_ERROR, sessionId, frame.replyId));
+            }
           } else if (options.ver660BufferedUsers && frame.payload.length >= 11) {
             const subCmd = frame.payload.readInt16LE(1);
             const fct = frame.payload.readInt32LE(3);
@@ -1990,6 +2026,227 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
         ).toBe(true);
       } finally {
         await mockGenuineZero.close();
+      }
+    });
+
+    it('handles ZLM60_TFT Ver 6.60 CMD_PREPARE_BUFFER (1503) -> CMD_DATA (1501) for 13 users, rejects stale replyId/truncated packets, and isolates from punch reconciliation', async () => {
+      const dirs = makeTempDirs();
+      tempCleanups.push(dirs.cleanup);
+
+      // Build a protocol-accurate 13-user ZLM60_TFT 72-byte dataset (4 + 13*72 = 940 bytes <= 1024)
+      const thirteenUsers = Array.from({ length: 13 }, (_, idx) =>
+        build72ByteUserRecord({
+          uid: idx + 1,
+          enrollmentId: String(100 + idx + 1),
+          name: `Staff ${idx + 1}`,
+          cardNo: idx === 0 ? 778899 : undefined,
+        })
+      );
+
+      // 1. Live Ver 6.60 single-frame CMD_DATA (1501) reply to CMD_PREPARE_BUFFER (1503) + stale frame resilience
+      const diagEvents: any[] = [];
+      const mockSingle1501 = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        platform: 'ZLM60_TFT',
+        firmwareVersion: 'Ver 6.60 Apr 13 2022',
+        userRecords: thirteenUsers,
+        freeSizesUserCount: 13,
+        prepareBufferDirectDataReply: true,
+        injectStaleFrameBeforePrepareBufferReply: true,
+      });
+
+      const uploadedPayloads: any[] = [];
+      const submittedPunches: any[] = [];
+      try {
+        const adapter = new ZKTecoTcpAdapter({
+          onDiagnostic: (evt) => diagEvents.push(evt),
+        });
+        await adapter.connect({ host: '127.0.0.1', port: mockSingle1501.port, timeoutMs: 3000 });
+        const users = await adapter.getUsers();
+        await adapter.disconnect();
+
+        expect(users).toHaveLength(13);
+        expect(users[0]).toEqual({
+          uid: 1,
+          enrollmentId: '101',
+          name: 'Staff 1',
+          cardNo: '778899',
+        });
+        expect(users[12]).toEqual({
+          uid: 13,
+          enrollmentId: '113',
+          name: 'Staff 13',
+          cardNo: null,
+        });
+        expect(diagEvents.some((d) => d.operation === 'get_free_sizes' && d.reportedUserCount === 13)).toBe(true);
+        expect(
+          diagEvents.some(
+            (d) =>
+              d.operation === 'read_with_buffer' &&
+              d.commandId === 1503 &&
+              d.replyCommand === 1501 &&
+              d.payloadBytes === 940
+          )
+        ).toBe(true);
+        expect(diagEvents.some((d) => d.operation === 'send_command' && /Skipped stale frame/i.test(d.message))).toBe(
+          true
+        );
+        expect(
+          diagEvents.some((d) => d.operation === 'send_command' && /Skipped foreign-session frame/i.test(d.message))
+        ).toBe(true);
+        expect(
+          diagEvents.some(
+            (d) =>
+              d.operation === 'decode_users' &&
+              d.outcome === 'SUCCESS' &&
+              d.reportedUserCount === 13 &&
+              d.recordCount === 13 &&
+              d.recordSize === 72
+          )
+        ).toBe(true);
+
+        // Verify BiometricBridgeRunner.syncTerminalUsersOnce uses this real adapter without touching punches
+        const runner = new BiometricBridgeRunner({
+          config: {
+            coreErpBaseUrl: 'https://erp.company.local',
+            allowInsecureHttp: false,
+            bridgeHost: '192.168.1.16',
+            bridgeVersion: '1.0.0',
+            healthHost: '127.0.0.1',
+            healthPort: 4379,
+            dataDir: dirs.dataDir,
+            logDir: dirs.logDir,
+            logLevel: 'debug',
+            batchSize: 100,
+            pollIntervalMs: 15000,
+            heartbeatIntervalMs: 60000,
+            connectTimeoutMs: 3000,
+            maxBackoffMs: 120000,
+            dpapiStorePath: path.join(dirs.dataDir, 'creds.json'),
+            terminals: [
+              {
+                id: 'essl-x2008-main',
+                name: 'eSSL X2008',
+                serialNumber: 'NFZ8252800275',
+                ipAddress: '127.0.0.1',
+                port: mockSingle1501.port,
+                deviceTimezone: 'Asia/Kolkata',
+                apiKey: 'bio_live_1501_test_secret_1234567890',
+              },
+            ],
+          },
+          logger: new BridgeLogger({ silentConsole: true }),
+          checkpointStore: new CheckpointStore(dirs.dataDir),
+          coreErpClient: {
+            sendHeartbeat: vi.fn(),
+            submitPunches: vi.fn().mockImplementation(async (_k, _sn, punches) => {
+              submittedPunches.push(...punches);
+              return {
+                success: true,
+                totalReceived: 0,
+                inserted: 0,
+                duplicates: 0,
+                unmappedEmployees: 0,
+                terminalId: 'essl-x2008-main',
+                terminalName: 'eSSL X2008',
+              };
+            }),
+            syncUsers: vi.fn().mockImplementation(async (_k, _sn, payload) => {
+              uploadedPayloads.push(payload);
+              return {
+                success: true,
+                terminalId: 'essl-x2008-main',
+                terminalName: 'eSSL X2008',
+                discoveredCount: payload.deviceUsers.length,
+                syncedCount: payload.deviceUsers.length,
+                syncedAt: new Date().toISOString(),
+              };
+            }),
+          },
+        });
+
+        const runnerRes = await runner.syncTerminalUsersOnce('essl-x2008-main');
+        expect(runnerRes.discoveredCount).toBe(13);
+        expect(runnerRes.syncedCount).toBe(13);
+        expect(uploadedPayloads).toHaveLength(1);
+        expect(uploadedPayloads[0].deviceUsers).toHaveLength(13);
+        expect(submittedPunches).toHaveLength(0);
+      } finally {
+        await mockSingle1501.close();
+      }
+
+      // 2. Multi-frame split CMD_DATA (1501) reply to 1503 with mid-transfer stale ACK_OK rejection
+      const mockSplit1501 = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        platform: 'ZLM60_TFT',
+        userRecords: thirteenUsers,
+        freeSizesUserCount: 13,
+        prepareBufferDirectDataReply: true,
+        splitDirectDataReply: true,
+        injectStaleFrameBeforePrepareBufferReply: true,
+      });
+      try {
+        const adapter = new ZKTecoTcpAdapter();
+        await adapter.connect({ host: '127.0.0.1', port: mockSplit1501.port, timeoutMs: 3000 });
+        const users = await adapter.getUsers();
+        await adapter.disconnect();
+        expect(users).toHaveLength(13);
+      } finally {
+        await mockSplit1501.close();
+      }
+
+      // 3. Truncated CMD_DATA (1501) where 4-byte header declares 936 bytes but only 72 bytes follow -> MUST fail with MALFORMED_RESPONSE
+      const mockTruncated1501 = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        userRecords: thirteenUsers,
+        freeSizesUserCount: 13,
+        prepareBufferDirectDataReply: true,
+        truncateDirectDataReply: true,
+      });
+      try {
+        const adapter = new ZKTecoTcpAdapter();
+        await adapter.connect({ host: '127.0.0.1', port: mockTruncated1501.port, timeoutMs: 400 });
+        try {
+          await expect(adapter.getUsers()).rejects.toMatchObject({
+            name: 'ZkProtocolError',
+          });
+        } finally {
+          await adapter.disconnect();
+        }
+      } finally {
+        await mockTruncated1501.close();
+      }
+
+      // 4. Empty CMD_DATA (1501) while CMD_GET_FREE_SIZES reports 13 -> MUST fail with MALFORMED_RESPONSE & diagnostic evidence
+      const mismatchDiags: any[] = [];
+      const mockEmpty1501Mismatch = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        freeSizesUserCount: 13,
+        prepareBufferDirectDataReply: true,
+        forceEmptyUserResponses: true,
+      });
+      try {
+        const adapter = new ZKTecoTcpAdapter({ onDiagnostic: (e) => mismatchDiags.push(e) });
+        await adapter.connect({ host: '127.0.0.1', port: mockEmpty1501Mismatch.port, timeoutMs: 3000 });
+        try {
+          await expect(adapter.getUsers()).rejects.toMatchObject({
+            name: 'ZkProtocolError',
+            code: 'MALFORMED_RESPONSE',
+          } satisfies Partial<ZkProtocolError>);
+          expect(
+            mismatchDiags.some(
+              (d) =>
+                d.operation === 'decode_users' &&
+                d.outcome === 'MALFORMED_RESPONSE' &&
+                d.reportedUserCount === 13 &&
+                d.recordCount === 0
+            )
+          ).toBe(true);
+        } finally {
+          await adapter.disconnect();
+        }
+      } finally {
+        await mockEmpty1501Mismatch.close();
       }
     });
   });

@@ -88,11 +88,13 @@ export type UserSyncOutcome =
   | 'MALFORMED_RESPONSE';
 
 export interface ProtocolDiagnosticEvent {
-  operation: 'get_free_sizes' | 'get_users' | 'read_with_buffer' | 'read_chunk' | 'decode_users';
+  operation: 'get_free_sizes' | 'get_users' | 'read_with_buffer' | 'read_chunk' | 'decode_users' | 'send_command';
   commandId?: number;
   commandName?: string;
   replyCommand?: number;
   replyCommandName?: string;
+  expectedReplyId?: number;
+  receivedReplyId?: number;
   payloadBytes?: number;
   expectedBytes?: number;
   chunkOffset?: number;
