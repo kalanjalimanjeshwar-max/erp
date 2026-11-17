@@ -40,10 +40,12 @@ import {
   RawPunchLogItem,
   PunchSyncStatus,
   PunchSyncSummaryResponse,
+  PunchReconciliationOptions,
   PunchReconciliationResponse,
   CreateBiometricTerminalRequest,
   CompanyProfile,
   DeviceEnrolledUserItem,
+  EmployeeItem,
 } from '../../shared/types.ts';
 import {
   BIOMETRIC_MODEL_PRESETS,
@@ -87,6 +89,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   // Punch Log Filters
   const [filterSyncStatus, setFilterSyncStatus] = useState<string>('');
   const [filterTerminalId, setFilterTerminalId] = useState<string>('');
+  const [filterEnrollmentId, setFilterEnrollmentId] = useState<string>('');
   const [filterStartDate, setFilterStartDate] = useState<string>('');
   const [filterEndDate, setFilterEndDate] = useState<string>('');
 
@@ -115,9 +118,15 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   const [isTriggeringSync, setIsTriggeringSync] = useState<boolean>(false);
   const [syncBatchSize, setSyncBatchSize] = useState<number>(100);
   const [syncSelectedTerminalId, setSyncSelectedTerminalId] = useState<string>('');
+  const [syncEnrollmentId, setSyncEnrollmentId] = useState<string>('');
+  const [syncSelectedEmployeeId, setSyncSelectedEmployeeId] = useState<string>('');
+  const [syncSelectedPunchId, setSyncSelectedPunchId] = useState<string>('');
   const [syncRetryErrors, setSyncRetryErrors] = useState<boolean>(false);
   const [syncOutcome, setSyncOutcome] = useState<PunchReconciliationResponse | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [reconcileEmployees, setReconcileEmployees] = useState<EmployeeItem[]>([]);
+  const [pendingPunchOptions, setPendingPunchOptions] = useState<RawPunchLogItem[]>([]);
+  const [isLoadingPendingPunchOptions, setIsLoadingPendingPunchOptions] = useState<boolean>(false);
 
   // Permission feedback
   const [permissionDeniedMessage, setPermissionDeniedMessage] = useState<string | null>(null);
@@ -177,6 +186,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
       const res = await api.getBiometricPunches({
         syncStatus: (filterSyncStatus as PunchSyncStatus) || undefined,
         terminalId: filterTerminalId || undefined,
+        userEnrollmentId: filterEnrollmentId.trim() || undefined,
         startDate: filterStartDate || undefined,
         endDate: filterEndDate || undefined,
         page: punchPage,
@@ -194,7 +204,37 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     } finally {
       setIsLoadingPunches(false);
     }
-  }, [filterSyncStatus, filterTerminalId, filterStartDate, filterEndDate, punchPage, punchLimit]);
+  }, [filterSyncStatus, filterTerminalId, filterEnrollmentId, filterStartDate, filterEndDate, punchPage, punchLimit]);
+
+  // Load Eligible Pending Punches & Employees for Targeted Reconciliation
+  const loadReconciliationTargets = useCallback(async (includeErrorPunches: boolean) => {
+    setIsLoadingPendingPunchOptions(true);
+    try {
+      const [pendingRes, errorRes, employeesRes] = await Promise.all([
+        api.getBiometricPunches({ syncStatus: 'PENDING', page: 1, limit: 100 }),
+        includeErrorPunches
+          ? api.getBiometricPunches({ syncStatus: 'ERROR', page: 1, limit: 100 })
+          : Promise.resolve({ items: [] as RawPunchLogItem[], total: 0, page: 1, limit: 100 }),
+        api.getEmployees({ limit: 500 }).catch(() => ({ items: [] as EmployeeItem[], total: 0, page: 1, limit: 500 })),
+      ]);
+
+      const mergedMap = new Map<string, RawPunchLogItem>();
+      for (const item of [...pendingRes.items, ...errorRes.items]) {
+        mergedMap.set(item.id, item);
+      }
+      const sorted = Array.from(mergedMap.values()).sort(
+        (a, b) => new Date(a.punchTime).getTime() - new Date(b.punchTime).getTime()
+      );
+      setPendingPunchOptions(sorted);
+      if (employeesRes.items.length > 0) {
+        setReconcileEmployees(employeesRes.items);
+      }
+    } catch {
+      // Non-fatal: manual text entry for Enrollment ID remains available
+    } finally {
+      setIsLoadingPendingPunchOptions(false);
+    }
+  }, []);
 
   const loadSelectedTerminalDeviceUsers = useCallback(async (terminalId: string) => {
     if (!terminalId) {
@@ -241,6 +281,12 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
       loadPunches();
     }
   }, [activeTab, loadPunches]);
+
+  useEffect(() => {
+    if (activeTab === 'sync' || isSyncModalOpen) {
+      loadReconciliationTargets(syncRetryErrors);
+    }
+  }, [activeTab, isSyncModalOpen, syncRetryErrors, loadReconciliationTargets]);
 
   // Handle Device Registration
   const handleRegisterDevice = async (e: React.FormEvent) => {
@@ -293,24 +339,31 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     }
   };
 
-  // Handle Manual Punch Sync
+  // Handle Manual Punch Sync (Default Batch or Targeted Filter / Single Punch)
   const handleTriggerSync = async () => {
     setIsTriggeringSync(true);
     setSyncError(null);
     setSyncOutcome(null);
 
     try {
-      const result = await api.triggerBiometricSync({
-        batchSize: Math.max(1, Math.min(500, syncBatchSize)),
-        terminalId: syncSelectedTerminalId || undefined,
+      const trimmedEnrollmentId = syncEnrollmentId.trim();
+      const payload: PunchReconciliationOptions = {
+        batchSize: syncSelectedPunchId ? 1 : Math.max(1, Math.min(500, syncBatchSize)),
         retryErrors: syncRetryErrors,
-      });
+        ...(syncSelectedTerminalId ? { terminalId: syncSelectedTerminalId } : {}),
+        ...(trimmedEnrollmentId ? { userEnrollmentId: trimmedEnrollmentId } : {}),
+        ...(syncSelectedEmployeeId ? { employeeId: syncSelectedEmployeeId } : {}),
+        ...(syncSelectedPunchId ? { punchId: syncSelectedPunchId } : {}),
+      };
+
+      const result = await api.triggerBiometricSync(payload);
 
       setSyncOutcome(result);
 
       // Refresh telemetry and punch log records
       loadSyncSummary();
       loadTerminals();
+      loadReconciliationTargets(syncRetryErrors);
       if (activeTab === 'punches') {
         loadPunches();
       }
@@ -320,6 +373,27 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     } finally {
       setIsTriggeringSync(false);
     }
+  };
+
+  const handleOpenTargetedPunchReconcile = (punch: RawPunchLogItem) => {
+    setSyncOutcome(null);
+    setSyncError(null);
+    setSyncSelectedTerminalId('');
+    setSyncEnrollmentId('');
+    setSyncSelectedEmployeeId('');
+    setSyncSelectedPunchId(punch.id);
+    setSyncRetryErrors(punch.syncStatus === 'ERROR');
+    setPendingPunchOptions((prev) =>
+      prev.some((item) => item.id === punch.id) ? prev : [punch, ...prev]
+    );
+    setIsSyncModalOpen(true);
+  };
+
+  const clearSyncFilters = () => {
+    setSyncSelectedTerminalId('');
+    setSyncEnrollmentId('');
+    setSyncSelectedEmployeeId('');
+    setSyncSelectedPunchId('');
   };
 
   // Copy API Key Helper
@@ -446,6 +520,48 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   const selectedUserSyncTerminal =
     terminals.find((t) => t.id === selectedUserSyncTerminalId) || null;
   const totalPages = Math.max(1, Math.ceil(punchTotal / punchLimit));
+
+  const selectedSyncEmployee =
+    reconcileEmployees.find((emp) => emp.id === syncSelectedEmployeeId) || null;
+  const trimmedSyncEnrollmentId = syncEnrollmentId.trim();
+  const isTargetedReconciliation = Boolean(
+    syncSelectedPunchId || trimmedSyncEnrollmentId || syncSelectedEmployeeId || syncSelectedTerminalId
+  );
+
+  const filteredPendingPunchOptions = pendingPunchOptions.filter((item) => {
+    if (syncSelectedPunchId && item.id === syncSelectedPunchId) return true;
+    if (syncSelectedTerminalId && item.terminalId !== syncSelectedTerminalId) return false;
+    if (trimmedSyncEnrollmentId && item.userEnrollmentId !== trimmedSyncEnrollmentId) return false;
+    if (selectedSyncEmployee) {
+      const activeMaps = (selectedSyncEmployee.biometricMappings || []).filter((m) => m.isActive);
+      const matchesExplicitMapping = activeMaps.some(
+        (m) => m.terminalId === item.terminalId && m.enrollmentId === item.userEnrollmentId
+      );
+      const matchesLegacy =
+        activeMaps.length === 0 &&
+        Boolean(selectedSyncEmployee.biometricDeviceId) &&
+        selectedSyncEmployee.biometricDeviceId === item.userEnrollmentId;
+      const matchesEmployeeId = item.matchedEmployeeId === selectedSyncEmployee.id;
+      if (!matchesExplicitMapping && !matchesLegacy && !matchesEmployeeId) return false;
+    }
+    return true;
+  });
+
+  const enrollmentSuggestions = Array.from(
+    new Set([
+      ...pendingPunchOptions.map((p) => p.userEnrollmentId),
+      ...selectedTerminalDeviceUsers.map((u) => u.enrollmentId),
+      ...reconcileEmployees.flatMap((emp) => [
+        ...(emp.biometricMappings || []).filter((m) => m.isActive).map((m) => m.enrollmentId),
+        ...(emp.biometricDeviceId ? [emp.biometricDeviceId] : []),
+      ]),
+    ].filter(Boolean))
+  ).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+
+  const selectedPunchOption =
+    pendingPunchOptions.find((p) => p.id === syncSelectedPunchId) ||
+    punches.find((p) => p.id === syncSelectedPunchId) ||
+    null;
 
   return (
     <div className="space-y-6">
@@ -1179,6 +1295,20 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
               ))}
             </select>
 
+            {/* Enrollment ID Filter */}
+            <div className="flex items-center gap-1.5">
+              <input
+                type="text"
+                value={filterEnrollmentId}
+                onChange={(e) => {
+                  setFilterEnrollmentId(e.target.value);
+                  setPunchPage(1);
+                }}
+                placeholder="Enrollment ID (e.g. 101)"
+                className="w-40 bg-slate-800 border border-slate-700 text-slate-200 text-xs font-mono rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+
             {/* Start Date */}
             <div className="flex items-center gap-1.5">
               <span className="text-[11px] text-slate-400">From:</span>
@@ -1207,11 +1337,12 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
               />
             </div>
 
-            {(filterSyncStatus || filterTerminalId || filterStartDate || filterEndDate) && (
+            {(filterSyncStatus || filterTerminalId || filterEnrollmentId || filterStartDate || filterEndDate) && (
               <button
                 onClick={() => {
                   setFilterSyncStatus('');
                   setFilterTerminalId('');
+                  setFilterEnrollmentId('');
                   setFilterStartDate('');
                   setFilterEndDate('');
                   setPunchPage(1);
@@ -1258,6 +1389,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                       <th className="py-3 px-4">Terminal</th>
                       <th className="py-3 px-4">Sync Status</th>
                       <th className="py-3 px-4">Reconciliation Outcome / Note</th>
+                      <th className="py-3 px-4 text-right">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 text-xs">
@@ -1327,6 +1459,21 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                               '—'
                             )}
                           </td>
+                          <td className="py-3 px-4 text-right whitespace-nowrap">
+                            {(isPending || isError) ? (
+                              <button
+                                type="button"
+                                onClick={() => handleOpenTargetedPunchReconcile(p)}
+                                title={`Reconcile only raw punch ${p.id} (Enrollment ${p.userEnrollmentId})`}
+                                className="inline-flex items-center gap-1 px-2.5 py-1 text-[11px] font-medium text-indigo-200 hover:text-white bg-indigo-950/70 hover:bg-indigo-800/80 border border-indigo-700/60 rounded-md transition cursor-pointer"
+                              >
+                                <Play className="w-3 h-3 text-indigo-400" />
+                                <span>Reconcile</span>
+                              </button>
+                            ) : (
+                              <span className="text-[11px] text-slate-600">—</span>
+                            )}
+                          </td>
                         </tr>
                       );
                     })}
@@ -1375,9 +1522,20 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             {/* Reconciliation Config & Trigger Card */}
             <div className="p-5 bg-slate-900/60 border border-slate-800 rounded-xl space-y-4">
-              <div className="flex items-center gap-2 pb-2 border-b border-slate-800">
-                <Activity className="w-4 h-4 text-indigo-400" />
-                <h3 className="text-sm font-semibold text-slate-100">Manual Punch Reconciliation Action</h3>
+              <div className="flex items-center justify-between gap-2 pb-2 border-b border-slate-800">
+                <div className="flex items-center gap-2">
+                  <Activity className="w-4 h-4 text-indigo-400" />
+                  <h3 className="text-sm font-semibold text-slate-100">Manual Punch Reconciliation Action</h3>
+                </div>
+                {isTargetedReconciliation && (
+                  <button
+                    type="button"
+                    onClick={clearSyncFilters}
+                    className="text-[11px] text-indigo-400 hover:text-indigo-300 font-medium cursor-pointer"
+                  >
+                    Reset Filters
+                  </button>
+                )}
               </div>
 
               <p className="text-xs text-slate-400 leading-relaxed">
@@ -1385,40 +1543,132 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                 employee shifts, assign work dates, and record verified attendance logs idempotently.
               </p>
 
+              <datalist id="reconcile-enrollment-suggestions">
+                {enrollmentSuggestions.map((eid) => (
+                  <option key={eid} value={eid} />
+                ))}
+              </datalist>
+
+              {isTargetedReconciliation ? (
+                <div className="p-3 bg-indigo-950/40 border border-indigo-700/60 rounded-lg text-[11px] text-indigo-200 space-y-1">
+                  <div className="font-semibold text-indigo-100">Targeted Reconciliation Mode Active</div>
+                  <div>
+                    Only pending punches matching your selected criteria will be evaluated — other pending employees
+                    and enrollment IDs will remain untouched.
+                    {selectedPunchOption && (
+                      <span className="block font-mono text-indigo-300 mt-1">
+                        Target RawPunchLog: {selectedPunchOption.id} (Enroll {selectedPunchOption.userEnrollmentId})
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="p-2.5 bg-slate-800/40 border border-slate-700/60 rounded-lg text-[11px] text-slate-400">
+                  Default batch mode: processes up to {syncBatchSize} pending company punches when no targeted filter is selected.
+                </div>
+              )}
+
               <div className="space-y-3 pt-1">
                 <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Batch Size (Records per execution)
-                  </label>
-                  <input
-                    type="number"
-                    min={1}
-                    max={500}
-                    value={syncBatchSize}
-                    onChange={(e) => setSyncBatchSize(parseInt(e.target.value, 10) || 100)}
-                    className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 font-mono tabular-nums focus:outline-none focus:border-indigo-500"
-                  />
-                  <span className="text-[11px] text-slate-400 mt-0.5 block">
-                    Bounded execution cap: 1 to 500 records to prevent blocking request loops.
-                  </span>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">
-                    Filter by Hardware Terminal (Optional)
-                  </label>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="block text-xs font-medium text-slate-300">
+                      Specific Pending Raw Punch (Optional)
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => loadReconciliationTargets(syncRetryErrors)}
+                      disabled={isLoadingPendingPunchOptions}
+                      className="text-[11px] text-indigo-400 hover:text-indigo-300 cursor-pointer disabled:opacity-50"
+                    >
+                      {isLoadingPendingPunchOptions ? 'Refreshing...' : 'Refresh List'}
+                    </button>
+                  </div>
                   <select
-                    value={syncSelectedTerminalId}
-                    onChange={(e) => setSyncSelectedTerminalId(e.target.value)}
+                    value={syncSelectedPunchId}
+                    onChange={(e) => setSyncSelectedPunchId(e.target.value)}
                     className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
                   >
-                    <option value="">All Company Terminals</option>
-                    {terminals.map((t) => (
-                      <option key={t.id} value={t.id}>
-                        {t.name} ({t.deviceSerialNumber})
+                    <option value="">All Matching Pending Punches (Use Filters / Batch)</option>
+                    {filteredPendingPunchOptions.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {formatDateTimeInTimezone(p.punchTime, timezone, { includeSeconds: true })} · Enroll {p.userEnrollmentId} · {p.inOutMode} · {p.terminalName || p.terminalId} [{p.syncStatus}] ({p.id.slice(0, 8)})
                       </option>
                     ))}
                   </select>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1">
+                      Enrollment ID Filter (Optional)
+                    </label>
+                    <input
+                      type="text"
+                      list="reconcile-enrollment-suggestions"
+                      value={syncEnrollmentId}
+                      onChange={(e) => setSyncEnrollmentId(e.target.value)}
+                      placeholder="e.g. 101"
+                      className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs font-mono rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1">
+                      Employee Filter (Optional)
+                    </label>
+                    <select
+                      value={syncSelectedEmployeeId}
+                      onChange={(e) => setSyncSelectedEmployeeId(e.target.value)}
+                      className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="">All Company Employees</option>
+                      {reconcileEmployees.map((emp) => (
+                        <option key={emp.id} value={emp.id}>
+                          {emp.fullName} ({emp.employeeCode}) [{emp.status}]
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1">
+                      Filter by Hardware Terminal (Optional)
+                    </label>
+                    <select
+                      value={syncSelectedTerminalId}
+                      onChange={(e) => setSyncSelectedTerminalId(e.target.value)}
+                      className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="">All Company Terminals</option>
+                      {terminals.map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.name} ({t.deviceSerialNumber})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1">
+                      Batch Size (Records per execution)
+                    </label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={500}
+                      disabled={Boolean(syncSelectedPunchId)}
+                      value={syncSelectedPunchId ? 1 : syncBatchSize}
+                      onChange={(e) => setSyncBatchSize(parseInt(e.target.value, 10) || 100)}
+                      className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 font-mono tabular-nums focus:outline-none focus:border-indigo-500 disabled:opacity-60"
+                    />
+                    <span className="text-[11px] text-slate-400 mt-0.5 block">
+                      {syncSelectedPunchId
+                        ? 'Locked to 1 record for specific punch ID.'
+                        : 'Bounded execution cap: 1 to 500 records.'}
+                    </span>
+                  </div>
                 </div>
 
                 <div className="pt-1">
@@ -1455,7 +1705,13 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                     ) : (
                       <>
                         <Activity className="w-3.5 h-3.5" />
-                        <span>Run Reconciliation Engine</span>
+                        <span>
+                          {syncSelectedPunchId
+                            ? 'Reconcile Selected Punch'
+                            : isTargetedReconciliation
+                            ? 'Run Targeted Reconciliation'
+                            : 'Run Reconciliation Engine'}
+                        </span>
                       </>
                     )}
                   </button>
@@ -1829,7 +2085,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
       {/* ==================================================================== */}
       {isSyncModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
-          <div className="w-full max-w-md bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 space-y-4 animate-in fade-in zoom-in-95 duration-150">
+          <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 space-y-4 animate-in fade-in zoom-in-95 duration-150">
             <div className="flex items-center justify-between pb-3 border-b border-slate-800">
               <div className="flex items-center gap-2">
                 <Activity className="w-5 h-5 text-indigo-400" />
@@ -1880,46 +2136,166 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                   </div>
                 </div>
 
-                <button
-                  onClick={() => setIsSyncModalOpen(false)}
-                  className="w-full py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold cursor-pointer"
-                >
-                  Close &amp; View Punch Logs
-                </button>
+                {syncOutcome.results.length > 0 && (
+                  <div className="space-y-1 max-h-36 overflow-y-auto pr-1">
+                    {syncOutcome.results.slice(0, 5).map((r) => (
+                      <div
+                        key={r.punchId}
+                        className="p-2 bg-slate-800/40 rounded border border-slate-700/40 text-[11px] flex items-center justify-between gap-2"
+                      >
+                        <span className="font-mono text-slate-300 truncate">
+                          Enroll {r.userEnrollmentId} · {r.workDate || 'Unassigned'} · {r.punchId.slice(0, 8)}
+                        </span>
+                        <span
+                          className={`font-mono font-semibold shrink-0 ${
+                            r.status === 'PROCESSED'
+                              ? 'text-emerald-400'
+                              : r.status === 'IGNORED'
+                              ? 'text-slate-400'
+                              : r.status === 'PENDING'
+                              ? 'text-amber-400'
+                              : 'text-rose-400'
+                          }`}
+                        >
+                          {r.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setSyncOutcome(null)}
+                    className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg text-xs font-medium cursor-pointer"
+                  >
+                    Reconcile Another
+                  </button>
+                  <button
+                    onClick={() => setIsSyncModalOpen(false)}
+                    className="flex-1 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold cursor-pointer"
+                  >
+                    Close &amp; View Punch Logs
+                  </button>
+                </div>
               </div>
             ) : (
               <div className="space-y-4">
-                <p className="text-xs text-slate-400 leading-relaxed">
-                  Reconcile pending punches with shift schedules. Safely handles debounces, overnight shifts, and protects locked payroll periods.
-                </p>
+                <div className="flex items-center justify-between gap-2">
+                  <p className="text-xs text-slate-400 leading-relaxed">
+                    Reconcile pending punches with shift schedules. Select targeted filters to isolate one punch, enrollment ID, or employee without affecting other pending logs.
+                  </p>
+                </div>
+
+                <datalist id="modal-reconcile-enrollment-suggestions">
+                  {enrollmentSuggestions.map((eid) => (
+                    <option key={eid} value={eid} />
+                  ))}
+                </datalist>
+
+                {isTargetedReconciliation && (
+                  <div className="p-2.5 bg-indigo-950/40 border border-indigo-700/60 rounded-lg text-[11px] text-indigo-200 flex items-start justify-between gap-2">
+                    <div>
+                      <span className="font-semibold text-indigo-100 block">Targeted Scope Active</span>
+                      <span>
+                        {selectedPunchOption
+                          ? `Only RawPunchLog ${selectedPunchOption.id.slice(0, 12)} (Enroll ${selectedPunchOption.userEnrollmentId}) will run.`
+                          : 'Only pending records matching your selected filters will be evaluated.'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={clearSyncFilters}
+                      className="text-indigo-300 hover:text-white underline shrink-0 cursor-pointer"
+                    >
+                      Clear
+                    </button>
+                  </div>
+                )}
 
                 <div className="space-y-3">
                   <div>
-                    <label className="block text-xs font-medium text-slate-300 mb-1">Batch Size</label>
-                    <input
-                      type="number"
-                      min={1}
-                      max={500}
-                      value={syncBatchSize}
-                      onChange={(e) => setSyncBatchSize(parseInt(e.target.value, 10) || 100)}
-                      className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 font-mono tabular-nums focus:outline-none focus:border-indigo-500"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-xs font-medium text-slate-300 mb-1">Terminal Filter (Optional)</label>
+                    <label className="block text-xs font-medium text-slate-300 mb-1">
+                      Specific Pending Raw Punch (Optional)
+                    </label>
                     <select
-                      value={syncSelectedTerminalId}
-                      onChange={(e) => setSyncSelectedTerminalId(e.target.value)}
+                      value={syncSelectedPunchId}
+                      onChange={(e) => setSyncSelectedPunchId(e.target.value)}
                       className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
                     >
-                      <option value="">All Company Terminals</option>
-                      {terminals.map((t) => (
-                        <option key={t.id} value={t.id}>
-                          {t.name} ({t.deviceSerialNumber})
+                      <option value="">All Matching Pending Punches</option>
+                      {filteredPendingPunchOptions.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {formatDateTimeInTimezone(p.punchTime, timezone, { includeSeconds: true })} · Enroll {p.userEnrollmentId} · {p.inOutMode} · {p.terminalName || p.terminalId} [{p.syncStatus}] ({p.id.slice(0, 8)})
                         </option>
                       ))}
                     </select>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-300 mb-1">
+                        Enrollment ID Filter (Optional)
+                      </label>
+                      <input
+                        type="text"
+                        list="modal-reconcile-enrollment-suggestions"
+                        value={syncEnrollmentId}
+                        onChange={(e) => setSyncEnrollmentId(e.target.value)}
+                        placeholder="e.g. 101"
+                        className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs font-mono rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-300 mb-1">
+                        Employee Filter (Optional)
+                      </label>
+                      <select
+                        value={syncSelectedEmployeeId}
+                        onChange={(e) => setSyncSelectedEmployeeId(e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
+                      >
+                        <option value="">All Company Employees</option>
+                        {reconcileEmployees.map((emp) => (
+                          <option key={emp.id} value={emp.id}>
+                            {emp.fullName} ({emp.employeeCode}) [{emp.status}]
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium text-slate-300 mb-1">Terminal Filter (Optional)</label>
+                      <select
+                        value={syncSelectedTerminalId}
+                        onChange={(e) => setSyncSelectedTerminalId(e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 focus:outline-none focus:border-indigo-500"
+                      >
+                        <option value="">All Company Terminals</option>
+                        {terminals.map((t) => (
+                          <option key={t.id} value={t.id}>
+                            {t.name} ({t.deviceSerialNumber})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-medium text-slate-300 mb-1">Batch Size</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={500}
+                        disabled={Boolean(syncSelectedPunchId)}
+                        value={syncSelectedPunchId ? 1 : syncBatchSize}
+                        onChange={(e) => setSyncBatchSize(parseInt(e.target.value, 10) || 100)}
+                        className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-3 py-2 font-mono tabular-nums focus:outline-none focus:border-indigo-500 disabled:opacity-60"
+                      />
+                    </div>
                   </div>
 
                   <div>
@@ -1962,7 +2338,13 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                     ) : (
                       <>
                         <Activity className="w-3.5 h-3.5" />
-                        <span>Run Sync</span>
+                        <span>
+                          {syncSelectedPunchId
+                            ? 'Reconcile Selected Punch'
+                            : isTargetedReconciliation
+                            ? 'Run Targeted Sync'
+                            : 'Run Sync'}
+                        </span>
                       </>
                     )}
                   </button>

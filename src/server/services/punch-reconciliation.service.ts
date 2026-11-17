@@ -768,14 +768,47 @@ export class PunchReconciliationService {
     actorUserId?: string,
     correlationId?: string
   ): Promise<PunchReconciliationResponse> {
-    const batchLimit = Math.min(500, Math.max(1, options?.batchSize || 100));
+    if (options?.punchId !== undefined && (typeof options.punchId !== 'string' || !options.punchId.trim())) {
+      const err = new Error('Targeted punchId filter cannot be empty.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+    if (options?.employeeId !== undefined && (typeof options.employeeId !== 'string' || !options.employeeId.trim())) {
+      const err = new Error('Targeted employeeId filter cannot be empty.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+    if (options?.terminalId !== undefined && (typeof options.terminalId !== 'string' || !options.terminalId.trim())) {
+      const err = new Error('Targeted terminalId filter cannot be empty.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+    if (
+      options?.userEnrollmentId !== undefined &&
+      (typeof options.userEnrollmentId !== 'string' || !options.userEnrollmentId.trim())
+    ) {
+      const err = new Error('Targeted userEnrollmentId filter cannot be empty.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    const targetPunchId = options?.punchId?.trim();
+    const targetEmployeeId = options?.employeeId?.trim();
+    const targetTerminalId = options?.terminalId?.trim();
+    const targetEnrollmentId = options?.userEnrollmentId?.trim();
+
+    const batchLimit = targetPunchId
+      ? 1
+      : Math.min(500, Math.max(1, options?.batchSize || 100));
     const keepUnmappedPending = options?.keepUnmappedPending !== false;
 
     const where: {
+      id?: string;
       companyId: string;
       syncStatus: PunchSyncStatus | { in: PunchSyncStatus[] };
       terminalId?: string;
       userEnrollmentId?: string;
+      OR?: Array<Record<string, unknown>>;
     } = {
       companyId,
       syncStatus: options?.retryErrors
@@ -783,11 +816,56 @@ export class PunchReconciliationService {
         : 'PENDING',
     };
 
-    if (options?.terminalId) {
-      where.terminalId = options.terminalId;
+    if (targetPunchId) {
+      where.id = targetPunchId;
     }
-    if (options?.userEnrollmentId && options.userEnrollmentId.trim()) {
-      where.userEnrollmentId = options.userEnrollmentId.trim();
+    if (targetTerminalId) {
+      where.terminalId = targetTerminalId;
+    }
+    if (targetEnrollmentId) {
+      where.userEnrollmentId = targetEnrollmentId;
+    }
+
+    if (targetEmployeeId) {
+      const targetEmployee =
+        typeof prisma.employee?.findFirst === 'function'
+          ? await prisma.employee.findFirst({
+              where: { id: targetEmployeeId, companyId },
+              select: { id: true, companyId: true, biometricDeviceId: true },
+            })
+          : null;
+
+      if (!targetEmployee) {
+        const err = new Error('Selected employee record not found in this company.');
+        (err as { statusCode?: number }).statusCode = 404;
+        throw err;
+      }
+
+      const activeMappings = await BiometricMappingService.listMappingsForEmployee(
+        companyId,
+        targetEmployee.id
+      );
+
+      const employeeOrConditions: Array<Record<string, unknown>> = [
+        { matchedEmployeeId: targetEmployee.id },
+      ];
+
+      for (const mapping of activeMappings) {
+        employeeOrConditions.push({
+          terminalId: mapping.terminalId,
+          userEnrollmentId: mapping.enrollmentId,
+          OR: [{ matchedEmployeeId: null }, { matchedEmployeeId: targetEmployee.id }],
+        });
+      }
+
+      if (activeMappings.length === 0 && targetEmployee.biometricDeviceId?.trim()) {
+        employeeOrConditions.push({
+          userEnrollmentId: targetEmployee.biometricDeviceId.trim(),
+          OR: [{ matchedEmployeeId: null }, { matchedEmployeeId: targetEmployee.id }],
+        });
+      }
+
+      where.OR = employeeOrConditions;
     }
 
     const pendingPunches = await prisma.rawPunchLog.findMany({
@@ -841,11 +919,13 @@ export class PunchReconciliationService {
         userId: actorUserId,
         action: 'BIOMETRIC_PUNCH_RECONCILE',
         entity: 'RawPunchLog',
-        entityId: companyId,
+        entityId: targetPunchId || companyId,
         correlationId,
         details: {
-          terminalId: options?.terminalId || null,
-          userEnrollmentId: options?.userEnrollmentId || null,
+          punchId: targetPunchId || null,
+          employeeId: targetEmployeeId || null,
+          terminalId: targetTerminalId || null,
+          userEnrollmentId: targetEnrollmentId || null,
           totalEvaluated: pendingPunches.length,
           processed: processedCount,
           pending: pendingCount,
@@ -913,6 +993,7 @@ export class PunchReconciliationService {
       syncStatus?: PunchSyncStatus;
       terminalId?: string;
       matchedEmployeeId?: string;
+      userEnrollmentId?: string;
       startDate?: string;
       endDate?: string;
     },
@@ -927,6 +1008,7 @@ export class PunchReconciliationService {
       syncStatus?: PunchSyncStatus;
       terminalId?: string;
       matchedEmployeeId?: string;
+      userEnrollmentId?: string;
       punchTime?: { gte?: Date; lte?: Date };
     } = { companyId };
 
@@ -938,6 +1020,9 @@ export class PunchReconciliationService {
     }
     if (filters?.matchedEmployeeId) {
       where.matchedEmployeeId = filters.matchedEmployeeId;
+    }
+    if (filters?.userEnrollmentId && filters.userEnrollmentId.trim()) {
+      where.userEnrollmentId = filters.userEnrollmentId.trim();
     }
     if (filters?.startDate || filters?.endDate) {
       where.punchTime = {};

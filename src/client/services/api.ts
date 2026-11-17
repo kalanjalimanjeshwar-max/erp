@@ -1107,7 +1107,7 @@ export const api = {
     request<TestBiometricConnectionResponse>(`/api/biometric/devices/${id}/test-connection`, {
       method: 'POST',
     }),
-  triggerBiometricDeviceSync: (id: string, data?: { batchSize?: number; retryErrors?: boolean }) =>
+  triggerBiometricDeviceSync: (id: string, data?: Omit<PunchReconciliationOptions, 'terminalId'>) =>
     request<TriggerTerminalSyncResponse>(`/api/biometric/devices/${id}/sync`, {
       method: 'POST',
       body: JSON.stringify(data || {}),
@@ -1141,6 +1141,7 @@ export const api = {
     syncStatus?: PunchSyncStatus;
     terminalId?: string;
     matchedEmployeeId?: string;
+    userEnrollmentId?: string;
     startDate?: string;
     endDate?: string;
     page?: number;
@@ -1150,6 +1151,7 @@ export const api = {
     if (params?.syncStatus) searchParams.append('syncStatus', params.syncStatus);
     if (params?.terminalId) searchParams.append('terminalId', params.terminalId);
     if (params?.matchedEmployeeId) searchParams.append('matchedEmployeeId', params.matchedEmployeeId);
+    if (params?.userEnrollmentId) searchParams.append('userEnrollmentId', params.userEnrollmentId);
     if (params?.startDate) searchParams.append('startDate', params.startDate);
     if (params?.endDate) searchParams.append('endDate', params.endDate);
     if (params?.page) searchParams.append('page', params.page.toString());

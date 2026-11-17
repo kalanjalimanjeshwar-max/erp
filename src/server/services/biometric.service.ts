@@ -921,6 +921,9 @@ export class BiometricService {
         terminalId: terminal.id,
         batchSize: options?.batchSize,
         retryErrors: options?.retryErrors,
+        userEnrollmentId: options?.userEnrollmentId,
+        employeeId: options?.employeeId,
+        punchId: options?.punchId,
       },
       actor.userId || actor.id,
       correlationId

@@ -1828,6 +1828,8 @@ export interface RawPunchLogItem {
 export interface PunchReconciliationOptions {
   terminalId?: string;
   userEnrollmentId?: string;
+  employeeId?: string;
+  punchId?: string;
   batchSize?: number;
   retryErrors?: boolean;
   keepUnmappedPending?: boolean;

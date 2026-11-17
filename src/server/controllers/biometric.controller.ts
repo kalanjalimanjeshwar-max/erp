@@ -122,6 +122,16 @@ export class BiometricController {
     }
   }
 
+  private static parseTargetedFilter(value: unknown, fieldName: string): string | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string' || !value.trim()) {
+      const err = new Error(`Invalid targeted reconciliation filter '${fieldName}': value must be a non-empty string.`);
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+    return value.trim();
+  }
+
   /**
    * POST /api/biometric/devices/:id/sync
    * Queues immediate bridge pull and reconciles pending raw punches for this terminal (requires BIOMETRIC:EDIT)
@@ -130,13 +140,16 @@ export class BiometricController {
     try {
       const actor = req.user as AuthUser;
       const { id } = req.params;
-      const { batchSize, retryErrors } = req.body || {};
+      const { batchSize, retryErrors, userEnrollmentId, employeeId, punchId } = req.body || {};
       const result = await BiometricService.triggerTerminalSync(
         actor,
         id,
         {
           batchSize: typeof batchSize === 'number' ? batchSize : undefined,
           retryErrors: retryErrors === true,
+          userEnrollmentId: BiometricController.parseTargetedFilter(userEnrollmentId, 'userEnrollmentId'),
+          employeeId: BiometricController.parseTargetedFilter(employeeId, 'employeeId'),
+          punchId: BiometricController.parseTargetedFilter(punchId, 'punchId'),
         },
         req.correlationId
       );
@@ -145,7 +158,7 @@ export class BiometricController {
       const status = (err as { statusCode?: number }).statusCode || 500;
       res.status(status).json({
         error: {
-          code: status === 404 ? 'TERMINAL_NOT_FOUND' : 'BIOMETRIC_TERMINAL_SYNC_FAILED',
+          code: status === 404 ? 'TERMINAL_NOT_FOUND' : status === 400 ? 'BIOMETRIC_INVALID_RECONCILIATION_FILTER' : 'BIOMETRIC_TERMINAL_SYNC_FAILED',
           message: (err as Error).message || 'Failed to sync biometric terminal.',
         },
       });
@@ -261,7 +274,7 @@ export class BiometricController {
   static async listPunches(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;
-      const { syncStatus, terminalId, matchedEmployeeId, startDate, endDate, page, limit } = req.query;
+      const { syncStatus, terminalId, matchedEmployeeId, userEnrollmentId, startDate, endDate, page, limit } = req.query;
 
       const result = await PunchReconciliationService.listPunches(
         actor.companyId,
@@ -269,6 +282,7 @@ export class BiometricController {
           syncStatus: typeof syncStatus === 'string' ? (syncStatus as any) : undefined,
           terminalId: typeof terminalId === 'string' ? terminalId : undefined,
           matchedEmployeeId: typeof matchedEmployeeId === 'string' ? matchedEmployeeId : undefined,
+          userEnrollmentId: typeof userEnrollmentId === 'string' && userEnrollmentId.trim() ? userEnrollmentId.trim() : undefined,
           startDate: typeof startDate === 'string' ? startDate : undefined,
           endDate: typeof endDate === 'string' ? endDate : undefined,
         },
@@ -321,14 +335,29 @@ export class BiometricController {
   static async triggerSync(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;
-      const { batchSize, terminalId, userEnrollmentId, retryErrors, keepUnmappedPending } = req.body || {};
+      const {
+        batchSize,
+        terminalId,
+        userEnrollmentId,
+        employeeId,
+        punchId,
+        retryErrors,
+        keepUnmappedPending,
+      } = req.body || {};
+
+      const parsedTerminalId = BiometricController.parseTargetedFilter(terminalId, 'terminalId');
+      const parsedEnrollmentId = BiometricController.parseTargetedFilter(userEnrollmentId, 'userEnrollmentId');
+      const parsedEmployeeId = BiometricController.parseTargetedFilter(employeeId, 'employeeId');
+      const parsedPunchId = BiometricController.parseTargetedFilter(punchId, 'punchId');
 
       const result = await PunchReconciliationService.reconcilePendingPunches(
         actor.companyId,
         {
           batchSize: typeof batchSize === 'number' ? batchSize : undefined,
-          terminalId: typeof terminalId === 'string' ? terminalId : undefined,
-          userEnrollmentId: typeof userEnrollmentId === 'string' ? userEnrollmentId : undefined,
+          terminalId: parsedTerminalId,
+          userEnrollmentId: parsedEnrollmentId,
+          employeeId: parsedEmployeeId,
+          punchId: parsedPunchId,
           retryErrors: retryErrors === true,
           keepUnmappedPending: typeof keepUnmappedPending === 'boolean' ? keepUnmappedPending : undefined,
         },
@@ -341,7 +370,12 @@ export class BiometricController {
       const status = (err as { statusCode?: number }).statusCode || 500;
       res.status(status).json({
         error: {
-          code: 'BIOMETRIC_SYNC_FAILED',
+          code:
+            status === 400
+              ? 'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+              : status === 404
+              ? 'BIOMETRIC_TARGET_NOT_FOUND'
+              : 'BIOMETRIC_SYNC_FAILED',
           message: (err as Error).message,
         },
       });
