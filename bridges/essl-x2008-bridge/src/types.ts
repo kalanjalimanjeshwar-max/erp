@@ -80,6 +80,30 @@ export interface DeviceEnrolledUser {
   cardNo: string | null;
 }
 
+export type UserSyncOutcome =
+  | 'SUCCESS'
+  | 'EMPTY_DEVICE_USERS'
+  | 'UNSUPPORTED_COMMAND'
+  | 'COMMUNICATION_FAILURE'
+  | 'MALFORMED_RESPONSE';
+
+export interface ProtocolDiagnosticEvent {
+  operation: 'get_free_sizes' | 'get_users' | 'read_with_buffer' | 'read_chunk' | 'decode_users';
+  commandId?: number;
+  commandName?: string;
+  replyCommand?: number;
+  replyCommandName?: string;
+  payloadBytes?: number;
+  expectedBytes?: number;
+  chunkOffset?: number;
+  chunkLength?: number;
+  reportedUserCount?: number | null;
+  recordSize?: number | null;
+  recordCount?: number;
+  outcome?: UserSyncOutcome;
+  message?: string;
+}
+
 /**
  * Isolated Hardware Protocol Adapter Contract.
  * Implementations MUST strictly read logs without deleting device attendance data.

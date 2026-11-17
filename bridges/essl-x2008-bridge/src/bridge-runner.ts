@@ -29,6 +29,8 @@ export interface DiagnosticReport {
   serialMatched: boolean;
   deviceInfo: DeviceInfo | null;
   attendanceRecordCount: number | null;
+  enrolledUserCount: number | null;
+  userQueryError: string | null;
   coreErpHeartbeatOk: boolean;
   error: string | null;
 }
@@ -65,7 +67,29 @@ export class BiometricBridgeRunner {
     this.logger = options.logger;
     this.checkpointStore = options.checkpointStore;
     this.coreErpClient = options.coreErpClient;
-    this.adapterFactory = options.adapterFactory || (() => new ZKTecoTcpAdapter());
+    this.adapterFactory =
+      options.adapterFactory ||
+      ((term) =>
+        new ZKTecoTcpAdapter({
+          onDiagnostic: (diag) => {
+            const meta = {
+              terminalId: term.id,
+              serialNumber: term.serialNumber,
+              ...diag,
+            };
+            if (
+              diag.outcome === 'MALFORMED_RESPONSE' ||
+              diag.outcome === 'UNSUPPORTED_COMMAND' ||
+              diag.outcome === 'COMMUNICATION_FAILURE'
+            ) {
+              this.logger.warn('terminal_protocol_diagnostic', meta);
+            } else if (diag.operation === 'decode_users') {
+              this.logger.info('terminal_protocol_diagnostic', meta);
+            } else {
+              this.logger.debug('terminal_protocol_diagnostic', meta);
+            }
+          },
+        }));
 
     validateTransportUrl(this.config.coreErpBaseUrl, this.config.allowInsecureHttp);
 
@@ -648,6 +672,8 @@ export class BiometricBridgeRunner {
       let serialMatched = false;
       let deviceInfo: DeviceInfo | null = null;
       let attendanceRecordCount: number | null = null;
+      let enrolledUserCount: number | null = null;
+      let userQueryError: string | null = null;
       let coreErpHeartbeatOk = false;
       let error: string | null = null;
 
@@ -667,6 +693,15 @@ export class BiometricBridgeRunner {
 
         const logs = await adapter.getAttendanceLogs();
         attendanceRecordCount = logs.length;
+
+        if (typeof adapter.getUsers === 'function') {
+          try {
+            const users = await adapter.getUsers();
+            enrolledUserCount = users.length;
+          } catch (uErr: unknown) {
+            userQueryError = redactSensitiveText((uErr as Error)?.message || 'Hardware user query failed');
+          }
+        }
       } catch (err: unknown) {
         error = redactSensitiveText((err as Error)?.message || 'Hardware connection test failed');
       } finally {
@@ -695,6 +730,8 @@ export class BiometricBridgeRunner {
         serialMatched,
         deviceInfo,
         attendanceRecordCount,
+        enrolledUserCount,
+        userQueryError,
         coreErpHeartbeatOk,
         error,
       });

@@ -16,7 +16,11 @@ import { AuthUser } from '../../src/shared/types.js';
 import {
   ZKTecoTcpAdapter,
   ZK_CMD,
+  ZK_FCT,
+  ZkProtocolError,
   buildZkTcpFrame,
+  decodeUserTablePayload,
+  decodeUserTablePayloadDetailed,
   extractZkTcpFrames,
 } from '../../bridges/essl-x2008-bridge/src/protocol/zkteco-tcp.adapter.js';
 import { CheckpointStore } from '../../bridges/essl-x2008-bridge/src/checkpoint-store.js';
@@ -109,19 +113,47 @@ async function startMockX2008Server(options: {
   serialNumber?: string;
   platform?: string;
   zkfpVersion?: string;
+  firmwareVersion?: string;
   requireAuth?: boolean;
   records?: Buffer[];
   userRecords?: Buffer[];
   failGetUsers?: boolean;
   usePrepareData?: boolean;
+  ver660BufferedUsers?: boolean;
+  streamChunkViaPrepareData?: boolean;
+  freeSizesUserCount?: number;
+  userTableHeaderless?: boolean;
+  forceEmptyUserResponses?: boolean;
+  rawMalformedUserPayload?: Buffer;
+  lateTrailingAckOnAttlog?: boolean;
 }): Promise<{
   port: number;
   receivedCommands: number[];
+  prepareBufferRequests: Array<{ command: number; fct: number; ext: number }>;
+  readBufferOffsets: Array<{ offset: number; length: number }>;
   close: () => Promise<void>;
 }> {
   const receivedCommands: number[] = [];
+  const prepareBufferRequests: Array<{ command: number; fct: number; ext: number }> = [];
+  const readBufferOffsets: Array<{ offset: number; length: number }> = [];
   const sessionId = 0x1234;
   let authenticated = !options.requireAuth;
+
+  const buildUserBufferPayload = (): Buffer => {
+    if (options.rawMalformedUserPayload) return options.rawMalformedUserPayload;
+    if (options.forceEmptyUserResponses) return Buffer.alloc(0);
+    const uRecs = options.userRecords || [];
+    const body = Buffer.concat(uRecs);
+    if (options.userTableHeaderless) {
+      return body;
+    }
+    const payload = Buffer.alloc(4 + body.length);
+    payload.writeUInt32LE(body.length, 0);
+    body.copy(payload, 4);
+    return payload;
+  };
+
+  let preparedBufferData: Buffer = Buffer.alloc(0);
 
   const server = net.createServer((socket) => {
     let recv: Buffer = Buffer.alloc(0);
@@ -153,7 +185,18 @@ async function startMockX2008Server(options: {
           else if (key === '~OEMVendor') val = '~OEMVendor=eSSL';
           socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId, Buffer.from(`${val}\0`, 'ascii')));
         } else if (frame.command === ZK_CMD.GET_VERSION) {
-          socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId, Buffer.from('Ver 6.60 Feb 2024\0', 'ascii')));
+          const ver = options.firmwareVersion ?? 'Ver 6.60 Apr 13 2022';
+          socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId, Buffer.from(`${ver}\0`, 'ascii')));
+        } else if (frame.command === ZK_CMD.GET_FREE_SIZES) {
+          const buf = Buffer.alloc(80, 0);
+          const userCount =
+            options.freeSizesUserCount !== undefined
+              ? options.freeSizesUserCount
+              : (options.userRecords?.length ?? 0);
+          buf.writeInt32LE(userCount, 4 * 4);
+          buf.writeInt32LE(userCount, 6 * 4);
+          buf.writeInt32LE(options.records?.length ?? 0, 8 * 4);
+          socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId, buf));
         } else if (frame.command === ZK_CMD.ATTLOG_RRQ) {
           const recs = options.records || [];
           const body = Buffer.concat(recs);
@@ -170,20 +213,72 @@ async function startMockX2008Server(options: {
             const mid = Math.ceil(payload.length / 2);
             socket.write(buildZkTcpFrame(ZK_CMD.DATA, sessionId, frame.replyId, payload.subarray(0, mid)));
             socket.write(buildZkTcpFrame(ZK_CMD.DATA, sessionId, frame.replyId, payload.subarray(mid)));
-            socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId));
+            if (options.lateTrailingAckOnAttlog) {
+              setTimeout(() => {
+                if (!socket.destroyed) {
+                  socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId));
+                }
+              }, 15);
+            } else {
+              socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId));
+            }
           } else {
             socket.write(buildZkTcpFrame(ZK_CMD.ACK_DATA, sessionId, frame.replyId, payload));
+          }
+        } else if (frame.command === ZK_CMD.PREPARE_BUFFER) {
+          if (options.failGetUsers) {
+            socket.write(buildZkTcpFrame(ZK_CMD.ACK_ERROR, sessionId, frame.replyId));
+          } else if (options.ver660BufferedUsers && frame.payload.length >= 11) {
+            const subCmd = frame.payload.readInt16LE(1);
+            const fct = frame.payload.readInt32LE(3);
+            const ext = frame.payload.readInt32LE(7);
+            prepareBufferRequests.push({ command: subCmd, fct, ext });
+
+            if (subCmd === ZK_CMD.USERTEMP_RRQ && fct === ZK_FCT.USER) {
+              preparedBufferData = buildUserBufferPayload();
+              const resp = Buffer.alloc(9, 0);
+              resp.writeUInt8(1, 0);
+              resp.writeUInt32LE(preparedBufferData.length, 1);
+              resp.writeUInt32LE(preparedBufferData.length, 5);
+              socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId, resp));
+            } else {
+              socket.write(buildZkTcpFrame(ZK_CMD.ACK_ERROR, sessionId, frame.replyId));
+            }
+          } else {
+            socket.write(buildZkTcpFrame(ZK_CMD.ACK_ERROR, sessionId, frame.replyId));
+          }
+        } else if (frame.command === ZK_CMD.READ_BUFFER) {
+          if (!options.ver660BufferedUsers || frame.payload.length < 8) {
+            socket.write(buildZkTcpFrame(ZK_CMD.ACK_ERROR, sessionId, frame.replyId));
+          } else {
+            const offset = frame.payload.readInt32LE(0);
+            const reqLen = frame.payload.readInt32LE(4);
+            readBufferOffsets.push({ offset, length: reqLen });
+            const slice = preparedBufferData.subarray(offset, offset + reqLen);
+            if (options.streamChunkViaPrepareData) {
+              const prep = Buffer.alloc(4);
+              prep.writeUInt32LE(slice.length, 0);
+              socket.write(buildZkTcpFrame(ZK_CMD.PREPARE_DATA, sessionId, frame.replyId, prep));
+              const half = Math.ceil(slice.length / 2);
+              if (half > 0) {
+                socket.write(buildZkTcpFrame(ZK_CMD.DATA, sessionId, frame.replyId, slice.subarray(0, half)));
+              }
+              if (slice.length > half) {
+                socket.write(buildZkTcpFrame(ZK_CMD.DATA, sessionId, frame.replyId, slice.subarray(half)));
+              }
+              socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId));
+            } else {
+              socket.write(buildZkTcpFrame(ZK_CMD.ACK_DATA, sessionId, frame.replyId, slice));
+            }
           }
         } else if (frame.command === ZK_CMD.USERTEMP_RRQ) {
           if (options.failGetUsers) {
             socket.write(buildZkTcpFrame(ZK_CMD.ACK_ERROR, sessionId, frame.replyId));
+          } else if (options.ver660BufferedUsers || options.forceEmptyUserResponses) {
+            // Reproduces Ver 6.60 ZLM60_TFT firmware returning empty ACK_OK to bare USERTEMP_RRQ (9)
+            socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId));
           } else {
-            const uRecs = options.userRecords || [];
-            const body = Buffer.concat(uRecs);
-            const payload = Buffer.alloc(4 + body.length);
-            payload.writeUInt32LE(body.length, 0);
-            body.copy(payload, 4);
-
+            const payload = buildUserBufferPayload();
             if (options.usePrepareData) {
               const prepHeader = Buffer.alloc(4);
               prepHeader.writeUInt32LE(payload.length, 0);
@@ -216,6 +311,8 @@ async function startMockX2008Server(options: {
   return {
     port: address.port,
     receivedCommands,
+    prepareBufferRequests,
+    readBufferOffsets,
     close: () =>
       new Promise<void>((resolve) => {
         server.close(() => resolve());
@@ -1636,6 +1733,264 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
         .set('Authorization', `Bearer ${adminToken}`);
       expect(listBRes.status).toBe(200);
       expect(listBRes.body).toEqual([]);
+    });
+
+    it('reads Ver 6.60 / ZLM60_TFT users via CMD_PREPARE_BUFFER (1503) + paginated CMD_READ_BUFFER (1504), handles delayed ATTLOG ACK_OK, and detects empty mismatch vs genuine 0 users', async () => {
+      const dirs = makeTempDirs();
+      tempCleanups.push(dirs.cleanup);
+
+      const user101 = build72ByteUserRecord({
+        uid: 1,
+        enrollmentId: '101',
+        name: 'Karthik Rao',
+        cardNo: 551122,
+      });
+      const manyUsers = [
+        user101,
+        ...Array.from({ length: 7 }, (_, idx) =>
+          build72ByteUserRecord({
+            uid: idx + 2,
+            enrollmentId: String(102 + idx),
+            name: `Operator ${idx + 2}`,
+          })
+        ),
+      ];
+      const attRec = build40ByteAttRecord({
+        uid: 1,
+        userId: '101',
+        verifyCode: 1,
+        inOutCode: 0,
+        year: 2026,
+        month: 11,
+        day: 16,
+        hour: 9,
+        minute: 15,
+        second: 0,
+      });
+
+      // 1. Real eSSL X2008 Ver 6.60 scenario:
+      //    - Bare USERTEMP_RRQ (9) returns empty ACK_OK (0 bytes)
+      //    - ATTLOG_RRQ emits a delayed trailing ACK_OK right before getUsers()
+      //    - CMD_PREPARE_BUFFER (1503) + multi-chunk CMD_READ_BUFFER (1504 with PREPARE_DATA->DATA) yields all 8 users including 101
+      const diagnostics: any[] = [];
+      const mockVer660 = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        platform: 'ZLM60_TFT',
+        firmwareVersion: 'Ver 6.60 Apr 13 2022',
+        records: [attRec],
+        userRecords: manyUsers,
+        usePrepareData: true,
+        ver660BufferedUsers: true,
+        streamChunkViaPrepareData: true,
+        lateTrailingAckOnAttlog: true,
+      });
+
+      try {
+        // Use small maxChunkBytes (256) to guarantee multi-chunk 1504 pagination across 4 + 8*72 = 580 bytes
+        const adapter = new ZKTecoTcpAdapter({
+          maxChunkBytes: 256,
+          onDiagnostic: (evt) => diagnostics.push(evt),
+        });
+        await adapter.connect({ host: '127.0.0.1', port: mockVer660.port, timeoutMs: 3000 });
+        const logs = await adapter.getAttendanceLogs();
+        expect(logs).toHaveLength(1);
+        expect(logs[0].userEnrollmentId).toBe('101');
+
+        const users = await adapter.getUsers();
+        await adapter.disconnect();
+
+        expect(users).toHaveLength(8);
+        expect(users[0]).toEqual({
+          uid: 1,
+          enrollmentId: '101',
+          name: 'Karthik Rao',
+          cardNo: '551122',
+        });
+        expect(mockVer660.prepareBufferRequests).toContainEqual({
+          command: ZK_CMD.USERTEMP_RRQ,
+          fct: ZK_FCT.USER,
+          ext: 0,
+        });
+        // Verify multi-chunk pagination (580 bytes -> 0..256, 256..512, 512..580)
+        expect(mockVer660.readBufferOffsets).toEqual([
+          { offset: 0, length: 256 },
+          { offset: 256, length: 256 },
+          { offset: 512, length: 68 },
+        ]);
+
+        expect(diagnostics.some((d) => d.operation === 'get_free_sizes' && d.reportedUserCount === 8)).toBe(true);
+        expect(diagnostics.some((d) => d.operation === 'read_with_buffer' && d.commandId === 1503)).toBe(true);
+        expect(diagnostics.filter((d) => d.operation === 'read_chunk' && d.commandId === 1504)).toHaveLength(3);
+        expect(
+          diagnostics.some(
+            (d) =>
+              d.operation === 'decode_users' &&
+              d.outcome === 'SUCCESS' &&
+              d.recordSize === 72 &&
+              d.recordCount === 8
+          )
+        ).toBe(true);
+      } finally {
+        await mockVer660.close();
+      }
+
+      // 2. End-to-end Runner syncTerminalUsersOnce & startup poll against live mock TCP Ver 6.60 server (no punch reconciliation)
+      const mockRunnerDevice = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        platform: 'ZLM60_TFT',
+        firmwareVersion: 'Ver 6.60 Apr 13 2022',
+        records: [],
+        userRecords: [user101],
+        ver660BufferedUsers: true,
+      });
+
+      const uploadedUsers: any[] = [];
+      const logger = new BridgeLogger({
+        level: 'debug',
+        logDir: dirs.logDir,
+        fileName: 'ver660-diag.log',
+        silentConsole: true,
+      });
+      const secretKey = 'bio_live_ver660_diagnostic_secret_9876543210';
+
+      try {
+        const runner = new BiometricBridgeRunner({
+          config: {
+            coreErpBaseUrl: 'https://erp.company.local',
+            allowInsecureHttp: false,
+            bridgeHost: '192.168.1.16',
+            bridgeVersion: '1.0.0',
+            healthHost: '127.0.0.1',
+            healthPort: 4379,
+            dataDir: dirs.dataDir,
+            logDir: dirs.logDir,
+            logLevel: 'debug',
+            batchSize: 100,
+            pollIntervalMs: 15000,
+            heartbeatIntervalMs: 60000,
+            connectTimeoutMs: 3000,
+            maxBackoffMs: 120000,
+            dpapiStorePath: path.join(dirs.dataDir, 'creds.json'),
+            terminals: [
+              {
+                id: 'x2008-ver660',
+                name: 'eSSL X2008 Ver660',
+                serialNumber: 'NFZ8252800275',
+                ipAddress: '127.0.0.1',
+                port: mockRunnerDevice.port,
+                commKey: 4321,
+                deviceTimezone: 'Asia/Kolkata',
+                apiKey: secretKey,
+              },
+            ],
+          },
+          logger,
+          checkpointStore: new CheckpointStore(dirs.dataDir),
+          coreErpClient: {
+            sendHeartbeat: vi.fn(),
+            submitPunches: vi.fn(),
+            syncUsers: vi.fn().mockImplementation(async (_k, _sn, payload) => {
+              uploadedUsers.push(...payload.deviceUsers);
+              return {
+                success: true,
+                terminalId: 'x2008-ver660',
+                terminalName: 'eSSL X2008 Ver660',
+                discoveredCount: payload.deviceUsers.length,
+                syncedCount: payload.deviceUsers.length,
+                syncedAt: new Date().toISOString(),
+              };
+            }),
+          },
+        });
+
+        const res = await runner.syncTerminalUsersOnce('x2008-ver660');
+        expect(res.discoveredCount).toBe(1);
+        expect(res.syncedCount).toBe(1);
+        expect(uploadedUsers[0]).toMatchObject({ uid: 1, enrollmentId: '101', name: 'Karthik Rao' });
+
+        const diagLog = fs.readFileSync(path.join(dirs.logDir, 'ver660-diag.log'), 'utf8');
+        expect(diagLog).toContain('terminal_protocol_diagnostic');
+        expect(diagLog).toContain('CMD_PREPARE_BUFFER');
+        expect(diagLog).toContain('CMD_READ_BUFFER');
+        expect(diagLog).not.toContain(secretKey);
+        expect(diagLog).not.toContain('4321');
+      } finally {
+        await mockRunnerDevice.close();
+      }
+
+      // 3. Headerless 72-byte user record decoding (specifically uid=1, role=0 must NOT be misparsed as length prefix!)
+      const headerlessSingle = decodeUserTablePayloadDetailed(user101);
+      expect(headerlessSingle.hasLengthPrefix).toBe(false);
+      expect(headerlessSingle.recordSize).toBe(72);
+      expect(headerlessSingle.users).toEqual([
+        { uid: 1, enrollmentId: '101', name: 'Karthik Rao', cardNo: '551122' },
+      ]);
+      expect(decodeUserTablePayload(Buffer.from([0, 0, 0, 0]))).toEqual([]);
+
+      // 4. Silent-zero protection: device reports freeSizes.users = 2 yet user-read returns 0 bytes -> MUST throw MALFORMED_RESPONSE
+      const mockMismatch = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        ver660BufferedUsers: true,
+        freeSizesUserCount: 2,
+        forceEmptyUserResponses: true,
+      });
+      try {
+        const adapter = new ZKTecoTcpAdapter();
+        await adapter.connect({ host: '127.0.0.1', port: mockMismatch.port, timeoutMs: 3000 });
+        try {
+          await expect(adapter.getUsers()).rejects.toMatchObject({
+            name: 'ZkProtocolError',
+            code: 'MALFORMED_RESPONSE',
+          } satisfies Partial<ZkProtocolError>);
+        } finally {
+          await adapter.disconnect();
+        }
+      } finally {
+        await mockMismatch.close();
+      }
+
+      // 5. Malformed non-72/non-28 byte payload throws explicit MALFORMED_RESPONSE
+      const mockCorrupt = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        ver660BufferedUsers: true,
+        freeSizesUserCount: 1,
+        rawMalformedUserPayload: Buffer.alloc(13, 0xaa),
+      });
+      try {
+        const adapter = new ZKTecoTcpAdapter();
+        await adapter.connect({ host: '127.0.0.1', port: mockCorrupt.port, timeoutMs: 3000 });
+        try {
+          await expect(adapter.getUsers()).rejects.toMatchObject({
+            name: 'ZkProtocolError',
+            code: 'MALFORMED_RESPONSE',
+          } satisfies Partial<ZkProtocolError>);
+        } finally {
+          await adapter.disconnect();
+        }
+      } finally {
+        await mockCorrupt.close();
+      }
+
+      // 6. Genuine device with 0 enrolled users returns [] cleanly with EMPTY_DEVICE_USERS diagnostic
+      const zeroDiagnostics: any[] = [];
+      const mockGenuineZero = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        ver660BufferedUsers: true,
+        userRecords: [],
+        freeSizesUserCount: 0,
+      });
+      try {
+        const adapter = new ZKTecoTcpAdapter({ onDiagnostic: (e) => zeroDiagnostics.push(e) });
+        await adapter.connect({ host: '127.0.0.1', port: mockGenuineZero.port, timeoutMs: 3000 });
+        const users = await adapter.getUsers();
+        await adapter.disconnect();
+        expect(users).toEqual([]);
+        expect(
+          zeroDiagnostics.some((d) => d.operation === 'decode_users' && d.outcome === 'EMPTY_DEVICE_USERS')
+        ).toBe(true);
+      } finally {
+        await mockGenuineZero.close();
+      }
     });
   });
 });
