@@ -41,9 +41,15 @@ export class CheckpointStore {
     };
   }
 
-  getTerminal(terminalKey: string, serialNumber: string): TerminalCheckpoint {
+  private ensureTerminal(terminalKey: string, serialNumber: string): TerminalCheckpoint {
     const existing = this.state.terminals[terminalKey];
     if (existing) {
+      existing.lastSuccessfulUserSyncAt = existing.lastSuccessfulUserSyncAt ?? null;
+      existing.lastUserSyncAttemptAt = existing.lastUserSyncAttemptAt ?? null;
+      existing.lastUserSyncError = existing.lastUserSyncError ?? null;
+      existing.discoveredUserCount = existing.discoveredUserCount ?? null;
+      existing.syncedUserCount = existing.syncedUserCount ?? null;
+      existing.pendingUserSync = existing.pendingUserSync ?? null;
       return existing;
     }
 
@@ -60,6 +66,12 @@ export class CheckpointStore {
       lastProcessedPunchCount: 0,
       lastError: null,
       deviceInfo: null,
+      lastSuccessfulUserSyncAt: null,
+      lastUserSyncAttemptAt: null,
+      lastUserSyncError: null,
+      discoveredUserCount: null,
+      syncedUserCount: null,
+      pendingUserSync: null,
     };
 
     this.state.terminals[terminalKey] = fresh;
@@ -67,12 +79,27 @@ export class CheckpointStore {
     return fresh;
   }
 
+  getTerminal(terminalKey: string, serialNumber: string): TerminalCheckpoint {
+    const term = this.ensureTerminal(terminalKey, serialNumber);
+    return {
+      ...term,
+      recentPunchIds: [...term.recentPunchIds],
+      pendingQueue: [...term.pendingQueue],
+      pendingUserSync: term.pendingUserSync
+        ? {
+            discoveredAt: term.pendingUserSync.discoveredAt,
+            users: [...term.pendingUserSync.users],
+          }
+        : null,
+    };
+  }
+
   /**
    * Filters newly polled device events against the persisted checkpoint & recent punch ring
    * so bridge restarts or overlapping device polls never re-queue already acknowledged punches.
    */
   filterNewEvents(terminalKey: string, serialNumber: string, candidates: NormalizedPunchEvent[]): NormalizedPunchEvent[] {
-    const cp = this.getTerminal(terminalKey, serialNumber);
+    const cp = this.ensureTerminal(terminalKey, serialNumber);
     const seen = new Set<string>(cp.recentPunchIds);
     for (const queued of cp.pendingQueue) {
       seen.add(queued.devicePunchId);
@@ -99,7 +126,7 @@ export class CheckpointStore {
 
   enqueuePending(terminalKey: string, serialNumber: string, events: NormalizedPunchEvent[]): void {
     if (events.length === 0) return;
-    const cp = this.getTerminal(terminalKey, serialNumber);
+    const cp = this.ensureTerminal(terminalKey, serialNumber);
     const existingIds = new Set(cp.pendingQueue.map((e) => e.devicePunchId));
     for (const evt of events) {
       if (!existingIds.has(evt.devicePunchId)) {
@@ -111,7 +138,7 @@ export class CheckpointStore {
   }
 
   markBatchAcknowledged(terminalKey: string, serialNumber: string, ackedEvents: NormalizedPunchEvent[]): void {
-    const cp = this.getTerminal(terminalKey, serialNumber);
+    const cp = this.ensureTerminal(terminalKey, serialNumber);
     const ackIds = new Set(ackedEvents.map((e) => e.devicePunchId));
 
     cp.pendingQueue = cp.pendingQueue.filter((e) => !ackIds.has(e.devicePunchId));
@@ -159,10 +186,16 @@ export class CheckpointStore {
         | 'lastProcessedPunchCount'
         | 'lastError'
         | 'deviceInfo'
+        | 'lastSuccessfulUserSyncAt'
+        | 'lastUserSyncAttemptAt'
+        | 'lastUserSyncError'
+        | 'discoveredUserCount'
+        | 'syncedUserCount'
+        | 'pendingUserSync'
       >
     >
   ): void {
-    const cp = this.getTerminal(terminalKey, serialNumber);
+    const cp = this.ensureTerminal(terminalKey, serialNumber);
     Object.assign(cp, patch);
     this.persist();
   }

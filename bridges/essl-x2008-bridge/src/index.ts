@@ -72,6 +72,23 @@ async function main(): Promise<void> {
     }
   }
 
+  if (args.includes('--sync-users-once')) {
+    let hadError = false;
+    const results = [];
+    for (const term of config.terminals) {
+      if (term.enabled === false) continue;
+      try {
+        const res = await runner.syncTerminalUsersOnce(term.id);
+        results.push({ terminalId: term.id, ok: true, ...res });
+      } catch (err: unknown) {
+        hadError = true;
+        results.push({ terminalId: term.id, ok: false, error: (err as Error).message });
+      }
+    }
+    console.log(JSON.stringify({ results }, null, 2));
+    process.exit(hadError ? 1 : 0);
+  }
+
   if (args.includes('--sync-once')) {
     let hadError = false;
     const results = [];

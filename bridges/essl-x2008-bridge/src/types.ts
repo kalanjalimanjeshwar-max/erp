@@ -101,6 +101,11 @@ export interface NormalizedPunchEvent {
   inOutMode: PunchInOutMode;
 }
 
+export interface PendingUserSyncSnapshot {
+  users: DeviceEnrolledUser[];
+  discoveredAt: string;
+}
+
 export interface TerminalCheckpoint {
   terminalKey: string;
   serialNumber: string;
@@ -114,6 +119,12 @@ export interface TerminalCheckpoint {
   lastProcessedPunchCount: number;
   lastError: string | null;
   deviceInfo?: DeviceInfo | null;
+  lastSuccessfulUserSyncAt?: string | null;
+  lastUserSyncAttemptAt?: string | null;
+  lastUserSyncError?: string | null;
+  discoveredUserCount?: number | null;
+  syncedUserCount?: number | null;
+  pendingUserSync?: PendingUserSyncSnapshot | null;
 }
 
 export interface BridgeCheckpointFile {
@@ -141,6 +152,11 @@ export interface TerminalRuntimeStatus {
   lastProcessedPunchCount: number;
   lastError: string | null;
   deviceInfo: DeviceInfo | null;
+  lastSuccessfulUserSyncAt: string | null;
+  lastUserSyncAttemptAt: string | null;
+  lastUserSyncError: string | null;
+  discoveredUserCount: number | null;
+  syncedUserCount: number | null;
 }
 
 export interface BridgeStatusSnapshot {

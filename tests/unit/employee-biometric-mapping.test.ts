@@ -698,6 +698,73 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
         cardNo: '998877',
       });
     });
+
+    it('surfaces dedicated syncDeviceUsers snapshot + telemetry in getEnrollmentOptionsForCompany and maps Employee 101 to real enrollment ID 101', async () => {
+      createInMemorySettingStore();
+
+      const employeesById = new Map<string, any>();
+      vi.spyOn(prisma.biometricTerminal, 'findMany').mockResolvedValue([esslTerminal] as any);
+      vi.spyOn(prisma.biometricTerminal, 'update').mockResolvedValue(esslTerminal as any);
+      vi.spyOn(prisma.employee, 'findMany').mockResolvedValue([]);
+      vi.spyOn(prisma.employee, 'findUnique').mockImplementation((async (args: any) => {
+        if (args.where?.companyId_employeeCode) return null;
+        return employeesById.get(args.where?.id) || null;
+      }) as any);
+      vi.spyOn(prisma.employee, 'create').mockImplementation((async (args: any) => {
+        const created = {
+          id: 'emp-101-synced',
+          ...args.data,
+          department: null,
+          designation: null,
+          shift: null,
+          user: null,
+          ledger: null,
+          salaryRevisions: [],
+          _count: { salaryRevisions: 0 },
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        };
+        employeesById.set(created.id, created);
+        return created;
+      }) as any);
+      vi.spyOn(prisma.employee, 'update').mockImplementation((async (args: any) => {
+        const existing = employeesById.get(args.where.id);
+        const updated = { ...existing, ...args.data, updatedAt: new Date() };
+        employeesById.set(updated.id, updated);
+        return updated;
+      }) as any);
+      vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValue([]);
+
+      await BiometricService.syncDeviceUsers(
+        { id: esslTerminal.id, companyId: companyAlphaId, name: esslTerminal.name, deviceSerialNumber: esslTerminal.deviceSerialNumber },
+        {
+          discoveredCount: 1,
+          deviceUsers: [{ uid: 1, enrollmentId: '101', name: 'Karthik Rao', cardNo: '445566' }],
+        }
+      );
+
+      const options = await BiometricMappingService.getEnrollmentOptionsForCompany(companyAlphaId);
+      expect(options.deviceUsersByTerminal[esslTerminal.id]).toHaveLength(1);
+      expect(options.terminals[0].discoveredUserCount).toBe(1);
+      expect(options.terminals[0].syncedUserCount).toBe(1);
+      expect(options.terminals[0].lastUserSyncAt).toBeTruthy();
+      expect(options.terminals[0].lastUserSyncError).toBeNull();
+
+      const created = await EmployeeService.createEmployee(adminActor, {
+        employeeCode: '101',
+        fullName: 'Karthik Rao',
+        dateOfJoining: '2026-10-01',
+        biometricMappings: [
+          { terminalId: esslTerminal.id, enrollmentId: '101', source: 'DEVICE_SYNC' },
+        ],
+      });
+      expect(created.biometricDeviceId).toBe('101');
+      expect(created.biometricMappings?.[0]).toMatchObject({
+        terminalId: esslTerminal.id,
+        enrollmentId: '101',
+        source: 'DEVICE_SYNC',
+      });
+    });
   });
 
   describe('6. Express API Routes & RBAC Enforcement', () => {
@@ -835,7 +902,7 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
   });
 
   describe('7. Frontend UI Source Contracts', () => {
-    it('replaces plain text biometric input in EmployeesPage.tsx with searchable terminal mapping UI and uses in-app activation/deactivation', () => {
+    it('replaces plain text biometric input in EmployeesPage.tsx with searchable terminal mapping UI, real device user dropdown, and manual fallback', () => {
       const empSource = fs.readFileSync(
         path.resolve(process.cwd(), 'src/client/pages/EmployeesPage.tsx'),
         'utf-8'
@@ -844,17 +911,28 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
       expect(empSource).toContain('activateEmployee');
       expect(empSource).toContain('Biometric Terminal &amp; Enrollment Mappings');
       expect(empSource).toContain('Search terminal name, model, serial, IP...');
+      expect(empSource).toContain('Hardware Enrolled Users');
+      expect(empSource).toContain('Refresh Device Users');
+      expect(empSource).toContain('Manual Enrollment ID Fallback');
+      expect(empSource).toContain('lastUserSyncError');
       expect(empSource).toContain('deactivateTarget');
       expect(empSource).not.toMatch(/window\.confirm|confirm\(/);
     });
 
-    it('renders Pending count in BiometricDevicesPage.tsx reconciliation summary panels', () => {
+    it('renders Pending count and Hardware User Synchronization controls in BiometricDevicesPage.tsx', () => {
       const bioSource = fs.readFileSync(
         path.resolve(process.cwd(), 'src/client/pages/BiometricDevicesPage.tsx'),
         'utf-8'
       );
       expect(bioSource).toContain('syncOutcome.pending ?? 0');
       expect(bioSource).toContain('>Pending<');
+      expect(bioSource).toContain('syncBiometricTerminalUsers');
+      expect(bioSource).toContain('Sync Device Users');
+      expect(bioSource).toContain('Selected terminal');
+      expect(bioSource).toContain('Last user sync');
+      expect(bioSource).toContain('Users discovered');
+      expect(bioSource).toContain('Users synchronized');
+      expect(bioSource).toContain('Errors');
     });
   });
 });

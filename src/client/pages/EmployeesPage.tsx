@@ -19,6 +19,7 @@ import {
   Server,
   Trash2,
   ChevronDown,
+  RefreshCw,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
 import {
@@ -107,6 +108,9 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
   const [isTerminalDropdownOpen, setIsTerminalDropdownOpen] = useState(false);
   const [selectedTerminalId, setSelectedTerminalId] = useState('');
   const [enrollmentInput, setEnrollmentInput] = useState('');
+  const [selectedDeviceUserDropdownId, setSelectedDeviceUserDropdownId] = useState('');
+  const [isRefreshingBiometricOptions, setIsRefreshingBiometricOptions] = useState(false);
+  const [biometricRefreshError, setBiometricRefreshError] = useState<string | null>(null);
   const [mappingError, setMappingError] = useState<string | null>(null);
   const [modalError, setModalError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -232,18 +236,41 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     [activeTerminals, selectedTerminalId]
   );
 
-  const syncedDeviceUsersForSelected = useMemo(() => {
+  const handleRefreshBiometricOptions = useCallback(async (quiet = false) => {
+    setIsRefreshingBiometricOptions(true);
+    if (!quiet) {
+      setBiometricRefreshError(null);
+    }
+    try {
+      const bioOpts = await api.getEmployeeBiometricOptions();
+      setBiometricOptions(bioOpts);
+      setBiometricRefreshError(null);
+    } catch (err: unknown) {
+      if (!quiet) {
+        setBiometricRefreshError(
+          err instanceof ApiError ? err.message : 'Failed to refresh biometric device users.'
+        );
+      }
+    } finally {
+      setIsRefreshingBiometricOptions(false);
+    }
+  }, []);
+
+  const allDeviceUsersForSelected = useMemo(() => {
     if (!selectedTerminalId || !biometricOptions?.deviceUsersByTerminal) return [];
-    const users = biometricOptions.deviceUsersByTerminal[selectedTerminalId] || [];
+    return biometricOptions.deviceUsersByTerminal[selectedTerminalId] || [];
+  }, [biometricOptions, selectedTerminalId]);
+
+  const syncedDeviceUsersForSelected = useMemo(() => {
     const q = enrollmentInput.trim().toLowerCase();
-    if (!q) return users;
-    return users.filter(
+    if (!q) return allDeviceUsersForSelected;
+    return allDeviceUsersForSelected.filter(
       (u) =>
         u.enrollmentId.toLowerCase().includes(q) ||
         (u.name && u.name.toLowerCase().includes(q)) ||
         (u.cardNo && u.cardNo.toLowerCase().includes(q))
     );
-  }, [biometricOptions, selectedTerminalId, enrollmentInput]);
+  }, [allDeviceUsersForSelected, enrollmentInput]);
 
   const findExternalMappingConflict = useCallback(
     (terminalId: string, enrollmentId: string) => {
@@ -304,6 +331,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     if (!staged) return;
     setFormMappings((prev) => [...prev, staged]);
     setEnrollmentInput('');
+    setSelectedDeviceUserDropdownId('');
     setMappingError(null);
   };
 
@@ -423,8 +451,10 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     setFormMappings([]);
     setTerminalSearch('');
     setIsTerminalDropdownOpen(false);
-    setSelectedTerminalId('');
+    setSelectedTerminalId(activeTerminals.length === 1 ? activeTerminals[0].id : '');
     setEnrollmentInput('');
+    setSelectedDeviceUserDropdownId('');
+    setBiometricRefreshError(null);
     setMappingError(null);
     setModalError(null);
   };
@@ -455,11 +485,17 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     );
     setTerminalSearch('');
     setIsTerminalDropdownOpen(false);
-    setSelectedTerminalId(activeTerminals.length === 1 ? activeTerminals[0].id : '');
+    setSelectedTerminalId(
+      emp.biometricMappings?.[0]?.terminalId ||
+        (activeTerminals.length === 1 ? activeTerminals[0].id : '')
+    );
     setEnrollmentInput('');
+    setSelectedDeviceUserDropdownId('');
+    setBiometricRefreshError(null);
     setMappingError(null);
     setModalError(null);
     setIsEmployeeModalOpen(true);
+    void handleRefreshBiometricOptions(true);
   };
 
   const handleActivateEmployee = async (emp: EmployeeItem) => {
@@ -675,6 +711,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
             onClick={() => {
               resetEmployeeForm();
               setIsEmployeeModalOpen(true);
+              void handleRefreshBiometricOptions(true);
             }}
             className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold rounded-lg shadow-sm transition cursor-pointer"
           >
@@ -1639,15 +1676,38 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
 
               {/* Searchable Biometric Terminal & Enrollment Mappings */}
               <div className="p-3.5 rounded-xl bg-slate-800/40 border border-slate-800 space-y-3">
-                <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <div className="flex items-center gap-2 text-slate-200 font-semibold">
                     <Fingerprint className="w-4 h-4 text-indigo-400" />
                     <span>Biometric Terminal &amp; Enrollment Mappings</span>
                   </div>
-                  <span className="text-[11px] text-slate-400 tabular-nums">
-                    {formMappings.length} mapped
-                  </span>
+                  <div className="flex items-center gap-3">
+                    {activeTerminals.length > 0 && (
+                      <button
+                        type="button"
+                        disabled={isRefreshingBiometricOptions}
+                        onClick={() => void handleRefreshBiometricOptions(false)}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-md text-[11px] font-medium text-indigo-300 hover:text-indigo-200 transition cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
+                      >
+                        <RefreshCw
+                          className={`w-3 h-3 ${isRefreshingBiometricOptions ? 'animate-spin' : ''}`}
+                        />
+                        <span>
+                          {isRefreshingBiometricOptions ? 'Refreshing...' : 'Refresh Device Users'}
+                        </span>
+                      </button>
+                    )}
+                    <span className="text-[11px] text-slate-400 font-mono tabular-nums">
+                      {formMappings.length} mapped
+                    </span>
+                  </div>
                 </div>
+
+                {biometricRefreshError && (
+                  <div className="p-2 rounded-lg bg-rose-950/50 border border-rose-800 text-[11px] text-rose-200">
+                    {biometricRefreshError}
+                  </div>
+                )}
 
                 {editingEmployee?.biometricDeviceId && formMappings.length === 0 && (
                   <div className="p-2.5 rounded-lg bg-amber-950/30 border border-amber-800/50 text-[11px] text-amber-200">
@@ -1708,6 +1768,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                                     type="button"
                                     onClick={() => {
                                       setSelectedTerminalId(term.id);
+                                      setSelectedDeviceUserDropdownId('');
                                       setIsTerminalDropdownOpen(false);
                                       setMappingError(null);
                                     }}
@@ -1743,34 +1804,151 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                         )}
                       </div>
 
-                      {/* Searchable / Direct Enrollment ID Input */}
+                      {/* Synced Hardware User Dropdown */}
                       <div>
-                        <label className="block text-slate-400 mb-1">Device Enrollment ID</label>
+                        <label className="block text-slate-400 mb-1">
+                          Hardware Enrolled Users
+                        </label>
                         <div className="flex items-center gap-2">
-                          <input
-                            type="text"
-                            placeholder={
-                              selectedTerminal
-                                ? 'Search hardware user or enter ID (e.g. 101)'
-                                : 'Select a terminal first'
-                            }
-                            disabled={!selectedTerminalId}
-                            value={enrollmentInput}
+                          <select
+                            aria-label="Hardware Enrolled Users"
+                            disabled={!selectedTerminalId || allDeviceUsersForSelected.length === 0}
+                            value={selectedDeviceUserDropdownId}
                             onChange={(e) => {
-                              setEnrollmentInput(e.target.value);
+                              const nextId = e.target.value;
+                              setSelectedDeviceUserDropdownId(nextId);
                               setMappingError(null);
+                              if (nextId) {
+                                handleAddMapping(nextId, 'DEVICE_SYNC');
+                              }
                             }}
                             className="flex-1 bg-slate-800 border border-slate-700 disabled:opacity-50 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono tabular-nums focus:outline-none focus:border-indigo-500"
-                          />
-                          <button
-                            type="button"
-                            disabled={!selectedTerminalId || !enrollmentInput.trim()}
-                            onClick={() => handleAddMapping()}
-                            className="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
                           >
-                            + Add Mapping
-                          </button>
+                            <option value="">
+                              {!selectedTerminalId
+                                ? 'Select a terminal first...'
+                                : allDeviceUsersForSelected.length === 0
+                                ? 'No synced hardware users available'
+                                : `Select hardware user (${allDeviceUsersForSelected.length} synced)...`}
+                            </option>
+                            {allDeviceUsersForSelected.map((u) => {
+                              const conflict = findExternalMappingConflict(
+                                selectedTerminalId,
+                                u.enrollmentId
+                              );
+                              const alreadyStaged = formMappings.some(
+                                (m) =>
+                                  m.terminalId === selectedTerminalId &&
+                                  m.enrollmentId === u.enrollmentId
+                              );
+                              const labelParts = [
+                                `${u.enrollmentId} — ${u.name || 'Unnamed User'}`,
+                              ];
+                              if (u.uid !== undefined && u.uid !== null) {
+                                labelParts.push(`UID ${u.uid}`);
+                              }
+                              if (u.cardNo) {
+                                labelParts.push(`Card ${u.cardNo}`);
+                              }
+                              if (alreadyStaged) {
+                                labelParts.push('[Added]');
+                              } else if (conflict) {
+                                labelParts.push(`[Mapped: ${conflict.employeeCode}]`);
+                              }
+                              return (
+                                <option
+                                  key={u.enrollmentId}
+                                  value={u.enrollmentId}
+                                  disabled={Boolean(conflict) || alreadyStaged}
+                                >
+                                  {labelParts.join(' · ')}
+                                </option>
+                              );
+                            })}
+                          </select>
                         </div>
+                      </div>
+                    </div>
+
+                    {/* Per-Terminal Hardware User Sync Status / Empty / Error Message */}
+                    {selectedTerminal && (
+                      <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1 text-[11px]">
+                        <div className="flex flex-wrap items-center justify-between gap-2 text-slate-400 font-mono tabular-nums">
+                          <span>
+                            Last user sync:{' '}
+                            <span className="text-slate-200">
+                              {selectedTerminal.lastUserSyncAt
+                                ? new Date(selectedTerminal.lastUserSyncAt).toLocaleString()
+                                : 'Never'}
+                            </span>
+                            {typeof selectedTerminal.discoveredUserCount === 'number' && (
+                              <>
+                                {' '}
+                                · Discovered: {selectedTerminal.discoveredUserCount}
+                              </>
+                            )}
+                            {typeof selectedTerminal.syncedUserCount === 'number' && (
+                              <>
+                                {' '}
+                                · Synced: {selectedTerminal.syncedUserCount}
+                              </>
+                            )}
+                          </span>
+                          {selectedTerminal.userSyncRequestedAt && (
+                            <span className="text-indigo-300">Bridge user sync queued</span>
+                          )}
+                        </div>
+
+                        {selectedTerminal.lastUserSyncError && (
+                          <div className="text-rose-300 font-mono">
+                            Hardware user sync error: {selectedTerminal.lastUserSyncError}
+                          </div>
+                        )}
+
+                        {allDeviceUsersForSelected.length === 0 && !selectedTerminal.lastUserSyncError && (
+                          <div className="text-slate-400">
+                            {selectedTerminal.lastUserSyncAt
+                              ? 'Hardware reported 0 enrolled users on the selected terminal. Enroll the user on the terminal or use the Manual Enrollment ID Fallback below.'
+                              : 'No hardware users synced yet for this terminal. Run Sync Device Users on the Biometric Devices page, then click Refresh Device Users.'}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Manual Enrollment ID Fallback */}
+                    <div>
+                      <div className="flex items-center justify-between gap-2 mb-1">
+                        <label className="block text-slate-300 font-medium">
+                          Manual Enrollment ID Fallback
+                        </label>
+                        <span className="text-[11px] text-slate-400">
+                          Use when hardware user sync is unavailable or to filter synced users
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          placeholder={
+                            selectedTerminal
+                              ? 'Filter synced hardware users or enter fallback ID (e.g. 101)'
+                              : 'Select a terminal first'
+                          }
+                          disabled={!selectedTerminalId}
+                          value={enrollmentInput}
+                          onChange={(e) => {
+                            setEnrollmentInput(e.target.value);
+                            setMappingError(null);
+                          }}
+                          className="flex-1 bg-slate-800 border border-slate-700 disabled:opacity-50 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono tabular-nums focus:outline-none focus:border-indigo-500"
+                        />
+                        <button
+                          type="button"
+                          disabled={!selectedTerminalId || !enrollmentInput.trim()}
+                          onClick={() => handleAddMapping()}
+                          className="px-3 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white rounded-lg text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                        >
+                          + Add Mapping
+                        </button>
                       </div>
                     </div>
 
@@ -1790,11 +1968,11 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                         );
                       })()}
 
-                    {/* Real hardware-synced user suggestions (only when synced from device) */}
+                    {/* Quick-select filtered hardware users list (real device users only) */}
                     {selectedTerminalId && syncedDeviceUsersForSelected.length > 0 && (
                       <div className="space-y-1">
                         <div className="text-[11px] text-slate-400">
-                          Synced Hardware Users on {selectedTerminal?.name}:
+                          Synced Hardware Users on {selectedTerminal?.name} ({syncedDeviceUsersForSelected.length}):
                         </div>
                         <div className="max-h-28 overflow-y-auto border border-slate-800 rounded-lg divide-y divide-slate-800/70 bg-slate-900/60">
                           {syncedDeviceUsersForSelected.map((u) => {
@@ -1815,11 +1993,13 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                                 onClick={() => handleAddMapping(u.enrollmentId, 'DEVICE_SYNC')}
                                 className="w-full text-left px-3 py-1.5 flex items-center justify-between gap-2 hover:bg-slate-800/70 disabled:opacity-50 text-[11px] cursor-pointer"
                               >
-                                <span className="font-mono tabular-nums text-slate-200">
+                                <span className="font-mono tabular-nums text-slate-200 truncate">
                                   ID {u.enrollmentId}
                                   {u.name ? ` · ${u.name}` : ''}
+                                  {u.uid !== undefined && u.uid !== null ? ` · UID ${u.uid}` : ''}
+                                  {u.cardNo ? ` · Card ${u.cardNo}` : ''}
                                 </span>
-                                <span className="text-slate-400">
+                                <span className="text-slate-400 shrink-0">
                                   {alreadyStaged
                                     ? 'Added'
                                     : conflict

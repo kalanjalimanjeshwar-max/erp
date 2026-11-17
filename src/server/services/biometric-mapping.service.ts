@@ -199,12 +199,19 @@ export class BiometricMappingService {
   static async saveDeviceUsersSnapshot(
     companyId: string,
     terminalId: string,
-    users: Array<{ uid?: number; enrollmentId: string; name?: string | null; cardNo?: string | null }>
-  ): Promise<void> {
-    if (!Array.isArray(users)) return;
-    if (typeof prisma.companySetting?.upsert !== 'function') return;
-
+    users: Array<{ uid?: number; enrollmentId: string; name?: string | null; cardNo?: string | null }>,
+    options?: { throwOnError?: boolean }
+  ): Promise<{
+    discoveredCount: number;
+    syncedCount: number;
+    syncedAt: string;
+    users: DeviceEnrolledUserItem[];
+  }> {
     const nowIso = new Date().toISOString();
+    if (!Array.isArray(users)) {
+      return { discoveredCount: 0, syncedCount: 0, syncedAt: nowIso, users: [] };
+    }
+
     const seen = new Set<string>();
     const normalized: StoredDeviceUserEntry[] = [];
 
@@ -223,39 +230,69 @@ export class BiometricMappingService {
       });
     }
 
-    try {
-      const existing = await this.readDeviceUsersMap(companyId);
-      const nextPayload: Record<string, StoredDeviceUserEntry[]> = {};
-      for (const [tid, list] of Object.entries(existing)) {
-        nextPayload[tid] = list.map((item) => ({
-          uid: item.uid,
-          enrollmentId: item.enrollmentId,
-          name: item.name ?? null,
-          cardNo: item.cardNo ?? null,
-          syncedAt: item.syncedAt || nowIso,
-        }));
-      }
-      nextPayload[terminalId] = normalized;
+    const mappedUsers: DeviceEnrolledUserItem[] = normalized.map((e) => ({
+      uid: e.uid,
+      enrollmentId: e.enrollmentId,
+      name: e.name ?? null,
+      cardNo: e.cardNo ?? null,
+      terminalId,
+      syncedAt: e.syncedAt,
+    }));
 
-      await prisma.companySetting.upsert({
-        where: {
-          companyId_key: {
+    if (typeof prisma.companySetting?.upsert !== 'function') {
+      return {
+        discoveredCount: users.length,
+        syncedCount: normalized.length,
+        syncedAt: nowIso,
+        users: mappedUsers,
+      };
+    }
+
+    try {
+      await this.withCompanyWriteLock(companyId, async () => {
+        const existing = await this.readDeviceUsersMap(companyId);
+        const nextPayload: Record<string, StoredDeviceUserEntry[]> = {};
+        for (const [tid, list] of Object.entries(existing)) {
+          nextPayload[tid] = list.map((item) => ({
+            uid: item.uid,
+            enrollmentId: item.enrollmentId,
+            name: item.name ?? null,
+            cardNo: item.cardNo ?? null,
+            syncedAt: item.syncedAt || nowIso,
+          }));
+        }
+        nextPayload[terminalId] = normalized;
+
+        await prisma.companySetting.upsert({
+          where: {
+            companyId_key: {
+              companyId,
+              key: BIOMETRIC_DEVICE_USERS_SETTING_KEY,
+            },
+          },
+          update: {
+            value: JSON.stringify(nextPayload),
+          },
+          create: {
             companyId,
             key: BIOMETRIC_DEVICE_USERS_SETTING_KEY,
+            value: JSON.stringify(nextPayload),
           },
-        },
-        update: {
-          value: JSON.stringify(nextPayload),
-        },
-        create: {
-          companyId,
-          key: BIOMETRIC_DEVICE_USERS_SETTING_KEY,
-          value: JSON.stringify(nextPayload),
-        },
+        });
       });
-    } catch {
-      // Non-fatal: snapshot failure must not interrupt heartbeat
+    } catch (err: unknown) {
+      if (options?.throwOnError) {
+        throw err;
+      }
+      // Non-fatal on heartbeat unless caller explicitly requested throwOnError
     }
+
+    return {
+      discoveredCount: users.length,
+      syncedCount: normalized.length,
+      syncedAt: nowIso,
+      users: mappedUsers,
+    };
   }
 
   private static async buildTerminalMetaMap(
@@ -421,7 +458,7 @@ export class BiometricMappingService {
     companyId: string,
     terminalsInput?: BiometricTerminalItem[]
   ): Promise<BiometricTerminalEnrollmentOptionsResponse> {
-    const [rawTerminals, deviceUsersByTerminal, mappings, employees] = await Promise.all([
+    const [rawTerminals, deviceUsersByTerminal, mappings, employees, telemetryRow] = await Promise.all([
       terminalsInput
         ? Promise.resolve(terminalsInput)
         : typeof prisma.biometricTerminal?.findMany === 'function'
@@ -441,33 +478,66 @@ export class BiometricMappingService {
             select: { id: true, employeeCode: true, fullName: true, status: true },
           })
         : Promise.resolve([]),
+      typeof prisma.companySetting?.findUnique === 'function'
+        ? prisma.companySetting
+            .findUnique({
+              where: {
+                companyId_key: {
+                  companyId,
+                  key: 'BIOMETRIC_BRIDGE_TELEMETRY_V1',
+                },
+              },
+            })
+            .catch(() => null)
+        : Promise.resolve(null),
     ]);
+
+    let telemetryMap: Record<string, any> = {};
+    try {
+      if (telemetryRow?.value) {
+        const parsed = JSON.parse(telemetryRow.value);
+        if (parsed && typeof parsed === 'object') {
+          telemetryMap = parsed;
+        }
+      }
+    } catch {
+      telemetryMap = {};
+    }
 
     const terminals: BiometricTerminalItem[] = (rawTerminals as any[])
       .filter((t) => t.isActive !== false && t.status !== 'DEACTIVATED')
-      .map((t) => ({
-        id: t.id,
-        companyId: t.companyId,
-        deviceSerialNumber: t.deviceSerialNumber,
-        name: t.name,
-        terminalModel: t.terminalModel,
-        ipAddress: t.ipAddress,
-        port: t.port,
-        location: t.location,
-        apiKeyPrefix: t.apiKeyPrefix,
-        status: t.status,
-        lastHeartbeatAt: t.lastHeartbeatAt
-          ? new Date(t.lastHeartbeatAt).toISOString()
-          : null,
-        lastSyncAt: t.lastSyncAt ? new Date(t.lastSyncAt).toISOString() : null,
-        firmwareVersion: t.firmwareVersion || null,
-        registeredByUserId: t.registeredByUserId,
-        registeredByUserName: t.registeredByUser?.fullName || t.registeredByUserName || null,
-        isActive: t.isActive,
-        notes: t.notes || null,
-        createdAt: t.createdAt ? new Date(t.createdAt).toISOString() : new Date().toISOString(),
-        updatedAt: t.updatedAt ? new Date(t.updatedAt).toISOString() : new Date().toISOString(),
-      }));
+      .map((t) => {
+        const tel = telemetryMap[t.id] || {};
+        return {
+          id: t.id,
+          companyId: t.companyId,
+          deviceSerialNumber: t.deviceSerialNumber,
+          name: t.name,
+          terminalModel: t.terminalModel,
+          ipAddress: t.ipAddress,
+          port: t.port,
+          location: t.location,
+          apiKeyPrefix: t.apiKeyPrefix,
+          status: t.status,
+          lastHeartbeatAt: t.lastHeartbeatAt
+            ? new Date(t.lastHeartbeatAt).toISOString()
+            : null,
+          lastSyncAt: t.lastSyncAt ? new Date(t.lastSyncAt).toISOString() : null,
+          firmwareVersion: t.firmwareVersion || null,
+          registeredByUserId: t.registeredByUserId,
+          registeredByUserName: t.registeredByUser?.fullName || t.registeredByUserName || null,
+          isActive: t.isActive,
+          notes: t.notes || null,
+          createdAt: t.createdAt ? new Date(t.createdAt).toISOString() : new Date().toISOString(),
+          updatedAt: t.updatedAt ? new Date(t.updatedAt).toISOString() : new Date().toISOString(),
+          lastUserSyncAt: tel.lastUserSyncAt ?? t.lastUserSyncAt ?? null,
+          lastUserSyncAttemptAt: tel.lastUserSyncAttemptAt ?? t.lastUserSyncAttemptAt ?? null,
+          lastUserSyncError: tel.lastUserSyncError ?? t.lastUserSyncError ?? null,
+          discoveredUserCount: tel.discoveredUserCount ?? t.discoveredUserCount ?? null,
+          syncedUserCount: tel.syncedUserCount ?? t.syncedUserCount ?? null,
+          userSyncRequestedAt: tel.userSyncRequestedAt ?? t.userSyncRequestedAt ?? null,
+        };
+      });
 
     const empMap = new Map<
       string,

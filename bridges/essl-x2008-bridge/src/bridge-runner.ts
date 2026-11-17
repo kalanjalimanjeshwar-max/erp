@@ -39,6 +39,7 @@ interface TerminalController {
   pollTimer: NodeJS.Timeout | null;
   heartbeatTimer: NodeJS.Timeout | null;
   inFlightSync: boolean;
+  inFlightUserSync: boolean;
   inFlightHeartbeat: boolean;
   deviceUsers?: DeviceEnrolledUser[];
 }
@@ -94,11 +95,18 @@ export class BiometricBridgeRunner {
           lastProcessedPunchCount: cp.lastProcessedPunchCount,
           lastError: cp.lastError,
           deviceInfo: cp.deviceInfo || null,
+          lastSuccessfulUserSyncAt: cp.lastSuccessfulUserSyncAt ?? null,
+          lastUserSyncAttemptAt: cp.lastUserSyncAttemptAt ?? null,
+          lastUserSyncError: cp.lastUserSyncError ?? null,
+          discoveredUserCount: cp.discoveredUserCount ?? null,
+          syncedUserCount: cp.syncedUserCount ?? null,
         },
         pollTimer: null,
         heartbeatTimer: null,
         inFlightSync: false,
+        inFlightUserSync: false,
         inFlightHeartbeat: false,
+        deviceUsers: cp.pendingUserSync?.users,
       });
     }
   }
@@ -231,6 +239,8 @@ export class BiometricBridgeRunner {
     const adapter = this.adapterFactory(term);
     let deviceInfo: DeviceInfo | null = ctrl.runtime.deviceInfo;
     let pulledRecords: DeviceAttendanceRecord[] = [];
+    let queriedUsers: DeviceEnrolledUser[] | null = null;
+    let userQueryAttemptIso: string | null = null;
 
     // 1. Poll physical biometric device over TCP (read-only)
     try {
@@ -258,16 +268,39 @@ export class BiometricBridgeRunner {
       }
 
       pulledRecords = await adapter.getAttendanceLogs();
+
       if (typeof adapter.getUsers === 'function') {
+        userQueryAttemptIso = new Date().toISOString();
+        ctrl.runtime.lastUserSyncAttemptAt = userQueryAttemptIso;
         try {
           const users = await adapter.getUsers();
-          if (Array.isArray(users) && users.length > 0) {
-            ctrl.deviceUsers = users;
+          if (!Array.isArray(users)) {
+            throw new Error('Hardware adapter returned an invalid enrolled user list.');
           }
-        } catch {
-          // Optional hardware user query failure must never block punch polling
+          queriedUsers = users;
+          ctrl.deviceUsers = users;
+          ctrl.runtime.discoveredUserCount = users.length;
+          this.checkpointStore.updateStatus(term.id, term.serialNumber, {
+            lastUserSyncAttemptAt: userQueryAttemptIso,
+            discoveredUserCount: users.length,
+          });
+        } catch (userErr: unknown) {
+          const safeUserErr = redactSensitiveText(
+            (userErr as Error)?.message || 'Hardware user query failed'
+          );
+          ctrl.runtime.lastUserSyncError = safeUserErr;
+          this.checkpointStore.updateStatus(term.id, term.serialNumber, {
+            lastUserSyncAttemptAt: userQueryAttemptIso,
+            lastUserSyncError: safeUserErr,
+          });
+          this.logger.warn('terminal_user_query_failed', {
+            terminalId: term.id,
+            serialNumber: term.serialNumber,
+            error: safeUserErr,
+          });
         }
       }
+
       ctrl.runtime.deviceReachable = true;
       this.checkpointStore.updateStatus(term.id, term.serialNumber, { deviceInfo });
     } catch (err: unknown) {
@@ -328,6 +361,21 @@ export class BiometricBridgeRunner {
       });
     }
 
+    // 4. Upload freshly discovered hardware users OR retry previously failed user upload
+    // Never blocks punch synchronization if hardware user upload fails.
+    const snapshotToUpload =
+      queriedUsers !== null
+        ? { users: queriedUsers, discoveredAt: userQueryAttemptIso || attemptIso }
+        : updatedCp.pendingUserSync || null;
+
+    if (snapshotToUpload) {
+      try {
+        await this.uploadTerminalUsers(ctrl, snapshotToUpload.users, snapshotToUpload.discoveredAt);
+      } catch {
+        // Error already logged and persisted on pendingUserSync for retry on next cycle
+      }
+    }
+
     this.logger.info('terminal_sync_completed', {
       terminalId: term.id,
       serialNumber: term.serialNumber,
@@ -348,7 +396,173 @@ export class BiometricBridgeRunner {
   }
 
   /**
-   * Sends a single authenticated heartbeat for a terminal and triggers immediate poll if syncRequested=true.
+   * Executes a dedicated hardware user discovery + upload cycle for a single terminal
+   * WITHOUT pulling attendance punches or triggering punch reconciliation.
+   */
+  async syncTerminalUsersOnce(terminalId: string): Promise<{
+    discoveredCount: number;
+    syncedCount: number;
+    syncedAt: string;
+    users: DeviceEnrolledUser[];
+  }> {
+    const ctrl = this.controllers.get(terminalId);
+    if (!ctrl) {
+      throw new Error(`Unknown terminal ID '${terminalId}'.`);
+    }
+
+    const term = ctrl.config;
+    const attemptIso = new Date().toISOString();
+    ctrl.runtime.lastUserSyncAttemptAt = attemptIso;
+    this.checkpointStore.updateStatus(term.id, term.serialNumber, {
+      lastUserSyncAttemptAt: attemptIso,
+    });
+
+    const adapter = this.adapterFactory(term);
+    let users: DeviceEnrolledUser[] = [];
+
+    try {
+      await adapter.connect({
+        host: term.ipAddress,
+        port: term.port,
+        commKey: term.commKey ?? 0,
+        timeoutMs: term.connectTimeoutMs ?? this.config.connectTimeoutMs,
+      });
+
+      const deviceInfo = await adapter.getDeviceInfo();
+      ctrl.runtime.deviceInfo = deviceInfo;
+
+      if (!term.skipSerialValidation) {
+        if (!deviceInfo.serialNumber) {
+          throw new Error(
+            `Device at ${term.ipAddress}:${term.port} did not return a serial number (~SerialNumber); refusing unverified user sync.`
+          );
+        }
+        if (deviceInfo.serialNumber.trim() !== term.serialNumber.trim()) {
+          throw new Error(
+            `Hardware serial mismatch at ${term.ipAddress}:${term.port}: expected '${term.serialNumber}', got '${deviceInfo.serialNumber}'.`
+          );
+        }
+      }
+
+      if (typeof adapter.getUsers !== 'function') {
+        throw new Error(
+          `Protocol adapter '${adapter.protocolName}' does not support enrolled hardware user queries.`
+        );
+      }
+
+      const rawUsers = await adapter.getUsers();
+      if (!Array.isArray(rawUsers)) {
+        throw new Error('Hardware adapter returned an invalid enrolled user list.');
+      }
+
+      users = rawUsers;
+      ctrl.deviceUsers = users;
+      ctrl.runtime.deviceReachable = true;
+      ctrl.runtime.discoveredUserCount = users.length;
+      this.checkpointStore.updateStatus(term.id, term.serialNumber, {
+        deviceInfo,
+        discoveredUserCount: users.length,
+      });
+    } catch (err: unknown) {
+      const safeErr = redactSensitiveText((err as Error)?.message || 'Hardware user query failed');
+      ctrl.runtime.deviceReachable = false;
+      ctrl.runtime.lastUserSyncError = safeErr;
+      this.checkpointStore.updateStatus(term.id, term.serialNumber, {
+        lastUserSyncAttemptAt: attemptIso,
+        lastUserSyncError: safeErr,
+      });
+      this.logger.warn('terminal_user_query_failed', {
+        terminalId: term.id,
+        serialNumber: term.serialNumber,
+        error: safeErr,
+      });
+      throw new Error(safeErr);
+    } finally {
+      try {
+        await adapter.disconnect();
+      } catch {
+        // Ignore teardown socket error
+      }
+    }
+
+    const res = await this.uploadTerminalUsers(ctrl, users, attemptIso);
+    return {
+      discoveredCount: res.discoveredCount,
+      syncedCount: res.syncedCount,
+      syncedAt: res.syncedAt,
+      users,
+    };
+  }
+
+  private async uploadTerminalUsers(
+    ctrl: TerminalController,
+    users: DeviceEnrolledUser[],
+    discoveredAt: string
+  ) {
+    const term = ctrl.config;
+    const apiKey = this.resolveKey(term);
+
+    try {
+      const res = await this.coreErpClient.syncUsers(apiKey, term.serialNumber, {
+        deviceUsers: users,
+        discoveredCount: users.length,
+        discoveredAt,
+        bridgeHost: this.config.bridgeHost,
+        bridgeVersion: this.config.bridgeVersion,
+      });
+
+      ctrl.runtime.bridgeConnected = true;
+      ctrl.runtime.authError = false;
+      ctrl.runtime.lastSuccessfulUserSyncAt = res.syncedAt;
+      ctrl.runtime.discoveredUserCount = res.discoveredCount;
+      ctrl.runtime.syncedUserCount = res.syncedCount;
+      ctrl.runtime.lastUserSyncError = null;
+
+      this.checkpointStore.updateStatus(term.id, term.serialNumber, {
+        lastSuccessfulUserSyncAt: res.syncedAt,
+        discoveredUserCount: res.discoveredCount,
+        syncedUserCount: res.syncedCount,
+        lastUserSyncError: null,
+        pendingUserSync: null,
+      });
+
+      this.logger.info('terminal_user_sync_completed', {
+        terminalId: term.id,
+        serialNumber: term.serialNumber,
+        discoveredUserCount: res.discoveredCount,
+        syncedUserCount: res.syncedCount,
+      });
+
+      return res;
+    } catch (err: unknown) {
+      const safeErr = redactSensitiveText((err as Error)?.message || 'Failed to upload hardware users to CoreERP');
+      ctrl.runtime.lastUserSyncError = safeErr;
+      ctrl.runtime.discoveredUserCount = users.length;
+      if (err instanceof CoreErpApiError && err.isAuthError) {
+        ctrl.runtime.authError = true;
+        ctrl.runtime.bridgeConnected = false;
+      }
+
+      this.checkpointStore.updateStatus(term.id, term.serialNumber, {
+        discoveredUserCount: users.length,
+        lastUserSyncError: safeErr,
+        pendingUserSync: { users, discoveredAt },
+      });
+
+      this.logger.warn('terminal_user_upload_failed', {
+        terminalId: term.id,
+        serialNumber: term.serialNumber,
+        discoveredUserCount: users.length,
+        statusCode: err instanceof CoreErpApiError ? err.statusCode : undefined,
+        error: safeErr,
+      });
+
+      throw err;
+    }
+  }
+
+  /**
+   * Sends a single authenticated heartbeat for a terminal and triggers immediate poll/user-sync if requested.
    */
   async sendTerminalHeartbeat(terminalId: string): Promise<boolean> {
     const ctrl = this.controllers.get(terminalId);
@@ -372,9 +586,11 @@ export class BiometricBridgeRunner {
         lastProcessedPunchCount: ctrl.runtime.lastProcessedPunchCount,
         lastSyncAttemptAt: ctrl.runtime.lastSyncAttemptAt || undefined,
         lastSyncAt: ctrl.runtime.lastSuccessfulSyncAt || undefined,
-        ...(ctrl.deviceUsers && ctrl.deviceUsers.length > 0
-          ? { deviceUsers: ctrl.deviceUsers }
-          : {}),
+        lastUserSyncAt: ctrl.runtime.lastSuccessfulUserSyncAt,
+        lastUserSyncAttemptAt: ctrl.runtime.lastUserSyncAttemptAt,
+        lastUserSyncError: ctrl.runtime.lastUserSyncError,
+        discoveredUserCount: ctrl.runtime.discoveredUserCount,
+        syncedUserCount: ctrl.runtime.syncedUserCount,
       });
 
       const nowIso = new Date().toISOString();
@@ -385,12 +601,18 @@ export class BiometricBridgeRunner {
         lastSuccessfulHeartbeatAt: nowIso,
       });
 
-      if (hbRes.syncRequested && this.running && !ctrl.inFlightSync) {
+      if (hbRes.syncRequested && this.running && !ctrl.inFlightSync && !ctrl.inFlightUserSync) {
         this.logger.info('bridge_sync_requested_by_server', {
           terminalId: term.id,
           serialNumber: term.serialNumber,
         });
         void this.runTerminalPollCycle(term.id);
+      } else if (hbRes.userSyncRequested && this.running && !ctrl.inFlightSync && !ctrl.inFlightUserSync) {
+        this.logger.info('bridge_user_sync_requested_by_server', {
+          terminalId: term.id,
+          serialNumber: term.serialNumber,
+        });
+        void this.runTerminalUserSync(term.id);
       }
 
       return true;
@@ -485,9 +707,23 @@ export class BiometricBridgeRunner {
     await this.sendTerminalHeartbeat(terminalId);
   }
 
+  private async runTerminalUserSync(terminalId: string): Promise<void> {
+    const ctrl = this.controllers.get(terminalId);
+    if (!ctrl || ctrl.inFlightUserSync || ctrl.inFlightSync) return;
+
+    ctrl.inFlightUserSync = true;
+    try {
+      await this.syncTerminalUsersOnce(terminalId);
+    } catch {
+      // Errors already logged and recorded in ctrl.runtime.lastUserSyncError
+    } finally {
+      ctrl.inFlightUserSync = false;
+    }
+  }
+
   private async runTerminalPollCycle(terminalId: string): Promise<void> {
     const ctrl = this.controllers.get(terminalId);
-    if (!ctrl || ctrl.inFlightSync) return;
+    if (!ctrl || ctrl.inFlightSync || ctrl.inFlightUserSync) return;
 
     if (ctrl.pollTimer) {
       clearTimeout(ctrl.pollTimer);

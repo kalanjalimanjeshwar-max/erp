@@ -13,6 +13,11 @@ export interface HeartbeatPayload {
   lastProcessedPunchCount?: number;
   lastSyncAttemptAt?: string;
   lastSyncAt?: string;
+  lastUserSyncAt?: string | null;
+  lastUserSyncAttemptAt?: string | null;
+  lastUserSyncError?: string | null;
+  discoveredUserCount?: number | null;
+  syncedUserCount?: number | null;
   deviceUsers?: Array<{
     uid?: number;
     enrollmentId: string;
@@ -29,6 +34,30 @@ export interface HeartbeatResult {
   status: string;
   syncRequested?: boolean;
   syncRequestedAt?: string | null;
+  userSyncRequested?: boolean;
+  userSyncRequestedAt?: string | null;
+}
+
+export interface UserSyncPayload {
+  deviceUsers: Array<{
+    uid?: number;
+    enrollmentId: string;
+    name?: string | null;
+    cardNo?: string | null;
+  }>;
+  discoveredCount?: number;
+  discoveredAt?: string;
+  bridgeHost?: string;
+  bridgeVersion?: string;
+}
+
+export interface UserSyncResult {
+  success: boolean;
+  terminalId: string;
+  terminalName: string;
+  discoveredCount: number;
+  syncedCount: number;
+  syncedAt: string;
 }
 
 export interface BatchSubmitResult {
@@ -65,6 +94,11 @@ export interface ICoreErpClient {
     punches: NormalizedPunchEvent[],
     meta?: { bridgeHost?: string; bridgeVersion?: string }
   ): Promise<BatchSubmitResult>;
+  syncUsers(
+    apiKey: string,
+    serialNumber: string,
+    payload: UserSyncPayload
+  ): Promise<UserSyncResult>;
 }
 
 export class CoreErpHttpClient implements ICoreErpClient {
@@ -91,6 +125,21 @@ export class CoreErpHttpClient implements ICoreErpClient {
       deviceSerialNumber: serialNumber,
       bridgeHost: meta?.bridgeHost,
       bridgeVersion: meta?.bridgeVersion,
+    });
+  }
+
+  async syncUsers(
+    apiKey: string,
+    serialNumber: string,
+    payload: UserSyncPayload
+  ): Promise<UserSyncResult> {
+    return this.postJson<UserSyncResult>('/api/biometric/users', apiKey, serialNumber, {
+      deviceUsers: payload.deviceUsers,
+      deviceSerialNumber: serialNumber,
+      discoveredCount: payload.discoveredCount ?? payload.deviceUsers.length,
+      discoveredAt: payload.discoveredAt,
+      bridgeHost: payload.bridgeHost,
+      bridgeVersion: payload.bridgeVersion,
     });
   }
 

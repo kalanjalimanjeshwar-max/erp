@@ -76,7 +76,7 @@ const SENSITIVE_KEY_PATTERN =
 export function redactSensitiveText(input: string): string {
   if (!input) return input;
   return input
-    .replace(/bio_live_[a-f0-9]{12,}/gi, (match) => `${match.slice(0, 12)}***REDACTED***`)
+    .replace(/bio_live_[A-Za-z0-9_-]{12,}/gi, (match) => `${match.slice(0, 12)}***REDACTED***`)
     .replace(/(Bearer\s+)[A-Za-z0-9._-]+/gi, '$1***REDACTED***')
     .replace(/(x-device-api-key['":\s=]+)[^\s"',}]+/gi, '$1***REDACTED***')
     .replace(/(commKey['":\s=]+)\d+/gi, '$1***REDACTED***');

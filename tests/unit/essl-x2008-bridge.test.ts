@@ -25,6 +25,7 @@ import { BridgeLogger } from '../../bridges/essl-x2008-bridge/src/logger.js';
 import { CoreErpApiError, ICoreErpClient } from '../../bridges/essl-x2008-bridge/src/coreerp-client.js';
 import { validateTransportUrl } from '../../bridges/essl-x2008-bridge/src/security/dpapi.js';
 import { deviceLocalDateTimeToUtcIso } from '../../bridges/essl-x2008-bridge/src/timezone.js';
+import { BiometricMappingService } from '../../src/server/services/biometric-mapping.service.js';
 import {
   BridgeConfig,
   DeviceAttendanceRecord,
@@ -83,6 +84,25 @@ function build40ByteAttRecord(params: {
 }
 
 /**
+ * Builds a 72-byte ZLM60_TFT user record wire buffer.
+ */
+function build72ByteUserRecord(params: {
+  uid: number;
+  enrollmentId: string;
+  name: string;
+  cardNo?: number;
+}): Buffer {
+  const rec = Buffer.alloc(72, 0);
+  rec.writeUInt16LE(params.uid, 0);
+  Buffer.from(params.name, 'ascii').copy(rec, 11);
+  if (params.cardNo !== undefined) {
+    rec.writeUInt32LE(params.cardNo >>> 0, 35);
+  }
+  Buffer.from(params.enrollmentId, 'ascii').copy(rec, 48);
+  return rec;
+}
+
+/**
  * Starts a local TCP server implementing the ZKTeco Standalone Pull TCP wire protocol (port 4370).
  */
 async function startMockX2008Server(options: {
@@ -91,6 +111,8 @@ async function startMockX2008Server(options: {
   zkfpVersion?: string;
   requireAuth?: boolean;
   records?: Buffer[];
+  userRecords?: Buffer[];
+  failGetUsers?: boolean;
   usePrepareData?: boolean;
 }): Promise<{
   port: number;
@@ -152,6 +174,32 @@ async function startMockX2008Server(options: {
           } else {
             socket.write(buildZkTcpFrame(ZK_CMD.ACK_DATA, sessionId, frame.replyId, payload));
           }
+        } else if (frame.command === ZK_CMD.USERTEMP_RRQ) {
+          if (options.failGetUsers) {
+            socket.write(buildZkTcpFrame(ZK_CMD.ACK_ERROR, sessionId, frame.replyId));
+          } else {
+            const uRecs = options.userRecords || [];
+            const body = Buffer.concat(uRecs);
+            const payload = Buffer.alloc(4 + body.length);
+            payload.writeUInt32LE(body.length, 0);
+            body.copy(payload, 4);
+
+            if (options.usePrepareData) {
+              const prepHeader = Buffer.alloc(4);
+              prepHeader.writeUInt32LE(payload.length, 0);
+              socket.write(buildZkTcpFrame(ZK_CMD.PREPARE_DATA, sessionId, frame.replyId, prepHeader));
+              const mid = Math.ceil(payload.length / 2);
+              if (mid > 0) {
+                socket.write(buildZkTcpFrame(ZK_CMD.DATA, sessionId, frame.replyId, payload.subarray(0, mid)));
+              }
+              if (payload.length > mid) {
+                socket.write(buildZkTcpFrame(ZK_CMD.DATA, sessionId, frame.replyId, payload.subarray(mid)));
+              }
+              socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId));
+            } else {
+              socket.write(buildZkTcpFrame(ZK_CMD.ACK_DATA, sessionId, frame.replyId, payload));
+            }
+          }
         } else if (frame.command === ZK_CMD.FREE_DATA || frame.command === ZK_CMD.EXIT) {
           socket.write(buildZkTcpFrame(ZK_CMD.ACK_OK, sessionId, frame.replyId));
           if (frame.command === ZK_CMD.EXIT) socket.end();
@@ -168,7 +216,13 @@ async function startMockX2008Server(options: {
   return {
     port: address.port,
     receivedCommands,
-    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+        if (typeof (server as any).closeAllConnections === 'function') {
+          (server as any).closeAllConnections();
+        }
+      }),
   };
 }
 
@@ -305,6 +359,7 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       const dummyClient: ICoreErpClient = {
         sendHeartbeat: vi.fn(),
         submitPunches: vi.fn(),
+        syncUsers: vi.fn(),
       };
 
       const baseCfg: BridgeConfig = {
@@ -389,6 +444,7 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
           coreErpClient: {
             sendHeartbeat: vi.fn(),
             submitPunches: vi.fn(),
+            syncUsers: vi.fn(),
           },
         });
 
@@ -576,6 +632,14 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
             terminalName: 'X2008',
           };
         }),
+        syncUsers: vi.fn().mockResolvedValue({
+          success: true,
+          terminalId: 'term-1',
+          terminalName: 'X2008',
+          discoveredCount: 0,
+          syncedCount: 0,
+          syncedAt: new Date().toISOString(),
+        }),
       };
 
       const makeConfig = (): BridgeConfig => ({
@@ -712,6 +776,14 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
               terminalName: 'X2008',
             };
           }),
+          syncUsers: vi.fn().mockResolvedValue({
+            success: true,
+            terminalId: 'term-1',
+            terminalName: 'X2008',
+            discoveredCount: 0,
+            syncedCount: 0,
+            syncedAt: new Date().toISOString(),
+          }),
         },
         adapterFactory: () => ({
           protocolName: 'mock',
@@ -825,6 +897,14 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
             terminalId: 'term-b',
             terminalName: 'Terminal B',
           }),
+          syncUsers: vi.fn().mockResolvedValue({
+            success: true,
+            terminalId: 'term-b',
+            terminalName: 'Terminal B',
+            discoveredCount: 0,
+            syncedCount: 0,
+            syncedAt: new Date().toISOString(),
+          }),
         },
         adapterFactory: (term) => ({
           protocolName: 'mock',
@@ -935,6 +1015,399 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       expect(recRes.status).toBe('ERROR');
       expect(recRes.message).toMatch(/Unmapped biometric enrollment ID/);
       expect(attendanceCreate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('6. Hardware User Synchronization, Telemetry & Error Reporting', () => {
+    it('reads real enrolled users over ZKTeco TCP protocol, distinguishes valid empty user list, and throws on ACK_ERROR', async () => {
+      const user101 = build72ByteUserRecord({
+        uid: 1,
+        enrollmentId: '101',
+        name: 'Karthik Rao',
+        cardNo: 551122,
+      });
+      const user102 = build72ByteUserRecord({
+        uid: 2,
+        enrollmentId: '102',
+        name: 'Meera Nair',
+      });
+
+      const mockWithUsers = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        userRecords: [user101, user102],
+        usePrepareData: true,
+      });
+
+      try {
+        const adapter = new ZKTecoTcpAdapter();
+        await adapter.connect({ host: '127.0.0.1', port: mockWithUsers.port, timeoutMs: 3000 });
+        const users = await adapter.getUsers();
+        await adapter.disconnect();
+
+        expect(users).toEqual([
+          { uid: 1, enrollmentId: '101', name: 'Karthik Rao', cardNo: '551122' },
+          { uid: 2, enrollmentId: '102', name: 'Meera Nair', cardNo: null },
+        ]);
+      } finally {
+        await mockWithUsers.close();
+      }
+
+      const mockEmpty = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        userRecords: [],
+      });
+      try {
+        const adapter = new ZKTecoTcpAdapter();
+        await adapter.connect({ host: '127.0.0.1', port: mockEmpty.port, timeoutMs: 3000 });
+        const users = await adapter.getUsers();
+        await adapter.disconnect();
+        expect(users).toEqual([]);
+      } finally {
+        await mockEmpty.close();
+      }
+
+      const mockError = await startMockX2008Server({
+        serialNumber: 'NFZ8252800275',
+        failGetUsers: true,
+      });
+      try {
+        const adapter = new ZKTecoTcpAdapter();
+        await adapter.connect({ host: '127.0.0.1', port: mockError.port, timeoutMs: 3000 });
+        try {
+          await expect(adapter.getUsers()).rejects.toThrowError(/CMD_ACK_ERROR on CMD_USERTEMP_RRQ/i);
+        } finally {
+          await adapter.disconnect();
+        }
+      } finally {
+        await mockError.close();
+      }
+    });
+
+    it('uploads real deviceUsers via syncTerminalUsersOnce and logs explicit failures without blocking punch polling', async () => {
+      const dirs = makeTempDirs();
+      tempCleanups.push(dirs.cleanup);
+
+      const secret = 'bio_live_usersync_secret_1234567890abcdef';
+      const logger = new BridgeLogger({
+        level: 'debug',
+        logDir: dirs.logDir,
+        fileName: 'user-sync-test.log',
+        silentConsole: true,
+      });
+
+      const realUsers = [
+        { uid: 1, enrollmentId: '101', name: 'Karthik Rao', cardNo: '445566' },
+      ];
+      let getUsersShouldFail = false;
+      let syncUsersShouldFail = false;
+      const syncedPayloads: any[] = [];
+      const submittedPunches: any[] = [];
+
+      const runner = new BiometricBridgeRunner({
+        config: {
+          coreErpBaseUrl: 'https://erp.company.local',
+          allowInsecureHttp: false,
+          bridgeHost: '192.168.1.16',
+          bridgeVersion: '1.0.0',
+          healthHost: '127.0.0.1',
+          healthPort: 4379,
+          dataDir: dirs.dataDir,
+          logDir: dirs.logDir,
+          logLevel: 'debug',
+          batchSize: 100,
+          pollIntervalMs: 15000,
+          heartbeatIntervalMs: 60000,
+          connectTimeoutMs: 2000,
+          maxBackoffMs: 120000,
+          dpapiStorePath: path.join(dirs.dataDir, 'creds.json'),
+          terminals: [
+            {
+              id: 'x2008-main',
+              name: 'X2008 Main',
+              serialNumber: 'NFZ8252800275',
+              ipAddress: '192.168.1.201',
+              port: 4370,
+              deviceTimezone: 'Asia/Kolkata',
+              apiKey: secret,
+            },
+          ],
+        },
+        logger,
+        checkpointStore: new CheckpointStore(dirs.dataDir),
+        coreErpClient: {
+          sendHeartbeat: vi.fn().mockResolvedValue({
+            success: true,
+            serverTime: new Date().toISOString(),
+            terminalId: 'x2008-main',
+            terminalName: 'X2008 Main',
+            status: 'ONLINE',
+          }),
+          submitPunches: vi.fn().mockImplementation(async (_k, _sn, punches) => {
+            submittedPunches.push(...punches);
+            return {
+              success: true,
+              totalReceived: punches.length,
+              inserted: punches.length,
+              duplicates: 0,
+              unmappedEmployees: 0,
+              terminalId: 'x2008-main',
+              terminalName: 'X2008 Main',
+            };
+          }),
+          syncUsers: vi.fn().mockImplementation(async (_k, _sn, payload) => {
+            if (syncUsersShouldFail) {
+              throw new CoreErpApiError(`503 Backend Busy (${secret})`, 503, 'HTTP_503');
+            }
+            syncedPayloads.push(payload);
+            return {
+              success: true,
+              terminalId: 'x2008-main',
+              terminalName: 'X2008 Main',
+              discoveredCount: payload.deviceUsers.length,
+              syncedCount: payload.deviceUsers.length,
+              syncedAt: '2026-11-16T06:00:00.000Z',
+            };
+          }),
+        },
+        adapterFactory: () => ({
+          protocolName: 'mock',
+          connect: vi.fn().mockResolvedValue(undefined),
+          getDeviceInfo: vi.fn().mockResolvedValue({
+            serialNumber: 'NFZ8252800275',
+            platform: 'ZLM60_TFT',
+            fingerprintAlgorithm: 'VX10.0',
+            firmwareVersion: '6.60',
+            deviceName: 'eSSL X2008',
+            oemVendor: 'eSSL',
+          }),
+          getAttendanceLogs: vi.fn().mockResolvedValue([
+            {
+              uid: 1,
+              userEnrollmentId: '101',
+              localDateTime: { year: 2026, month: 11, day: 16, hour: 9, minute: 0, second: 0 },
+              verifyCode: 1,
+              verifyType: 'FINGERPRINT',
+              inOutCode: 0,
+              inOutMode: 'CHECK_IN',
+              workCode: 0,
+              recordSequence: 0,
+            },
+          ]),
+          getUsers: vi.fn().mockImplementation(async () => {
+            if (getUsersShouldFail) {
+              throw new Error('Device rejected USERTEMP_RRQ (reply command=2001)');
+            }
+            return realUsers;
+          }),
+          disconnect: vi.fn().mockResolvedValue(undefined),
+        }),
+      });
+
+      // 1. Dedicated user sync succeeds without touching attendance punches
+      const userRes = await runner.syncTerminalUsersOnce('x2008-main');
+      expect(userRes.discoveredCount).toBe(1);
+      expect(userRes.syncedCount).toBe(1);
+      expect(syncedPayloads).toHaveLength(1);
+      expect(syncedPayloads[0].deviceUsers[0]).toMatchObject({ enrollmentId: '101', name: 'Karthik Rao' });
+      expect(submittedPunches).toHaveLength(0);
+
+      // 2a. API upload failure during syncTerminalUsersOnce queues pendingUserSync and logs warning without secret
+      syncUsersShouldFail = true;
+      await expect(runner.syncTerminalUsersOnce('x2008-main')).rejects.toThrowError(/503 Backend Busy/);
+
+      const afterUploadFail = runner.getStatusSnapshot().terminals[0];
+      expect(afterUploadFail.lastUserSyncError).toMatch(/503 Backend Busy/);
+      const cpAfterFail = new CheckpointStore(dirs.dataDir).getTerminal('x2008-main', 'NFZ8252800275');
+      expect(cpAfterFail.pendingUserSync?.users).toHaveLength(1);
+
+      // 2b. When CoreERP recovers, syncTerminalOnce() uploads punches AND clears pendingUserSync + error
+      syncUsersShouldFail = false;
+      const recoveryPollRes = await runner.syncTerminalOnce('x2008-main');
+      expect(recoveryPollRes.uploadedCount).toBe(1);
+      expect(submittedPunches).toHaveLength(1);
+      expect(runner.getStatusSnapshot().terminals[0].lastUserSyncError).toBeNull();
+      const cpRecovered = new CheckpointStore(dirs.dataDir).getTerminal('x2008-main', 'NFZ8252800275');
+      expect(cpRecovered.pendingUserSync).toBeNull();
+      expect(syncedPayloads).toHaveLength(2);
+
+      // 3. When hardware getUsers() fails during punch polling, error is recorded & logged WITHOUT blocking punch polling
+      getUsersShouldFail = true;
+      const pollWithUserErr = await runner.syncTerminalOnce('x2008-main');
+      expect(pollWithUserErr.pulledCount).toBe(1);
+      expect(runner.getStatusSnapshot().terminals[0].lastUserSyncError).toMatch(/rejected USERTEMP_RRQ/);
+
+      const logText = fs.readFileSync(path.join(dirs.logDir, 'user-sync-test.log'), 'utf8');
+      expect(logText).toContain('terminal_user_upload_failed');
+      expect(logText).toContain('terminal_user_query_failed');
+      expect(logText).not.toContain(secret);
+    });
+
+    it('persists dedicated POST /api/biometric/users per terminal, isolates multiple terminals, and queues POST /api/biometric/devices/:id/sync-users without running PunchReconciliationService', async () => {
+      const store = new Map<string, string>();
+      vi.spyOn(prisma.companySetting, 'findUnique').mockImplementation((async (args: any) => {
+        const key = `${args.where.companyId_key.companyId}::${args.where.companyId_key.key}`;
+        const val = store.get(key);
+        return val === undefined
+          ? null
+          : ({ id: key, companyId: args.where.companyId_key.companyId, key: args.where.companyId_key.key, value: val } as any);
+      }) as any);
+      vi.spyOn(prisma.companySetting, 'upsert').mockImplementation((async (args: any) => {
+        const key = `${args.where.companyId_key.companyId}::${args.where.companyId_key.key}`;
+        const val = args.update?.value ?? args.create?.value ?? '{}';
+        store.set(key, val);
+        return { id: key, companyId: args.where.companyId_key.companyId, key: args.where.companyId_key.key, value: val } as any;
+      }) as any);
+
+      const keyA = 'bio_live_term_a_secret_0000111122223333';
+      const keyB = 'bio_live_term_b_secret_0000111122223333';
+      const hashA = crypto.createHash('sha256').update(keyA).digest('hex');
+      const hashB = crypto.createHash('sha256').update(keyB).digest('hex');
+
+      const termA = {
+        id: 'term-a',
+        companyId: 'comp-1',
+        deviceSerialNumber: 'NFZ8252800275',
+        name: 'Main X2008',
+        terminalModel: 'eSSL X2008',
+        ipAddress: '192.168.1.201',
+        port: 4370,
+        location: 'Lobby',
+        apiKeyPrefix: 'bio_live_terma',
+        apiKeyHash: hashA,
+        status: 'ONLINE' as const,
+        lastHeartbeatAt: new Date(),
+        lastSyncAt: new Date(),
+        firmwareVersion: 'Ver 6.60',
+        registeredByUserId: 'u-admin',
+        registeredByUser: { fullName: 'Admin' },
+        isActive: true,
+        notes: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      const termB = {
+        ...termA,
+        id: 'term-b',
+        deviceSerialNumber: 'SN-GATE-B',
+        name: 'Warehouse Terminal',
+        apiKeyPrefix: 'bio_live_termb',
+        apiKeyHash: hashB,
+      };
+
+      vi.spyOn(prisma.biometricTerminal, 'findFirst').mockImplementation((async (args: any) => {
+        const where = args?.where || {};
+        if (where.apiKeyHash === hashA) return termA as any;
+        if (where.apiKeyHash === hashB) return termB as any;
+        if (where.id === 'term-a' && where.companyId === 'comp-1') return termA as any;
+        if (where.id === 'term-b' && where.companyId === 'comp-1') return termB as any;
+        return null;
+      }) as any);
+      vi.spyOn(prisma.biometricTerminal, 'findMany').mockResolvedValue([termA, termB] as any);
+      vi.spyOn(prisma.biometricTerminal, 'update').mockResolvedValue(termA as any);
+      vi.spyOn(prisma.employee, 'findMany').mockResolvedValue([]);
+
+      // Serial mismatch rejected on /api/biometric/users
+      const mismatchRes = await request(app)
+        .post('/api/biometric/users')
+        .set('X-Device-Api-Key', keyA)
+        .set('X-Device-Serial', 'WRONG-SERIAL')
+        .send({ deviceUsers: [{ uid: 1, enrollmentId: '101', name: 'Karthik' }] });
+      expect(mismatchRes.status).toBe(403);
+
+      // Upload real user 101 to Terminal A
+      const uploadARes = await request(app)
+        .post('/api/biometric/users')
+        .set('X-Device-Api-Key', keyA)
+        .set('X-Device-Serial', 'NFZ8252800275')
+        .send({
+          discoveredCount: 1,
+          deviceUsers: [{ uid: 1, enrollmentId: '101', name: 'Karthik Rao', cardNo: '445566' }],
+        });
+      expect(uploadARes.status).toBe(200);
+      expect(uploadARes.body.discoveredCount).toBe(1);
+      expect(uploadARes.body.syncedCount).toBe(1);
+
+      // Upload different user 202 to Terminal B
+      const uploadBRes = await request(app)
+        .post('/api/biometric/users')
+        .set('X-Device-Api-Key', keyB)
+        .set('X-Device-Serial', 'SN-GATE-B')
+        .send({
+          discoveredCount: 1,
+          deviceUsers: [{ uid: 5, enrollmentId: '202', name: 'Suresh B', cardNo: null }],
+        });
+      expect(uploadBRes.status).toBe(200);
+
+      // Both terminals maintain isolated snapshots
+      const options = await BiometricMappingService.getEnrollmentOptionsForCompany('comp-1');
+      expect(options.deviceUsersByTerminal['term-a']).toHaveLength(1);
+      expect(options.deviceUsersByTerminal['term-a'][0].enrollmentId).toBe('101');
+      expect(options.deviceUsersByTerminal['term-b']).toHaveLength(1);
+      expect(options.deviceUsersByTerminal['term-b'][0].enrollmentId).toBe('202');
+      expect(options.terminals.find((t) => t.id === 'term-a')?.discoveredUserCount).toBe(1);
+      expect(options.terminals.find((t) => t.id === 'term-a')?.syncedUserCount).toBe(1);
+
+      // Admin triggers POST /api/biometric/devices/term-a/sync-users -> MUST NOT trigger PunchReconciliationService!
+      const adminUser: AuthUser = {
+        id: 'u-admin',
+        userId: 'u-admin',
+        companyId: 'comp-1',
+        email: 'admin@namma.local',
+        fullName: 'Admin User',
+        role: 'ADMIN',
+        isActive: true,
+        tokenVersion: 1,
+      };
+      const adminToken = AuthService.generateSessionToken({
+        userId: adminUser.userId,
+        companyId: adminUser.companyId,
+        email: adminUser.email,
+        role: adminUser.role,
+        tokenVersion: adminUser.tokenVersion,
+      });
+      vi.spyOn(prisma.user, 'findUnique').mockResolvedValue({ ...adminUser } as any);
+      vi.spyOn(prisma.rolePermission, 'findUnique').mockResolvedValue(null as any);
+      const reconcileSpy = vi.spyOn(PunchReconciliationService, 'reconcilePendingPunches');
+
+      const triggerRes = await request(app)
+        .post('/api/biometric/devices/term-a/sync-users')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({});
+      expect(triggerRes.status).toBe(200);
+      expect(triggerRes.body.bridgeUserSyncQueued).toBe(true);
+      expect(triggerRes.body.deviceUsers).toHaveLength(1);
+      expect(reconcileSpy).not.toHaveBeenCalled();
+
+      // Heartbeat sees userSyncRequested: true
+      const hbRes = await request(app)
+        .post('/api/biometric/heartbeat')
+        .set('X-Device-Api-Key', keyA)
+        .set('X-Device-Serial', 'NFZ8252800275')
+        .send({ bridgeConnected: true });
+      expect(hbRes.status).toBe(200);
+      expect(hbRes.body.userSyncRequested).toBe(true);
+      expect(hbRes.body.userSyncRequestedAt).toBeTruthy();
+
+      // Empty user list on Terminal B clears its snapshot cleanly without affecting Terminal A
+      const emptyBRes = await request(app)
+        .post('/api/biometric/users')
+        .set('X-Device-Api-Key', keyB)
+        .set('X-Device-Serial', 'SN-GATE-B')
+        .send({ discoveredCount: 0, deviceUsers: [] });
+      expect(emptyBRes.status).toBe(200);
+      expect(emptyBRes.body.syncedCount).toBe(0);
+
+      const listARes = await request(app)
+        .get('/api/biometric/devices/term-a/users')
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(listARes.status).toBe(200);
+      expect(listARes.body).toHaveLength(1);
+
+      const listBRes = await request(app)
+        .get('/api/biometric/devices/term-b/users')
+        .set('Authorization', `Bearer ${adminToken}`);
+      expect(listBRes.status).toBe(200);
+      expect(listBRes.body).toEqual([]);
     });
   });
 });

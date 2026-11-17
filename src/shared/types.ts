@@ -1651,6 +1651,12 @@ export interface BiometricTerminalItem {
   syncRequestedAt?: string | null;
   platform?: string | null;
   fingerprintAlgorithm?: string | null;
+  lastUserSyncAt?: string | null;
+  lastUserSyncAttemptAt?: string | null;
+  lastUserSyncError?: string | null;
+  discoveredUserCount?: number | null;
+  syncedUserCount?: number | null;
+  userSyncRequestedAt?: string | null;
 }
 
 export interface CreateBiometricTerminalRequest {
@@ -1719,6 +1725,11 @@ export interface TerminalHeartbeatRequest {
   lastProcessedPunchCount?: number;
   lastSyncAttemptAt?: string;
   lastSyncAt?: string;
+  lastUserSyncAt?: string | null;
+  lastUserSyncAttemptAt?: string | null;
+  lastUserSyncError?: string | null;
+  discoveredUserCount?: number | null;
+  syncedUserCount?: number | null;
   deviceUsers?: Array<{
     uid?: number;
     enrollmentId: string;
@@ -1735,6 +1746,31 @@ export interface TerminalHeartbeatResponse {
   status: BiometricTerminalStatus;
   syncRequested?: boolean;
   syncRequestedAt?: string | null;
+  userSyncRequested?: boolean;
+  userSyncRequestedAt?: string | null;
+}
+
+export interface SyncDeviceUsersRequest {
+  deviceUsers: Array<{
+    uid?: number;
+    enrollmentId: string;
+    name?: string | null;
+    cardNo?: string | null;
+  }>;
+  deviceSerialNumber?: string;
+  discoveredCount?: number;
+  discoveredAt?: string;
+  bridgeHost?: string;
+  bridgeVersion?: string;
+}
+
+export interface SyncDeviceUsersResponse {
+  success: boolean;
+  terminalId: string;
+  terminalName: string;
+  discoveredCount: number;
+  syncedCount: number;
+  syncedAt: string;
 }
 
 export interface TestBiometricConnectionResponse {
@@ -1753,6 +1789,15 @@ export interface TriggerTerminalSyncResponse {
   message: string;
   terminal: BiometricTerminalItem;
   reconciliation: PunchReconciliationResponse;
+}
+
+export interface TriggerTerminalUserSyncResponse {
+  success: boolean;
+  bridgeUserSyncQueued: boolean;
+  userSyncRequestedAt: string;
+  message: string;
+  terminal: BiometricTerminalItem;
+  deviceUsers: DeviceEnrolledUserItem[];
 }
 
 // ============================================================================

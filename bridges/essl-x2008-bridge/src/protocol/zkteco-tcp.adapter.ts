@@ -367,7 +367,9 @@ export function decodeUserTablePayload(rawPayload: Buffer): DeviceEnrolledUser[]
   } else if (recordBuffer.length % 28 === 0) {
     recordSize = 28;
   } else {
-    return [];
+    throw new Error(
+      `Unsupported ZK user table payload size (${recordBuffer.length} bytes); expected multiple of 72 (ZLM60_TFT) or 28.`
+    );
   }
 
   const users: DeviceEnrolledUser[] = [];
@@ -607,7 +609,9 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
         } else if (frame.command === ZK_CMD.ACK_OK) {
           break;
         } else if (frame.command === ZK_CMD.ACK_ERROR) {
-          return [];
+          throw new Error('Biometric device returned CMD_ACK_ERROR while streaming enrolled users.');
+        } else {
+          throw new Error(`Unexpected response command ${frame.command} while streaming enrolled users.`);
         }
       }
 
@@ -624,7 +628,11 @@ export class ZKTecoTcpAdapter implements IBiometricProtocolAdapter {
       return decodeUserTablePayload(Buffer.concat(chunks));
     }
 
-    return [];
+    if (firstReply.command === ZK_CMD.ACK_ERROR) {
+      throw new Error('Device returned CMD_ACK_ERROR on CMD_USERTEMP_RRQ.');
+    }
+
+    throw new Error(`Unexpected response command ${firstReply.command} for CMD_USERTEMP_RRQ.`);
   }
 
   async disconnect(): Promise<void> {

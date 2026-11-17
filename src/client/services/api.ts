@@ -97,6 +97,8 @@ import {
   CreateBiometricTerminalResponse,
   TestBiometricConnectionResponse,
   TriggerTerminalSyncResponse,
+  TriggerTerminalUserSyncResponse,
+  DeviceEnrolledUserItem,
   BatchPunchSubmissionRequest,
   BatchPunchSubmissionResponse,
   TerminalHeartbeatRequest,
@@ -1110,6 +1112,13 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data || {}),
     }),
+  syncBiometricTerminalUsers: (id: string) =>
+    request<TriggerTerminalUserSyncResponse>(`/api/biometric/devices/${id}/sync-users`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+  getBiometricTerminalDeviceUsers: (id: string) =>
+    request<DeviceEnrolledUserItem[]>(`/api/biometric/devices/${id}/users`),
   sendTerminalHeartbeat: (apiKey: string, data?: TerminalHeartbeatRequest) =>
     request<TerminalHeartbeatResponse>('/api/biometric/heartbeat', {
       method: 'POST',

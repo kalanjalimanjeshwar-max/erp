@@ -28,6 +28,7 @@ import {
   Terminal,
   BookOpen,
   Play,
+  Users,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
 import { LoadingSpinner } from '../components/common/LoadingSpinner.tsx';
@@ -42,6 +43,7 @@ import {
   PunchReconciliationResponse,
   CreateBiometricTerminalRequest,
   CompanyProfile,
+  DeviceEnrolledUserItem,
 } from '../../shared/types.ts';
 import {
   BIOMETRIC_MODEL_PRESETS,
@@ -127,6 +129,10 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   const [isRotating, setIsRotating] = useState<boolean>(false);
   const [testingTerminalId, setTestingTerminalId] = useState<string | null>(null);
   const [syncingTerminalId, setSyncingTerminalId] = useState<string | null>(null);
+  const [selectedUserSyncTerminalId, setSelectedUserSyncTerminalId] = useState<string>('');
+  const [syncingUsersTerminalId, setSyncingUsersTerminalId] = useState<string | null>(null);
+  const [selectedTerminalDeviceUsers, setSelectedTerminalDeviceUsers] = useState<DeviceEnrolledUserItem[]>([]);
+  const [isLoadingDeviceUsers, setIsLoadingDeviceUsers] = useState<boolean>(false);
   const [showBridgeGuide, setShowBridgeGuide] = useState<boolean>(false);
   const [actionSuccessMessage, setActionSuccessMessage] = useState<string | null>(null);
   const [actionErrorMessage, setActionErrorMessage] = useState<string | null>(null);
@@ -190,10 +196,45 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     }
   }, [filterSyncStatus, filterTerminalId, filterStartDate, filterEndDate, punchPage, punchLimit]);
 
+  const loadSelectedTerminalDeviceUsers = useCallback(async (terminalId: string) => {
+    if (!terminalId) {
+      setSelectedTerminalDeviceUsers([]);
+      return;
+    }
+    setIsLoadingDeviceUsers(true);
+    try {
+      const users = await api.getBiometricTerminalDeviceUsers(terminalId);
+      setSelectedTerminalDeviceUsers(users);
+    } catch {
+      setSelectedTerminalDeviceUsers([]);
+    } finally {
+      setIsLoadingDeviceUsers(false);
+    }
+  }, []);
+
   useEffect(() => {
     loadTerminals();
     loadSyncSummary();
   }, [loadTerminals, loadSyncSummary]);
+
+  useEffect(() => {
+    if (terminals.length === 0) {
+      setSelectedUserSyncTerminalId('');
+      setSelectedTerminalDeviceUsers([]);
+      return;
+    }
+    const existingStillExists = terminals.some((t) => t.id === selectedUserSyncTerminalId);
+    if (!existingStillExists) {
+      const preferred = terminals.find((t) => t.isActive) || terminals[0];
+      setSelectedUserSyncTerminalId(preferred.id);
+    }
+  }, [terminals, selectedUserSyncTerminalId]);
+
+  useEffect(() => {
+    if (selectedUserSyncTerminalId) {
+      loadSelectedTerminalDeviceUsers(selectedUserSyncTerminalId);
+    }
+  }, [selectedUserSyncTerminalId, loadSelectedTerminalDeviceUsers]);
 
   useEffect(() => {
     if (activeTab === 'punches') {
@@ -383,6 +424,27 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     }
   };
 
+  // Handle Explicit Hardware User Sync Trigger (never runs PunchReconciliationService)
+  const handleSyncDeviceUsers = async (terminal: BiometricTerminalItem) => {
+    setSelectedUserSyncTerminalId(terminal.id);
+    setSyncingUsersTerminalId(terminal.id);
+    setActionErrorMessage(null);
+    setActionSuccessMessage(null);
+    try {
+      const res = await api.syncBiometricTerminalUsers(terminal.id);
+      setTerminals((prev) => prev.map((t) => (t.id === terminal.id ? res.terminal : t)));
+      setSelectedTerminalDeviceUsers(res.deviceUsers || []);
+      setActionSuccessMessage(`${terminal.name}: ${res.message}`);
+    } catch (err: unknown) {
+      const apiErr = err as ApiError;
+      setActionErrorMessage(apiErr.message || 'Failed to queue hardware user sync.');
+    } finally {
+      setSyncingUsersTerminalId(null);
+    }
+  };
+
+  const selectedUserSyncTerminal =
+    terminals.find((t) => t.id === selectedUserSyncTerminalId) || null;
   const totalPages = Math.max(1, Math.ceil(punchTotal / punchLimit));
 
   return (
@@ -416,6 +478,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
             onClick={() => {
               loadTerminals();
               loadSyncSummary();
+              if (selectedUserSyncTerminalId) loadSelectedTerminalDeviceUsers(selectedUserSyncTerminalId);
               if (activeTab === 'punches') loadPunches();
             }}
             disabled={isLoadingTerminals || isLoadingPunches || isLoadingSummary}
@@ -644,6 +707,184 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
             </div>
           )}
 
+          {terminals.length > 0 && (
+            <div className="p-4 bg-slate-900/60 border border-slate-800 rounded-xl space-y-4">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-800">
+                <div className="flex items-start gap-2.5">
+                  <Users className="w-4 h-4 text-indigo-400 shrink-0 mt-0.5" />
+                  <div>
+                    <h3 className="text-sm font-semibold text-slate-100">
+                      Hardware User Synchronization
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Reads enrolled employee IDs, names, UIDs, and card numbers directly from hardware without triggering attendance punch reconciliation.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  <select
+                    value={selectedUserSyncTerminalId}
+                    onChange={(e) => setSelectedUserSyncTerminalId(e.target.value)}
+                    aria-label="Select terminal for hardware user synchronization"
+                    className="bg-slate-800 border border-slate-700 text-slate-200 text-xs rounded-lg px-2.5 py-1.5 focus:outline-none focus:border-indigo-500"
+                  >
+                    {terminals.map((t) => (
+                      <option key={t.id} value={t.id}>
+                        {t.name} ({t.deviceSerialNumber})
+                      </option>
+                    ))}
+                  </select>
+
+                  <button
+                    type="button"
+                    disabled={
+                      !selectedUserSyncTerminal ||
+                      !selectedUserSyncTerminal.isActive ||
+                      syncingUsersTerminalId === selectedUserSyncTerminal?.id
+                    }
+                    onClick={() =>
+                      selectedUserSyncTerminal && handleSyncDeviceUsers(selectedUserSyncTerminal)
+                    }
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 rounded-lg transition cursor-pointer whitespace-nowrap shrink-0"
+                  >
+                    <RefreshCw
+                      className={`w-3.5 h-3.5 ${
+                        syncingUsersTerminalId === selectedUserSyncTerminal?.id ? 'animate-spin' : ''
+                      }`}
+                    />
+                    <span>
+                      {syncingUsersTerminalId === selectedUserSyncTerminal?.id
+                        ? 'Queueing User Sync...'
+                        : 'Sync Device Users'}
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              {selectedUserSyncTerminal && (
+                <div className="space-y-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-xs">
+                    <div className="p-2.5 rounded-lg bg-slate-950/50 border border-slate-800/80">
+                      <div className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">
+                        Selected terminal
+                      </div>
+                      <div className="text-slate-100 font-medium mt-1 truncate">
+                        {selectedUserSyncTerminal.name}
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-400 truncate">
+                        {selectedUserSyncTerminal.terminalModel} · {selectedUserSyncTerminal.deviceSerialNumber}
+                      </div>
+                    </div>
+
+                    <div className="p-2.5 rounded-lg bg-slate-950/50 border border-slate-800/80">
+                      <div className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">
+                        Last user sync
+                      </div>
+                      <div
+                        className="text-slate-200 font-mono tabular-nums mt-1"
+                        title={
+                          selectedUserSyncTerminal.lastUserSyncAt
+                            ? `UTC: ${formatUtcTimestamp(selectedUserSyncTerminal.lastUserSyncAt)}`
+                            : undefined
+                        }
+                      >
+                        {selectedUserSyncTerminal.lastUserSyncAt
+                          ? formatDateTimeInTimezone(selectedUserSyncTerminal.lastUserSyncAt, timezone, {
+                              includeZoneAbbr: true,
+                            })
+                          : 'Never'}
+                      </div>
+                      {selectedUserSyncTerminal.userSyncRequestedAt && (
+                        <div className="text-[11px] text-indigo-300 mt-0.5 font-mono">
+                          Sync queued for bridge
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="p-2.5 rounded-lg bg-slate-950/50 border border-slate-800/80">
+                      <div className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">
+                        Users discovered
+                      </div>
+                      <div className="text-base font-bold text-slate-100 font-mono tabular-nums mt-1">
+                        {selectedUserSyncTerminal.discoveredUserCount ?? '—'}
+                      </div>
+                    </div>
+
+                    <div className="p-2.5 rounded-lg bg-slate-950/50 border border-slate-800/80">
+                      <div className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">
+                        Users synchronized
+                      </div>
+                      <div className="text-base font-bold text-emerald-400 font-mono tabular-nums mt-1">
+                        {selectedUserSyncTerminal.syncedUserCount ?? selectedTerminalDeviceUsers.length}
+                      </div>
+                    </div>
+
+                    <div className="p-2.5 rounded-lg bg-slate-950/50 border border-slate-800/80">
+                      <div className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">
+                        Errors
+                      </div>
+                      <div
+                        className={`text-[11px] font-mono mt-1 break-words ${
+                          selectedUserSyncTerminal.lastUserSyncError
+                            ? 'text-rose-300'
+                            : 'text-slate-400'
+                        }`}
+                        title={selectedUserSyncTerminal.lastUserSyncError || undefined}
+                      >
+                        {selectedUserSyncTerminal.lastUserSyncError || 'None'}
+                      </div>
+                    </div>
+                  </div>
+
+                  {isLoadingDeviceUsers ? (
+                    <div className="text-xs text-slate-400 font-mono">
+                      Loading synchronized device users...
+                    </div>
+                  ) : selectedTerminalDeviceUsers.length > 0 ? (
+                    <div className="border border-slate-800 rounded-lg overflow-hidden">
+                      <div className="px-3 py-2 bg-slate-900/90 border-b border-slate-800 flex items-center justify-between text-[11px] text-slate-400">
+                        <span>Enrolled Hardware Users ({selectedTerminalDeviceUsers.length})</span>
+                        <span className="font-mono tabular-nums">
+                          Terminal: {selectedUserSyncTerminal.deviceSerialNumber}
+                        </span>
+                      </div>
+                      <div className="max-h-40 overflow-y-auto divide-y divide-slate-800/70 bg-slate-950/40 text-xs">
+                        {selectedTerminalDeviceUsers.map((u) => (
+                          <div
+                            key={`${u.terminalId}::${u.enrollmentId}`}
+                            className="px-3 py-1.5 flex items-center justify-between gap-3"
+                          >
+                            <div className="flex items-center gap-3 min-w-0">
+                              <span className="font-mono tabular-nums font-semibold text-indigo-300 shrink-0">
+                                ID {u.enrollmentId}
+                              </span>
+                              <span className="text-slate-200 truncate">
+                                {u.name || 'Unnamed Device User'}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-3 text-[11px] font-mono tabular-nums text-slate-400 shrink-0">
+                              {u.uid !== undefined && u.uid !== null && <span>UID {u.uid}</span>}
+                              {u.cardNo && <span>Card {u.cardNo}</span>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-slate-400">
+                      {selectedUserSyncTerminal.lastUserSyncError
+                        ? 'Hardware user sync encountered an error. Check bridge connectivity and retry Sync Device Users.'
+                        : selectedUserSyncTerminal.lastUserSyncAt
+                        ? 'Hardware reported 0 enrolled users on the last sync.'
+                        : 'No hardware users synchronized for this terminal yet. Click Sync Device Users to read enrolled users from hardware.'}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+
           {isLoadingTerminals ? (
             <div className="py-12 flex justify-center">
               <LoadingSpinner message="Loading registered biometric terminals..." size="md" />
@@ -831,6 +1072,15 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                                   >
                                     <PlugZap className={`w-3 h-3 text-indigo-400 ${isTesting ? 'animate-spin' : ''}`} />
                                     <span>{isTesting ? 'Testing...' : 'Test'}</span>
+                                  </button>
+                                  <button
+                                    onClick={() => handleSyncDeviceUsers(terminal)}
+                                    disabled={syncingUsersTerminalId === terminal.id}
+                                    title="Queue hardware user synchronization only (does not reconcile attendance)"
+                                    className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-indigo-200 hover:text-white bg-indigo-950/60 hover:bg-indigo-900/80 border border-indigo-800/60 rounded-md transition cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
+                                  >
+                                    <Users className={`w-3 h-3 text-indigo-400 ${syncingUsersTerminalId === terminal.id ? 'animate-pulse' : ''}`} />
+                                    <span>{syncingUsersTerminalId === terminal.id ? 'Queueing...' : 'Sync Users'}</span>
                                   </button>
                                   <button
                                     onClick={() => handleSyncTerminal(terminal)}

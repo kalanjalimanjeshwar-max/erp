@@ -153,6 +153,48 @@ export class BiometricController {
   }
 
   /**
+   * POST /api/biometric/devices/:id/sync-users
+   * Queues hardware user synchronization ONLY for this terminal (never runs punch reconciliation)
+   */
+  static async syncTerminalUsers(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const { id } = req.params;
+      const result = await BiometricService.triggerTerminalUserSync(actor, id, req.correlationId);
+      res.status(200).json(result);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: status === 404 ? 'TERMINAL_NOT_FOUND' : 'BIOMETRIC_TERMINAL_USER_SYNC_FAILED',
+          message: (err as Error).message || 'Failed to queue hardware user sync.',
+        },
+      });
+    }
+  }
+
+  /**
+   * GET /api/biometric/devices/:id/users
+   * Lists persisted hardware users synced from this terminal (requires BIOMETRIC:VIEW)
+   */
+  static async listDeviceUsers(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const { id } = req.params;
+      const users = await BiometricService.getTerminalDeviceUsers(actor.companyId, id);
+      res.json(users);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: status === 404 ? 'TERMINAL_NOT_FOUND' : 'BIOMETRIC_DEVICE_USERS_LIST_FAILED',
+          message: (err as Error).message || 'Failed to load synced device users.',
+        },
+      });
+    }
+  }
+
+  /**
    * POST /api/biometric/heartbeat
    * Authenticated device heartbeat ping (authenticated via device API key)
    */
@@ -166,6 +208,26 @@ export class BiometricController {
       res.status(status).json({
         error: {
           code: 'BIOMETRIC_HEARTBEAT_FAILED',
+          message: (err as Error).message,
+        },
+      });
+    }
+  }
+
+  /**
+   * POST /api/biometric/users
+   * Authenticated dedicated hardware user snapshot upload (authenticated via device API key)
+   */
+  static async ingestUsers(req: AuthenticatedDeviceRequest, res: Response): Promise<void> {
+    try {
+      const terminal = req.terminal;
+      const result = await BiometricService.syncDeviceUsers(terminal, req.body, req.correlationId);
+      res.json(result);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: 'BIOMETRIC_USERS_SYNC_FAILED',
           message: (err as Error).message,
         },
       });

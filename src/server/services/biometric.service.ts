@@ -9,10 +9,14 @@ import {
   CreateBiometricTerminalResponse,
   BatchPunchSubmissionRequest,
   BatchPunchSubmissionResponse,
+  DeviceEnrolledUserItem,
+  SyncDeviceUsersRequest,
+  SyncDeviceUsersResponse,
   TerminalHeartbeatRequest,
   TerminalHeartbeatResponse,
   TestBiometricConnectionResponse,
   TriggerTerminalSyncResponse,
+  TriggerTerminalUserSyncResponse,
   BiometricTerminalStatus,
   BiometricVerifyType,
   PunchInOutMode,
@@ -44,6 +48,12 @@ export interface TerminalBridgeTelemetry {
   syncRequestedAt?: string | null;
   platform?: string | null;
   fingerprintAlgorithm?: string | null;
+  lastUserSyncAt?: string | null;
+  lastUserSyncAttemptAt?: string | null;
+  lastUserSyncError?: string | null;
+  discoveredUserCount?: number | null;
+  syncedUserCount?: number | null;
+  userSyncRequestedAt?: string | null;
 }
 
 export class BiometricService {
@@ -91,6 +101,9 @@ export class BiometricService {
     }
     if (typeof nextEntry.lastTestConnectionMessage === 'string') {
       nextEntry.lastTestConnectionMessage = redactSensitiveText(nextEntry.lastTestConnectionMessage).slice(0, 500);
+    }
+    if (typeof nextEntry.lastUserSyncError === 'string') {
+      nextEntry.lastUserSyncError = redactSensitiveText(nextEntry.lastUserSyncError).slice(0, 500);
     }
 
     existingMap[terminalId] = nextEntry;
@@ -245,6 +258,12 @@ export class BiometricService {
       syncRequestedAt: telemetry?.syncRequestedAt ?? null,
       platform: telemetry?.platform ?? null,
       fingerprintAlgorithm: telemetry?.fingerprintAlgorithm ?? null,
+      lastUserSyncAt: telemetry?.lastUserSyncAt ?? null,
+      lastUserSyncAttemptAt: telemetry?.lastUserSyncAttemptAt ?? null,
+      lastUserSyncError: telemetry?.lastUserSyncError ?? null,
+      discoveredUserCount: telemetry?.discoveredUserCount ?? null,
+      syncedUserCount: telemetry?.syncedUserCount ?? null,
+      userSyncRequestedAt: telemetry?.userSyncRequestedAt ?? null,
     };
   }
 
@@ -433,16 +452,38 @@ export class BiometricService {
     if (payload.lastSyncAttemptAt) {
       telemetryPatch.lastSyncAttemptAt = payload.lastSyncAttemptAt;
     }
-
-    const updatedTelemetry = await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, telemetryPatch);
+    if (payload.lastUserSyncAt !== undefined) {
+      telemetryPatch.lastUserSyncAt = payload.lastUserSyncAt;
+    }
+    if (payload.lastUserSyncAttemptAt !== undefined) {
+      telemetryPatch.lastUserSyncAttemptAt = payload.lastUserSyncAttemptAt;
+    }
+    if (payload.lastUserSyncError !== undefined) {
+      telemetryPatch.lastUserSyncError = payload.lastUserSyncError
+        ? redactSensitiveText(payload.lastUserSyncError.trim())
+        : null;
+    }
+    if (typeof payload.discoveredUserCount === 'number' && payload.discoveredUserCount >= 0) {
+      telemetryPatch.discoveredUserCount = payload.discoveredUserCount;
+    }
+    if (typeof payload.syncedUserCount === 'number' && payload.syncedUserCount >= 0) {
+      telemetryPatch.syncedUserCount = payload.syncedUserCount;
+    }
 
     if (Array.isArray(payload.deviceUsers)) {
-      await BiometricMappingService.saveDeviceUsersSnapshot(
+      const snap = await BiometricMappingService.saveDeviceUsersSnapshot(
         terminal.companyId,
         terminal.id,
         payload.deviceUsers
       );
+      telemetryPatch.lastUserSyncAt = snap.syncedAt;
+      telemetryPatch.lastUserSyncAttemptAt = snap.syncedAt;
+      telemetryPatch.lastUserSyncError = null;
+      telemetryPatch.discoveredUserCount = snap.discoveredCount;
+      telemetryPatch.syncedUserCount = snap.syncedCount;
     }
+
+    const updatedTelemetry = await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, telemetryPatch);
 
     // Check if an admin requested an out-of-band bridge sync after the last sync attempt
     let syncRequested = false;
@@ -454,6 +495,15 @@ export class BiometricService {
       syncRequested = !Number.isNaN(reqMs) && reqMs > attemptMs;
     }
 
+    let userSyncRequested = false;
+    if (updatedTelemetry.userSyncRequestedAt) {
+      const reqMs = new Date(updatedTelemetry.userSyncRequestedAt).getTime();
+      const attemptMs = updatedTelemetry.lastUserSyncAttemptAt
+        ? new Date(updatedTelemetry.lastUserSyncAttemptAt).getTime()
+        : 0;
+      userSyncRequested = !Number.isNaN(reqMs) && reqMs > attemptMs;
+    }
+
     return {
       success: true,
       serverTime: now.toISOString(),
@@ -462,6 +512,100 @@ export class BiometricService {
       status: derivedStatus,
       syncRequested,
       syncRequestedAt: syncRequested ? updatedTelemetry.syncRequestedAt || null : null,
+      userSyncRequested,
+      userSyncRequestedAt: userSyncRequested ? updatedTelemetry.userSyncRequestedAt || null : null,
+    };
+  }
+
+  /**
+   * Dedicated authenticated hardware user synchronization ingestion endpoint (POST /api/biometric/users).
+   * Persists verified hardware users idempotently, enforces serial & company ownership, and updates telemetry.
+   */
+  static async syncDeviceUsers(
+    terminal: any,
+    payload: SyncDeviceUsersRequest,
+    correlationId?: string
+  ): Promise<SyncDeviceUsersResponse> {
+    if (!payload || !Array.isArray(payload.deviceUsers)) {
+      const err = new Error('Payload must contain a "deviceUsers" array of enrolled hardware users.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (
+      payload.deviceSerialNumber &&
+      payload.deviceSerialNumber.trim() &&
+      terminal.deviceSerialNumber &&
+      payload.deviceSerialNumber.trim() !== terminal.deviceSerialNumber
+    ) {
+      const mismatchMsg = `Device serial number mismatch during hardware user sync: expected '${terminal.deviceSerialNumber}', received '${payload.deviceSerialNumber.trim()}'.`;
+      await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, {
+        lastUserSyncAttemptAt: new Date().toISOString(),
+        lastUserSyncError: mismatchMsg,
+      });
+      const err = new Error(mismatchMsg);
+      (err as { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
+    const attemptIso = payload.discoveredAt || new Date().toISOString();
+    const discoveredCount =
+      typeof payload.discoveredCount === 'number' && payload.discoveredCount >= 0
+        ? payload.discoveredCount
+        : payload.deviceUsers.length;
+
+    const snap = await BiometricMappingService.saveDeviceUsersSnapshot(
+      terminal.companyId,
+      terminal.id,
+      payload.deviceUsers,
+      { throwOnError: true }
+    );
+
+    const now = new Date();
+    if (typeof prisma.biometricTerminal?.update === 'function') {
+      await prisma.biometricTerminal.update({
+        where: { id: terminal.id },
+        data: {
+          lastHeartbeatAt: now,
+          status: 'ONLINE',
+        },
+      });
+    }
+
+    await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, {
+      bridgeConnected: true,
+      bridgeHost: payload.bridgeHost?.trim() || undefined,
+      bridgeVersion: payload.bridgeVersion?.trim() || undefined,
+      lastBridgeHeartbeatAt: now.toISOString(),
+      lastUserSyncAt: snap.syncedAt,
+      lastUserSyncAttemptAt: attemptIso,
+      lastUserSyncError: null,
+      discoveredUserCount: discoveredCount,
+      syncedUserCount: snap.syncedCount,
+      userSyncRequestedAt: null,
+    });
+
+    await AuditService.log({
+      companyId: terminal.companyId,
+      userId: terminal.registeredByUserId,
+      action: 'BIOMETRIC_DEVICE_USERS_SYNC',
+      entity: 'BiometricTerminal',
+      entityId: terminal.id,
+      correlationId,
+      details: {
+        deviceSerialNumber: terminal.deviceSerialNumber,
+        discoveredCount,
+        syncedCount: snap.syncedCount,
+      },
+    });
+
+    return {
+      success: true,
+      terminalId: terminal.id,
+      terminalName: terminal.name,
+      discoveredCount,
+      syncedCount: snap.syncedCount,
+      syncedAt: snap.syncedAt,
     };
   }
 
@@ -519,6 +663,7 @@ export class BiometricService {
     await this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
       bridgeConnected: false,
       syncRequestedAt: null,
+      userSyncRequestedAt: null,
     });
 
     await AuditService.log({
@@ -794,6 +939,103 @@ export class BiometricService {
       terminal: this.mapToTerminalItem(terminal, updatedTel),
       reconciliation,
     };
+  }
+
+  /**
+   * Queues an explicit hardware user synchronization request for the LAN Bridge ONLY.
+   * Never triggers attendance punch reconciliation.
+   */
+  static async triggerTerminalUserSync(
+    actor: AuthUser,
+    terminalId: string,
+    correlationId?: string
+  ): Promise<TriggerTerminalUserSyncResponse> {
+    const terminal = await prisma.biometricTerminal.findFirst({
+      where: {
+        id: terminalId,
+        companyId: actor.companyId,
+      },
+      include: {
+        registeredByUser: {
+          select: { fullName: true },
+        },
+      },
+    });
+
+    if (!terminal) {
+      const err = new Error('Biometric terminal not found.');
+      (err as { statusCode?: number }).statusCode = 404;
+      throw err;
+    }
+
+    if (!terminal.isActive || terminal.status === 'DEACTIVATED') {
+      const err = new Error('Cannot sync hardware users for a deactivated biometric terminal.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    const userSyncRequestedAt = new Date().toISOString();
+    const [updatedTel, deviceUsersMap] = await Promise.all([
+      this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
+        userSyncRequestedAt,
+      }),
+      BiometricMappingService.readDeviceUsersMap(actor.companyId),
+    ]);
+
+    const deviceUsers: DeviceEnrolledUserItem[] = deviceUsersMap[terminal.id] || [];
+    const bridgeFresh = this.isBridgeFresh(terminal, updatedTel);
+
+    await AuditService.log({
+      companyId: actor.companyId,
+      userId: actor.userId || actor.id,
+      action: 'BIOMETRIC_DEVICE_USER_SYNC_QUEUED',
+      entity: 'BiometricTerminal',
+      entityId: terminal.id,
+      correlationId,
+      details: {
+        deviceSerialNumber: terminal.deviceSerialNumber,
+        name: terminal.name,
+        userSyncRequestedAt,
+      },
+    });
+
+    const message = bridgeFresh
+      ? `Queued hardware user sync for "${terminal.name}". The LAN Bridge will read enrolled users on its next heartbeat without running punch reconciliation.`
+      : `Queued hardware user sync for "${terminal.name}". Enrolled users will be read when the Windows LAN Bridge reconnects or completes its next cycle.`;
+
+    return {
+      success: true,
+      bridgeUserSyncQueued: true,
+      userSyncRequestedAt,
+      message,
+      terminal: this.mapToTerminalItem(terminal, updatedTel),
+      deviceUsers,
+    };
+  }
+
+  /**
+   * Lists the persisted hardware user snapshot for a single company-owned terminal.
+   */
+  static async getTerminalDeviceUsers(
+    companyId: string,
+    terminalId: string
+  ): Promise<DeviceEnrolledUserItem[]> {
+    const terminal = await prisma.biometricTerminal.findFirst({
+      where: {
+        id: terminalId,
+        companyId,
+      },
+      select: { id: true },
+    });
+
+    if (!terminal) {
+      const err = new Error('Biometric terminal not found.');
+      (err as { statusCode?: number }).statusCode = 404;
+      throw err;
+    }
+
+    const deviceUsersMap = await BiometricMappingService.readDeviceUsersMap(companyId);
+    return deviceUsersMap[terminal.id] || [];
   }
 
   private static probeTcpPort(
