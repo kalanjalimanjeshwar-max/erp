@@ -12,17 +12,17 @@ import {
 import { PunchReconciliationService } from '../../src/server/services/punch-reconciliation.service.js';
 
 /**
- * Real PostgreSQL 16 Concurrency Integration Test:
- * Concurrent Punch Reconciliation Race-Condition Investigation
+ * Real PostgreSQL 16 Concurrency Integration Test Suite:
+ * Biometric Punch Reconciliation Locking, Advisory Serialization & Rollback Safety
  *
  * Scope & Safety:
  * 1. Dedicated Test Database: Strictly requires COREERP_INTEGRATION_TEST_MODE=true and TEST_DATABASE_URL
- *    pointing to isolated 'core_erp_integration_test' on localhost:5434.
+ *    pointing to isolated 'core_erp_integration_test' on localhost/127.0.0.1:5434.
  * 2. Never connects to operational (5432), development (5432), or standard unit-test (5433) databases.
  * 3. If integration mode is not enabled, TEST_DATABASE_URL is missing, or the dedicated PostgreSQL
- *    TCP endpoint on localhost:5434 is unreachable, marks the test genuinely SKIPPED via `ctx.skip(...)`
+ *    TCP endpoint on port 5434 is unreachable, marks the test genuinely SKIPPED via `ctx.skip(...)`
  *    with an explicit `[BLOCKED / NOT RUN]` diagnostic note — never falsely reporting PASS.
- * 4. Once localhost:5434 is reachable, never masks `$connect()`, authentication, missing database,
+ * 4. Once port 5434 is reachable, never masks `$connect()`, authentication, missing database,
  *    missing migration/table, PostgreSQL version, or database identity errors.
  */
 describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconciliation', () => {
@@ -32,22 +32,22 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
   let isDbConnected = false;
   let testPrisma: PrismaClient | null = null;
 
-  const testCompanyId = crypto.randomUUID();
-  const testUserId = crypto.randomUUID();
-  const testEmployeeId = crypto.randomUUID();
-  const testTerminalId = crypto.randomUUID();
-  const testPunchId = crypto.randomUUID();
+  const createdCompanyIds = new Set<string>();
 
-  const cleanupTestData = async (client: PrismaClient, tolerateCleanupErrors = false) => {
+  const cleanupCompanyFixtures = async (
+    client: PrismaClient,
+    companyId: string,
+    tolerateCleanupErrors = false
+  ) => {
     const deleteOps = [
-      () => client.auditLog.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.attendance.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.rawPunchLog.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.companySetting.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.employee.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.biometricTerminal.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.user.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.company.deleteMany({ where: { id: testCompanyId } }),
+      () => client.auditLog.deleteMany({ where: { companyId } }),
+      () => client.attendance.deleteMany({ where: { companyId } }),
+      () => client.rawPunchLog.deleteMany({ where: { companyId } }),
+      () => client.companySetting.deleteMany({ where: { companyId } }),
+      () => client.employee.deleteMany({ where: { companyId } }),
+      () => client.biometricTerminal.deleteMany({ where: { companyId } }),
+      () => client.user.deleteMany({ where: { companyId } }),
+      () => client.company.deleteMany({ where: { id: companyId } }),
     ];
 
     for (const op of deleteOps) {
@@ -61,6 +61,70 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
         await op();
       }
     }
+  };
+
+  const seedCompanyFixture = async (client: PrismaClient) => {
+    const companyId = crypto.randomUUID();
+    const userId = crypto.randomUUID();
+    const employeeId = crypto.randomUUID();
+    const terminalId = crypto.randomUUID();
+
+    createdCompanyIds.add(companyId);
+
+    await client.company.create({
+      data: {
+        id: companyId,
+        code: `RC-${companyId.slice(0, 8)}`,
+        name: `Concurrent Reconciliation Test Co ${companyId.slice(0, 6)}`,
+        currency: 'USD',
+        timezone: 'UTC',
+      },
+    });
+
+    await client.user.create({
+      data: {
+        id: userId,
+        companyId,
+        email: `recon-int-${userId.slice(0, 8)}@coreerp.local`,
+        fullName: 'Reconciliation Integration Admin',
+        passwordHash: 'not-used-in-test',
+        role: 'ADMIN',
+        isActive: true,
+      },
+    });
+
+    await client.employee.create({
+      data: {
+        id: employeeId,
+        companyId,
+        employeeCode: `EMP-${employeeId.slice(0, 8)}`,
+        fullName: 'Concurrent Test Employee',
+        dateOfJoining: new Date('2026-01-01T00:00:00.000Z'),
+        status: 'ACTIVE',
+        biometricDeviceId: '101',
+      },
+    });
+
+    const apiKeyHash = crypto
+      .createHash('sha256')
+      .update(`bio_recon_int_key_${terminalId}`)
+      .digest('hex');
+
+    await client.biometricTerminal.create({
+      data: {
+        id: terminalId,
+        companyId,
+        deviceSerialNumber: `INT-X2008-${terminalId.slice(0, 8)}`,
+        name: 'Reconciliation Integration Gate',
+        terminalModel: 'eSSL X2008',
+        apiKeyHash,
+        apiKeyPrefix: 'bio_rec_',
+        registeredByUserId: userId,
+        isActive: true,
+      },
+    });
+
+    return { companyId, userId, employeeId, terminalId };
   };
 
   const checkPortReachable = (
@@ -89,11 +153,45 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     });
   };
 
+  const assertDatabaseSafety = async (ctx: {
+    annotate: (message: string, type?: string) => Promise<unknown>;
+    skip: (note?: string) => never;
+  }): Promise<PrismaClient> => {
+    if (blockedReason) {
+      console.warn(blockedReason);
+      await ctx.annotate(blockedReason, 'blocked');
+      ctx.skip(blockedReason);
+    }
+
+    if (!isDbConnected || !testPrisma) {
+      throw new Error(
+        '[INTEGRATION TEST INVARIANT ERROR] Database connection state inconsistent without blockedReason.'
+      );
+    }
+
+    expect(process.env.DATABASE_URL).toBeUndefined();
+    expect(process.env.COREERP_INTEGRATION_TEST_MODE).toBe('true');
+    expect(getPrismaClient()).toBe(testPrisma);
+    expect(global.__prismaClient).toBe(testPrisma);
+
+    const urlConsistency = verifyDatabaseUrlConsistency(testDbUrl!, prisma);
+    expect(urlConsistency.consistent).toBe(true);
+    expect(urlConsistency.portMatch).toBe(true);
+    expect(urlConsistency.databaseMatch).toBe(true);
+
+    const liveDbCheck = await prisma.$queryRaw<Array<{ db_name: string }>>`
+      SELECT current_database() AS db_name
+    `;
+    expect(liveDbCheck[0]?.db_name).toBe('core_erp_integration_test');
+
+    return testPrisma;
+  };
+
   beforeAll(async () => {
     if (!isIntegrationMode || !testDbUrl || testDbUrl === '') {
       blockedReason =
         '[BLOCKED / NOT RUN] Concurrent punch reconciliation PostgreSQL 16 integration test requires ' +
-        'COREERP_INTEGRATION_TEST_MODE=true and TEST_DATABASE_URL targeting localhost:5434/core_erp_integration_test.';
+        'COREERP_INTEGRATION_TEST_MODE=true and TEST_DATABASE_URL targeting 127.0.0.1:5434/core_erp_integration_test.';
       console.warn(`\n${blockedReason}\n`);
       return;
     }
@@ -140,7 +238,6 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
       return;
     }
 
-    // Endpoint is reachable: do NOT catch or downgrade $connect(), auth, missing DB, PG version, identity, or Prisma errors.
     testPrisma = configureIntegrationPrismaClient(testDbUrl);
     await testPrisma.$connect();
 
@@ -166,7 +263,9 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
   afterAll(async () => {
     try {
       if (testPrisma && isDbConnected) {
-        await cleanupTestData(testPrisma, true);
+        for (const companyId of createdCompanyIds) {
+          await cleanupCompanyFixtures(testPrisma, companyId, true);
+        }
       }
     } finally {
       if (testPrisma) {
@@ -178,132 +277,57 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     }
   });
 
-  it('should investigate concurrent reconciliation of the same RawPunchLog punch on PostgreSQL 16', async (ctx) => {
-    if (blockedReason) {
-      console.warn(blockedReason);
-      await ctx.annotate(blockedReason, 'blocked');
-      ctx.skip(blockedReason);
-    }
-
-    if (!isDbConnected || !testPrisma) {
-      throw new Error(
-        '[INTEGRATION TEST INVARIANT ERROR] Database connection state inconsistent without blockedReason.'
-      );
-    }
-
-    // Prove singleton & proxy routing points strictly to the dedicated localhost:5434 integration client
-    expect(process.env.DATABASE_URL).toBeUndefined();
-    expect(process.env.COREERP_INTEGRATION_TEST_MODE).toBe('true');
-    expect(getPrismaClient()).toBe(testPrisma);
-    expect(global.__prismaClient).toBe(testPrisma);
-
-    const urlConsistency = verifyDatabaseUrlConsistency(testDbUrl!, prisma);
-    expect(urlConsistency.consistent).toBe(true);
-    expect(urlConsistency.portMatch).toBe(true);
-    expect(urlConsistency.databaseMatch).toBe(true);
-
-    const liveDbCheck = await prisma.$queryRaw<Array<{ db_name: string }>>`
-      SELECT current_database() AS db_name
-    `;
-    expect(liveDbCheck[0]?.db_name).toBe('core_erp_integration_test');
-
-    // 1. Create isolated company, user, employee, terminal, and pending raw punch fixtures
-    await testPrisma.company.create({
-      data: {
-        id: testCompanyId,
-        code: `RC-${testCompanyId.slice(0, 8)}`,
-        name: 'Concurrent Reconciliation Test Co',
-        currency: 'USD',
-        timezone: 'UTC',
-      },
-    });
-
-    await testPrisma.user.create({
-      data: {
-        id: testUserId,
-        companyId: testCompanyId,
-        email: 'recon-int-admin@coreerp.local',
-        fullName: 'Reconciliation Integration Admin',
-        passwordHash: 'not-used-in-test',
-        role: 'ADMIN',
-        isActive: true,
-      },
-    });
-
-    await testPrisma.employee.create({
-      data: {
-        id: testEmployeeId,
-        companyId: testCompanyId,
-        employeeCode: 'EMP-RECON-101',
-        fullName: 'Concurrent Test Employee',
-        dateOfJoining: new Date('2026-01-01T00:00:00.000Z'),
-        status: 'ACTIVE',
-        biometricDeviceId: '101',
-      },
-    });
-
-    const apiKeyHash = crypto
-      .createHash('sha256')
-      .update(`bio_recon_int_key_${testTerminalId}`)
-      .digest('hex');
-    await testPrisma.biometricTerminal.create({
-      data: {
-        id: testTerminalId,
-        companyId: testCompanyId,
-        deviceSerialNumber: 'INT-RECON-X2008',
-        name: 'Reconciliation Integration Gate',
-        terminalModel: 'eSSL X2008',
-        apiKeyHash,
-        apiKeyPrefix: 'bio_rec_',
-        registeredByUserId: testUserId,
-        isActive: true,
-      },
-    });
-
+  it('serializes two concurrent requests that both select the SAME PENDING RawPunchLog at the read boundary', async (ctx) => {
+    const client = await assertDatabaseSafety(ctx);
+    const { companyId, employeeId, terminalId } = await seedCompanyFixture(client);
+    const punchId = crypto.randomUUID();
     const punchTime = new Date('2026-10-19T09:30:00.000Z');
     const workDateObj = new Date('2026-10-19T00:00:00.000Z');
 
-    await testPrisma.rawPunchLog.create({
+    await client.rawPunchLog.create({
       data: {
-        id: testPunchId,
-        companyId: testCompanyId,
-        terminalId: testTerminalId,
-        devicePunchId: 'int-reconcile-concurrent-p1',
+        id: punchId,
+        companyId,
+        terminalId,
+        devicePunchId: `dp-${punchId.slice(0, 8)}`,
         userEnrollmentId: '101',
         punchTime,
         verifyType: 'FINGERPRINT',
         inOutMode: 'CHECK_IN',
         syncStatus: 'PENDING',
-        idempotencyKey: `${testTerminalId}:int-reconcile-concurrent-p1`,
+        idempotencyKey: `${terminalId}:${punchId}`,
         matchedEmployeeId: null,
       },
     });
 
-    // 2. Invoke targeted reconciliation concurrently twice for the SAME PENDING RawPunchLog punch.
-    // Synchronize at $transaction entry so both calls are guaranteed to observe syncStatus === 'PENDING'
-    // in findMany() and race concurrently against PostgreSQL FOR UPDATE row-level locking.
-    let arrivedAtTransaction = 0;
-    let releaseBarrier!: () => void;
-    const bothEnteredTransaction = new Promise<void>((resolve) => {
-      releaseBarrier = resolve;
+    // Synchronize at the actual candidate-selection read boundary (`rawPunchLog.findMany`)
+    // so both concurrent requests actually observe and return the SAME PENDING record from
+    // PostgreSQL before either enters reconcilePunch() / FOR UPDATE locking.
+    const observedSelections: Array<Array<{ id: string }>> = [];
+    let arrivedAtReadBoundary = 0;
+    let releaseReadBarrier!: () => void;
+    const bothObservedPending = new Promise<void>((resolve) => {
+      releaseReadBarrier = resolve;
     });
-    const origTransaction = testPrisma.$transaction.bind(testPrisma);
-    const txBarrierSpy = vi
-      .spyOn(testPrisma, '$transaction')
-      .mockImplementation((async (fn: any, opts?: any) => {
-        arrivedAtTransaction += 1;
-        if (arrivedAtTransaction >= 2) {
-          releaseBarrier();
+    const origFindMany = client.rawPunchLog.findMany.bind(client.rawPunchLog);
+    const findManyBarrierSpy = vi
+      .spyOn(client.rawPunchLog, 'findMany')
+      .mockImplementation((async (args: any) => {
+        const rows = (await origFindMany(args)) as Array<{ id: string }>;
+        observedSelections.push(rows);
+        arrivedAtReadBoundary += 1;
+        if (arrivedAtReadBoundary >= 2) {
+          releaseReadBarrier();
         }
-        await bothEnteredTransaction;
-        return origTransaction(fn, opts);
+        await bothObservedPending;
+        return rows;
       }) as any);
 
     const runConcurrentReconcile = () =>
-      PunchReconciliationService.reconcilePendingPunches(testCompanyId, {
-        punchId: testPunchId,
+      PunchReconciliationService.reconcilePendingPunches(companyId, {
+        punchId,
       }).catch((err) => {
-        releaseBarrier();
+        releaseReadBarrier();
         throw err;
       });
 
@@ -312,10 +336,13 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     try {
       [resA, resB] = await Promise.all([runConcurrentReconcile(), runConcurrentReconcile()]);
     } finally {
-      txBarrierSpy.mockRestore();
+      findManyBarrierSpy.mockRestore();
     }
 
-    expect(arrivedAtTransaction).toBe(2);
+    // Prove both callers selected the exact same PENDING row from PostgreSQL before racing
+    expect(arrivedAtReadBoundary).toBe(2);
+    expect(observedSelections).toEqual([[{ id: punchId }], [{ id: punchId }]]);
+
     expect(resA.totalEvaluated).toBe(1);
     expect(resB.totalEvaluated).toBe(1);
     expect(resA.errors).toBe(0);
@@ -329,38 +356,23 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
       'Punch was already successfully processed.',
     ]);
 
-    // 3. Verify RawPunchLog final status is PROCESSED with resolved employee and no error
-    const rawPunchAfterConcurrent = await testPrisma.rawPunchLog.findUnique({
-      where: { id: testPunchId },
+    const rawPunchAfterConcurrent = await client.rawPunchLog.findUnique({
+      where: { id: punchId },
     });
     expect(rawPunchAfterConcurrent).not.toBeNull();
     expect(rawPunchAfterConcurrent!.syncStatus).toBe('PROCESSED');
     expect(rawPunchAfterConcurrent!.errorMessage).toBeNull();
-    expect(rawPunchAfterConcurrent!.matchedEmployeeId).toBe(testEmployeeId);
+    expect(rawPunchAfterConcurrent!.matchedEmployeeId).toBe(employeeId);
 
-    const totalPunchesForCompany = await testPrisma.rawPunchLog.count({
-      where: { companyId: testCompanyId },
-    });
-    expect(totalPunchesForCompany).toBe(1);
-
-    // 4. Verify exactly one Attendance record exists for (companyId, employeeId, workDate)
-    const attendanceRows = await testPrisma.attendance.findMany({
-      where: {
-        companyId: testCompanyId,
-        employeeId: testEmployeeId,
-        workDate: workDateObj,
-      },
+    const attendanceRows = await client.attendance.findMany({
+      where: { companyId, employeeId, workDate: workDateObj },
     });
     expect(attendanceRows).toHaveLength(1);
-
-    const totalAttendanceForCompany = await testPrisma.attendance.count({
-      where: { companyId: testCompanyId },
-    });
-    expect(totalAttendanceForCompany).toBe(1);
+    expect(await client.attendance.count({ where: { companyId } })).toBe(1);
 
     const attendance = attendanceRows[0];
-    expect(attendance.companyId).toBe(testCompanyId);
-    expect(attendance.employeeId).toBe(testEmployeeId);
+    expect(attendance.companyId).toBe(companyId);
+    expect(attendance.employeeId).toBe(employeeId);
     expect(attendance.workDate.toISOString()).toBe(workDateObj.toISOString());
     expect(attendance.source).toBe('BIOMETRIC');
     expect(attendance.status).toBe('PRESENT');
@@ -370,46 +382,407 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     expect(attendance.overtimeMinutes).toBe(0);
     expect(attendance.notes).toBe(`Biometric Check-In at ${punchTime.toISOString()}`);
 
-    // Verify no unexpected AuditLog side effects occurred during punch-level reconciliation
-    const auditLogCountAfterConcurrent = await testPrisma.auditLog.count({
-      where: { companyId: testCompanyId },
-    });
-    expect(auditLogCountAfterConcurrent).toBe(0);
+    expect(await client.auditLog.count({ where: { companyId } })).toBe(0);
 
-    // 5. Verify subsequent reconciliation call does not re-process an already-processed punch
-    const followUpBatch = await PunchReconciliationService.reconcilePendingPunches(testCompanyId, {
-      punchId: testPunchId,
+    // Subsequent reconciliation is idempotent and leaves DB timestamps/notes untouched
+    const followUpBatch = await PunchReconciliationService.reconcilePendingPunches(companyId, {
+      punchId,
     });
     expect(followUpBatch.totalEvaluated).toBe(0);
     expect(followUpBatch.processed).toBe(0);
-    expect(followUpBatch.pending).toBe(0);
-    expect(followUpBatch.ignored).toBe(0);
     expect(followUpBatch.errors).toBe(0);
 
-    const followUpSingle = await PunchReconciliationService.reconcilePunch(testPunchId);
+    const followUpSingle = await PunchReconciliationService.reconcilePunch(punchId, undefined, {
+      expectedCompanyId: companyId,
+    });
     expect(followUpSingle.status).toBe('PROCESSED');
     expect(followUpSingle.message).toBe('Punch was already successfully processed.');
 
-    // Re-query DB directly to confirm Attendance and RawPunchLog were untouched by subsequent calls
-    const rawPunchAfterFollowUp = await testPrisma.rawPunchLog.findUnique({
-      where: { id: testPunchId },
-    });
+    const rawPunchAfterFollowUp = await client.rawPunchLog.findUnique({ where: { id: punchId } });
     expect(rawPunchAfterFollowUp!.syncStatus).toBe('PROCESSED');
     expect(rawPunchAfterFollowUp!.updatedAt.toISOString()).toBe(
       rawPunchAfterConcurrent!.updatedAt.toISOString()
     );
 
-    const attendanceAfterFollowUp = await testPrisma.attendance.findMany({
-      where: {
-        companyId: testCompanyId,
-        employeeId: testEmployeeId,
-        workDate: workDateObj,
-      },
+    const attendanceAfterFollowUp = await client.attendance.findMany({
+      where: { companyId, employeeId, workDate: workDateObj },
     });
     expect(attendanceAfterFollowUp).toHaveLength(1);
     expect(attendanceAfterFollowUp[0].updatedAt.toISOString()).toBe(
       attendance.updatedAt.toISOString()
     );
     expect(attendanceAfterFollowUp[0].notes).toBe(attendance.notes);
+  });
+
+  it('serializes two DISTINCT PENDING RawPunchLog IDs (CHECK_IN + CHECK_OUT) for the same employee and workDate when no Attendance row exists yet', async (ctx) => {
+    const client = await assertDatabaseSafety(ctx);
+    const { companyId, employeeId, terminalId } = await seedCompanyFixture(client);
+    const punchInId = crypto.randomUUID();
+    const punchOutId = crypto.randomUUID();
+    const checkInTime = new Date('2026-10-20T09:30:00.000Z');
+    const checkOutTime = new Date('2026-10-20T18:15:00.000Z');
+    const workDateObj = new Date('2026-10-20T00:00:00.000Z');
+
+    await client.rawPunchLog.createMany({
+      data: [
+        {
+          id: punchInId,
+          companyId,
+          terminalId,
+          devicePunchId: `dp-in-${punchInId.slice(0, 8)}`,
+          userEnrollmentId: '101',
+          punchTime: checkInTime,
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          idempotencyKey: `${terminalId}:${punchInId}`,
+          matchedEmployeeId: null,
+        },
+        {
+          id: punchOutId,
+          companyId,
+          terminalId,
+          devicePunchId: `dp-out-${punchOutId.slice(0, 8)}`,
+          userEnrollmentId: '101',
+          punchTime: checkOutTime,
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_OUT',
+          syncStatus: 'PENDING',
+          idempotencyKey: `${terminalId}:${punchOutId}`,
+          matchedEmployeeId: null,
+        },
+      ],
+    });
+
+    // Synchronize inside the transaction right BEFORE the advisory lock acquisition
+    // (after each transaction has already locked its own distinct RawPunchLog row FOR UPDATE)
+    // so both concurrent transactions observe no pre-existing Attendance row and race into
+    // PostgreSQL pg_advisory_xact_lock(companyId, employeeId, workDate).
+    const origResolveTz = PunchReconciliationService.resolveCompanyTimezone.bind(
+      PunchReconciliationService
+    );
+    let arrivedBeforeAdvisoryLock = 0;
+    let releaseBeforeAdvisoryLock!: () => void;
+    const bothReadyForAdvisoryLock = new Promise<void>((resolve) => {
+      releaseBeforeAdvisoryLock = resolve;
+    });
+    const tzBarrierSpy = vi
+      .spyOn(PunchReconciliationService, 'resolveCompanyTimezone')
+      .mockImplementation((async (cid: string, tx?: any) => {
+        const tz = await origResolveTz(cid, tx);
+        arrivedBeforeAdvisoryLock += 1;
+        if (arrivedBeforeAdvisoryLock >= 2) {
+          releaseBeforeAdvisoryLock();
+        }
+        await bothReadyForAdvisoryLock;
+        return tz;
+      }) as any);
+
+    const runTargeted = (targetPunchId: string) =>
+      PunchReconciliationService.reconcilePendingPunches(companyId, {
+        punchId: targetPunchId,
+      }).catch((err) => {
+        releaseBeforeAdvisoryLock();
+        throw err;
+      });
+
+    let resIn: Awaited<ReturnType<typeof PunchReconciliationService.reconcilePendingPunches>>;
+    let resOut: Awaited<ReturnType<typeof PunchReconciliationService.reconcilePendingPunches>>;
+    try {
+      [resIn, resOut] = await Promise.all([runTargeted(punchInId), runTargeted(punchOutId)]);
+    } finally {
+      tzBarrierSpy.mockRestore();
+    }
+
+    expect(arrivedBeforeAdvisoryLock).toBe(2);
+    expect(resIn.totalEvaluated).toBe(1);
+    expect(resOut.totalEvaluated).toBe(1);
+    expect(resIn.errors).toBe(0);
+    expect(resOut.errors).toBe(0);
+    expect(resIn.ignored).toBe(0);
+    expect(resOut.ignored).toBe(0);
+    expect(resIn.results[0]?.status).toBe('PROCESSED');
+    expect(resOut.results[0]?.status).toBe('PROCESSED');
+
+    // Depending on which transaction acquires pg_advisory_xact_lock first,
+    // either (CHECK_IN creates -> CHECK_OUT updates) or (CHECK_OUT creates -> CHECK_IN assigns).
+    const messagePair = [resIn.results[0]?.message, resOut.results[0]?.message];
+    const validOrders = [
+      ['Check-in recorded successfully.', 'Check-out updated successfully.'],
+      ['Check-in assigned to existing record.', 'Check-out recorded without check-in.'],
+    ];
+    expect(
+      validOrders.some(
+        (expected) => expected[0] === messagePair[0] && expected[1] === messagePair[1]
+      )
+    ).toBe(true);
+
+    // Neither punch is overwritten as ERROR
+    const [punchInRow, punchOutRow] = await Promise.all([
+      client.rawPunchLog.findUnique({ where: { id: punchInId } }),
+      client.rawPunchLog.findUnique({ where: { id: punchOutId } }),
+    ]);
+    expect(punchInRow?.syncStatus).toBe('PROCESSED');
+    expect(punchInRow?.errorMessage).toBeNull();
+    expect(punchInRow?.matchedEmployeeId).toBe(employeeId);
+    expect(punchOutRow?.syncStatus).toBe('PROCESSED');
+    expect(punchOutRow?.errorMessage).toBeNull();
+    expect(punchOutRow?.matchedEmployeeId).toBe(employeeId);
+
+    // Strictly ONE Attendance record exists with BOTH checkIn and checkOut recorded
+    const attendanceRows = await client.attendance.findMany({
+      where: { companyId, employeeId, workDate: workDateObj },
+    });
+    expect(attendanceRows).toHaveLength(1);
+    expect(await client.attendance.count({ where: { companyId } })).toBe(1);
+    expect(attendanceRows[0].checkIn?.toISOString()).toBe(checkInTime.toISOString());
+    expect(attendanceRows[0].checkOut?.toISOString()).toBe(checkOutTime.toISOString());
+    expect(attendanceRows[0].status).toBe('PRESENT');
+    expect(attendanceRows[0].source).toBe('BIOMETRIC');
+  });
+
+  it('serializes two DISTINCT rapid duplicate CHECK_IN punches within 2 minutes without P2002 ERROR and debounces the second cleanly', async (ctx) => {
+    const client = await assertDatabaseSafety(ctx);
+    const { companyId, employeeId, terminalId } = await seedCompanyFixture(client);
+    const punch1Id = crypto.randomUUID();
+    const punch2Id = crypto.randomUUID();
+    const t1 = new Date('2026-10-21T09:30:00.000Z');
+    const t2 = new Date('2026-10-21T09:30:45.000Z'); // 45s apart -> debounced by business rules
+    const workDateObj = new Date('2026-10-21T00:00:00.000Z');
+
+    await client.rawPunchLog.createMany({
+      data: [
+        {
+          id: punch1Id,
+          companyId,
+          terminalId,
+          devicePunchId: `dp-dup1-${punch1Id.slice(0, 8)}`,
+          userEnrollmentId: '101',
+          punchTime: t1,
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          idempotencyKey: `${terminalId}:${punch1Id}`,
+          matchedEmployeeId: null,
+        },
+        {
+          id: punch2Id,
+          companyId,
+          terminalId,
+          devicePunchId: `dp-dup2-${punch2Id.slice(0, 8)}`,
+          userEnrollmentId: '101',
+          punchTime: t2,
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          idempotencyKey: `${terminalId}:${punch2Id}`,
+          matchedEmployeeId: null,
+        },
+      ],
+    });
+
+    const origResolveTz = PunchReconciliationService.resolveCompanyTimezone.bind(
+      PunchReconciliationService
+    );
+    let arrivedBeforeAdvisoryLock = 0;
+    let releaseBeforeAdvisoryLock!: () => void;
+    const bothReadyForAdvisoryLock = new Promise<void>((resolve) => {
+      releaseBeforeAdvisoryLock = resolve;
+    });
+    const tzBarrierSpy = vi
+      .spyOn(PunchReconciliationService, 'resolveCompanyTimezone')
+      .mockImplementation((async (cid: string, tx?: any) => {
+        const tz = await origResolveTz(cid, tx);
+        arrivedBeforeAdvisoryLock += 1;
+        if (arrivedBeforeAdvisoryLock >= 2) {
+          releaseBeforeAdvisoryLock();
+        }
+        await bothReadyForAdvisoryLock;
+        return tz;
+      }) as any);
+
+    const runTargeted = (targetPunchId: string) =>
+      PunchReconciliationService.reconcilePendingPunches(companyId, {
+        punchId: targetPunchId,
+      }).catch((err) => {
+        releaseBeforeAdvisoryLock();
+        throw err;
+      });
+
+    let res1: Awaited<ReturnType<typeof PunchReconciliationService.reconcilePendingPunches>>;
+    let res2: Awaited<ReturnType<typeof PunchReconciliationService.reconcilePendingPunches>>;
+    try {
+      [res1, res2] = await Promise.all([runTargeted(punch1Id), runTargeted(punch2Id)]);
+    } finally {
+      tzBarrierSpy.mockRestore();
+    }
+
+    expect(arrivedBeforeAdvisoryLock).toBe(2);
+    expect(res1.errors).toBe(0);
+    expect(res2.errors).toBe(0);
+
+    const statuses = [res1.results[0]?.status, res2.results[0]?.status].sort();
+    expect(statuses).toEqual(['IGNORED', 'PROCESSED']);
+
+    const messages = [res1.results[0]?.message, res2.results[0]?.message].sort();
+    expect(messages).toEqual([
+      'Check-in recorded successfully.',
+      'Duplicate check-in punch debounced within 2 minutes.',
+    ]);
+
+    const [p1Row, p2Row] = await Promise.all([
+      client.rawPunchLog.findUnique({ where: { id: punch1Id } }),
+      client.rawPunchLog.findUnique({ where: { id: punch2Id } }),
+    ]);
+    expect([p1Row?.syncStatus, p2Row?.syncStatus].sort()).toEqual(['IGNORED', 'PROCESSED']);
+    expect(p1Row?.syncStatus).not.toBe('ERROR');
+    expect(p2Row?.syncStatus).not.toBe('ERROR');
+
+    const attendanceRows = await client.attendance.findMany({
+      where: { companyId, employeeId, workDate: workDateObj },
+    });
+    expect(attendanceRows).toHaveLength(1);
+    expect(await client.attendance.count({ where: { companyId } })).toBe(1);
+  });
+
+  it('rolls back PostgreSQL writes on mid-transaction abort and never overwrites committed PROCESSED rows in error handler', async (ctx) => {
+    const client = await assertDatabaseSafety(ctx);
+    const { companyId, employeeId, terminalId } = await seedCompanyFixture(client);
+    const rollbackPunchId = crypto.randomUUID();
+    const guardedPunchId = crypto.randomUUID();
+    const workDateObj = new Date('2026-10-22T00:00:00.000Z');
+
+    await client.rawPunchLog.createMany({
+      data: [
+        {
+          id: rollbackPunchId,
+          companyId,
+          terminalId,
+          devicePunchId: `dp-rb-${rollbackPunchId.slice(0, 8)}`,
+          userEnrollmentId: '101',
+          punchTime: new Date('2026-10-22T09:05:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          idempotencyKey: `${terminalId}:${rollbackPunchId}`,
+          matchedEmployeeId: null,
+        },
+        {
+          id: guardedPunchId,
+          companyId,
+          terminalId,
+          devicePunchId: `dp-guard-${guardedPunchId.slice(0, 8)}`,
+          userEnrollmentId: '101',
+          punchTime: new Date('2026-10-23T09:05:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          idempotencyKey: `${terminalId}:${guardedPunchId}`,
+          matchedEmployeeId: null,
+        },
+      ],
+    });
+
+    // Part A: Force a real PostgreSQL rollback AFTER Attendance & RawPunchLog writes succeed inside the tx
+    const origTx = client.$transaction.bind(client);
+    let sawUncommittedAttendance = false;
+    const rollbackTxSpy = vi
+      .spyOn(client, '$transaction')
+      .mockImplementationOnce((async (cb: any, opts?: any) =>
+        origTx(async (tx: any) => {
+          await cb(tx);
+          const inTxCount = await tx.attendance.count({
+            where: { companyId, employeeId, workDate: workDateObj },
+          });
+          sawUncommittedAttendance = inTxCount === 1;
+          throw new Error('Simulated post-write PostgreSQL transaction abort');
+        }, opts)) as any);
+
+    try {
+      await expect(
+        PunchReconciliationService.reconcilePunch(rollbackPunchId, undefined, {
+          expectedCompanyId: companyId,
+        })
+      ).rejects.toThrow('Simulated post-write PostgreSQL transaction abort');
+    } finally {
+      rollbackTxSpy.mockRestore();
+    }
+
+    expect(sawUncommittedAttendance).toBe(true);
+    // Verify PostgreSQL rolled back both Attendance creation and RawPunchLog updates
+    expect(
+      await client.attendance.count({
+        where: { companyId, employeeId, workDate: workDateObj },
+      })
+    ).toBe(0);
+    const afterDirectRollback = await client.rawPunchLog.findUnique({
+      where: { id: rollbackPunchId },
+    });
+    expect(afterDirectRollback?.syncStatus).toBe('PENDING');
+    expect(afterDirectRollback?.matchedEmployeeId).toBeNull();
+
+    // Part B: Verify reconcilePendingPunches catch handler marks unfinalized punch ERROR on failure
+    const origTx2 = client.$transaction.bind(client);
+    const errorTxSpy = vi
+      .spyOn(client, '$transaction')
+      .mockImplementationOnce((async (cb: any, opts?: any) =>
+        origTx2(async (tx: any) => {
+          await cb(tx);
+          throw new Error('Simulated batch reconciliation abort');
+        }, opts)) as any);
+
+    let errBatchRes: Awaited<ReturnType<typeof PunchReconciliationService.reconcilePendingPunches>>;
+    try {
+      errBatchRes = await PunchReconciliationService.reconcilePendingPunches(companyId, {
+        punchId: rollbackPunchId,
+      });
+    } finally {
+      errorTxSpy.mockRestore();
+    }
+
+    expect(errBatchRes.errors).toBe(1);
+    const afterBatchError = await client.rawPunchLog.findUnique({
+      where: { id: rollbackPunchId },
+    });
+    expect(afterBatchError?.syncStatus).toBe('ERROR');
+    expect(afterBatchError?.errorMessage).toContain('Simulated batch reconciliation abort');
+    expect(
+      await client.attendance.count({
+        where: { companyId, employeeId, workDate: workDateObj },
+      })
+    ).toBe(0);
+
+    // Part C: Verify guarded error handler NEVER overwrites an already-committed PROCESSED punch
+    const origReconcilePunch = PunchReconciliationService.reconcilePunch.bind(
+      PunchReconciliationService
+    );
+    const postCommitThrowSpy = vi
+      .spyOn(PunchReconciliationService, 'reconcilePunch')
+      .mockImplementationOnce(async (id, corrId, opts) => {
+        await origReconcilePunch(id, corrId, opts);
+        throw new Error('Simulated post-commit caller exception');
+      });
+
+    let guardedRes: Awaited<ReturnType<typeof PunchReconciliationService.reconcilePendingPunches>>;
+    try {
+      guardedRes = await PunchReconciliationService.reconcilePendingPunches(companyId, {
+        punchId: guardedPunchId,
+      });
+    } finally {
+      postCommitThrowSpy.mockRestore();
+    }
+
+    expect(guardedRes.errors).toBe(1);
+    const guardedPunchAfter = await client.rawPunchLog.findUnique({
+      where: { id: guardedPunchId },
+    });
+    // Must stay PROCESSED with null errorMessage because updateMany guards notIn ['PROCESSED', 'IGNORED']
+    expect(guardedPunchAfter?.syncStatus).toBe('PROCESSED');
+    expect(guardedPunchAfter?.errorMessage).toBeNull();
+    expect(
+      await client.attendance.count({
+        where: { companyId, employeeId, workDate: new Date('2026-10-23T00:00:00.000Z') },
+      })
+    ).toBe(1);
   });
 });

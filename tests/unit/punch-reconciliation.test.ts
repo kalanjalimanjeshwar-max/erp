@@ -2,7 +2,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../../src/server/app.js';
 import { prisma } from '../../src/server/db/client.js';
-import { PunchReconciliationService } from '../../src/server/services/punch-reconciliation.service.js';
+import {
+  PunchReconciliationService,
+  deriveAttendanceAdvisoryLockKeys,
+} from '../../src/server/services/punch-reconciliation.service.js';
 import { AuthService } from '../../src/server/services/auth.service.js';
 import { AuditService } from '../../src/server/services/audit.service.js';
 import { AuthUser } from '../../src/shared/types.ts';
@@ -957,7 +960,83 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
     });
   });
 
-  describe('8. Concurrency Locking, Rollback, Idempotency & Debounce Guarantees', () => {
+  describe('8. Mock-Based Concurrency Locking, Rollback, Idempotency & Debounce Unit Simulations (Real DB Concurrency is Tested in tests/integration/concurrent-punch-reconciliation.test.ts)', () => {
+    it('derives deterministic company/employee/workDate advisory lock keys and acquires FOR UPDATE then pg_advisory_xact_lock before attendance lookup', async () => {
+      const uuidCompanyA = '22222222-2222-4222-8222-222222222210';
+      const uuidCompanyB = '22222222-2222-4222-8222-222222222211';
+      const uuidEmpId = '33333333-3333-4333-8333-333333333310';
+      const uuidPunchId = '11111111-1111-4111-8111-111111111110';
+
+      const keysA1 = deriveAttendanceAdvisoryLockKeys(uuidCompanyA, uuidEmpId, '2026-10-19');
+      const keysA2 = deriveAttendanceAdvisoryLockKeys(uuidCompanyA, uuidEmpId, '2026-10-19');
+      const keysDiffCompany = deriveAttendanceAdvisoryLockKeys(uuidCompanyB, uuidEmpId, '2026-10-19');
+      const keysDiffDate = deriveAttendanceAdvisoryLockKeys(uuidCompanyA, uuidEmpId, '2026-10-20');
+
+      expect(keysA1).toEqual(keysA2);
+      expect(keysA1).not.toEqual(keysDiffCompany);
+      expect(keysA1).not.toEqual(keysDiffDate);
+      expect(Number.isInteger(keysA1[0])).toBe(true);
+      expect(Number.isInteger(keysA1[1])).toBe(true);
+
+      const callOrder: string[] = [];
+      const txQueryRaw = vi.fn(async () => {
+        callOrder.push('RAW_PUNCH_FOR_UPDATE');
+        return [{ id: uuidPunchId }];
+      });
+      const txExecuteRaw = vi.fn(async (_strings: TemplateStringsArray, k1: number, k2: number) => {
+        callOrder.push(`ADVISORY_XACT_LOCK:${k1}:${k2}`);
+        return 1;
+      });
+      const txFindUnique = vi.fn(async () => {
+        callOrder.push('RAW_PUNCH_READ');
+        return {
+          id: uuidPunchId,
+          companyId: uuidCompanyA,
+          userEnrollmentId: 'BIO-1001',
+          punchTime: new Date('2026-10-19T09:00:00.000Z'),
+          inOutMode: 'CHECK_IN' as const,
+          syncStatus: 'PENDING' as const,
+          matchedEmployeeId: uuidEmpId,
+          matchedEmployee: { ...defaultMockEmployee, id: uuidEmpId, companyId: uuidCompanyA },
+        };
+      });
+      const txAttFindUnique = vi.fn(async () => {
+        callOrder.push('ATTENDANCE_FIND_UNIQUE');
+        return null;
+      });
+      const txAttCreate = vi.fn(async () => {
+        callOrder.push('ATTENDANCE_CREATE');
+        return { id: 'att-created-1' };
+      });
+
+      const txSpy = vi.spyOn(prisma, '$transaction').mockImplementationOnce((async (cb: any) =>
+        cb({
+          $queryRaw: txQueryRaw,
+          $executeRaw: txExecuteRaw,
+          rawPunchLog: { findUnique: txFindUnique, update: vi.fn().mockResolvedValue({}) },
+          company: { findUnique: vi.fn().mockResolvedValue({ timezone: 'UTC' }) },
+          payrollPeriod: { findFirst: vi.fn().mockResolvedValue(null) },
+          attendance: { findUnique: txAttFindUnique, create: txAttCreate },
+          leaveRequest: { findFirst: vi.fn().mockResolvedValue(null) },
+        })) as any);
+
+      try {
+        const res = await PunchReconciliationService.reconcilePunch(uuidPunchId, undefined, {
+          expectedCompanyId: uuidCompanyA,
+        });
+        expect(res.status).toBe('PROCESSED');
+        expect(callOrder).toEqual([
+          'RAW_PUNCH_FOR_UPDATE',
+          'RAW_PUNCH_READ',
+          `ADVISORY_XACT_LOCK:${keysA1[0]}:${keysA1[1]}`,
+          'ATTENDANCE_FIND_UNIQUE',
+          'ATTENDANCE_CREATE',
+        ]);
+      } finally {
+        txSpy.mockRestore();
+      }
+    });
+
     it('acquires FOR UPDATE lock before reading syncStatus and returns idempotent PROCESSED result when already processed', async () => {
       const uuidPunchId = '11111111-1111-4111-8111-111111111101';
       const uuidCompanyId = '22222222-2222-4222-8222-222222222201';
@@ -1063,6 +1142,7 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         try {
           const mockTx = {
             $queryRaw: vi.fn().mockResolvedValue([{ id: committedPunch.id }]),
+            $executeRaw: vi.fn().mockResolvedValue(1),
             rawPunchLog: {
               findUnique: vi.fn(async () => ({
                 ...committedPunch,
@@ -1187,6 +1267,7 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
 
         const mockTx = {
           $queryRaw: vi.fn().mockResolvedValue([{ id: uuidPunchId }]),
+          $executeRaw: vi.fn().mockResolvedValue(1),
           rawPunchLog: {
             findUnique: vi.fn(async () => ({
               ...stagingPunch,

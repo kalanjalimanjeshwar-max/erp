@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import { prisma } from '../db/client.js';
 import {
   PunchSyncStatus,
@@ -14,6 +15,22 @@ import { BiometricMappingService } from './biometric-mapping.service.js';
 const DEBOUNCE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Derives a deterministic pair of signed 32-bit integers for PostgreSQL
+ * `pg_advisory_xact_lock(int4, int4)` scoped to (companyId, employeeId, workDate).
+ */
+export function deriveAttendanceAdvisoryLockKeys(
+  companyId: string,
+  employeeId: string,
+  workDateStr: string
+): [number, number] {
+  const digest = crypto
+    .createHash('sha256')
+    .update(`attendance_reconcile:${companyId}:${employeeId}:${workDateStr}`)
+    .digest();
+  return [digest.readInt32BE(0), digest.readInt32BE(4)];
+}
 
 export interface LocalTimeParts {
   year: number;
@@ -400,6 +417,24 @@ export class PunchReconciliationService {
       const shift = employee.shift;
       const workDateStr = this.determineWorkDate(punch.punchTime, timeZone, shift);
       const workDateObj = new Date(`${workDateStr}T00:00:00.000Z`);
+
+      // B2. Acquire a PostgreSQL transaction-scoped advisory lock keyed by
+      // (companyId, employeeId, workDateStr) BEFORE checking/creating Attendance.
+      // This serializes concurrent transactions for distinct RawPunchLog IDs belonging
+      // to the same employee and work date even when no Attendance row exists yet.
+      const hasExecuteRaw = typeof (tx as any).$executeRaw === 'function';
+      const isMockedExecuteRaw =
+        hasExecuteRaw && typeof ((tx as any).$executeRaw as { mock?: unknown }).mock === 'object';
+      if (hasExecuteRaw && (tx !== prisma || isMockedExecuteRaw)) {
+        const [lockKey1, lockKey2] = deriveAttendanceAdvisoryLockKeys(
+          punch.companyId,
+          employee.id,
+          workDateStr
+        );
+        await (tx as any).$executeRaw`
+          SELECT pg_advisory_xact_lock(${lockKey1}::integer, ${lockKey2}::integer)
+        `;
+      }
 
       // C. Data & Payroll Integrity: Protect Finalized / Processed / Posted Payroll Periods
       const lockedPayroll = await tx.payrollPeriod.findFirst({
