@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { PrismaClient } from '@prisma/client';
 import net from 'net';
 import crypto from 'crypto';
@@ -279,18 +279,55 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
       },
     });
 
-    // 2. Invoke targeted reconciliation concurrently twice for the SAME RawPunchLog punch
-    const [resA, resB] = await Promise.all([
-      PunchReconciliationService.reconcilePendingPunches(testCompanyId, {
-        punchId: testPunchId,
-      }),
-      PunchReconciliationService.reconcilePendingPunches(testCompanyId, {
-        punchId: testPunchId,
-      }),
-    ]);
+    // 2. Invoke targeted reconciliation concurrently twice for the SAME PENDING RawPunchLog punch.
+    // Synchronize at $transaction entry so both calls are guaranteed to observe syncStatus === 'PENDING'
+    // in findMany() and race concurrently against PostgreSQL FOR UPDATE row-level locking.
+    let arrivedAtTransaction = 0;
+    let releaseBarrier!: () => void;
+    const bothEnteredTransaction = new Promise<void>((resolve) => {
+      releaseBarrier = resolve;
+    });
+    const origTransaction = testPrisma.$transaction.bind(testPrisma);
+    const txBarrierSpy = vi
+      .spyOn(testPrisma, '$transaction')
+      .mockImplementation((async (fn: any, opts?: any) => {
+        arrivedAtTransaction += 1;
+        if (arrivedAtTransaction >= 2) {
+          releaseBarrier();
+        }
+        await bothEnteredTransaction;
+        return origTransaction(fn, opts);
+      }) as any);
 
+    const runConcurrentReconcile = () =>
+      PunchReconciliationService.reconcilePendingPunches(testCompanyId, {
+        punchId: testPunchId,
+      }).catch((err) => {
+        releaseBarrier();
+        throw err;
+      });
+
+    let resA: Awaited<ReturnType<typeof PunchReconciliationService.reconcilePendingPunches>>;
+    let resB: Awaited<ReturnType<typeof PunchReconciliationService.reconcilePendingPunches>>;
+    try {
+      [resA, resB] = await Promise.all([runConcurrentReconcile(), runConcurrentReconcile()]);
+    } finally {
+      txBarrierSpy.mockRestore();
+    }
+
+    expect(arrivedAtTransaction).toBe(2);
+    expect(resA.totalEvaluated).toBe(1);
+    expect(resB.totalEvaluated).toBe(1);
     expect(resA.errors).toBe(0);
     expect(resB.errors).toBe(0);
+    expect(resA.ignored).toBe(0);
+    expect(resB.ignored).toBe(0);
+    expect(resA.results[0]?.status).toBe('PROCESSED');
+    expect(resB.results[0]?.status).toBe('PROCESSED');
+    expect([resA.results[0]?.message, resB.results[0]?.message].sort()).toEqual([
+      'Check-in recorded successfully.',
+      'Punch was already successfully processed.',
+    ]);
 
     // 3. Verify RawPunchLog final status is PROCESSED with resolved employee and no error
     const rawPunchAfterConcurrent = await testPrisma.rawPunchLog.findUnique({
@@ -322,6 +359,9 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     expect(totalAttendanceForCompany).toBe(1);
 
     const attendance = attendanceRows[0];
+    expect(attendance.companyId).toBe(testCompanyId);
+    expect(attendance.employeeId).toBe(testEmployeeId);
+    expect(attendance.workDate.toISOString()).toBe(workDateObj.toISOString());
     expect(attendance.source).toBe('BIOMETRIC');
     expect(attendance.status).toBe('PRESENT');
     expect(attendance.checkIn?.toISOString()).toBe(punchTime.toISOString());

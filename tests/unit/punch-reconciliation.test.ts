@@ -956,5 +956,362 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
       rawUpdateSpy.mockRestore();
     });
   });
+
+  describe('8. Concurrency Locking, Rollback, Idempotency & Debounce Guarantees', () => {
+    it('acquires FOR UPDATE lock before reading syncStatus and returns idempotent PROCESSED result when already processed', async () => {
+      const uuidPunchId = '11111111-1111-4111-8111-111111111101';
+      const uuidCompanyId = '22222222-2222-4222-8222-222222222201';
+      const callOrder: string[] = [];
+
+      const txQueryRaw = vi.fn(async () => {
+        callOrder.push('FOR_UPDATE');
+        return [{ id: uuidPunchId }];
+      });
+      const txFindUnique = vi.fn(async () => {
+        callOrder.push('FIND_UNIQUE');
+        return {
+          id: uuidPunchId,
+          companyId: uuidCompanyId,
+          userEnrollmentId: '101',
+          punchTime: new Date('2026-10-19T09:00:00.000Z'),
+          inOutMode: 'CHECK_IN' as const,
+          syncStatus: 'PROCESSED' as const,
+          matchedEmployeeId: 'emp-uuid-1',
+          matchedEmployee: defaultMockEmployee,
+        };
+      });
+      const txAttCreate = vi.fn();
+      const txAttUpdate = vi.fn();
+      const txRawUpdate = vi.fn();
+
+      const txSpy = vi.spyOn(prisma, '$transaction').mockImplementationOnce((async (cb: any) =>
+        cb({
+          $queryRaw: txQueryRaw,
+          rawPunchLog: { findUnique: txFindUnique, update: txRawUpdate },
+          attendance: { create: txAttCreate, update: txAttUpdate },
+        })) as any);
+
+      try {
+        const result = await PunchReconciliationService.reconcilePunch(uuidPunchId, undefined, {
+          expectedCompanyId: uuidCompanyId,
+        });
+
+        expect(callOrder).toEqual(['FOR_UPDATE', 'FIND_UNIQUE']);
+        expect(txQueryRaw).toHaveBeenCalledTimes(1);
+        expect(result.status).toBe('PROCESSED');
+        expect(result.matchedEmployeeId).toBe('emp-uuid-1');
+        expect(result.message).toBe('Punch was already successfully processed.');
+        expect(txAttCreate).not.toHaveBeenCalled();
+        expect(txAttUpdate).not.toHaveBeenCalled();
+        expect(txRawUpdate).not.toHaveBeenCalled();
+      } finally {
+        txSpy.mockRestore();
+      }
+    });
+
+    it('serializes concurrent duplicate requests on the same PENDING punch without IGNORED overwrite or duplicate Attendance', async () => {
+      const uuidCompanyId = '22222222-2222-4222-8222-222222222202';
+      const uuidPunchId = '11111111-1111-4111-8111-111111111102';
+      const punchTime = new Date('2026-10-19T09:00:00.000Z');
+
+      const committedPunch = {
+        id: uuidPunchId,
+        companyId: uuidCompanyId,
+        terminalId: 'term-uuid-1',
+        userEnrollmentId: 'BIO-1001',
+        punchTime,
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        errorMessage: null as string | null,
+        matchedEmployeeId: null as string | null,
+      };
+      const committedAttendance: Array<Record<string, any>> = [];
+
+      // Barrier ensures both concurrent reconcilePendingPunches calls finish findMany() as PENDING
+      let arrived = 0;
+      let releaseBarrier!: () => void;
+      const bothReady = new Promise<void>((resolve) => {
+        releaseBarrier = resolve;
+      });
+
+      // Async mutex simulates PostgreSQL SELECT ... FOR UPDATE row lock
+      let lockQueue = Promise.resolve();
+      const acquireRowLock = async (): Promise<() => void> => {
+        let unlock!: () => void;
+        const next = new Promise<void>((resolve) => {
+          unlock = resolve;
+        });
+        const prev = lockQueue;
+        lockQueue = prev.then(() => next);
+        await prev;
+        return unlock;
+      };
+
+      const findManySpy = vi
+        .spyOn(prisma.rawPunchLog, 'findMany')
+        .mockImplementation((async () => {
+          if (committedPunch.syncStatus !== 'PENDING') return [];
+          return [{ id: committedPunch.id }] as any;
+        }) as any);
+
+      const txSpy = vi.spyOn(prisma, '$transaction').mockImplementation((async (cb: any) => {
+        arrived += 1;
+        if (arrived >= 2) releaseBarrier();
+        await bothReady;
+
+        const unlock = await acquireRowLock();
+        try {
+          const mockTx = {
+            $queryRaw: vi.fn().mockResolvedValue([{ id: committedPunch.id }]),
+            rawPunchLog: {
+              findUnique: vi.fn(async () => ({
+                ...committedPunch,
+                company: { id: uuidCompanyId, timezone: 'UTC' },
+                terminal: { id: 'term-uuid-1', name: 'Gate', location: 'Main' },
+                matchedEmployee: committedPunch.matchedEmployeeId
+                  ? { ...defaultMockEmployee, companyId: uuidCompanyId }
+                  : null,
+              })),
+              update: vi.fn(async (args: any) => {
+                Object.assign(committedPunch, args.data);
+                return { ...committedPunch };
+              }),
+            },
+            companySetting: {
+              findUnique: vi.fn(async () => null),
+            },
+            employee: {
+              findFirst: vi.fn(async () => ({
+                ...defaultMockEmployee,
+                companyId: uuidCompanyId,
+              })),
+            },
+            company: {
+              findUnique: vi.fn(async () => ({ timezone: 'UTC' })),
+            },
+            payrollPeriod: {
+              findFirst: vi.fn(async () => null),
+            },
+            attendance: {
+              findUnique: vi.fn(
+                async (args: any) =>
+                  committedAttendance.find(
+                    (a) =>
+                      a.companyId === args.where.companyId_employeeId_workDate.companyId &&
+                      a.employeeId === args.where.companyId_employeeId_workDate.employeeId &&
+                      a.workDate.toISOString() ===
+                        args.where.companyId_employeeId_workDate.workDate.toISOString()
+                  ) || null
+              ),
+              create: vi.fn(async (args: any) => {
+                const duplicate = committedAttendance.find(
+                  (a) =>
+                    a.companyId === args.data.companyId &&
+                    a.employeeId === args.data.employeeId &&
+                    a.workDate.toISOString() === args.data.workDate.toISOString()
+                );
+                if (duplicate) {
+                  const p2002 = new Error('Unique constraint failed on Attendance');
+                  (p2002 as any).code = 'P2002';
+                  throw p2002;
+                }
+                const row = { id: `att-${committedAttendance.length + 1}`, ...args.data };
+                committedAttendance.push(row);
+                return row;
+              }),
+            },
+            leaveRequest: {
+              findFirst: vi.fn(async () => null),
+            },
+          };
+
+          return await cb(mockTx);
+        } finally {
+          unlock();
+        }
+      }) as any);
+
+      try {
+        const [resA, resB] = await Promise.all([
+          PunchReconciliationService.reconcilePendingPunches(uuidCompanyId, {
+            punchId: uuidPunchId,
+          }),
+          PunchReconciliationService.reconcilePendingPunches(uuidCompanyId, {
+            punchId: uuidPunchId,
+          }),
+        ]);
+
+        expect(arrived).toBe(2);
+        expect(resA.totalEvaluated).toBe(1);
+        expect(resB.totalEvaluated).toBe(1);
+        expect(resA.errors).toBe(0);
+        expect(resB.errors).toBe(0);
+        expect(resA.ignored).toBe(0);
+        expect(resB.ignored).toBe(0);
+        expect(resA.results[0]?.status).toBe('PROCESSED');
+        expect(resB.results[0]?.status).toBe('PROCESSED');
+        expect([resA.results[0]?.message, resB.results[0]?.message].sort()).toEqual([
+          'Check-in recorded successfully.',
+          'Punch was already successfully processed.',
+        ]);
+        expect(committedPunch.syncStatus).toBe('PROCESSED');
+        expect(committedPunch.matchedEmployeeId).toBe(defaultMockEmployee.id);
+        expect(committedAttendance).toHaveLength(1);
+      } finally {
+        findManySpy.mockRestore();
+        txSpy.mockRestore();
+      }
+    });
+
+    it('rolls back partial Attendance writes on transaction failure and never overwrites a PROCESSED punch in catch fallback', async () => {
+      const uuidCompanyId = '22222222-2222-4222-8222-222222222203';
+      const uuidPunchId = '11111111-1111-4111-8111-111111111103';
+
+      const committedPunch = {
+        id: uuidPunchId,
+        companyId: uuidCompanyId,
+        terminalId: 'term-uuid-1',
+        userEnrollmentId: 'BIO-1001',
+        punchTime: new Date('2026-10-19T09:00:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        errorMessage: null as string | null,
+        matchedEmployeeId: defaultMockEmployee.id,
+      };
+      const committedAttendance: Array<Record<string, any>> = [];
+
+      // Simulate atomic transaction buffer that rolls back on throw
+      const txSpy = vi.spyOn(prisma, '$transaction').mockImplementationOnce((async (cb: any) => {
+        const stagingPunch = { ...committedPunch };
+        const stagingAttendance = [...committedAttendance];
+
+        const mockTx = {
+          $queryRaw: vi.fn().mockResolvedValue([{ id: uuidPunchId }]),
+          rawPunchLog: {
+            findUnique: vi.fn(async () => ({
+              ...stagingPunch,
+              company: { id: uuidCompanyId, timezone: 'UTC' },
+              terminal: { id: 'term-uuid-1', name: 'Gate', location: 'Main' },
+              matchedEmployee: { ...defaultMockEmployee, companyId: uuidCompanyId },
+            })),
+            update: vi.fn(async () => {
+              throw new Error('Simulated DB connection drop before commit');
+            }),
+          },
+          company: { findUnique: vi.fn(async () => ({ timezone: 'UTC' })) },
+          payrollPeriod: { findFirst: vi.fn(async () => null) },
+          attendance: {
+            findUnique: vi.fn(async () => null),
+            create: vi.fn(async (args: any) => {
+              const row = { id: 'att-staged-1', ...args.data };
+              stagingAttendance.push(row);
+              return row;
+            }),
+          },
+          leaveRequest: { findFirst: vi.fn(async () => null) },
+        };
+
+        const out = await cb(mockTx);
+        Object.assign(committedPunch, stagingPunch);
+        committedAttendance.splice(0, committedAttendance.length, ...stagingAttendance);
+        return out;
+      }) as any);
+
+      // Simulate concurrent catch-guard check when punch is already PROCESSED
+      const findManySpy = vi
+        .spyOn(prisma.rawPunchLog, 'findMany')
+        .mockResolvedValueOnce([{ id: uuidPunchId }] as any);
+      const updateManySpy = vi
+        .spyOn(prisma.rawPunchLog, 'updateMany')
+        .mockImplementation((async (args: any) => {
+          const excluded: string[] = args?.where?.syncStatus?.notIn || [];
+          if (!excluded.includes(committedPunch.syncStatus)) {
+            Object.assign(committedPunch, args.data);
+            return { count: 1 } as any;
+          }
+          return { count: 0 } as any;
+        }) as any);
+
+      try {
+        // 1. Direct reconcilePunch throws and leaves committed store rolled back
+        await expect(
+          PunchReconciliationService.reconcilePunch(uuidPunchId)
+        ).rejects.toThrow('Simulated DB connection drop before commit');
+        expect(committedAttendance).toHaveLength(0);
+        expect(committedPunch.syncStatus).toBe('PENDING');
+
+        // 2. reconcilePendingPunches catch block uses guarded updateMany that skips PROCESSED rows
+        committedPunch.syncStatus = 'PROCESSED' as any;
+        txSpy.mockRejectedValueOnce(new Error('Simulated transient transaction error'));
+
+        const batchRes = await PunchReconciliationService.reconcilePendingPunches(uuidCompanyId, {
+          punchId: uuidPunchId,
+        });
+        expect(batchRes.errors).toBe(1);
+        expect(updateManySpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: {
+              id: uuidPunchId,
+              syncStatus: { notIn: ['PROCESSED', 'IGNORED'] },
+            },
+          })
+        );
+        expect(committedPunch.syncStatus).toBe('PROCESSED');
+      } finally {
+        txSpy.mockRestore();
+        findManySpy.mockRestore();
+        updateManySpy.mockRestore();
+      }
+    });
+
+    it('preserves existing 2-minute debounce behavior for rapid repeated CHECK_OUT punches', async () => {
+      const existingAttendance = {
+        id: 'att-uuid-debounce-out',
+        companyId: companyAlphaId,
+        employeeId: 'emp-uuid-1',
+        workDate: new Date('2026-10-19T00:00:00.000Z'),
+        checkIn: new Date('2026-10-19T09:00:00.000Z'),
+        checkOut: new Date('2026-10-19T18:00:00.000Z'),
+      };
+
+      const punchDupOut = {
+        id: 'punch-dup-out',
+        companyId: companyAlphaId,
+        userEnrollmentId: 'BIO-1001',
+        punchTime: new Date('2026-10-19T18:01:30.000Z'), // 90 seconds after checkOut
+        inOutMode: 'CHECK_OUT' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployee: defaultMockEmployee,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(punchDupOut as any);
+      vi.spyOn(prisma.company, 'findUnique').mockResolvedValueOnce({ timezone: 'UTC' } as any);
+      vi.spyOn(prisma.payrollPeriod, 'findFirst').mockResolvedValueOnce(null);
+      vi.spyOn(prisma.attendance, 'findUnique').mockResolvedValueOnce(existingAttendance as any);
+      const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+      const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+
+      try {
+        const result = await PunchReconciliationService.reconcilePunch('punch-dup-out');
+
+        expect(result.status).toBe('IGNORED');
+        expect(result.message).toBe('Duplicate check-out punch debounced within 2 minutes.');
+        expect(attUpdateSpy).not.toHaveBeenCalled();
+        expect(rawUpdateSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: 'punch-dup-out' },
+            data: expect.objectContaining({
+              syncStatus: 'IGNORED',
+              errorMessage: 'Duplicate check-out punch debounced within 2 minutes.',
+            }),
+          })
+        );
+      } finally {
+        attUpdateSpy.mockRestore();
+        rawUpdateSpy.mockRestore();
+      }
+    });
+  });
 });
+
 

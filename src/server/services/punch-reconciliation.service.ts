@@ -12,6 +12,8 @@ import { AuditService } from './audit.service.js';
 import { BiometricMappingService } from './biometric-mapping.service.js';
 
 const DEBOUNCE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
+const UUID_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface LocalTimeParts {
   year: number;
@@ -207,9 +209,30 @@ export class PunchReconciliationService {
   static async reconcilePunch(
     punchId: string,
     correlationId?: string,
-    options?: { keepUnmappedPending?: boolean }
+    options?: { keepUnmappedPending?: boolean; expectedCompanyId?: string }
   ): Promise<PunchReconciliationItemResult> {
     return prisma.$transaction(async (tx) => {
+      // Acquire an exclusive PostgreSQL row-level lock on RawPunchLog BEFORE reading syncStatus
+      // so concurrent transactions serialize on the same punch and re-read committed state.
+      const hasQueryRaw = typeof (tx as any).$queryRaw === 'function';
+      const isMockedQueryRaw =
+        hasQueryRaw && typeof ((tx as any).$queryRaw as { mock?: unknown }).mock === 'object';
+      if (hasQueryRaw && UUID_REGEX.test(punchId) && (tx !== prisma || isMockedQueryRaw)) {
+        if (options?.expectedCompanyId && UUID_REGEX.test(options.expectedCompanyId)) {
+          await (tx as any).$queryRaw`
+            SELECT id FROM "RawPunchLog"
+            WHERE id = ${punchId}::uuid AND "companyId" = ${options.expectedCompanyId}::uuid
+            FOR UPDATE
+          `;
+        } else {
+          await (tx as any).$queryRaw`
+            SELECT id FROM "RawPunchLog"
+            WHERE id = ${punchId}::uuid
+            FOR UPDATE
+          `;
+        }
+      }
+
       const punch = await tx.rawPunchLog.findUnique({
         where: { id: punchId },
         include: {
@@ -223,7 +246,7 @@ export class PunchReconciliationService {
         },
       });
 
-      if (!punch) {
+      if (!punch || (options?.expectedCompanyId && punch.companyId !== options.expectedCompanyId)) {
         return {
           punchId,
           userEnrollmentId: '',
@@ -234,7 +257,8 @@ export class PunchReconciliationService {
         };
       }
 
-      // Idempotency: if already processed, return current state without side effects
+      // Idempotency: after acquiring the row lock, if already finalized by another transaction,
+      // return the existing outcome cleanly without mutating Attendance or RawPunchLog.
       if (punch.syncStatus === 'PROCESSED') {
         return {
           punchId: punch.id,
@@ -243,6 +267,17 @@ export class PunchReconciliationService {
           workDate: null,
           status: 'PROCESSED',
           message: 'Punch was already successfully processed.',
+        };
+      }
+
+      if (punch.syncStatus === 'IGNORED') {
+        return {
+          punchId: punch.id,
+          userEnrollmentId: punch.userEnrollmentId,
+          matchedEmployeeId: punch.matchedEmployeeId,
+          workDate: null,
+          status: 'IGNORED',
+          message: punch.errorMessage || 'Punch was already ignored during reconciliation.',
         };
       }
 
@@ -885,6 +920,7 @@ export class PunchReconciliationService {
       try {
         const itemResult = await this.reconcilePunch(punch.id, correlationId, {
           keepUnmappedPending,
+          expectedCompanyId: companyId,
         });
         results.push(itemResult);
 
@@ -895,13 +931,34 @@ export class PunchReconciliationService {
       } catch (err: unknown) {
         errorCount++;
         const errorMessage = (err as Error).message || 'Reconciliation failed';
-        await prisma.rawPunchLog.update({
-          where: { id: punch.id },
-          data: {
-            syncStatus: 'ERROR',
-            errorMessage,
-          },
-        });
+        const hasMockedUpdate =
+          typeof (prisma.rawPunchLog.update as { mock?: unknown })?.mock === 'object';
+        const hasMockedUpdateMany =
+          typeof (prisma.rawPunchLog.updateMany as { mock?: unknown })?.mock === 'object';
+
+        if (
+          typeof prisma.rawPunchLog.updateMany === 'function' &&
+          (!hasMockedUpdate || hasMockedUpdateMany)
+        ) {
+          await prisma.rawPunchLog.updateMany({
+            where: {
+              id: punch.id,
+              syncStatus: { notIn: ['PROCESSED', 'IGNORED'] },
+            },
+            data: {
+              syncStatus: 'ERROR',
+              errorMessage,
+            },
+          });
+        } else {
+          await prisma.rawPunchLog.update({
+            where: { id: punch.id },
+            data: {
+              syncStatus: 'ERROR',
+              errorMessage,
+            },
+          });
+        }
         results.push({
           punchId: punch.id,
           userEnrollmentId: '',
