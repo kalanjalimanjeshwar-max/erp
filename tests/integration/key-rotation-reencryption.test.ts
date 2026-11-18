@@ -29,7 +29,8 @@ import net from 'net';
 
 describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run', () => {
   const testDbUrl = process.env.TEST_DATABASE_URL;
-  let isDbReachable = false;
+  let blockedReason: string | null = null;
+  let isDbConnected = false;
   let testPrisma: PrismaClient | null = null;
 
   const testCompanyId = '00000000-0000-4000-a000-000000000097';
@@ -68,33 +69,41 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
     }
   };
 
-  const checkPortReachable = (host: string, port: number, timeoutMs = 1000): Promise<boolean> => {
+  const checkPortReachable = (
+    host: string,
+    port: number,
+    timeoutMs = 1000
+  ): Promise<{ reachable: boolean; code?: string }> => {
     return new Promise((resolve) => {
       const socket = new net.Socket();
+      let settled = false;
+      const finish = (result: { reachable: boolean; code?: string }) => {
+        if (!settled) {
+          settled = true;
+          socket.destroy();
+          resolve(result);
+        }
+      };
+
       socket.setTimeout(timeoutMs);
-      socket.once('connect', () => {
-        socket.destroy();
-        resolve(true);
-      });
-      socket.once('timeout', () => {
-        socket.destroy();
-        resolve(false);
-      });
-      socket.once('error', () => {
-        resolve(false);
-      });
+      socket.once('connect', () => finish({ reachable: true }));
+      socket.once('timeout', () => finish({ reachable: false, code: 'TIMEOUT' }));
+      socket.once('error', (err: NodeJS.ErrnoException) =>
+        finish({ reachable: false, code: err.code || 'SOCKET_ERROR' })
+      );
       socket.connect(port, host);
     });
   };
 
   beforeAll(async () => {
     if (!testDbUrl || testDbUrl.trim() === '') {
+      blockedReason =
+        '[BLOCKED / NOT RUN] TEST_DATABASE_URL is not configured for PostgreSQL 16 key-rotation integration test.';
       console.warn(
-        '\n[INTEGRATION TEST BLOCKED / NOT RUN]: TEST_DATABASE_URL is not configured.\n' +
+        `\n${blockedReason}\n` +
         'To run live integration tests against PostgreSQL 16 on Windows/Docker:\n' +
         '  TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm test\n'
       );
-      isDbReachable = false;
       return;
     }
 
@@ -130,50 +139,66 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       throw new Error('[SECURITY FATAL] Dedicated database name must strictly be "core_erp_integration_test".');
     }
 
-    const reachable = await checkPortReachable(host, port);
-    if (!reachable) {
-      console.warn(
-        '\n[INTEGRATION TEST BLOCKED / NOT RUN]: PostgreSQL 16 integration database is unreachable at localhost:5434.\n'
-      );
-      isDbReachable = false;
+    const probe = await checkPortReachable(host, port);
+    if (!probe.reachable) {
+      blockedReason =
+        `[BLOCKED / NOT RUN] PostgreSQL 16 integration database is unreachable at ${host}:${port} ` +
+        `(${probe.code || 'UNREACHABLE'}).`;
+      console.warn(`\n${blockedReason}\n`);
       return;
     }
 
-    try {
-      testPrisma = configureIntegrationPrismaClient(testDbUrl);
-      await testPrisma.$connect();
+    // Endpoint is reachable: do NOT catch or downgrade $connect(), auth, missing DB, PG version, identity, or Prisma errors.
+    testPrisma = configureIntegrationPrismaClient(testDbUrl);
+    await testPrisma.$connect();
 
-      const versionResult = await testPrisma.$queryRawUnsafe<Array<{ version: string }>>('SELECT version();');
-      const versionString = versionResult[0]?.version || '';
-      const isPg16 = /PostgreSQL\s+16\b/i.test(versionString);
-      if (!isPg16) {
-        throw new Error('[SECURITY FATAL] Integration test requires PostgreSQL major version 16.');
-      }
-
-      isDbReachable = true;
-    } catch (err: any) {
-      if (err.message && err.message.includes('[SECURITY FATAL]')) {
-        throw err;
-      }
-      console.warn('[INTEGRATION TEST BLOCKED]: Database connection failed.');
-      isDbReachable = false;
+    const versionResult = await testPrisma.$queryRawUnsafe<Array<{ version: string }>>('SELECT version();');
+    const versionString = versionResult[0]?.version || '';
+    const isPg16 = /PostgreSQL\s+16\b/i.test(versionString);
+    if (!isPg16) {
+      throw new Error('[SECURITY FATAL] Integration test requires PostgreSQL major version 16.');
     }
+
+    const dbRows = await testPrisma.$queryRawUnsafe<Array<{ db_name: string }>>(
+      'SELECT current_database() AS db_name;'
+    );
+    const actualDbName = dbRows[0]?.db_name;
+    if (actualDbName !== 'core_erp_integration_test') {
+      throw new Error(
+        `[SECURITY FATAL] Integration client connected to unexpected database "${actualDbName || 'unknown'}".`
+      );
+    }
+
+    isDbConnected = true;
   });
 
   afterAll(async () => {
-    if (testPrisma) {
-      await cleanupTestData(testPrisma);
-      await testPrisma.$disconnect();
+    try {
+      if (testPrisma && isDbConnected) {
+        await cleanupTestData(testPrisma);
+      }
+    } finally {
+      if (testPrisma) {
+        try {
+          await testPrisma.$disconnect();
+        } catch {}
+      }
+      resetPrismaClientForTesting();
+      EncryptionService.resetKeyRingForTesting();
     }
-    resetPrismaClientForTesting();
-    EncryptionService.resetKeyRingForTesting();
   });
 
-  it('should identify historical-key record in dry run, verify inventory, and leave database unmutated', async () => {
-    if (!isDbReachable || !testPrisma) {
-      console.warn('Skipping execution: PostgreSQL 16 test instance offline or TEST_DATABASE_URL not configured (Status: BLOCKED / NOT RUN).');
-      expect(true).toBe(true);
-      return;
+  it('should identify historical-key record in dry run, verify inventory, and leave database unmutated', async (ctx) => {
+    if (blockedReason) {
+      console.warn(blockedReason);
+      await ctx.annotate(blockedReason, 'blocked');
+      ctx.skip(blockedReason);
+    }
+
+    if (!isDbConnected || !testPrisma) {
+      throw new Error(
+        '[INTEGRATION TEST INVARIANT ERROR] Database connection state inconsistent without blockedReason.'
+      );
     }
 
     // Clean up any stale data from previous aborted runs
@@ -273,11 +298,17 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
     }
   });
 
-  it('should execute live controlled re-encryption on a single test fixture under active key k2, verify round-trip, and clean up safely', async () => {
-    if (!isDbReachable || !testPrisma) {
-      console.warn('Skipping execution: PostgreSQL 16 test instance offline or TEST_DATABASE_URL not configured (Status: BLOCKED / NOT RUN).');
-      expect(true).toBe(true);
-      return;
+  it('should execute live controlled re-encryption on a single test fixture under active key k2, verify round-trip, and clean up safely', async (ctx) => {
+    if (blockedReason) {
+      console.warn(blockedReason);
+      await ctx.annotate(blockedReason, 'blocked');
+      ctx.skip(blockedReason);
+    }
+
+    if (!isDbConnected || !testPrisma) {
+      throw new Error(
+        '[INTEGRATION TEST INVARIANT ERROR] Database connection state inconsistent without blockedReason.'
+      );
     }
 
     // Clean up any stale data from previous runs

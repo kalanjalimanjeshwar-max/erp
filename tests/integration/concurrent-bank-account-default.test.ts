@@ -26,7 +26,8 @@ import net from 'net';
 
 describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switching', () => {
   const testDbUrl = process.env.TEST_DATABASE_URL;
-  let isDbReachable = false;
+  let blockedReason: string | null = null;
+  let isDbConnected = false;
   let testPrisma1: PrismaClient | null = null;
   let testPrisma2: PrismaClient | null = null;
 
@@ -59,21 +60,28 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
   };
 
   // Helper to test if TCP port is reachable before attempting Prisma connection
-  const checkPortReachable = (host: string, port: number, timeoutMs = 1000): Promise<boolean> => {
+  const checkPortReachable = (
+    host: string,
+    port: number,
+    timeoutMs = 1000
+  ): Promise<{ reachable: boolean; code?: string }> => {
     return new Promise((resolve) => {
       const socket = new net.Socket();
+      let settled = false;
+      const finish = (result: { reachable: boolean; code?: string }) => {
+        if (!settled) {
+          settled = true;
+          socket.destroy();
+          resolve(result);
+        }
+      };
+
       socket.setTimeout(timeoutMs);
-      socket.once('connect', () => {
-        socket.destroy();
-        resolve(true);
-      });
-      socket.once('timeout', () => {
-        socket.destroy();
-        resolve(false);
-      });
-      socket.once('error', () => {
-        resolve(false);
-      });
+      socket.once('connect', () => finish({ reachable: true }));
+      socket.once('timeout', () => finish({ reachable: false, code: 'TIMEOUT' }));
+      socket.once('error', (err: NodeJS.ErrnoException) =>
+        finish({ reachable: false, code: err.code || 'SOCKET_ERROR' })
+      );
       socket.connect(port, host);
     });
   };
@@ -81,14 +89,15 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
   beforeAll(async () => {
     // 1. Require an explicitly provided TEST_DATABASE_URL
     if (!testDbUrl || testDbUrl.trim() === '') {
+      blockedReason =
+        '[BLOCKED / NOT RUN] TEST_DATABASE_URL is not configured for PostgreSQL 16 concurrency integration test.';
       console.warn(
-        '\n[INTEGRATION TEST BLOCKED / NOT RUN]: TEST_DATABASE_URL is not configured.' +
+        `\n${blockedReason}` +
         '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
         '\n  1. Start container: docker compose -f docker-compose.integration-test.yml up -d' +
         '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
         '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency\n'
       );
-      isDbReachable = false;
       return;
     }
 
@@ -153,62 +162,82 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       );
     }
 
-    const reachable = await checkPortReachable(host, port);
-    if (!reachable) {
+    const probe = await checkPortReachable(host, port);
+    if (!probe.reachable) {
+      blockedReason =
+        `[BLOCKED / NOT RUN] PostgreSQL 16 integration database is unreachable at ${host}:${port} ` +
+        `(${probe.code || 'UNREACHABLE'}).`;
       console.warn(
-        '\n[INTEGRATION TEST BLOCKED / NOT RUN]: PostgreSQL 16 integration database is unreachable at localhost:5434.' +
+        `\n${blockedReason}` +
         '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
         '\n  1. Start container: docker compose -f docker-compose.integration-test.yml up -d' +
         '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
         '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency\n'
       );
-      isDbReachable = false;
       return;
     }
 
-    try {
-      testPrisma1 = configureIntegrationPrismaClient(testDbUrl);
-      testPrisma2 = new PrismaClient({ datasources: { db: { url: testDbUrl } } });
-      await testPrisma1.$connect();
-      await testPrisma2.$connect();
+    // Endpoint is reachable: do NOT catch or downgrade $connect(), auth, missing DB, PG version, identity, or Prisma errors.
+    testPrisma1 = configureIntegrationPrismaClient(testDbUrl);
+    testPrisma2 = new PrismaClient({ datasources: { db: { url: testDbUrl } } });
+    await testPrisma1.$connect();
+    await testPrisma2.$connect();
 
-      // Verify PostgreSQL major version 16
-      const versionResult = await testPrisma1.$queryRawUnsafe<Array<{ version: string }>>('SELECT version();');
-      const versionString = versionResult[0]?.version || '';
-      const isPg16 = /PostgreSQL\s+16\b/i.test(versionString);
-      if (!isPg16) {
-        throw new Error(
-          '[SECURITY FATAL] Integration test requires PostgreSQL major version 16.'
-        );
-      }
-
-      isDbReachable = true;
-    } catch (err: any) {
-      if (err.message && err.message.includes('[SECURITY FATAL]')) {
-        throw err;
-      }
-      console.warn('[INTEGRATION TEST BLOCKED]: Database connection failed. Details have been withheld to protect credentials.');
-      isDbReachable = false;
+    // Verify PostgreSQL major version 16
+    const versionResult = await testPrisma1.$queryRawUnsafe<Array<{ version: string }>>('SELECT version();');
+    const versionString = versionResult[0]?.version || '';
+    const isPg16 = /PostgreSQL\s+16\b/i.test(versionString);
+    if (!isPg16) {
+      throw new Error(
+        '[SECURITY FATAL] Integration test requires PostgreSQL major version 16.'
+      );
     }
+
+    // Verify connected database identity
+    const dbRows = await testPrisma1.$queryRawUnsafe<Array<{ db_name: string }>>(
+      'SELECT current_database() AS db_name;'
+    );
+    const actualDbName = dbRows[0]?.db_name;
+    if (actualDbName !== 'core_erp_integration_test') {
+      throw new Error(
+        `[SECURITY FATAL] Integration client connected to unexpected database "${actualDbName || 'unknown'}".`
+      );
+    }
+
+    isDbConnected = true;
   });
 
   afterAll(async () => {
-    if (testPrisma1) {
-      await cleanupTestData(testPrisma1);
-      await testPrisma1.$disconnect();
+    try {
+      if (testPrisma1 && isDbConnected) {
+        await cleanupTestData(testPrisma1);
+      }
+    } finally {
+      if (testPrisma1) {
+        try {
+          await testPrisma1.$disconnect();
+        } catch {}
+      }
+      if (testPrisma2) {
+        try {
+          await testPrisma2.$disconnect();
+        } catch {}
+      }
+      resetPrismaClientForTesting();
     }
-    if (testPrisma2) {
-      await testPrisma2.$disconnect();
-    }
-    resetPrismaClientForTesting();
   });
 
-  it('should enforce exactly one active default bank account under real concurrent switching', async () => {
-    if (!isDbReachable || !testPrisma1 || !testPrisma2) {
-      // Mark as blocked without failing Vitest suite
-      console.warn('Skipping execution: PostgreSQL 16 test instance offline or TEST_DATABASE_URL not configured (Status: BLOCKED / NOT RUN).');
-      expect(true).toBe(true);
-      return;
+  it('should enforce exactly one active default bank account under real concurrent switching', async (ctx) => {
+    if (blockedReason) {
+      console.warn(blockedReason);
+      await ctx.annotate(blockedReason, 'blocked');
+      ctx.skip(blockedReason);
+    }
+
+    if (!isDbConnected || !testPrisma1 || !testPrisma2) {
+      throw new Error(
+        '[INTEGRATION TEST INVARIANT ERROR] Database connection state inconsistent without blockedReason.'
+      );
     }
 
     // Initialize encryption service for test session

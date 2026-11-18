@@ -130,7 +130,6 @@ describe('PostgreSQL 16 Concurrency Integration Test: Biometric Raw Punch Ingest
     // Endpoint is reachable: do NOT catch or downgrade $connect(), auth, missing DB, schema, or config errors.
     testPrisma = configureIntegrationPrismaClient(testDbUrl);
     await testPrisma.$connect();
-    isDbConnected = true;
 
     const versionRows = await testPrisma.$queryRaw<Array<{ version: string }>>`SELECT version() AS version`;
     const serverVersion = versionRows[0]?.version || '';
@@ -147,14 +146,23 @@ describe('PostgreSQL 16 Concurrency Integration Test: Biometric Raw Punch Ingest
         `[SECURITY FATAL] Integration client connected to unexpected database "${actualDbName || 'unknown'}".`
       );
     }
+
+    isDbConnected = true;
   });
 
   afterAll(async () => {
-    if (testPrisma && isDbConnected) {
-      await cleanupTestData(testPrisma, true);
-      await testPrisma.$disconnect();
+    try {
+      if (testPrisma && isDbConnected) {
+        await cleanupTestData(testPrisma, true);
+      }
+    } finally {
+      if (testPrisma) {
+        try {
+          await testPrisma.$disconnect();
+        } catch {}
+      }
+      resetPrismaClientForTesting();
     }
-    resetPrismaClientForTesting();
   });
 
   it('should deduplicate concurrent identical raw punch batches atomically on PostgreSQL 16', async (ctx) => {
