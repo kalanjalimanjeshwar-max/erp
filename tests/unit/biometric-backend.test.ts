@@ -7,7 +7,7 @@ import { BiometricService } from '../../src/server/services/biometric.service.js
 import { AuditService } from '../../src/server/services/audit.service.js';
 import { AuthUser } from '../../src/shared/types.js';
 import { AuthService } from '../../src/server/services/auth.service.js';
-import { installUnitPrismaGuard } from '../helpers/unit-prisma-guard.js';
+import { installUnitPrismaGuard, validateIsolatedUnitDbEnv } from '../helpers/unit-prisma-guard.js';
 
 // Mock AuditService
 vi.mock('../../src/server/services/audit.service.js', () => ({
@@ -968,6 +968,68 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
           ],
         })
       ).rejects.toThrowError(/\[UNIT TEST DB ISOLATION ERROR\] Unexpected unmocked Prisma call/);
+
+      expect(() => (prisma as any).payslip.findMany()).toThrowError(
+        /\[UNIT TEST DB ISOLATION ERROR\] Unexpected unmocked Prisma call: prisma\.payslip\.findMany\(\)/
+      );
+      expect(() => (prisma as any).$connect()).toThrowError(
+        /\[UNIT TEST DB ISOLATION ERROR\] Unexpected unmocked Prisma call: prisma\.\$connect\(\)/
+      );
+    });
+
+    it('should validate both DATABASE_URL and TEST_DATABASE_URL with URL parsing in isolated unit mode', () => {
+      const origDbUrl = process.env.DATABASE_URL;
+      const origTestDbUrl = process.env.TEST_DATABASE_URL;
+      const origIntegrationMode = process.env.COREERP_INTEGRATION_TEST_MODE;
+
+      try {
+        delete process.env.COREERP_INTEGRATION_TEST_MODE;
+
+        // Approved 5433/core_erp_test URLs (or unset) pass without connecting to DB
+        delete process.env.DATABASE_URL;
+        delete process.env.TEST_DATABASE_URL;
+        expect(() => validateIsolatedUnitDbEnv()).not.toThrow();
+
+        process.env.DATABASE_URL = 'postgresql://u:p@localhost:5433/core_erp_test?schema=public';
+        process.env.TEST_DATABASE_URL = 'postgresql://u:p@127.0.0.1:5433/core_erp_test';
+        expect(() => validateIsolatedUnitDbEnv()).not.toThrow();
+
+        // Reject explicit 5432 on DATABASE_URL & TEST_DATABASE_URL
+        process.env.DATABASE_URL = 'postgresql://u:p@localhost:5432/core_erp_test';
+        expect(() => validateIsolatedUnitDbEnv()).toThrow(/port 5432/);
+
+        process.env.DATABASE_URL = 'postgresql://u:p@localhost:5433/core_erp_test';
+        process.env.TEST_DATABASE_URL = 'postgresql://u:p@localhost:5432/core_erp_test';
+        expect(() => validateIsolatedUnitDbEnv()).toThrow(/TEST_DATABASE_URL resolves to port 5432/);
+
+        // Reject omitted port (implicit PostgreSQL default port 5432)
+        delete process.env.TEST_DATABASE_URL;
+        process.env.DATABASE_URL = 'postgresql://u:p@localhost/core_erp_test';
+        expect(() => validateIsolatedUnitDbEnv()).toThrow(/port 5432/);
+
+        // Reject 5434 on both DATABASE_URL and TEST_DATABASE_URL
+        process.env.DATABASE_URL = 'postgresql://u:p@localhost:5434/core_erp_test';
+        expect(() => validateIsolatedUnitDbEnv()).toThrow(/port 5434/);
+
+        process.env.DATABASE_URL = 'postgresql://u:p@localhost:5433/core_erp_test';
+        process.env.TEST_DATABASE_URL =
+          'postgresql://u:p@localhost:5434/core_erp_integration_test';
+        expect(() => validateIsolatedUnitDbEnv()).toThrow(/TEST_DATABASE_URL targets port 5434/);
+
+        // Reject COREERP_INTEGRATION_TEST_MODE=true
+        delete process.env.TEST_DATABASE_URL;
+        process.env.COREERP_INTEGRATION_TEST_MODE = 'true';
+        expect(() => validateIsolatedUnitDbEnv()).toThrow(/COREERP_INTEGRATION_TEST_MODE=true/);
+      } finally {
+        if (origDbUrl === undefined) delete process.env.DATABASE_URL;
+        else process.env.DATABASE_URL = origDbUrl;
+
+        if (origTestDbUrl === undefined) delete process.env.TEST_DATABASE_URL;
+        else process.env.TEST_DATABASE_URL = origTestDbUrl;
+
+        if (origIntegrationMode === undefined) delete process.env.COREERP_INTEGRATION_TEST_MODE;
+        else process.env.COREERP_INTEGRATION_TEST_MODE = origIntegrationMode;
+      }
     });
   });
 });

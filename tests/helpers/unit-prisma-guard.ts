@@ -1,5 +1,10 @@
 import { vi } from 'vitest';
+import { Prisma } from '@prisma/client';
 import { getPrismaClient, prisma } from '../../src/server/db/client.js';
+
+const APPROVED_UNIT_TEST_HOSTS = new Set(['localhost', '127.0.0.1']);
+const APPROVED_UNIT_TEST_PORT = '5433';
+const APPROVED_UNIT_TEST_DB_NAME = 'core_erp_test';
 
 const DELEGATE_METHODS = [
   'findUnique',
@@ -29,22 +34,8 @@ const TOP_LEVEL_CLIENT_METHODS = [
   '$executeRaw',
   '$executeRawUnsafe',
   '$transaction',
-] as const;
-
-const KNOWN_MODEL_DELEGATES = [
-  'company',
-  'companySetting',
-  'user',
-  'rolePermission',
-  'auditLog',
-  'employee',
-  'shift',
-  'attendance',
-  'leaveRequest',
-  'payrollPeriod',
-  'payslip',
-  'biometricTerminal',
-  'rawPunchLog',
+  '$use',
+  '$extends',
 ] as const;
 
 export interface UnitPrismaGuardContext {
@@ -52,12 +43,96 @@ export interface UnitPrismaGuardContext {
 }
 
 /**
+ * Parses and validates a single database environment variable for isolated unit-test mode.
+ *
+ * Rules:
+ * - If unset/empty, no URL is required by unit-test mocks.
+ * - If present, parses strictly via `new URL(...)` (no substring checks).
+ * - Rejects non-PostgreSQL protocols and non-local hosts.
+ * - Rejects port 5432 (explicit or implicit PostgreSQL default) and port 5434 (integration DB).
+ * - Preserves only the approved isolated unit-test target: localhost/127.0.0.1 port 5433 / core_erp_test.
+ * - Never includes raw URLs or credentials in error messages.
+ */
+function validateUnitDatabaseUrl(
+  envName: 'DATABASE_URL' | 'TEST_DATABASE_URL',
+  rawUrl: string | undefined
+): void {
+  if (!rawUrl || rawUrl.trim() === '') {
+    return;
+  }
+
+  const cleaned = rawUrl.trim().replace(/^["']|["']$/g, '');
+  let parsed: URL;
+  try {
+    parsed = new URL(cleaned);
+  } catch {
+    throw new Error(
+      `[UNIT TEST DB SAFETY VIOLATION] Invalid URL format for ${envName} in isolated unit test mode.`
+    );
+  }
+
+  if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
+    throw new Error(
+      `[UNIT TEST DB SAFETY VIOLATION] Forbidden protocol "${parsed.protocol}" in ${envName} in isolated unit test mode.`
+    );
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (!APPROVED_UNIT_TEST_HOSTS.has(hostname)) {
+    throw new Error(
+      `[UNIT TEST DB SAFETY VIOLATION] Unapproved host "${hostname}" in ${envName} in isolated unit test mode. Only localhost or 127.0.0.1 is permitted.`
+    );
+  }
+
+  // Omitting port in a PostgreSQL URL defaults to port 5432; evaluate effective port explicitly.
+  const effectivePort = parsed.port || '5432';
+  if (effectivePort === '5432') {
+    throw new Error(
+      `[UNIT TEST DB SAFETY VIOLATION] ${envName} resolves to port 5432 (operational/dev default) in isolated unit test mode.`
+    );
+  }
+  if (effectivePort === '5434') {
+    throw new Error(
+      `[UNIT TEST DB SAFETY VIOLATION] ${envName} targets port 5434 (integration test database) in isolated unit test mode.`
+    );
+  }
+  if (effectivePort !== APPROVED_UNIT_TEST_PORT) {
+    throw new Error(
+      `[UNIT TEST DB SAFETY VIOLATION] ${envName} targets unapproved port ${effectivePort} in isolated unit test mode. Only port ${APPROVED_UNIT_TEST_PORT} is permitted.`
+    );
+  }
+
+  const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
+  if (dbName !== APPROVED_UNIT_TEST_DB_NAME) {
+    throw new Error(
+      `[UNIT TEST DB SAFETY VIOLATION] ${envName} targets unapproved database "${dbName || '(none)'}" in isolated unit test mode. Expected "${APPROVED_UNIT_TEST_DB_NAME}".`
+    );
+  }
+}
+
+/**
+ * Validates that the current process environment is safe for isolated unit tests.
+ * Performs purely in-memory validation with zero database or network calls.
+ */
+export function validateIsolatedUnitDbEnv(): void {
+  if (process.env.COREERP_INTEGRATION_TEST_MODE === 'true') {
+    throw new Error(
+      '[UNIT TEST DB SAFETY VIOLATION] COREERP_INTEGRATION_TEST_MODE=true is forbidden in isolated unit test mode.'
+    );
+  }
+
+  validateUnitDatabaseUrl('DATABASE_URL', process.env.DATABASE_URL);
+  validateUnitDatabaseUrl('TEST_DATABASE_URL', process.env.TEST_DATABASE_URL);
+}
+
+/**
  * Installs a strict unit-test isolation guard on the shared `prisma` proxy.
  *
  * Guarantees:
- * 1. Verifies test DATABASE_URL never targets port 5432.
- * 2. Replaces every Prisma model delegate method and client-level query/transaction method
- *    with a fail-fast spy throwing `[UNIT TEST DB ISOLATION ERROR]` if unmocked.
+ * 1. Parses and validates both DATABASE_URL and TEST_DATABASE_URL (rejects 5432/5434; allows 5433 only).
+ * 2. Replaces every Prisma model delegate method (across all Prisma.ModelName delegates)
+ *    and client-level query/connection/transaction method with a fail-fast spy throwing
+ *    `[UNIT TEST DB ISOLATION ERROR]` if unmocked — without opening any DB connection.
  * 3. Installs a clean per-test in-memory `companySetting` store (`findUnique` / `upsert`)
  *    and baseline `rolePermission` defaults (`findUnique: null`, `findMany: []`).
  *
@@ -66,15 +141,14 @@ export interface UnitPrismaGuardContext {
 export function installUnitPrismaGuard(options?: {
   allowCompanySettingStore?: boolean;
 }): UnitPrismaGuardContext {
-  const dbUrl = process.env.DATABASE_URL || '';
-  if (dbUrl.includes(':5432')) {
-    throw new Error(
-      '[UNIT TEST DB SAFETY VIOLATION] DATABASE_URL targets port 5432 in isolated unit test mode.'
-    );
-  }
+  validateIsolatedUnitDbEnv();
 
   const client = getPrismaClient() as unknown as Record<string, any>;
-  const modelNames = new Set<string>(KNOWN_MODEL_DELEGATES);
+  const modelNames = new Set<string>(
+    Object.values(Prisma.ModelName).map(
+      (name) => name.charAt(0).toLowerCase() + name.slice(1)
+    )
+  );
 
   for (const key of Object.keys(client)) {
     if (!key.startsWith('$') && !key.startsWith('_')) {
@@ -100,7 +174,17 @@ export function installUnitPrismaGuard(options?: {
     const delegate = (prisma as any)[modelName];
     if (!delegate || typeof delegate !== 'object') continue;
 
-    for (const method of DELEGATE_METHODS) {
+    const methodsToTrap = new Set<string>(DELEGATE_METHODS);
+    for (const prop of [
+      ...Object.keys(delegate),
+      ...Object.getOwnPropertyNames(Object.getPrototypeOf(delegate) || {}),
+    ]) {
+      if (prop !== 'constructor' && typeof delegate[prop] === 'function') {
+        methodsToTrap.add(prop);
+      }
+    }
+
+    for (const method of methodsToTrap) {
       if (typeof delegate[method] === 'function') {
         vi.spyOn(delegate, method).mockImplementation(() => {
           throw new Error(

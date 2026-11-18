@@ -122,6 +122,13 @@ export function createPrismaClient(databaseUrl?: string): PrismaClient {
  * Singleton Prisma Client proxy for the application lifecycle
  */
 let cachedClient: PrismaClient | null = null;
+const prismaProxyTarget = {} as PrismaClient;
+
+function clearPrismaProxyTarget(): void {
+  for (const key of Reflect.ownKeys(prismaProxyTarget)) {
+    Reflect.deleteProperty(prismaProxyTarget, key);
+  }
+}
 
 export function resetPrismaClientForTesting(): void {
   if (cachedClient) {
@@ -130,6 +137,7 @@ export function resetPrismaClientForTesting(): void {
     } catch {}
   }
   cachedClient = null;
+  clearPrismaProxyTarget();
   if (typeof global !== 'undefined') {
     delete (global as any).__prismaClient;
   }
@@ -170,6 +178,7 @@ export function configureIntegrationPrismaClient(databaseUrl: string): PrismaCli
     } catch {}
     cachedClient = null;
   }
+  clearPrismaProxyTarget();
   if (typeof global !== 'undefined') {
     delete (global as any).__prismaClient;
   }
@@ -318,7 +327,7 @@ export function verifyDatabaseUrlConsistency(
   };
 }
 
-export const prisma: PrismaClient = new Proxy({} as PrismaClient, {
+export const prisma: PrismaClient = new Proxy(prismaProxyTarget, {
   get(target, prop) {
     if (prop in target) {
       return (target as unknown as Record<string, unknown>)[prop as string];
