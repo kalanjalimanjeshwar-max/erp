@@ -183,6 +183,17 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
     await testPrisma1.$connect();
     await testPrisma2.$connect();
 
+    // Verify secondary integration client database identity immediately after connect
+    const dbRows2 = await testPrisma2.$queryRawUnsafe<Array<{ db_name: string }>>(
+      'SELECT current_database() AS db_name;'
+    );
+    const actualDbName2 = dbRows2[0]?.db_name;
+    if (actualDbName2 !== 'core_erp_integration_test') {
+      throw new Error(
+        `[SECURITY FATAL] Secondary integration client connected to unexpected database "${actualDbName2 || 'unknown'}".`
+      );
+    }
+
     // Verify PostgreSQL major version 16
     const versionResult = await testPrisma1.$queryRawUnsafe<Array<{ version: string }>>('SELECT version();');
     const versionString = versionResult[0]?.version || '';
