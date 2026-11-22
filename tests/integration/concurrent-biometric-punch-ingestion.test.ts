@@ -194,12 +194,18 @@ describe('PostgreSQL 16 Concurrency Integration Test: Biometric Raw Punch Ingest
     expect(urlConsistency.portMatch).toBe(true);
     expect(urlConsistency.databaseMatch).toBe(true);
 
-    const liveDbCheck = await prisma.$queryRaw<Array<{ db_name: string; server_port: number | null }>>`
-      SELECT current_database() AS db_name, inet_server_port() AS server_port
+    const liveDbCheck = await prisma.$queryRaw<
+      Array<{ db_name: string; db_user: string; server_port: number | null }>
+    >`
+      SELECT current_database() AS db_name, current_user AS db_user, inet_server_port() AS server_port
     `;
     expect(liveDbCheck[0]?.db_name).toBe('core_erp_integration_test');
+    expect(liveDbCheck[0]?.db_user).toBe('erp_integration_user');
+    // Docker maps host port 5434 to container-internal port 5432 ("5434:5432"), so PostgreSQL's
+    // inet_server_port() reports 5432 inside the container (or 5434 on a native host listener).
+    // Client-side host port 5434 routing is strictly enforced above via _engineConfig & verifyDatabaseUrlConsistency.
     if (liveDbCheck[0]?.server_port !== null && liveDbCheck[0]?.server_port !== undefined) {
-      expect(liveDbCheck[0].server_port).toBe(5434);
+      expect([5432, 5434]).toContain(liveDbCheck[0].server_port);
     }
 
     await cleanupTestData(testPrisma);
