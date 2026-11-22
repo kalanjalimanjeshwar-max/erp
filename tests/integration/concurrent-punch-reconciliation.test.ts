@@ -352,7 +352,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     expect(resA.results[0]?.status).toBe('PROCESSED');
     expect(resB.results[0]?.status).toBe('PROCESSED');
     expect([resA.results[0]?.message, resB.results[0]?.message].sort()).toEqual([
-      'Check-in recorded successfully.',
+      'Check-in recorded as open punch pending check-out.',
       'Punch was already successfully processed.',
     ]);
 
@@ -381,6 +381,32 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     expect(attendance.lateMinutes).toBe(0);
     expect(attendance.overtimeMinutes).toBe(0);
     expect(attendance.notes).toBe(`Biometric Check-In at ${punchTime.toISOString()}`);
+    expect(attendance.hasIncompletePunch).toBe(true);
+    expect(attendance.punchPairsCount).toBe(0);
+    expect(attendance.actualWorkedMinutes).toBe(0);
+
+    const punchEvents = await client.attendancePunchEvent.findMany({
+      where: { companyId, attendanceId: attendance.id },
+      orderBy: [{ punchTime: 'asc' }, { createdAt: 'asc' }],
+    });
+    expect(punchEvents).toHaveLength(1);
+    expect(punchEvents[0].rawPunchLogId).toBe(punchId);
+    expect(punchEvents[0].inOutMode).toBe('CHECK_IN');
+    expect(punchEvents[0].punchTime.toISOString()).toBe(punchTime.toISOString());
+    expect(punchEvents[0].source).toBe('BIOMETRIC');
+
+    const intervals = await client.attendanceInterval.findMany({
+      where: { companyId, attendanceId: attendance.id },
+      orderBy: { sequence: 'asc' },
+    });
+    expect(intervals).toHaveLength(1);
+    expect(intervals[0].sequence).toBe(1);
+    expect(intervals[0].isComplete).toBe(false);
+    expect(intervals[0].durationMinutes).toBe(0);
+    expect(intervals[0].inEventId).toBe(punchEvents[0].id);
+    expect(intervals[0].outEventId).toBeNull();
+    expect(intervals[0].checkIn?.toISOString()).toBe(punchTime.toISOString());
+    expect(intervals[0].checkOut).toBeNull();
 
     expect(await client.auditLog.count({ where: { companyId } })).toBe(0);
 
@@ -505,11 +531,18 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     expect(resOut.results[0]?.status).toBe('PROCESSED');
 
     // Depending on which transaction acquires pg_advisory_xact_lock first,
-    // either (CHECK_IN creates -> CHECK_OUT updates) or (CHECK_OUT creates -> CHECK_IN assigns).
+    // either (CHECK_IN opens -> CHECK_OUT pairs chronologically) or
+    // (CHECK_OUT opens incomplete -> CHECK_IN pairs chronologically).
     const messagePair = [resIn.results[0]?.message, resOut.results[0]?.message];
     const validOrders = [
-      ['Check-in recorded successfully.', 'Check-out updated successfully.'],
-      ['Check-in assigned to existing record.', 'Check-out recorded without check-in.'],
+      [
+        'Check-in recorded as open punch pending check-out.',
+        'Check-out paired chronologically (1 pair).',
+      ],
+      [
+        'Check-in paired chronologically (1 pair).',
+        'Incomplete check-out recorded as PROCESSED pending matching check-in.',
+      ],
     ];
     expect(
       validOrders.some(
@@ -539,6 +572,34 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     expect(attendanceRows[0].checkOut?.toISOString()).toBe(checkOutTime.toISOString());
     expect(attendanceRows[0].status).toBe('PRESENT');
     expect(attendanceRows[0].source).toBe('BIOMETRIC');
+    expect(attendanceRows[0].hasIncompletePunch).toBe(false);
+    expect(attendanceRows[0].punchPairsCount).toBe(1);
+    expect(attendanceRows[0].actualWorkedMinutes).toBe(525);
+
+    const punchEvents = await client.attendancePunchEvent.findMany({
+      where: { companyId, attendanceId: attendanceRows[0].id },
+      orderBy: [{ punchTime: 'asc' }, { createdAt: 'asc' }],
+    });
+    expect(punchEvents).toHaveLength(2);
+    expect(punchEvents[0].rawPunchLogId).toBe(punchInId);
+    expect(punchEvents[0].inOutMode).toBe('CHECK_IN');
+    expect(punchEvents[0].punchTime.toISOString()).toBe(checkInTime.toISOString());
+    expect(punchEvents[1].rawPunchLogId).toBe(punchOutId);
+    expect(punchEvents[1].inOutMode).toBe('CHECK_OUT');
+    expect(punchEvents[1].punchTime.toISOString()).toBe(checkOutTime.toISOString());
+
+    const intervals = await client.attendanceInterval.findMany({
+      where: { companyId, attendanceId: attendanceRows[0].id },
+      orderBy: { sequence: 'asc' },
+    });
+    expect(intervals).toHaveLength(1);
+    expect(intervals[0].sequence).toBe(1);
+    expect(intervals[0].isComplete).toBe(true);
+    expect(intervals[0].durationMinutes).toBe(525);
+    expect(intervals[0].inEventId).toBe(punchEvents[0].id);
+    expect(intervals[0].outEventId).toBe(punchEvents[1].id);
+    expect(intervals[0].checkIn?.toISOString()).toBe(checkInTime.toISOString());
+    expect(intervals[0].checkOut?.toISOString()).toBe(checkOutTime.toISOString());
   });
 
   it('serializes two DISTINCT rapid duplicate CHECK_IN punches within 2 minutes without P2002 ERROR and debounces the second cleanly', async (ctx) => {
@@ -626,7 +687,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
 
     const messages = [res1.results[0]?.message, res2.results[0]?.message].sort();
     expect(messages).toEqual([
-      'Check-in recorded successfully.',
+      'Check-in recorded as open punch pending check-out.',
       'Duplicate check-in punch debounced within 2 minutes.',
     ]);
 
@@ -643,6 +704,37 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     });
     expect(attendanceRows).toHaveLength(1);
     expect(await client.attendance.count({ where: { companyId } })).toBe(1);
+
+    const winningPunch = p1Row?.syncStatus === 'PROCESSED' ? p1Row : p2Row;
+    expect(winningPunch).not.toBeNull();
+
+    const attendance = attendanceRows[0];
+    expect(attendance.hasIncompletePunch).toBe(true);
+    expect(attendance.punchPairsCount).toBe(0);
+    expect(attendance.actualWorkedMinutes).toBe(0);
+
+    const punchEvents = await client.attendancePunchEvent.findMany({
+      where: { companyId, attendanceId: attendance.id },
+      orderBy: [{ punchTime: 'asc' }, { createdAt: 'asc' }],
+    });
+    expect(punchEvents).toHaveLength(1);
+    expect(punchEvents[0].rawPunchLogId).toBe(winningPunch!.id);
+    expect(punchEvents[0].inOutMode).toBe('CHECK_IN');
+    expect(punchEvents[0].punchTime.toISOString()).toBe(winningPunch!.punchTime.toISOString());
+    expect(punchEvents[0].source).toBe('BIOMETRIC');
+
+    const intervals = await client.attendanceInterval.findMany({
+      where: { companyId, attendanceId: attendance.id },
+      orderBy: { sequence: 'asc' },
+    });
+    expect(intervals).toHaveLength(1);
+    expect(intervals[0].sequence).toBe(1);
+    expect(intervals[0].isComplete).toBe(false);
+    expect(intervals[0].durationMinutes).toBe(0);
+    expect(intervals[0].inEventId).toBe(punchEvents[0].id);
+    expect(intervals[0].outEventId).toBeNull();
+    expect(intervals[0].checkIn?.toISOString()).toBe(winningPunch!.punchTime.toISOString());
+    expect(intervals[0].checkOut).toBeNull();
   });
 
   it('rolls back PostgreSQL writes on mid-transaction abort and never overwrites committed PROCESSED rows in error handler', async (ctx) => {
