@@ -34,13 +34,14 @@ services:
   # ============================================================================
   # One-Shot Database Migration Runner (Prisma Migrate Deploy)
   # Applies pending migrations in order and exits with code 0.
-  # Migrations do NOT run inside application replicas.
-  # Can also be run manually during deployment: docker compose run --rm migration
+  # Migrations do NOT run inside application replicas or on ordinary `docker compose up -d`.
+  # Run explicitly via the migration profile after building the shared app image:
+  #   docker compose --env-file .env.production build app
+  #   docker compose --env-file .env.production --profile migration run --rm migration
   # ============================================================================
   migration:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: coreerp:local
+    profiles: ["migration"]
     container_name: coreerp-migration
     restart: "no"
     command: ["npx", "prisma", "migrate", "deploy"]
@@ -57,9 +58,10 @@ services:
   # ============================================================================
   # CoreERP Application Server (Express API + React Frontend)
   # Multi-stage container running as non-root user 'erpuser'.
-  # Depends on the migration step completing successfully before booting.
+  # Starts against healthy PostgreSQL only; migrations are run explicitly via the migration profile.
   # ============================================================================
   app:
+    image: coreerp:local
     build:
       context: .
       dockerfile: Dockerfile
@@ -85,8 +87,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-      migration:
-        condition: service_completed_successfully
     networks:
       - coreerp-network
 
