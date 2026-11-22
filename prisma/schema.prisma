@@ -131,12 +131,15 @@ model Company {
   salaryRevisions    SalaryRevision[]
 
   // Phase 7: Attendance, Shift, Leave and Payroll Relations
-  shifts             Shift[]
-  attendances        Attendance[]
-  leaveTypes         LeaveType[]
-  leaveRequests      LeaveRequest[]
-  payrollPeriods     PayrollPeriod[]
-  payslips           Payslip[]
+  shifts               Shift[]
+  attendances          Attendance[]
+  leaveTypes           LeaveType[]
+  leaveRequests        LeaveRequest[]
+  payrollPeriods       PayrollPeriod[]
+  payslips             Payslip[]
+  workPolicyRevisions  EmployeeWorkPolicyRevision[]
+  attendancePunchEvents AttendancePunchEvent[]
+  attendanceIntervals  AttendanceInterval[]
 
   // Employee Expense Claims Relations
   expenseClaims           ExpenseClaim[]
@@ -195,10 +198,11 @@ model User {
   salaryRevisionsCreated SalaryRevision[] @relation("SalaryRevisionCreatedByUser")
 
   // Phase 7 Attendance, Leave & Payroll relations
-  leaveRequestsReviewed LeaveRequest[]  @relation("LeaveReviewedByUser")
-  payrollPeriodsCreated PayrollPeriod[] @relation("PayrollCreatedByUser")
-  payrollAccountsApproved PayrollPeriod[] @relation("PayrollAccountsApprovedByUser")
-  payrollAdminApproved    PayrollPeriod[] @relation("PayrollAdminApprovedByUser")
+  leaveRequestsReviewed       LeaveRequest[]               @relation("LeaveReviewedByUser")
+  payrollPeriodsCreated       PayrollPeriod[]              @relation("PayrollCreatedByUser")
+  payrollAccountsApproved     PayrollPeriod[]              @relation("PayrollAccountsApprovedByUser")
+  payrollAdminApproved        PayrollPeriod[]              @relation("PayrollAdminApprovedByUser")
+  workPolicyRevisionsCreated  EmployeeWorkPolicyRevision[] @relation("WorkPolicyRevisionCreatedByUser")
 
   // Phase 8 Biometric relations
   terminalsRegistered   BiometricTerminal[] @relation("TerminalRegisteredByUser")
@@ -902,30 +906,61 @@ model Employee {
 
   salaryRevisions   SalaryRevision[]
 
-  // Phase 7: Shift, Attendance, Leave and Payroll relations
-  shiftId           String?          @db.Uuid
-  shift             Shift?           @relation(fields: [shiftId], references: [id], onDelete: SetNull)
-  attendances       Attendance[]
-  leaveRequests     LeaveRequest[]
-  payslips          Payslip[]
+  // Phase 7: Shift, Attendance, Leave, Work Policy and Payroll relations
+  shiftId               String?                      @db.Uuid
+  shift                 Shift?                       @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  dailyWorkingHours     Decimal?                     @db.Decimal(4, 2)
+  monthlyLeaveAllowance Decimal?                     @db.Decimal(5, 2)
+  workPolicyRevisions   EmployeeWorkPolicyRevision[]
+  attendances           Attendance[]
+  leaveRequests         LeaveRequest[]
+  payslips              Payslip[]
 
   // Phase 8: Biometric raw punch logs
-  rawPunchLogs      RawPunchLog[]    @relation("EmployeeRawPunches")
+  rawPunchLogs          RawPunchLog[]                @relation("EmployeeRawPunches")
 
   // Stage 2.1: Persistent Admin Notifications Relations
-  notifications     Notification[]
+  notifications         Notification[]
 
   // Employee Expense Claims Relations
-  expenseClaims        ExpenseClaim[]   @relation("EmployeeExpenseClaims")
-  managedExpenseClaims ExpenseClaim[]   @relation("ManagerExpenseClaims")
+  expenseClaims         ExpenseClaim[]               @relation("EmployeeExpenseClaims")
+  managedExpenseClaims  ExpenseClaim[]               @relation("ManagerExpenseClaims")
 
   @@unique([companyId, employeeCode])
+  @@unique([id, companyId])
   @@index([companyId])
   @@index([departmentId])
   @@index([designationId])
   @@index([shiftId])
   @@index([status])
   @@index([dateOfJoining])
+}
+
+/// Effective-Dated Employee Working Hours, Shift, and Monthly Leave Allowance History
+model EmployeeWorkPolicyRevision {
+  id                    String    @id @default(uuid()) @db.Uuid
+  companyId             String    @db.Uuid
+  company               Company   @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  employeeId            String    @db.Uuid
+  employee              Employee  @relation(fields: [employeeId, companyId], references: [id, companyId], onDelete: Restrict)
+  shiftId               String?   @db.Uuid
+  shift                 Shift?    @relation(fields: [shiftId, companyId], references: [id, companyId], onDelete: Restrict)
+  dailyWorkingHours     Decimal?  @db.Decimal(4, 2)
+  monthlyLeaveAllowance Decimal?  @db.Decimal(5, 2)
+  effectiveFrom         DateTime  @db.Date
+  effectiveTo           DateTime? @db.Date
+  revisionReason        String?   @db.VarChar(255)
+  notes                 String?   @db.Text
+  createdByUserId       String    @db.Uuid
+  createdByUser         User      @relation("WorkPolicyRevisionCreatedByUser", fields: [createdByUserId, companyId], references: [id, companyId], onDelete: Restrict)
+  createdAt             DateTime  @default(now()) @db.Timestamptz(6)
+  updatedAt             DateTime  @updatedAt @db.Timestamptz(6)
+
+  @@unique([companyId, employeeId, effectiveFrom], map: "EmployeeWorkPolicyRevision_comp_emp_effFrom_key")
+  @@index([companyId, employeeId, effectiveFrom, effectiveTo], map: "EmployeeWorkPolicyRevision_comp_emp_range_idx")
+  @@index([employeeId])
+  @@index([effectiveFrom])
+  @@index([shiftId])
 }
 
 /// Employee Fixed Salary Structure and Revision History
@@ -1011,39 +1046,98 @@ model Shift {
   createdAt       DateTime     @default(now()) @db.Timestamptz(6)
   updatedAt       DateTime     @updatedAt @db.Timestamptz(6)
 
-  employees       Employee[]
-  attendances     Attendance[]
+  employees           Employee[]
+  workPolicyRevisions EmployeeWorkPolicyRevision[]
+  attendances         Attendance[]
 
   @@unique([companyId, code])
+  @@unique([id, companyId])
   @@index([companyId])
   @@index([isActive])
 }
 
 /// Company-scoped Employee Attendance Log
 model Attendance {
-  id              String           @id @default(uuid()) @db.Uuid
-  companyId       String           @db.Uuid
-  company         Company          @relation(fields: [companyId], references: [id], onDelete: Restrict)
-  employeeId      String           @db.Uuid
-  employee        Employee         @relation(fields: [employeeId], references: [id], onDelete: Restrict)
-  shiftId         String?          @db.Uuid
-  shift           Shift?           @relation(fields: [shiftId], references: [id], onDelete: SetNull)
-  workDate        DateTime         @db.Date
-  checkIn         DateTime?        @db.Timestamptz(6)
-  checkOut        DateTime?        @db.Timestamptz(6)
-  status          AttendanceStatus @default(PRESENT)
-  lateMinutes     Int              @default(0)
-  overtimeMinutes Int              @default(0)
-  source          AttendanceSource @default(MANUAL)
-  notes           String?          @db.Text
-  createdAt       DateTime         @default(now()) @db.Timestamptz(6)
-  updatedAt       DateTime         @updatedAt @db.Timestamptz(6)
+  id                  String                 @id @default(uuid()) @db.Uuid
+  companyId           String                 @db.Uuid
+  company             Company                @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  employeeId          String                 @db.Uuid
+  employee            Employee               @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  shiftId             String?                @db.Uuid
+  shift               Shift?                 @relation(fields: [shiftId], references: [id], onDelete: SetNull)
+  workDate            DateTime               @db.Date
+  checkIn             DateTime?              @db.Timestamptz(6)
+  checkOut            DateTime?              @db.Timestamptz(6)
+  status              AttendanceStatus       @default(PRESENT)
+  lateMinutes         Int                    @default(0)
+  overtimeMinutes     Int                    @default(0)
+  actualWorkedMinutes Int?
+  hasIncompletePunch  Boolean                @default(false)
+  punchPairsCount     Int                    @default(0)
+  source              AttendanceSource       @default(MANUAL)
+  notes               String?                @db.Text
+  createdAt           DateTime               @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime               @updatedAt @db.Timestamptz(6)
+
+  punchEvents         AttendancePunchEvent[]
+  intervals           AttendanceInterval[]
 
   @@unique([companyId, employeeId, workDate])
+  @@unique([id, companyId])
   @@index([companyId])
   @@index([employeeId])
   @@index([workDate])
   @@index([status])
+}
+
+/// Individual chronological IN/OUT punch event linked to a daily Attendance record
+model AttendancePunchEvent {
+  id            String               @id @default(uuid()) @db.Uuid
+  companyId     String               @db.Uuid
+  company       Company              @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  attendanceId  String               @db.Uuid
+  attendance    Attendance           @relation(fields: [attendanceId, companyId], references: [id, companyId], onDelete: Cascade)
+  rawPunchLogId String?              @db.Uuid
+  rawPunchLog   RawPunchLog?         @relation("RawPunchAttendanceEvent", fields: [rawPunchLogId, companyId], references: [id, companyId], onDelete: Restrict)
+  punchTime     DateTime             @db.Timestamptz(6)
+  inOutMode     PunchInOutMode
+  source        AttendanceSource     @default(BIOMETRIC)
+  createdAt     DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime             @updatedAt @db.Timestamptz(6)
+
+  inIntervals   AttendanceInterval[] @relation("IntervalInEvent")
+  outIntervals  AttendanceInterval[] @relation("IntervalOutEvent")
+
+  @@unique([rawPunchLogId, companyId])
+  @@unique([id, attendanceId, companyId])
+  @@index([companyId])
+  @@index([attendanceId, punchTime])
+}
+
+/// Chronologically paired (or incomplete) work interval within a daily Attendance record
+model AttendanceInterval {
+  id              String                @id @default(uuid()) @db.Uuid
+  companyId       String                @db.Uuid
+  company         Company               @relation(fields: [companyId], references: [id], onDelete: Restrict)
+  attendanceId    String                @db.Uuid
+  attendance      Attendance            @relation(fields: [attendanceId, companyId], references: [id, companyId], onDelete: Cascade)
+  sequence        Int
+  inEventId       String?               @db.Uuid
+  // Paired SQL FKs use ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED so Attendance cascade deletes pass while direct event deletes stay blocked
+  inEvent         AttendancePunchEvent? @relation("IntervalInEvent", fields: [inEventId, attendanceId, companyId], references: [id, attendanceId, companyId], onDelete: NoAction)
+  outEventId      String?               @db.Uuid
+  outEvent        AttendancePunchEvent? @relation("IntervalOutEvent", fields: [outEventId, attendanceId, companyId], references: [id, attendanceId, companyId], onDelete: NoAction)
+  checkIn         DateTime?             @db.Timestamptz(6)
+  checkOut        DateTime?             @db.Timestamptz(6)
+  durationMinutes Int                   @default(0)
+  isComplete      Boolean               @default(false)
+  createdAt       DateTime              @default(now()) @db.Timestamptz(6)
+  updatedAt       DateTime              @updatedAt @db.Timestamptz(6)
+
+  @@unique([attendanceId, sequence])
+  @@index([companyId])
+  @@index([inEventId])
+  @@index([outEventId])
 }
 
 /// Company-scoped Leave Type Configuration
@@ -1249,12 +1343,14 @@ model RawPunchLog {
   errorMessage       String?             @db.Text
   rawPayload         String?             @db.Text
   idempotencyKey     String              @db.VarChar(128)
-  matchedEmployeeId  String?             @db.Uuid
-  matchedEmployee    Employee?           @relation("EmployeeRawPunches", fields: [matchedEmployeeId], references: [id], onDelete: SetNull)
-  createdAt          DateTime            @default(now()) @db.Timestamptz(6)
-  updatedAt          DateTime            @updatedAt @db.Timestamptz(6)
+  matchedEmployeeId  String?               @db.Uuid
+  matchedEmployee    Employee?             @relation("EmployeeRawPunches", fields: [matchedEmployeeId], references: [id], onDelete: SetNull)
+  attendanceEvent    AttendancePunchEvent? @relation("RawPunchAttendanceEvent")
+  createdAt          DateTime              @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime              @updatedAt @db.Timestamptz(6)
 
   @@unique([companyId, idempotencyKey])
+  @@unique([id, companyId])
   @@index([companyId])
   @@index([terminalId])
   @@index([userEnrollmentId])

@@ -494,7 +494,7 @@ export default function App() {
               onNavigateToLogin={() => setCurrentTab('login')}
             />
           ) : (
-            <LeavePage currentUser={currentUser!} />
+            <LeavePage currentUser={currentUser!} companyProfile={companyProfile} />
           ))}
 
         {currentTab === 'payroll' &&

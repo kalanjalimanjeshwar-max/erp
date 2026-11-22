@@ -175,3 +175,105 @@ export function formatUtcTimestamp(
     fallback: options?.fallback ?? '—',
   });
 }
+
+/**
+ * Formats a UTC timestamp into 24-hour HH:mm in the target timezone for <input type="time">.
+ */
+export function formatTimeInputInTimezone(
+  ts: string | Date | null | undefined,
+  tz?: string | null
+): string {
+  return formatTimeInTimezone(ts, tz, {
+    hour12: false,
+    includeSeconds: false,
+    includeZoneAbbr: false,
+    fallback: '',
+  });
+}
+
+/**
+ * Shifts a YYYY-MM-DD calendar date string by `days` days cleanly in UTC calendar space.
+ */
+export function addCalendarDaysToDateStr(dateStr: string, days: number): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr.trim());
+  if (!match) return dateStr;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const dt = new Date(Date.UTC(year, month - 1, day + days));
+  return dt.toISOString().split('T')[0];
+}
+
+/**
+ * Converts a local calendar date (YYYY-MM-DD) and local wall-clock time (HH:mm or HH:mm:ss)
+ * in the company's configured timezone into a UTC ISO-8601 timestamp string.
+ */
+export function localDateTimeToUtcIso(
+  dateStr: string,
+  timeStr: string,
+  tz?: string | null
+): string | null {
+  const dateMatch = /^(\d{4})-(\d{2})-(\d{2})$/.exec((dateStr || '').trim());
+  const timeMatch = /^(\d{2}):(\d{2})(?::(\d{2}))?$/.exec((timeStr || '').trim());
+  if (!dateMatch || !timeMatch) return null;
+
+  const year = Number(dateMatch[1]);
+  const month = Number(dateMatch[2]);
+  const day = Number(dateMatch[3]);
+  const hour = Number(timeMatch[1]);
+  const minute = Number(timeMatch[2]);
+  const second = timeMatch[3] ? Number(timeMatch[3]) : 0;
+
+  if (
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59 ||
+    second < 0 ||
+    second > 59
+  ) {
+    return null;
+  }
+
+  // Validate calendar date (e.g., reject 2026-02-31)
+  const calendarCheck = new Date(Date.UTC(year, month - 1, day));
+  if (
+    calendarCheck.getUTCFullYear() !== year ||
+    calendarCheck.getUTCMonth() !== month - 1 ||
+    calendarCheck.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  const effectiveTz = getEffectiveTimeZone(tz);
+  const targetAsUtcMs = Date.UTC(year, month - 1, day, hour, minute, second, 0);
+
+  if (effectiveTz === 'UTC' || effectiveTz === 'Etc/UTC') {
+    return new Date(targetAsUtcMs).toISOString();
+  }
+
+  const computeOffsetMs = (instantMs: number): number => {
+    const parts = getDateTimeParts(new Date(instantMs), effectiveTz);
+    const shownAsUtcMs = Date.UTC(
+      Number(parts.year),
+      Number(parts.month) - 1,
+      Number(parts.day),
+      Number(parts.hour),
+      Number(parts.minute),
+      Number(parts.second),
+      0
+    );
+    return shownAsUtcMs - instantMs;
+  };
+
+  // Two-pass offset refinement handles non-UTC boundaries and DST transitions accurately
+  const firstPassMs = targetAsUtcMs - computeOffsetMs(targetAsUtcMs);
+  const secondPassMs = targetAsUtcMs - computeOffsetMs(firstPassMs);
+
+  return new Date(secondPassMs).toISOString();
+}
+

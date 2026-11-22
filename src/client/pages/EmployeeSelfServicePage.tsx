@@ -51,6 +51,472 @@ export interface DemoSalaryAdvance {
   isSimulated: boolean;
 }
 
+function formatEssMinutes(totalMinutes: number | null | undefined): string {
+  if (totalMinutes === null || totalMinutes === undefined || !Number.isFinite(totalMinutes)) {
+    return '--';
+  }
+  const safe = Math.max(0, Math.round(totalMinutes));
+  const hrs = Math.floor(safe / 60);
+  const mins = safe % 60;
+  return `${hrs}h ${String(mins).padStart(2, '0')}m`;
+}
+
+export function computeEssPayslipDeductionSummary(
+  ps: Pick<PayslipItem, 'deductions' | 'lossOfPayDeduction'>
+): {
+  lopDeduction: number;
+  otherDeductions: number;
+  totalDeductions: number;
+} {
+  const totalDeductions = Math.max(0, Number(ps.deductions) || 0);
+  const lopDeduction = Math.max(0, Number(ps.lossOfPayDeduction) || 0);
+  const otherDeductions = Math.max(0, Number((totalDeductions - lopDeduction).toFixed(2)));
+  return {
+    lopDeduction,
+    otherDeductions,
+    totalDeductions,
+  };
+}
+
+export interface EssMonthlyWorkingHoursSummaryCardProps {
+  leaveSummary: MonthlyLeaveSummary;
+  selectedYear: number;
+  selectedMonth: number;
+  baseCurrency?: string;
+  roundingPrecision?: number;
+}
+
+export const EssMonthlyWorkingHoursSummaryCard: React.FC<EssMonthlyWorkingHoursSummaryCardProps> = ({
+  leaveSummary,
+  selectedYear,
+  selectedMonth,
+  baseCurrency,
+  roundingPrecision,
+}) => {
+  const shortTimeHours = leaveSummary.shortTimeHours ?? leaveSummary.deductibleShortHours ?? 0;
+  const extraTimeHours = leaveSummary.extraTimeHours ?? 0;
+  const incompleteCount = leaveSummary.incompleteAttendanceCount ?? 0;
+
+  return (
+    <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
+        <div className="flex items-center gap-2">
+          <Clock className="w-4 h-4 text-emerald-400" />
+          <h2 className="text-xs font-bold uppercase tracking-wider text-slate-200">
+            Working Schedule &amp; Salary Deduction Breakdown ({selectedYear}-{String(selectedMonth).padStart(2, '0')})
+          </h2>
+        </div>
+        <div className="text-xs text-slate-400 font-mono">
+          {leaveSummary.shiftSchedule ? (
+            <span className="text-emerald-400 font-medium">{leaveSummary.shiftSchedule}</span>
+          ) : leaveSummary.configuredDailyWorkingHours !== null ? (
+            <span className="text-indigo-300 font-medium">
+              Daily Target: {leaveSummary.configuredDailyWorkingHours} hrs/day (No Shift Assigned)
+            </span>
+          ) : (
+            <span className="text-amber-400 font-medium">No Official Shift Assigned</span>
+          )}
+        </div>
+      </div>
+
+      {/* Incomplete Attendance Alert & Policy Warnings */}
+      {(incompleteCount > 0 || (leaveSummary.warnings && leaveSummary.warnings.length > 0)) && (
+        <div className="space-y-2">
+          {incompleteCount > 0 && (
+            <div className="p-3 bg-amber-950/50 border border-amber-700/80 rounded-lg flex items-start gap-2.5 text-xs text-amber-200">
+              <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <span>
+                <strong>
+                  {incompleteCount} incomplete attendance record{incompleteCount === 1 ? '' : 's'} detected:
+                </strong>{' '}
+                Missing check-out punch(es) require administrative review.
+              </span>
+            </div>
+          )}
+          {leaveSummary.warnings &&
+            leaveSummary.warnings.map((w, idx) => (
+              <div
+                key={idx}
+                className="p-3 bg-amber-950/40 border border-amber-800/80 rounded-lg flex items-start gap-2.5 text-xs text-amber-200"
+              >
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <span>{w}</span>
+              </div>
+            ))}
+        </div>
+      )}
+
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+        <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
+          <span className="text-[10px] text-slate-500 uppercase font-semibold">Configured Hours</span>
+          <div className="text-sm font-bold text-slate-200 mt-1">
+            {leaveSummary.configuredDailyWorkingHours !== null
+              ? `${leaveSummary.configuredDailyWorkingHours} hrs/day`
+              : 'Unavailable'}
+          </div>
+        </div>
+
+        <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
+          <span className="text-[10px] text-slate-500 uppercase font-semibold">Monthly Allowance</span>
+          <div className="text-sm font-bold text-indigo-300 mt-1">
+            {leaveSummary.monthlyLeaveAllowance ?? 4.0} days
+          </div>
+        </div>
+
+        <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
+          <span className="text-[10px] text-slate-500 uppercase font-semibold">Monthly Leave Used</span>
+          <div className="text-sm font-bold text-slate-200 mt-1">
+            {leaveSummary.monthApprovedDays ?? leaveSummary.approvedDays} days
+          </div>
+        </div>
+
+        <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
+          <span className="text-[10px] text-slate-500 uppercase font-semibold">Remaining Leave</span>
+          <div className="text-sm font-bold text-emerald-400 mt-1">
+            {leaveSummary.monthRemainingLeave ?? 4} days
+          </div>
+        </div>
+
+        <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
+          <span className="text-[10px] text-slate-500 uppercase font-semibold">Daily Salary Rate</span>
+          <div className="text-sm font-bold text-slate-200 mt-1">
+            {leaveSummary.dailySalaryRate
+              ? formatMoney(leaveSummary.dailySalaryRate, baseCurrency, { decimals: roundingPrecision })
+              : '--'}
+            <span className="text-[10px] text-slate-500 font-normal ml-1">/ 30d</span>
+          </div>
+        </div>
+
+        <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
+          <span className="text-[10px] text-slate-500 uppercase font-semibold">Hourly Salary Rate</span>
+          <div className="text-sm font-bold text-slate-200 mt-1">
+            {leaveSummary.hourlySalaryRate
+              ? formatMoney(leaveSummary.hourlySalaryRate, baseCurrency, { decimals: roundingPrecision })
+              : '--'}
+            <span className="text-[10px] text-slate-500 font-normal ml-1">/ hr</span>
+          </div>
+        </div>
+      </div>
+
+      {/* Actual Worked vs Required, Short Time & Extra Time (Separated) */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+        <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
+          <span className="text-[10px] text-slate-500 uppercase font-semibold">Actual Worked vs Required</span>
+          <div className="text-sm font-bold font-mono tabular-nums text-slate-200 mt-1">
+            {formatEssMinutes(leaveSummary.totalActualWorkedMinutes)} /{' '}
+            {formatEssMinutes(leaveSummary.totalRequiredMinutes)}
+          </div>
+          <div className="text-[10px] text-slate-500 mt-0.5">
+            {leaveSummary.totalActualWorkedMinutes ?? 0} min worked · {leaveSummary.totalRequiredMinutes ?? 0} min required
+          </div>
+        </div>
+
+        <div className="bg-slate-950 p-3 rounded-lg border border-rose-900/40">
+          <span className="text-[10px] text-slate-500 uppercase font-semibold">Short Time</span>
+          <div
+            className={`text-sm font-bold font-mono tabular-nums mt-1 ${
+              shortTimeHours > 0 ? 'text-rose-400' : 'text-slate-300'
+            }`}
+          >
+            {shortTimeHours} hrs
+          </div>
+          <div className="text-[10px] text-slate-500 mt-0.5">
+            {leaveSummary.shortTimeMinutes !== undefined ? `${leaveSummary.shortTimeMinutes} min` : 'Deductible shortfall'}
+          </div>
+        </div>
+
+        <div className="bg-slate-950 p-3 rounded-lg border border-sky-900/50">
+          <span className="text-[10px] text-sky-400 uppercase font-semibold">Extra Time (Informational Only)</span>
+          <div className="text-sm font-bold font-mono tabular-nums text-sky-300 mt-1">
+            {extraTimeHours} hrs
+          </div>
+          <div className="text-[10px] text-sky-300/80 mt-0.5">
+            {leaveSummary.extraTimeMinutes !== undefined ? `${leaveSummary.extraTimeMinutes} min · ` : ''}
+            Informational only — never offsets Short Time.
+          </div>
+        </div>
+
+        <div
+          className={`bg-slate-950 p-3 rounded-lg border ${
+            incompleteCount > 0 ? 'border-amber-700/70' : 'border-slate-800/80'
+          }`}
+        >
+          <span className="text-[10px] text-slate-500 uppercase font-semibold">Incomplete Attendance</span>
+          <div
+            className={`text-sm font-bold font-mono tabular-nums mt-1 ${
+              incompleteCount > 0 ? 'text-amber-400' : 'text-emerald-400'
+            }`}
+          >
+            {incompleteCount} record{incompleteCount === 1 ? '' : 's'}
+          </div>
+          <div className="text-[10px] text-slate-500 mt-0.5">
+            {incompleteCount > 0 ? 'Pending punch completion' : 'No incomplete punches'}
+          </div>
+        </div>
+      </div>
+
+      {/* Deductions Breakdown Box */}
+      <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 space-y-3">
+        <div className="text-xs font-semibold text-slate-300 flex items-center justify-between">
+          <span>Payroll Deductions Computation</span>
+          <span className="text-[11px] text-slate-500">Extra Time is informational only and never offsets Short Time</span>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="p-3 bg-slate-900/60 rounded border border-slate-800/60 flex justify-between items-center">
+            <div>
+              <div className="text-[11px] text-slate-400">Excess Leave Deduction</div>
+              <div className="text-[10px] text-slate-500">
+                {leaveSummary.monthlyExcessLeaveDays ?? 0} excess day(s) × Daily Rate
+              </div>
+            </div>
+            <div className="text-sm font-bold text-rose-400">
+              {formatMoney(leaveSummary.excessLeaveDeduction || 0, baseCurrency, { decimals: roundingPrecision })}
+            </div>
+          </div>
+
+          <div className="p-3 bg-slate-900/60 rounded border border-slate-800/60 flex justify-between items-center">
+            <div>
+              <div className="text-[11px] text-slate-400">Short-Hours Deduction</div>
+              <div className="text-[10px] text-slate-500">
+                {shortTimeHours} hrs × Hourly Rate
+              </div>
+            </div>
+            <div className="text-sm font-bold text-rose-400">
+              {formatMoney(leaveSummary.shortHoursDeduction || 0, baseCurrency, { decimals: roundingPrecision })}
+            </div>
+          </div>
+
+          <div className="p-3 bg-slate-900/80 rounded border border-rose-900/40 flex justify-between items-center">
+            <div>
+              <div className="text-[11px] text-slate-300 font-medium">Total Deductions</div>
+              <div className="text-[10px] text-slate-500">Excess Leave + Short Hours</div>
+            </div>
+            <div className="text-base font-extrabold text-rose-400">
+              {formatMoney(leaveSummary.totalSalaryDeductions || 0, baseCurrency, { decimals: roundingPrecision })}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export interface EssPayslipVoucherContentProps {
+  payslip: PayslipItem;
+  baseCurrency?: string;
+  roundingPrecision?: number;
+}
+
+export const EssPayslipVoucherContent: React.FC<EssPayslipVoucherContentProps> = ({
+  payslip,
+  baseCurrency,
+  roundingPrecision,
+}) => {
+  const { lopDeduction, otherDeductions, totalDeductions } = computeEssPayslipDeductionSummary(payslip);
+  const breakdown = payslip.reconciliationBreakdown;
+  const currency = breakdown?.currency || baseCurrency;
+  const overtimeVal = Number(payslip.overtimePay) || 0;
+
+  return (
+    <div className="space-y-5">
+      {/* Employee Information Header */}
+      <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+        <div>
+          <span className="text-slate-500 block text-[10px]">EMPLOYEE NAME</span>
+          <span className="font-semibold text-slate-200">{payslip.employeeName}</span>
+        </div>
+        <div>
+          <span className="text-slate-500 block text-[10px]">EMPLOYEE CODE</span>
+          <span className="font-mono text-slate-200">{payslip.employeeCode}</span>
+        </div>
+        <div>
+          <span className="text-slate-500 block text-[10px]">PAYMENT DATE</span>
+          <span className="text-slate-200">{payslip.paymentDate || 'Processed'}</span>
+        </div>
+        <div>
+          <span className="text-slate-500 block text-[10px]">STATUS</span>
+          <span className="text-emerald-400 font-semibold">{payslip.status}</span>
+        </div>
+      </div>
+
+      {/* Breakdown Columns */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+        {/* Earnings */}
+        <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-2.5">
+          <h4 className="font-bold text-slate-300 uppercase tracking-wider text-[11px] pb-2 border-b border-slate-800/80">
+            Gross Earnings
+          </h4>
+          <div className="flex justify-between text-slate-400">
+            <span>Basic Fixed Salary:</span>
+            <span className="font-mono text-slate-200">
+              {formatMoney(payslip.basicSalary, currency, { decimals: roundingPrecision })}
+            </span>
+          </div>
+          <div className="flex justify-between text-slate-400">
+            <span>Allowances:</span>
+            <span className="font-mono text-emerald-400">
+              +{formatMoney(payslip.allowances, currency, { decimals: roundingPrecision })}
+            </span>
+          </div>
+          <div className="flex justify-between text-slate-400">
+            <div>
+              <span>Overtime Pay:</span>
+              {overtimeVal === 0 && (
+                <span className="block text-[10px] text-slate-500">0.00 (Extra Time is not paid as OT)</span>
+              )}
+            </div>
+            <span className="font-mono text-emerald-400">
+              +{formatMoney(payslip.overtimePay, currency, { decimals: roundingPrecision })}
+            </span>
+          </div>
+          <div className="pt-2 border-t border-slate-800 flex justify-between font-bold text-slate-200">
+            <span>Total Gross Earnings:</span>
+            <span className="font-mono">
+              {formatMoney(payslip.grossSalary, currency, { decimals: roundingPrecision })}
+            </span>
+          </div>
+        </div>
+
+        {/* Deductions — Matches PayrollPage semantics (no LOP double-counting) */}
+        <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-2.5">
+          <h4 className="font-bold text-slate-300 uppercase tracking-wider text-[11px] pb-2 border-b border-slate-800/80">
+            Statutory &amp; LOP Deductions
+          </h4>
+          <div className="flex justify-between text-slate-400">
+            <span>Loss of Pay (LOP):</span>
+            <span className="font-mono text-amber-400">
+              {lopDeduction > 0
+                ? formatMoney(-Math.abs(lopDeduction), currency, { decimals: roundingPrecision })
+                : formatMoney(0, currency, { decimals: roundingPrecision })}
+            </span>
+          </div>
+          {breakdown && (
+            <div className="pl-3 border-l border-slate-800 space-y-1 text-[11px]">
+              <div className="flex justify-between text-slate-500">
+                <span>↳ Excess Leave Deduction (incl. in LOP):</span>
+                <span className="font-mono text-amber-300/90">
+                  {formatMoney(breakdown.excessLeaveDeduction || 0, currency, { decimals: roundingPrecision })}
+                </span>
+              </div>
+              <div className="flex justify-between text-slate-500">
+                <span>↳ Short-Hours Deduction (incl. in LOP):</span>
+                <span className="font-mono text-amber-300/90">
+                  {formatMoney(breakdown.shortHoursDeduction || 0, currency, { decimals: roundingPrecision })}
+                </span>
+              </div>
+            </div>
+          )}
+          <div className="flex justify-between text-slate-400">
+            <span>Other Deductions:</span>
+            <span className="font-mono text-rose-400">
+              {otherDeductions > 0
+                ? formatMoney(-Math.abs(otherDeductions), currency, { decimals: roundingPrecision })
+                : formatMoney(0, currency, { decimals: roundingPrecision })}
+            </span>
+          </div>
+          <div className="pt-2 border-t border-slate-800 flex justify-between font-bold text-slate-200">
+            <span>Total Deductions:</span>
+            <span className="font-mono text-rose-300">
+              {totalDeductions > 0
+                ? formatMoney(-Math.abs(totalDeductions), currency, { decimals: roundingPrecision })
+                : formatMoney(0, currency, { decimals: roundingPrecision })}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Structured Reconciliation Breakdown (when derived from persisted notes) */}
+      {breakdown && (
+        <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3 text-xs">
+          <div className="flex items-center justify-between">
+            <h4 className="font-bold text-slate-300 uppercase tracking-wider text-[11px]">
+              Policy &amp; Attendance Reconciliation
+            </h4>
+            <span className="text-[10px] text-slate-500">Read-only breakdown</span>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+            <div className="p-2.5 bg-slate-900/70 border border-slate-800 rounded-lg">
+              <span className="text-[10px] text-slate-500 uppercase block">Monthly Leave Allowance</span>
+              <span className="font-mono font-semibold text-indigo-300 text-sm">
+                {breakdown.monthlyLeaveAllowance !== null ? `${breakdown.monthlyLeaveAllowance} days` : '--'}
+              </span>
+            </div>
+            <div className="p-2.5 bg-slate-900/70 border border-slate-800 rounded-lg">
+              <span className="text-[10px] text-slate-500 uppercase block">Short Time Hours</span>
+              <span
+                className={`font-mono font-semibold text-sm ${
+                  (breakdown.shortTimeHours ?? 0) > 0 ? 'text-rose-400' : 'text-slate-200'
+                }`}
+              >
+                {breakdown.shortTimeHours !== null ? `${breakdown.shortTimeHours} hrs` : '--'}
+              </span>
+            </div>
+            <div className="p-2.5 bg-slate-900/70 border border-sky-900/50 rounded-lg">
+              <span className="text-[10px] text-sky-400 uppercase block">Extra Time (Informational Only)</span>
+              <span className="font-mono font-semibold text-sky-300 text-sm">
+                {breakdown.extraTimeHours !== null ? `${breakdown.extraTimeHours} hrs` : '--'}
+              </span>
+              <span className="text-[10px] text-sky-300/75 block mt-0.5">
+                Informational only — never offsets Short Time
+              </span>
+            </div>
+          </div>
+
+          {breakdown.warnings.length > 0 && (
+            <div className="space-y-1.5 pt-1">
+              {breakdown.warnings.map((warning, idx) => (
+                <div
+                  key={idx}
+                  className="p-2.5 bg-amber-950/40 border border-amber-800/70 rounded-lg flex items-start gap-2 text-[11px] text-amber-200"
+                >
+                  <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                  <span>{warning}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Preserved Original Notes */}
+      {payslip.notes && (
+        <div className="bg-slate-950/80 border border-slate-800 rounded-xl p-3.5 text-[11px] space-y-1">
+          <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-500">
+            Official Reconciliation Notes
+          </div>
+          <p className="text-slate-300 font-mono leading-relaxed break-words">{payslip.notes}</p>
+        </div>
+      )}
+
+      {/* Net Salary Summary */}
+      <div className="bg-emerald-950/40 border border-emerald-500/30 rounded-xl p-4 flex items-center justify-between">
+        <div>
+          <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400">
+            Net Disbursed Compensation
+          </span>
+          <p className="text-xs text-emerald-200/70">Credited to employee bank account / ledger</p>
+        </div>
+        <div className="text-3xl font-extrabold text-white font-mono">
+          {formatMoney(payslip.netSalary, currency, { decimals: roundingPrecision })}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export function validateSalaryAdvanceAmount(
+  rawAmount: string
+): { valid: boolean; amount?: number; error?: string } {
+  const numAmount = parseFloat(rawAmount);
+  if (isNaN(numAmount) || numAmount <= 0) {
+    return {
+      valid: false,
+      error: 'Please provide a valid non-zero advance amount.',
+    };
+  }
+  return { valid: true, amount: numAmount };
+}
+
 export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = ({
   currentUser,
   companyProfile,
@@ -97,6 +563,7 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
   const [advanceAmount, setAdvanceAmount] = useState<string>('500.00');
   const [advanceReason, setAdvanceReason] = useState<string>('Emergency home repairs');
   const [advanceMonths, setAdvanceMonths] = useState<number>(2);
+  const [advanceError, setAdvanceError] = useState<string | null>(null);
 
   // Load Leave Data
   const loadLeaveData = useCallback(async () => {
@@ -450,12 +917,14 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
   // Handle Salary Advance Simulation Submission
   const handleApplyAdvance = (e: React.FormEvent) => {
     e.preventDefault();
-    const numAmount = parseFloat(advanceAmount);
-    if (isNaN(numAmount) || numAmount <= 0) {
-      alert('Please provide a valid non-zero advance amount.');
+    const validation = validateSalaryAdvanceAmount(advanceAmount);
+    if (!validation.valid || validation.amount === undefined) {
+      setAdvanceError(validation.error || 'Please provide a valid non-zero advance amount.');
       return;
     }
 
+    setAdvanceError(null);
+    const numAmount = validation.amount;
     const monthly = parseFloat((numAmount / advanceMonths).toFixed(2));
     const newAdv: DemoSalaryAdvance = {
       id: `ADV-${new Date().getFullYear()}-${String(salaryAdvances.length + 1).padStart(3, '0')}`,
@@ -787,133 +1256,13 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
 
           {/* Monthly Working Schedule & Salary Deduction Breakdown */}
           {leaveSummary && (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm space-y-4">
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
-                <div className="flex items-center gap-2">
-                  <Clock className="w-4 h-4 text-emerald-400" />
-                  <h2 className="text-xs font-bold uppercase tracking-wider text-slate-200">
-                    Working Schedule & Salary Deduction Breakdown ({selectedYear}-{String(selectedMonth).padStart(2, '0')})
-                  </h2>
-                </div>
-                <div className="text-xs text-slate-400 font-mono">
-                  {leaveSummary.shiftSchedule ? (
-                    <span className="text-emerald-400 font-medium">{leaveSummary.shiftSchedule}</span>
-                  ) : (
-                    <span className="text-amber-400 font-medium">No Official Shift Assigned</span>
-                  )}
-                </div>
-              </div>
-
-              {/* Warnings Banner if any */}
-              {leaveSummary.warnings && leaveSummary.warnings.length > 0 && (
-                <div className="space-y-2">
-                  {leaveSummary.warnings.map((w, idx) => (
-                    <div
-                      key={idx}
-                      className="p-3 bg-amber-950/40 border border-amber-800/80 rounded-lg flex items-start gap-2.5 text-xs text-amber-200"
-                    >
-                      <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
-                      <span>{w}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
-                <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
-                  <span className="text-[10px] text-slate-500 uppercase font-semibold">Configured Hours</span>
-                  <div className="text-sm font-bold text-slate-200 mt-1">
-                    {leaveSummary.configuredDailyWorkingHours !== null
-                      ? `${leaveSummary.configuredDailyWorkingHours} hrs/day`
-                      : 'Unavailable'}
-                  </div>
-                </div>
-
-                <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
-                  <span className="text-[10px] text-slate-500 uppercase font-semibold">Monthly Allowance</span>
-                  <div className="text-sm font-bold text-indigo-300 mt-1">
-                    {leaveSummary.monthlyLeaveAllowance ?? 4.0} days
-                  </div>
-                </div>
-
-                <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
-                  <span className="text-[10px] text-slate-500 uppercase font-semibold">Monthly Leave Used</span>
-                  <div className="text-sm font-bold text-slate-200 mt-1">
-                    {leaveSummary.monthApprovedDays ?? leaveSummary.approvedDays} days
-                  </div>
-                </div>
-
-                <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
-                  <span className="text-[10px] text-slate-500 uppercase font-semibold">Remaining Leave</span>
-                  <div className="text-sm font-bold text-emerald-400 mt-1">
-                    {leaveSummary.monthRemainingLeave ?? 4} days
-                  </div>
-                </div>
-
-                <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
-                  <span className="text-[10px] text-slate-500 uppercase font-semibold">Daily Salary Rate</span>
-                  <div className="text-sm font-bold text-slate-200 mt-1">
-                    {leaveSummary.dailySalaryRate
-                      ? formatMoney(leaveSummary.dailySalaryRate, baseCurrency, { decimals: roundingPrecision })
-                      : '--'}
-                    <span className="text-[10px] text-slate-500 font-normal ml-1">/ 30d</span>
-                  </div>
-                </div>
-
-                <div className="bg-slate-950 p-3 rounded-lg border border-slate-800/80">
-                  <span className="text-[10px] text-slate-500 uppercase font-semibold">Hourly Salary Rate</span>
-                  <div className="text-sm font-bold text-slate-200 mt-1">
-                    {leaveSummary.hourlySalaryRate
-                      ? formatMoney(leaveSummary.hourlySalaryRate, baseCurrency, { decimals: roundingPrecision })
-                      : '--'}
-                    <span className="text-[10px] text-slate-500 font-normal ml-1">/ hr</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Deductions Breakdown Box */}
-              <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 space-y-3">
-                <div className="text-xs font-semibold text-slate-300 flex items-center justify-between">
-                  <span>Payroll Deductions Computation</span>
-                  <span className="text-[11px] text-slate-500">Non-duplication policy enforced</span>
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                  <div className="p-3 bg-slate-900/60 rounded border border-slate-800/60 flex justify-between items-center">
-                    <div>
-                      <div className="text-[11px] text-slate-400">Excess Leave Deduction</div>
-                      <div className="text-[10px] text-slate-500">
-                        {leaveSummary.monthlyExcessLeaveDays ?? 0} excess day(s) × Daily Rate
-                      </div>
-                    </div>
-                    <div className="text-sm font-bold text-rose-400">
-                      {formatMoney(leaveSummary.excessLeaveDeduction || 0, baseCurrency, { decimals: roundingPrecision })}
-                    </div>
-                  </div>
-
-                  <div className="p-3 bg-slate-900/60 rounded border border-slate-800/60 flex justify-between items-center">
-                    <div>
-                      <div className="text-[11px] text-slate-400">Short-Hours Deduction</div>
-                      <div className="text-[10px] text-slate-500">
-                        {leaveSummary.deductibleShortHours ?? 0} hrs × Hourly Rate
-                      </div>
-                    </div>
-                    <div className="text-sm font-bold text-rose-400">
-                      {formatMoney(leaveSummary.shortHoursDeduction || 0, baseCurrency, { decimals: roundingPrecision })}
-                    </div>
-                  </div>
-
-                  <div className="p-3 bg-slate-900/80 rounded border border-rose-900/40 flex justify-between items-center">
-                    <div>
-                      <div className="text-[11px] text-slate-300 font-medium">Total Deductions</div>
-                      <div className="text-[10px] text-slate-500">Excess Leave + Short Hours</div>
-                    </div>
-                    <div className="text-base font-extrabold text-rose-400">
-                      {formatMoney(leaveSummary.totalSalaryDeductions || 0, baseCurrency, { decimals: roundingPrecision })}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            </div>
+            <EssMonthlyWorkingHoursSummaryCard
+              leaveSummary={leaveSummary}
+              selectedYear={selectedYear}
+              selectedMonth={selectedMonth}
+              baseCurrency={baseCurrency}
+              roundingPrecision={roundingPrecision}
+            />
           )}
 
           {/* Leave Requests Table */}
@@ -1097,8 +1446,8 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                       <th className="py-3 px-4">Period</th>
                       <th className="py-3 px-4">Gross Salary</th>
                       <th className="py-3 px-4">Allowances</th>
-                      <th className="py-3 px-4">Deductions</th>
-                      <th className="py-3 px-4">LOP Deduction</th>
+                      <th className="py-3 px-4">Total Deductions</th>
+                      <th className="py-3 px-4">LOP (Included)</th>
                       <th className="py-3 px-4">Net Payout</th>
                       <th className="py-3 px-4">Status</th>
                       <th className="py-3 px-4">Voucher</th>
@@ -1187,7 +1536,10 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
               </p>
             </div>
             <button
-              onClick={() => setIsAdvanceModalOpen(true)}
+              onClick={() => {
+                setAdvanceError(null);
+                setIsAdvanceModalOpen(true);
+              }}
               className="flex items-center gap-2 bg-amber-600 hover:bg-amber-500 text-white text-xs font-semibold px-4 py-2 rounded-lg shadow-sm transition-all shadow-amber-600/30"
             >
               <Plus className="w-4 h-4" />
@@ -1391,7 +1743,7 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
       {/* ========================================================================= */}
       {selectedPayslip && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-sm animate-in fade-in">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full p-6 space-y-6 shadow-2xl">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto p-6 space-y-6 shadow-2xl">
             <div className="flex items-center justify-between pb-4 border-b border-slate-800">
               <div className="flex items-center gap-2">
                 <DollarSign className="w-5 h-5 text-indigo-400" />
@@ -1410,101 +1762,11 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
               </button>
             </div>
 
-            {/* Employee Information Header */}
-            <div className="bg-slate-950 border border-slate-800 p-4 rounded-xl grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
-              <div>
-                <span className="text-slate-500 block text-[10px]">EMPLOYEE NAME</span>
-                <span className="font-semibold text-slate-200">{selectedPayslip.employeeName}</span>
-              </div>
-              <div>
-                <span className="text-slate-500 block text-[10px]">EMPLOYEE CODE</span>
-                <span className="font-mono text-slate-200">{selectedPayslip.employeeCode}</span>
-              </div>
-              <div>
-                <span className="text-slate-500 block text-[10px]">PAYMENT DATE</span>
-                <span className="text-slate-200">{selectedPayslip.paymentDate || 'Processed'}</span>
-              </div>
-              <div>
-                <span className="text-slate-500 block text-[10px]">STATUS</span>
-                <span className="text-emerald-400 font-semibold">{selectedPayslip.status}</span>
-              </div>
-            </div>
-
-            {/* Breakdown Columns */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
-              {/* Earnings */}
-              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-2.5">
-                <h4 className="font-bold text-slate-300 uppercase tracking-wider text-[11px] pb-2 border-b border-slate-800/80">
-                  Gross Earnings
-                </h4>
-                <div className="flex justify-between text-slate-400">
-                  <span>Basic Fixed Salary:</span>
-                  <span className="font-mono text-slate-200">
-                    {formatMoney(selectedPayslip.basicSalary, baseCurrency, { decimals: roundingPrecision })}
-                  </span>
-                </div>
-                <div className="flex justify-between text-slate-400">
-                  <span>Allowances:</span>
-                  <span className="font-mono text-emerald-400">
-                    +{formatMoney(selectedPayslip.allowances, baseCurrency, { decimals: roundingPrecision })}
-                  </span>
-                </div>
-                <div className="flex justify-between text-slate-400">
-                  <span>Overtime Pay:</span>
-                  <span className="font-mono text-emerald-400">
-                    +{formatMoney(selectedPayslip.overtimePay, baseCurrency, { decimals: roundingPrecision })}
-                  </span>
-                </div>
-                <div className="pt-2 border-t border-slate-800 flex justify-between font-bold text-slate-200">
-                  <span>Total Gross Earnings:</span>
-                  <span className="font-mono">
-                    {formatMoney(selectedPayslip.grossSalary, baseCurrency, { decimals: roundingPrecision })}
-                  </span>
-                </div>
-              </div>
-
-              {/* Deductions */}
-              <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-2.5">
-                <h4 className="font-bold text-slate-300 uppercase tracking-wider text-[11px] pb-2 border-b border-slate-800/80">
-                  Statutory & LOP Deductions
-                </h4>
-                <div className="flex justify-between text-slate-400">
-                  <span>Loss of Pay (LOP):</span>
-                  <span className="font-mono text-rose-400">
-                    {formatMoney(-Math.abs(Number(selectedPayslip.lossOfPayDeduction)), baseCurrency, { decimals: roundingPrecision })}
-                  </span>
-                </div>
-                <div className="flex justify-between text-slate-400">
-                  <span>Other Deductions:</span>
-                  <span className="font-mono text-rose-400">
-                    {formatMoney(-Math.abs(Number(selectedPayslip.deductions)), baseCurrency, { decimals: roundingPrecision })}
-                  </span>
-                </div>
-                <div className="pt-2 border-t border-slate-800 flex justify-between font-bold text-slate-200">
-                  <span>Total Deductions:</span>
-                  <span className="font-mono text-rose-300">
-                    {formatMoney(
-                      -(parseFloat(selectedPayslip.deductions) + parseFloat(selectedPayslip.lossOfPayDeduction)),
-                      baseCurrency,
-                      { decimals: roundingPrecision }
-                    )}
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            {/* Net Salary Summary */}
-            <div className="bg-emerald-950/40 border border-emerald-500/30 rounded-xl p-4 flex items-center justify-between">
-              <div>
-                <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-400">
-                  Net Disbursed Compensation
-                </span>
-                <p className="text-xs text-emerald-200/70">Credited to employee bank account / ledger</p>
-              </div>
-              <div className="text-3xl font-extrabold text-white font-mono">
-                {formatMoney(selectedPayslip.netSalary, baseCurrency, { decimals: roundingPrecision })}
-              </div>
-            </div>
+            <EssPayslipVoucherContent
+              payslip={selectedPayslip}
+              baseCurrency={baseCurrency}
+              roundingPrecision={roundingPrecision}
+            />
 
             <div className="flex justify-between items-center pt-3 border-t border-slate-800">
               <span className="text-[11px] text-slate-500 font-mono">
@@ -1534,7 +1796,10 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                 <h3 className="text-base font-bold text-white">Request Salary Advance</h3>
               </div>
               <button
-                onClick={() => setIsAdvanceModalOpen(false)}
+                onClick={() => {
+                  setAdvanceError(null);
+                  setIsAdvanceModalOpen(false);
+                }}
                 className="text-slate-400 hover:text-white p-1 rounded-lg"
               >
                 <X className="w-5 h-5" />
@@ -1544,6 +1809,16 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
             <p className="text-xs text-amber-300/80 bg-amber-950/40 p-3 rounded-lg border border-amber-800/40">
               Note: This is an interactive preview demonstration for Stage 2. Submitted requests are in-memory and will not alter production balances.
             </p>
+
+            {advanceError && (
+              <div
+                role="alert"
+                className="p-3 bg-rose-500/10 border border-rose-500/20 text-rose-300 rounded-lg text-xs flex items-center gap-2"
+              >
+                <AlertCircle className="w-4 h-4 shrink-0" />
+                <span>{advanceError}</span>
+              </div>
+            )}
 
             <form onSubmit={handleApplyAdvance} className="space-y-4 text-xs">
               <div>
@@ -1556,7 +1831,10 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
                   min="50"
                   max="5000"
                   value={advanceAmount}
-                  onChange={(e) => setAdvanceAmount(e.target.value)}
+                  onChange={(e) => {
+                    setAdvanceAmount(e.target.value);
+                    if (advanceError) setAdvanceError(null);
+                  }}
                   className="w-full bg-slate-950 border border-slate-800 text-slate-200 rounded-lg p-2.5 font-mono focus:border-amber-500 focus:outline-none"
                   required
                 />
@@ -1593,7 +1871,10 @@ export const EmployeeSelfServicePage: React.FC<EmployeeSelfServicePageProps> = (
               <div className="flex justify-end gap-3 pt-3 border-t border-slate-800">
                 <button
                   type="button"
-                  onClick={() => setIsAdvanceModalOpen(false)}
+                  onClick={() => {
+                    setAdvanceError(null);
+                    setIsAdvanceModalOpen(false);
+                  }}
                   className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs font-semibold"
                 >
                   Cancel

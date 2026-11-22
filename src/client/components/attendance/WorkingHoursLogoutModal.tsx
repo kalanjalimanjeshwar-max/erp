@@ -11,9 +11,22 @@ import {
   ExternalLink,
 } from 'lucide-react';
 import { api, ApiError } from '../../services/api.ts';
-import { WorkingHoursSummary, AuthUser, CompanyProfile } from '../../../shared/types.ts';
-import { formatTimeInTimezone, getEffectiveTimeZone, getTimezoneShortName } from '../../../shared/timezone.ts';
+import {
+  WorkingHoursSummary,
+  AttendanceIntervalItem,
+  AuthUser,
+  CompanyProfile,
+} from '../../../shared/types.ts';
+import {
+  formatTimeInTimezone,
+  getEffectiveTimeZone,
+  getTimezoneShortName,
+} from '../../../shared/timezone.ts';
 import { LoadingSpinner } from '../common/LoadingSpinner.tsx';
+
+export type WorkingHoursSummaryWithIntervals = WorkingHoursSummary & {
+  intervals?: AttendanceIntervalItem[];
+};
 
 interface WorkingHoursLogoutModalProps {
   isOpen: boolean;
@@ -24,6 +37,212 @@ interface WorkingHoursLogoutModalProps {
   onNavigateToAttendance?: () => void;
 }
 
+export function formatWorkedHoursMinutes(minutes: number | null | undefined): string {
+  if (typeof minutes !== 'number' || Number.isNaN(minutes)) return '—';
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+
+export const WorkingHoursSummaryContent: React.FC<{
+  summary: WorkingHoursSummaryWithIntervals;
+  fallbackTimezone?: string | null;
+}> = ({ summary, fallbackTimezone }) => {
+  const effectiveTimezone = getEffectiveTimeZone(summary.timezone || fallbackTimezone);
+
+  const formatIsoTime = (iso: string | null) => {
+    if (!iso) return 'None';
+    return formatTimeInTimezone(iso, effectiveTimezone, {
+      hour12: true,
+      includeZoneAbbr: true,
+      fallback: iso,
+    });
+  };
+
+  const intervals = Array.isArray(summary.intervals)
+    ? [...summary.intervals].sort((a, b) => a.sequence - b.sequence)
+    : [];
+
+  const showWorkedBreakdown =
+    summary.expectedDurationHours !== null ||
+    summary.shortDurationMinutes > 0 ||
+    summary.overtimeDurationMinutes > 0 ||
+    typeof summary.actualWorkedMinutes === 'number';
+
+  return (
+    <div className="space-y-4">
+      {/* Shift & Workday Metadata Card */}
+      <div className="grid grid-cols-2 gap-2 text-xs bg-slate-950/60 border border-slate-800/80 rounded-xl p-3.5">
+        <div className="flex items-center gap-2 text-slate-400">
+          <Calendar className="w-3.5 h-3.5 text-slate-500" />
+          <span>Work Date:</span>
+          <span className="font-mono font-medium text-slate-200">{summary.workDate}</span>
+        </div>
+        <div className="flex items-center gap-2 text-slate-400">
+          <Clock className="w-3.5 h-3.5 text-slate-500" />
+          <span>Timezone:</span>
+          <span className="font-mono font-medium text-slate-200">{summary.timezone}</span>
+        </div>
+        <div className="col-span-2 flex items-center justify-between gap-2 text-slate-400 border-t border-slate-800/60 pt-2 mt-1">
+          <div className="flex items-center gap-2">
+            <Briefcase className="w-3.5 h-3.5 text-slate-500" />
+            <span>Assigned Shift:</span>
+            <span className="font-medium text-slate-200">
+              {summary.shiftSchedule || 'No shift assigned'}
+            </span>
+          </div>
+          {typeof summary.punchPairsCount === 'number' && (
+            <span className="font-mono text-[11px] px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700">
+              Punch Pairs: {summary.punchPairsCount}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Incomplete-Punch Warning */}
+      {summary.hasIncompletePunch === true && (
+        <div
+          role="alert"
+          className="p-3 rounded-xl bg-amber-950/40 border border-amber-700/60 text-amber-200 text-xs flex items-start gap-2.5"
+        >
+          <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+          <div>
+            <div className="font-semibold text-amber-100">Incomplete Punch Warning</div>
+            <p className="text-[11px] text-amber-200/90 mt-0.5">
+              One or more IN/OUT punch sequences are unclosed for today. Worked duration reflects completed punch pairs only.
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Attendance Punch Timestamps */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 text-xs">
+        <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
+          <div className="text-[11px] text-slate-400">Check-In Punch</div>
+          <div className="text-sm font-semibold text-slate-200 mt-0.5">
+            {formatIsoTime(summary.checkIn)}
+          </div>
+        </div>
+        <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
+          <div className="text-[11px] text-slate-400">Check-Out Punch</div>
+          <div className={`text-sm font-semibold mt-0.5 ${summary.checkOut ? 'text-slate-200' : 'text-rose-400'}`}>
+            {summary.checkOut ? formatIsoTime(summary.checkOut) : 'Missing Punch'}
+          </div>
+        </div>
+        <div className="col-span-2 sm:col-span-1 bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
+          <div className="text-[11px] text-slate-400">Duration Completed</div>
+          <div className="text-sm font-semibold text-indigo-300 mt-0.5">
+            {summary.workedDurationHours !== null ? `${summary.workedDurationHours}h` : 'Incomplete'}
+          </div>
+          {typeof summary.actualWorkedMinutes === 'number' && (
+            <div className="text-[11px] font-mono text-slate-400 mt-0.5">
+              {summary.actualWorkedMinutes} mins ({formatWorkedHoursMinutes(summary.actualWorkedMinutes)})
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Multi-Interval Details when available */}
+      {intervals.length > 0 && (
+        <div className="bg-slate-950/60 border border-slate-800 rounded-xl p-3 space-y-2 text-xs">
+          <div className="flex items-center justify-between text-[11px] text-slate-400 font-semibold uppercase tracking-wide">
+            <span>Recorded IN/OUT Intervals</span>
+            <span className="font-mono text-slate-300">
+              {typeof summary.punchPairsCount === 'number'
+                ? `${summary.punchPairsCount} completed pair(s)`
+                : `${intervals.filter((iv) => iv.isComplete).length} completed pair(s)`}
+            </span>
+          </div>
+          <div className="divide-y divide-slate-800/70">
+            {intervals.map((iv) => (
+              <div key={iv.id} className="py-1.5 flex items-center justify-between gap-2 text-[11px]">
+                <div className="font-mono text-slate-300">
+                  <span className="text-slate-500 mr-1.5">#{iv.sequence}</span>
+                  <span>IN {formatIsoTime(iv.checkIn)}</span>
+                  <span className="text-slate-500 mx-1.5">→</span>
+                  <span className={iv.checkOut ? 'text-slate-300' : 'text-amber-400'}>
+                    OUT {iv.checkOut ? formatIsoTime(iv.checkOut) : 'Missing'}
+                  </span>
+                </div>
+                <div className="font-mono text-slate-400 shrink-0">
+                  {iv.isComplete ? `${iv.durationMinutes}m` : 'Open'}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Separate Non-Netted Short Time & Informational Extra Time */}
+      {showWorkedBreakdown && (
+        <div className="grid grid-cols-2 gap-2.5 text-xs">
+          <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
+            <div className="text-[11px] text-slate-400">Short Time</div>
+            <div
+              className={`text-sm font-mono font-semibold mt-0.5 ${
+                summary.shortDurationMinutes > 0 ? 'text-amber-300' : 'text-slate-300'
+              }`}
+            >
+              {summary.shortDurationMinutes} mins
+            </div>
+            <div className="text-[10px] text-slate-500 mt-0.5">
+              Tracked independently for payroll compliance
+            </div>
+          </div>
+          <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
+            <div className="text-[11px] text-slate-400">Extra Time</div>
+            <div
+              className={`text-sm font-mono font-semibold mt-0.5 ${
+                summary.overtimeDurationMinutes > 0 ? 'text-indigo-300' : 'text-slate-300'
+              }`}
+            >
+              {summary.overtimeDurationMinutes > 0 ? `+${summary.overtimeDurationMinutes} mins` : '0 mins'}
+            </div>
+            <div className="text-[10px] text-slate-400 mt-0.5">
+              Informational only — does not offset Short Time
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Explanatory Policy Notice */}
+      <div
+        className={`p-4 rounded-xl border text-xs leading-relaxed space-y-1.5 ${
+          summary.requiresAttendanceAction
+            ? 'bg-rose-950/30 border-rose-800/50 text-rose-200'
+            : summary.status === 'SHORT_HOURS'
+            ? 'bg-amber-950/30 border-amber-800/50 text-amber-200'
+            : summary.status === 'OVERTIME'
+            ? 'bg-indigo-950/30 border-indigo-800/50 text-indigo-200'
+            : 'bg-emerald-950/30 border-emerald-800/50 text-emerald-200'
+        }`}
+      >
+        <div className="font-semibold flex items-center gap-1.5">
+          {summary.requiresAttendanceAction ? (
+            <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
+          ) : summary.status === 'SHORT_HOURS' ? (
+            <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+          )}
+          <span>Working-Hours Evaluation</span>
+        </div>
+        <p>{summary.statusMessage}</p>
+      </div>
+
+      {/* Crucial Safeguard Warning */}
+      <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl text-[11px] text-slate-400 flex items-start gap-2.5">
+        <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+        <span>
+          <strong>Attendance Safety Rule:</strong> Logging out of this application terminates your active web
+          session, but <strong>does NOT record an attendance punch</strong>. To complete your shift, ensure you
+          record a Check-Out punch on the Attendance register.
+        </span>
+      </div>
+    </div>
+  );
+};
+
 export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = ({
   isOpen,
   currentUser,
@@ -32,7 +251,7 @@ export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = (
   onConfirmLogout,
   onNavigateToAttendance,
 }) => {
-  const [summary, setSummary] = useState<WorkingHoursSummary | null>(null);
+  const [summary, setSummary] = useState<WorkingHoursSummaryWithIntervals | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [fetchError, setFetchError] = useState<string | null>(null);
 
@@ -70,6 +289,9 @@ export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = (
           checkIn: previewCheckInIso,
           checkOut: null, // Simulated missing punch
           workedDurationHours: null,
+          actualWorkedMinutes: 0,
+          punchPairsCount: 0,
+          hasIncompletePunch: true,
           shortDurationMinutes: 0,
           overtimeDurationMinutes: 0,
           status: 'INCOMPLETE_ATTENDANCE',
@@ -102,7 +324,7 @@ export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = (
     return () => {
       isMounted = false;
     };
-  }, [isOpen, currentUser]);
+  }, [isOpen, currentUser, companyProfile?.timezone]);
 
   if (!isOpen) return null;
 
@@ -162,15 +384,6 @@ export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = (
     }
   };
 
-  const formatIsoTime = (iso: string | null) => {
-    if (!iso) return 'None';
-    return formatTimeInTimezone(iso, summary?.timezone || companyProfile?.timezone, {
-      hour12: true,
-      includeZoneAbbr: true,
-      fallback: iso,
-    });
-  };
-
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-fadeIn"
@@ -178,7 +391,7 @@ export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = (
       aria-modal="true"
       aria-labelledby="logout-summary-title"
     >
-      <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl text-slate-200 space-y-5">
+      <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-lg w-full p-6 shadow-2xl text-slate-200 space-y-5 max-h-[90vh] overflow-y-auto">
         {/* Modal Header */}
         <div className="flex items-start justify-between border-b border-slate-800/80 pb-4">
           <div className="flex items-center gap-3">
@@ -215,85 +428,10 @@ export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = (
             </p>
           </div>
         ) : summary ? (
-          <div className="space-y-4">
-            {/* Shift & Workday Metadata Card */}
-            <div className="grid grid-cols-2 gap-2 text-xs bg-slate-950/60 border border-slate-800/80 rounded-xl p-3.5">
-              <div className="flex items-center gap-2 text-slate-400">
-                <Calendar className="w-3.5 h-3.5 text-slate-500" />
-                <span>Work Date:</span>
-                <span className="font-mono font-medium text-slate-200">{summary.workDate}</span>
-              </div>
-              <div className="flex items-center gap-2 text-slate-400">
-                <Clock className="w-3.5 h-3.5 text-slate-500" />
-                <span>Timezone:</span>
-                <span className="font-mono font-medium text-slate-200">{summary.timezone}</span>
-              </div>
-              <div className="col-span-2 flex items-center gap-2 text-slate-400 border-t border-slate-800/60 pt-2 mt-1">
-                <Briefcase className="w-3.5 h-3.5 text-slate-500" />
-                <span>Assigned Shift:</span>
-                <span className="font-medium text-slate-200">
-                  {summary.shiftSchedule || 'No shift assigned'}
-                </span>
-              </div>
-            </div>
-
-            {/* Attendance Punch Timestamps */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5 text-xs">
-              <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
-                <div className="text-[11px] text-slate-400">Check-In Punch</div>
-                <div className="text-sm font-semibold text-slate-200 mt-0.5">
-                  {formatIsoTime(summary.checkIn)}
-                </div>
-              </div>
-              <div className="bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
-                <div className="text-[11px] text-slate-400">Check-Out Punch</div>
-                <div className={`text-sm font-semibold mt-0.5 ${summary.checkOut ? 'text-slate-200' : 'text-rose-400'}`}>
-                  {summary.checkOut ? formatIsoTime(summary.checkOut) : 'Missing Punch'}
-                </div>
-              </div>
-              <div className="col-span-2 sm:col-span-1 bg-slate-950/60 border border-slate-800 p-3 rounded-xl">
-                <div className="text-[11px] text-slate-400">Duration Completed</div>
-                <div className="text-sm font-semibold text-indigo-300 mt-0.5">
-                  {summary.workedDurationHours !== null ? `${summary.workedDurationHours}h` : 'Incomplete'}
-                </div>
-              </div>
-            </div>
-
-            {/* Explanatory Policy Notice */}
-            <div
-              className={`p-4 rounded-xl border text-xs leading-relaxed space-y-1.5 ${
-                summary.requiresAttendanceAction
-                  ? 'bg-rose-950/30 border-rose-800/50 text-rose-200'
-                  : summary.status === 'SHORT_HOURS'
-                  ? 'bg-amber-950/30 border-amber-800/50 text-amber-200'
-                  : summary.status === 'OVERTIME'
-                  ? 'bg-indigo-950/30 border-indigo-800/50 text-indigo-200'
-                  : 'bg-emerald-950/30 border-emerald-800/50 text-emerald-200'
-              }`}
-            >
-              <div className="font-semibold flex items-center gap-1.5">
-                {summary.requiresAttendanceAction ? (
-                  <AlertCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
-                ) : summary.status === 'SHORT_HOURS' ? (
-                  <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0" />
-                ) : (
-                  <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
-                )}
-                <span>Working-Hours Evaluation</span>
-              </div>
-              <p>{summary.statusMessage}</p>
-            </div>
-
-            {/* Crucial Safeguard Warning */}
-            <div className="p-3 bg-slate-950/80 border border-slate-800 rounded-xl text-[11px] text-slate-400 flex items-start gap-2.5">
-              <AlertCircle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
-              <span>
-                <strong>Attendance Safety Rule:</strong> Logging out of this application terminates your active web
-                session, but <strong>does NOT record an attendance punch</strong>. To complete your shift, ensure you
-                record a Check-Out punch on the Attendance register.
-              </span>
-            </div>
-          </div>
+          <WorkingHoursSummaryContent
+            summary={summary}
+            fallbackTimezone={companyProfile?.timezone}
+          />
         ) : null}
 
         {/* Modal Action Buttons */}
@@ -335,3 +473,4 @@ export const WorkingHoursLogoutModal: React.FC<WorkingHoursLogoutModalProps> = (
     </div>
   );
 };
+

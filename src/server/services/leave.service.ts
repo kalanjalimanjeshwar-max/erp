@@ -11,6 +11,11 @@ import {
 } from '../../shared/types.js';
 import { AuditService } from './audit.service.js';
 import { Decimal, AccountingMath } from '../accounting/decimal-math.js';
+import {
+  WorkPolicyService,
+  formatUtcDateOnly,
+  ShiftDurationShape,
+} from './work-policy.service.js';
 
 const VALID_LEAVE_STATUSES: LeaveStatus[] = ['PENDING', 'APPROVED', 'REJECTED', 'CANCELLED'];
 
@@ -850,6 +855,8 @@ export class LeaveService {
         fullName: true,
         employeeCode: true,
         shiftId: true,
+        dailyWorkingHours: true,
+        monthlyLeaveAllowance: true,
         shift: {
           select: {
             id: true,
@@ -863,8 +870,7 @@ export class LeaveService {
         salaryRevisions: {
           where: { effectiveFrom: { lte: endOfMonth } },
           orderBy: { effectiveFrom: 'desc' },
-          take: 1,
-          select: { fixedSalary: true },
+          select: { fixedSalary: true, effectiveFrom: true, effectiveTo: true },
         },
       },
     });
@@ -1093,114 +1099,228 @@ export class LeaveService {
     const excessLeaveDays = roundLeaveDays(Math.max(0, totalAnnualUsedDays - totalAnnualEntitlement));
     const cleanOverlappingMonthApprovedDays = roundLeaveDays(overlappingMonthApprovedDays);
 
-    // 1. Working Hours Configuration
-    let configuredDailyWorkingHours: number | null = null;
-    let shiftSchedule: string | null = null;
+    // 1. Resolve effective-dated work policy revisions overlapping this calendar month
+    const policyRevisions = await WorkPolicyService.listRevisionsForEmployee(
+      actor.companyId,
+      targetEmployeeId,
+      db,
+      { startDate: startOfMonth, endDate: endOfMonth }
+    );
 
-    if (employee.shift) {
-      const s = employee.shift;
-      const startMin = parseInt(s.startTime.slice(0, 2), 10) * 60 + parseInt(s.startTime.slice(3, 5), 10);
-      const endMin = parseInt(s.endTime.slice(0, 2), 10) * 60 + parseInt(s.endTime.slice(3, 5), 10);
-      const durationMin = s.isOvernight && endMin <= startMin
-        ? (endMin + 1440 - startMin)
-        : (endMin - startMin);
-      configuredDailyWorkingHours = Math.round((durationMin / 60) * 100) / 100;
-      shiftSchedule = `${s.name} (${s.startTime} – ${s.endTime}${s.isOvernight ? ' +1d' : ''})`;
-    }
+    const monthEndDateKey = formatUtcDateOnly(endOfMonth);
+    const monthEndPolicy = WorkPolicyService.resolvePolicyForDate({
+      date: monthEndDateKey,
+      employee: employee as any,
+      revisions: policyRevisions,
+    });
 
-    // 2. Salary Rates (Fixed 30-day divisor per company policy)
+    const configuredDailyWorkingHours = monthEndPolicy.effectiveDailyWorkingHours;
+    const shiftSchedule =
+      monthEndPolicy.shiftSchedule ||
+      (configuredDailyWorkingHours !== null
+        ? `Custom Schedule (${configuredDailyWorkingHours}h/day)`
+        : null);
+
+    const resolveEffectiveSalaryForDate = (dateKey: string): Decimal | null => {
+      const revs = employee.salaryRevisions as
+        | Array<{ fixedSalary: string | number | Decimal; effectiveFrom?: Date | string; effectiveTo?: Date | string | null }>
+        | undefined;
+      if (!revs || revs.length === 0) return null;
+      for (const rev of revs) {
+        const fromKey = rev.effectiveFrom
+          ? typeof rev.effectiveFrom === 'string'
+            ? rev.effectiveFrom.slice(0, 10)
+            : formatUtcDateOnly(rev.effectiveFrom)
+          : null;
+        const toKey = rev.effectiveTo
+          ? typeof rev.effectiveTo === 'string'
+            ? rev.effectiveTo.slice(0, 10)
+            : formatUtcDateOnly(rev.effectiveTo)
+          : null;
+        if ((fromKey === null || fromKey <= dateKey) && (toKey === null || toKey >= dateKey)) {
+          const dec = AccountingMath.from(rev.fixedSalary);
+          return AccountingMath.gt(dec, 0) ? dec : null;
+        }
+      }
+      const fallback = AccountingMath.from(revs[0].fixedSalary);
+      return AccountingMath.gt(fallback, 0) ? fallback : null;
+    };
+
+    // 2. Salary Rates (Fixed 30-day divisor per company policy; month summary snapshot as of month-end)
     let monthlySalaryStr: string | null = null;
     let dailySalaryRateStr: string | null = null;
     let hourlySalaryRateStr: string | null = null;
     let dailySalaryRateDecimal: Decimal | null = null;
     let hourlySalaryRateDecimal: Decimal | null = null;
 
-    if (employee.salaryRevisions && employee.salaryRevisions.length > 0) {
-      const fixedSalaryDecimal = AccountingMath.from(employee.salaryRevisions[0].fixedSalary);
-      if (AccountingMath.gt(fixedSalaryDecimal, 0)) {
-        monthlySalaryStr = AccountingMath.format(fixedSalaryDecimal, 2);
-        dailySalaryRateDecimal = fixedSalaryDecimal.dividedBy(30).toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
-        dailySalaryRateStr = AccountingMath.format(dailySalaryRateDecimal, 2);
+    const monthEndSalaryDecimal = resolveEffectiveSalaryForDate(monthEndDateKey);
+    if (monthEndSalaryDecimal) {
+      monthlySalaryStr = AccountingMath.format(monthEndSalaryDecimal, 2);
+      dailySalaryRateDecimal = monthEndSalaryDecimal
+        .dividedBy(30)
+        .toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+      dailySalaryRateStr = AccountingMath.format(dailySalaryRateDecimal, 2);
 
-        if (configuredDailyWorkingHours !== null && configuredDailyWorkingHours > 0) {
-          hourlySalaryRateDecimal = dailySalaryRateDecimal
-            .dividedBy(configuredDailyWorkingHours)
-            .toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
-          hourlySalaryRateStr = AccountingMath.format(hourlySalaryRateDecimal, 2);
-        }
+      if (configuredDailyWorkingHours !== null && configuredDailyWorkingHours > 0) {
+        hourlySalaryRateDecimal = dailySalaryRateDecimal
+          .dividedBy(configuredDailyWorkingHours)
+          .toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+        hourlySalaryRateStr = AccountingMath.format(hourlySalaryRateDecimal, 2);
       }
     }
 
-    // 3. Monthly Leave Allowance (4 days per company policy, no carry-forward)
-    const monthlyLeaveAllowance = 4.0;
+    // 3. Monthly Leave Allowance (effective-dated per calendar month; fallback 4.0 days, no carry-forward)
+    const monthlyLeaveAllowance = WorkPolicyService.resolveMonthlyLeaveAllowanceForMonth({
+      year,
+      month,
+      employee: employee as any,
+      revisions: policyRevisions,
+    });
     const monthApprovedDays = totalMonthApprovedDays;
     const monthRemainingLeave = Math.max(0, roundLeaveDays(monthlyLeaveAllowance - monthApprovedDays));
     const monthlyExcessLeaveDays = Math.max(0, roundLeaveDays(monthApprovedDays - monthlyLeaveAllowance));
 
     // 4. Duplicate Deduction Prevention: Identify dates covered by excess leave, absence, or half-day
+    // Use deduplicated daily occupancy from approvedDailyOccupancy (chronologically ordered) so
+    // overlapping approved leave requests on the same date cannot overcount running leave days.
     const excessLeaveDatesSet = new Set<string>();
     let accumulatedApprovedDays = 0;
-    for (const req of approvedRequests) {
-      const dates = getDateDaysList(req.startDate, req.endDate);
-      const calendarSpan = Math.max(1, dates.length);
-      const rawTotalDays = Number(req.totalDays);
-      const totalDays = !isNaN(rawTotalDays) && rawTotalDays > 0 ? rawTotalDays : calendarSpan;
-      const dailyWeight = totalDays / calendarSpan;
-      for (const d of dates) {
-        if (d.startsWith(monthPrefix)) {
-          accumulatedApprovedDays += dailyWeight;
-          if (accumulatedApprovedDays > 4.0) {
-            excessLeaveDatesSet.add(d);
-          }
-        }
+    const monthApprovedEntries = Array.from(approvedDailyOccupancy.entries())
+      .filter(([d, occupancy]) => d.startsWith(monthPrefix) && occupancy > 0)
+      .sort(([a], [b]) => a.localeCompare(b));
+
+    for (const [dateKey, dayOccupancy] of monthApprovedEntries) {
+      accumulatedApprovedDays = roundLeaveDays(accumulatedApprovedDays + dayOccupancy);
+      if (accumulatedApprovedDays > monthlyLeaveAllowance) {
+        excessLeaveDatesSet.add(dateKey);
       }
     }
 
-    // 5. Short Hours Calculation from Valid Attendance Records
+    // 5. Independent Daily Short Time & Extra Time Calculation (NO offsetting across days)
     let totalShortMinutes = 0;
+    let totalExtraMinutes = 0;
+    let totalRequiredMinutes = 0;
+    let totalActualWorkedMinutes = 0;
     let incompleteAttendanceCount = 0;
+    let hasAnyConfiguredDailyHoursInMonth = configuredDailyWorkingHours !== null;
 
-    for (const att of monthlyAttendances) {
+    const shortRateBuckets = new Map<
+      string,
+      { salary: Decimal; requiredHours: number; shortMinutes: number }
+    >();
+
+    for (const att of monthlyAttendances as any[]) {
       const dateKey = att.workDate.toISOString().split('T')[0];
+      const dayPolicy = WorkPolicyService.resolvePolicyForDate({
+        date: dateKey,
+        employee: employee as any,
+        revisions: policyRevisions,
+        attendanceShiftOverride: (att.shift as ShiftDurationShape | null) || null,
+      });
 
-      // Prevent duplicate deductions: full-day absence, half-day attendance, or excess leave
-      if (att.status === 'ABSENT' || att.status === 'HALF_DAY' || excessLeaveDatesSet.has(dateKey)) {
+      if (dayPolicy.effectiveDailyRequiredMinutes !== null) {
+        hasAnyConfiguredDailyHoursInMonth = true;
+      }
+
+      // Prevent duplicate deductions: full-day absence, half-day attendance, on-leave, or excess leave
+      if (
+        att.status === 'ABSENT' ||
+        att.status === 'HALF_DAY' ||
+        att.status === 'ON_LEAVE' ||
+        excessLeaveDatesSet.has(dateKey)
+      ) {
         continue;
       }
 
-      // Missing check-out record requires administrative review; do NOT deduct automatically
-      if (att.checkIn && !att.checkOut) {
+      const isIncomplete =
+        typeof att.hasIncompletePunch === 'boolean'
+          ? att.hasIncompletePunch
+          : Boolean((att.checkIn && !att.checkOut) || (!att.checkIn && att.checkOut));
+
+      // Missing check-out / orphan check-in or check-out requires review; do NOT deduct automatically
+      if (isIncomplete) {
         incompleteAttendanceCount++;
         continue;
       }
 
-      if (att.checkIn && att.checkOut) {
-        const effectiveShift = att.shift || employee.shift;
-        if (effectiveShift) {
-          const startMin = parseInt(effectiveShift.startTime.slice(0, 2), 10) * 60 + parseInt(effectiveShift.startTime.slice(3, 5), 10);
-          const endMin = parseInt(effectiveShift.endTime.slice(0, 2), 10) * 60 + parseInt(effectiveShift.endTime.slice(3, 5), 10);
-          const expectedMin = effectiveShift.isOvernight && endMin <= startMin
-            ? (endMin + 1440 - startMin)
-            : (endMin - startMin);
+      const workedMin =
+        typeof att.actualWorkedMinutes === 'number'
+          ? att.actualWorkedMinutes
+          : att.checkIn && att.checkOut
+          ? Math.max(0, Math.round((att.checkOut.getTime() - att.checkIn.getTime()) / (1000 * 60)))
+          : null;
 
-          const workedMin = Math.round((att.checkOut.getTime() - att.checkIn.getTime()) / (1000 * 60));
-          if (workedMin < expectedMin) {
-            totalShortMinutes += (expectedMin - workedMin);
+      if (
+        workedMin !== null &&
+        dayPolicy.effectiveDailyRequiredMinutes !== null &&
+        dayPolicy.effectiveDailyWorkingHours !== null &&
+        dayPolicy.effectiveDailyWorkingHours > 0
+      ) {
+        const expectedMin = dayPolicy.effectiveDailyRequiredMinutes;
+        totalRequiredMinutes += expectedMin;
+        totalActualWorkedMinutes += workedMin;
+
+        const dayShortMin = Math.max(0, expectedMin - workedMin);
+        const dayExtraMin = Math.max(0, workedMin - expectedMin);
+
+        // Sum Short Time and Extra Time independently without offsetting
+        totalShortMinutes += dayShortMin;
+        totalExtraMinutes += dayExtraMin;
+
+        if (dayShortMin > 0) {
+          const effectiveSalaryForDay = resolveEffectiveSalaryForDate(dateKey);
+          if (effectiveSalaryForDay) {
+            const bucketKey = `${AccountingMath.format(effectiveSalaryForDay, 4)}::${dayPolicy.effectiveDailyWorkingHours}`;
+            const existingBucket = shortRateBuckets.get(bucketKey);
+            if (existingBucket) {
+              existingBucket.shortMinutes += dayShortMin;
+            } else {
+              shortRateBuckets.set(bucketKey, {
+                salary: effectiveSalaryForDay,
+                requiredHours: dayPolicy.effectiveDailyWorkingHours,
+                shortMinutes: dayShortMin,
+              });
+            }
           }
         }
       }
     }
 
-    const deductibleShortHours = Math.round((totalShortMinutes / 60) * 100) / 100;
+    const shortTimeHours = Math.round((totalShortMinutes / 60) * 100) / 100;
+    const extraTimeHours = Math.round((totalExtraMinutes / 60) * 100) / 100;
+    const deductibleShortHours = shortTimeHours;
 
-    // 6. Monetary Deductions
+    // 6. Monetary Deductions (Salary / 30 daily rate + per-day effective hourly rate for short hours; Extra Time is NEVER added)
     const excessLeaveDeductionDecimal = dailySalaryRateDecimal
       ? dailySalaryRateDecimal.times(monthlyExcessLeaveDays).toDecimalPlaces(4, Decimal.ROUND_HALF_UP)
       : new Decimal(0);
 
-    const shortHoursDeductionDecimal = (hourlySalaryRateDecimal && deductibleShortHours > 0)
-      ? hourlySalaryRateDecimal.times(deductibleShortHours).toDecimalPlaces(4, Decimal.ROUND_HALF_UP)
-      : new Decimal(0);
+    let shortHoursDeductionDecimal = new Decimal(0);
+    if (shortRateBuckets.size === 1) {
+      const onlyBucket = Array.from(shortRateBuckets.values())[0];
+      const bucketDailyRate = onlyBucket.salary
+        .dividedBy(30)
+        .toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+      const bucketHourlyRate = bucketDailyRate
+        .dividedBy(onlyBucket.requiredHours)
+        .toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+      shortHoursDeductionDecimal = bucketHourlyRate
+        .times(deductibleShortHours)
+        .toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+    } else if (shortRateBuckets.size > 1) {
+      let accumulatedDeduction = new Decimal(0);
+      for (const bucket of shortRateBuckets.values()) {
+        const bucketDailyRate = bucket.salary
+          .dividedBy(30)
+          .toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+        const bucketHourlyRate = bucketDailyRate
+          .dividedBy(bucket.requiredHours)
+          .toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+        const bucketHours = new Decimal(bucket.shortMinutes).dividedBy(60);
+        accumulatedDeduction = accumulatedDeduction.plus(bucketHourlyRate.times(bucketHours));
+      }
+      shortHoursDeductionDecimal = accumulatedDeduction.toDecimalPlaces(4, Decimal.ROUND_HALF_UP);
+    }
 
     const totalSalaryDeductionsDecimal = excessLeaveDeductionDecimal.plus(shortHoursDeductionDecimal);
 
@@ -1210,7 +1330,7 @@ export class LeaveService {
 
     // 7. Policy Warnings & Notices
     const warnings: string[] = [];
-    if (!employee.shift) {
+    if (!hasAnyConfiguredDailyHoursInMonth) {
       warnings.push(
         'No assigned working schedule/shift found for this employee. Configured daily working hours are unavailable; hourly-rate and short-hours deductions were skipped. Please assign an official shift.'
       );
@@ -1253,6 +1373,12 @@ export class LeaveService {
       configuredDailyWorkingHours,
       shiftSchedule,
       deductibleShortHours,
+      shortTimeMinutes: totalShortMinutes,
+      extraTimeMinutes: totalExtraMinutes,
+      shortTimeHours,
+      extraTimeHours,
+      totalRequiredMinutes,
+      totalActualWorkedMinutes,
       incompleteAttendanceCount,
       excessLeaveDeduction,
       shortHoursDeduction,

@@ -12,6 +12,16 @@ import {
   AdminNotificationType,
 } from '../../shared/types.js';
 import { AuditService } from './audit.service.js';
+import {
+  WorkPolicyService,
+  canUsePrismaDelegate,
+  ShiftDurationShape,
+} from './work-policy.service.js';
+import {
+  localDateTimeToUtcIso,
+  formatTimeInTimezone,
+  addCalendarDaysToDateStr,
+} from '../../shared/timezone.js';
 
 const VALID_STATUSES: AttendanceStatus[] = ['PRESENT', 'ABSENT', 'HALF_DAY', 'LATE', 'ON_LEAVE'];
 const VALID_SOURCES: AttendanceSource[] = ['MANUAL', 'BIOMETRIC'];
@@ -39,12 +49,13 @@ export class AttendanceService {
   }
 
   /**
-   * Helper: Calculates late minutes given checkIn timestamp, shift, and workDate
+   * Helper: Calculates late minutes given UTC checkIn timestamp, shift, workDate, and company timezone
    */
-  private static calculateLateMinutes(
+  static calculateLateMinutes(
     checkIn: Date | null,
     workDateStr: string,
-    shift: { startTime: string; graceMinutes: number } | null
+    shift: { startTime: string; graceMinutes: number } | null,
+    timeZone = 'UTC'
   ): number {
     if (!checkIn || !shift || !shift.startTime) {
       return 0;
@@ -52,13 +63,20 @@ export class AttendanceService {
 
     // Parse shift start on workDate
     const [startH, startM] = shift.startTime.split(':').map(Number);
-    if (isNaN(startH) || isNaN(startM)) {
+    if (isNaN(startH) || isNaN(startM) || startH < 0 || startH > 23 || startM < 0 || startM > 59) {
       return 0;
     }
 
-    // Align checkIn time on workDate
-    const scheduledStart = new Date(`${workDateStr}T${shift.startTime}:00.000Z`);
-    const graceMs = shift.graceMinutes * 60 * 1000;
+    // Interpret scheduled shift start on workDate in the company's local timezone,
+    // then compare as the corresponding UTC instant against the UTC checkIn timestamp.
+    const normalizedStartTime = `${String(startH).padStart(2, '0')}:${String(startM).padStart(2, '0')}`;
+    const scheduledStartIso = localDateTimeToUtcIso(workDateStr, normalizedStartTime, timeZone);
+    if (!scheduledStartIso) {
+      return 0;
+    }
+
+    const scheduledStart = new Date(scheduledStartIso);
+    const graceMs = (shift.graceMinutes || 0) * 60 * 1000;
     const graceThreshold = new Date(scheduledStart.getTime() + graceMs);
 
     if (checkIn.getTime() > graceThreshold.getTime()) {
@@ -67,6 +85,77 @@ export class AttendanceService {
     }
 
     return 0;
+  }
+
+  /**
+   * Helper: Blocks manual attendance mutations when a company-scoped PayrollPeriod covering
+   * the workDate is already locked (PROCESSED, ACCOUNTS_APPROVED, or POSTED).
+   */
+  private static async assertPayrollPeriodUnlocked(
+    companyId: string,
+    workDateObj: Date,
+    workDateStr: string
+  ): Promise<void> {
+    if (!canUsePrismaDelegate(prisma, 'payrollPeriod', 'findFirst')) {
+      return;
+    }
+
+    const lockedPayroll = await prisma.payrollPeriod.findFirst({
+      where: {
+        companyId,
+        startDate: { lte: workDateObj },
+        endDate: { gte: workDateObj },
+        status: { in: ['PROCESSED', 'ACCOUNTS_APPROVED', 'POSTED'] },
+      },
+      select: { id: true, name: true, status: true },
+    });
+
+    if (lockedPayroll) {
+      const err = new Error(
+        `Cannot modify attendance for ${workDateStr}: payroll period '${lockedPayroll.name || lockedPayroll.id}' is already in '${lockedPayroll.status}' status.`
+      );
+      (err as { statusCode?: number }).statusCode = 409;
+      throw err;
+    }
+  }
+
+  /**
+   * Helper: Detects whether an Attendance record is backed by persisted biometric punch events
+   * or work intervals so manual edits cannot corrupt summary fields or diverge from audit links.
+   */
+  private static async hasBiometricEventsOrIntervals(
+    companyId: string,
+    attendanceId: string
+  ): Promise<boolean> {
+    if (canUsePrismaDelegate(prisma, 'attendancePunchEvent', 'count')) {
+      const eventCount = await (prisma as any).attendancePunchEvent.count({
+        where: { companyId, attendanceId },
+      });
+      if (eventCount > 0) return true;
+    } else if (canUsePrismaDelegate(prisma, 'attendancePunchEvent', 'findMany')) {
+      const events = await (prisma as any).attendancePunchEvent.findMany({
+        where: { companyId, attendanceId },
+        select: { id: true },
+        take: 1,
+      });
+      if (Array.isArray(events) && events.length > 0) return true;
+    }
+
+    if (canUsePrismaDelegate(prisma, 'attendanceInterval', 'count')) {
+      const intervalCount = await (prisma as any).attendanceInterval.count({
+        where: { companyId, attendanceId },
+      });
+      if (intervalCount > 0) return true;
+    } else if (canUsePrismaDelegate(prisma, 'attendanceInterval', 'findMany')) {
+      const intervals = await (prisma as any).attendanceInterval.findMany({
+        where: { companyId, attendanceId },
+        select: { id: true },
+        take: 1,
+      });
+      if (Array.isArray(intervals) && intervals.length > 0) return true;
+    }
+
+    return false;
   }
 
   /**
@@ -123,6 +212,10 @@ export class AttendanceService {
       }
     }
 
+    const includeMultiPairRelations =
+      canUsePrismaDelegate(prisma, 'attendanceInterval', 'findMany') ||
+      canUsePrismaDelegate(prisma, 'attendancePunchEvent', 'findMany');
+
     const [total, records] = await Promise.all([
       prisma.attendance.count({ where }),
       prisma.attendance.findMany({
@@ -132,34 +225,140 @@ export class AttendanceService {
         orderBy: [{ workDate: 'desc' }, { createdAt: 'desc' }],
         include: {
           employee: {
-            select: { employeeCode: true, fullName: true },
+            select: {
+              employeeCode: true,
+              fullName: true,
+              shiftId: true,
+              dailyWorkingHours: true,
+              monthlyLeaveAllowance: true,
+              shift: {
+                select: {
+                  id: true,
+                  name: true,
+                  startTime: true,
+                  endTime: true,
+                  isOvernight: true,
+                },
+              },
+            },
           },
           shift: {
-            select: { name: true },
+            select: {
+              id: true,
+              name: true,
+              startTime: true,
+              endTime: true,
+              isOvernight: true,
+            },
           },
+          ...(includeMultiPairRelations
+            ? {
+                intervals: { orderBy: { sequence: 'asc' as const } },
+                punchEvents: { orderBy: { punchTime: 'asc' as const } },
+              }
+            : {}),
         },
       }),
     ]);
 
-    const items: AttendanceItem[] = records.map((r) => ({
-      id: r.id,
-      companyId: r.companyId,
-      employeeId: r.employeeId,
-      employeeCode: r.employee.employeeCode,
-      employeeName: r.employee.fullName,
-      shiftId: r.shiftId,
-      shiftName: r.shift?.name || null,
-      workDate: r.workDate.toISOString().split('T')[0],
-      checkIn: r.checkIn ? r.checkIn.toISOString() : null,
-      checkOut: r.checkOut ? r.checkOut.toISOString() : null,
-      status: r.status as AttendanceStatus,
-      lateMinutes: r.lateMinutes,
-      overtimeMinutes: r.overtimeMinutes,
-      source: r.source as AttendanceSource,
-      notes: r.notes,
-      createdAt: r.createdAt.toISOString(),
-      updatedAt: r.updatedAt.toISOString(),
-    }));
+    const employeeIds = Array.from(new Set(records.map((r) => r.employeeId)));
+    const policyMap = await WorkPolicyService.listRevisionsForEmployees(
+      actor.companyId,
+      employeeIds,
+      prisma
+    );
+
+    const items: AttendanceItem[] = records.map((r: any) => {
+      const workDateStr = r.workDate.toISOString().split('T')[0];
+      const revisions = policyMap.get(r.employeeId) || [];
+      const dailyPolicy = WorkPolicyService.resolvePolicyForDate({
+        date: workDateStr,
+        employee: r.employee || {},
+        revisions,
+        attendanceShiftOverride: (r.shift as ShiftDurationShape | null) || null,
+      });
+
+      const actualWorkedMinutes =
+        typeof r.actualWorkedMinutes === 'number'
+          ? r.actualWorkedMinutes
+          : r.checkIn && r.checkOut
+          ? Math.max(0, Math.round((r.checkOut.getTime() - r.checkIn.getTime()) / 60000))
+          : null;
+      const hasIncompletePunch =
+        typeof r.hasIncompletePunch === 'boolean'
+          ? r.hasIncompletePunch
+          : Boolean((r.checkIn && !r.checkOut) || (!r.checkIn && r.checkOut));
+      const punchPairsCount =
+        typeof r.punchPairsCount === 'number'
+          ? r.punchPairsCount
+          : r.checkIn && r.checkOut && r.checkOut.getTime() >= r.checkIn.getTime()
+          ? 1
+          : 0;
+
+      const requiredMinutes = dailyPolicy.effectiveDailyRequiredMinutes;
+      let shortTimeMinutes: number | null = 0;
+      let extraTimeMinutes: number | null = 0;
+      if (requiredMinutes === null) {
+        shortTimeMinutes = null;
+        extraTimeMinutes = null;
+      } else if (
+        !hasIncompletePunch &&
+        actualWorkedMinutes !== null &&
+        r.status !== 'ABSENT' &&
+        r.status !== 'ON_LEAVE' &&
+        r.status !== 'HALF_DAY'
+      ) {
+        shortTimeMinutes = Math.max(0, requiredMinutes - actualWorkedMinutes);
+        extraTimeMinutes = Math.max(0, actualWorkedMinutes - requiredMinutes);
+      }
+
+      return {
+        id: r.id,
+        companyId: r.companyId,
+        employeeId: r.employeeId,
+        employeeCode: r.employee.employeeCode,
+        employeeName: r.employee.fullName,
+        shiftId: r.shiftId,
+        shiftName: r.shift?.name || null,
+        workDate: workDateStr,
+        checkIn: r.checkIn ? r.checkIn.toISOString() : null,
+        checkOut: r.checkOut ? r.checkOut.toISOString() : null,
+        status: r.status as AttendanceStatus,
+        lateMinutes: r.lateMinutes,
+        overtimeMinutes: r.overtimeMinutes,
+        actualWorkedMinutes,
+        hasIncompletePunch,
+        punchPairsCount,
+        requiredMinutes,
+        shortTimeMinutes,
+        extraTimeMinutes,
+        intervals: Array.isArray(r.intervals)
+          ? r.intervals.map((iv: any) => ({
+              id: iv.id,
+              sequence: iv.sequence,
+              inEventId: iv.inEventId ?? null,
+              outEventId: iv.outEventId ?? null,
+              checkIn: iv.checkIn ? new Date(iv.checkIn).toISOString() : null,
+              checkOut: iv.checkOut ? new Date(iv.checkOut).toISOString() : null,
+              durationMinutes: iv.durationMinutes,
+              isComplete: Boolean(iv.isComplete),
+            }))
+          : undefined,
+        punchEvents: Array.isArray(r.punchEvents)
+          ? r.punchEvents.map((ev: any) => ({
+              id: ev.id,
+              rawPunchLogId: ev.rawPunchLogId ?? null,
+              punchTime: new Date(ev.punchTime).toISOString(),
+              inOutMode: ev.inOutMode,
+              source: ev.source,
+            }))
+          : undefined,
+        source: r.source as AttendanceSource,
+        notes: r.notes,
+        createdAt: r.createdAt.toISOString(),
+        updatedAt: r.updatedAt.toISOString(),
+      };
+    });
 
     return { items, total, page, limit };
   }
@@ -168,11 +367,47 @@ export class AttendanceService {
    * Gets single attendance record by ID with company and employee scoping
    */
   static async getAttendanceById(actor: AuthUser, id: string): Promise<AttendanceItem> {
-    const record = await prisma.attendance.findUnique({
+    const includeMultiPairRelations =
+      canUsePrismaDelegate(prisma, 'attendanceInterval', 'findMany') ||
+      canUsePrismaDelegate(prisma, 'attendancePunchEvent', 'findMany');
+
+    const record: any = await prisma.attendance.findUnique({
       where: { id },
       include: {
-        employee: { select: { employeeCode: true, fullName: true, userId: true } },
-        shift: { select: { name: true } },
+        employee: {
+          select: {
+            employeeCode: true,
+            fullName: true,
+            userId: true,
+            shiftId: true,
+            dailyWorkingHours: true,
+            monthlyLeaveAllowance: true,
+            shift: {
+              select: {
+                id: true,
+                name: true,
+                startTime: true,
+                endTime: true,
+                isOvernight: true,
+              },
+            },
+          },
+        },
+        shift: {
+          select: {
+            id: true,
+            name: true,
+            startTime: true,
+            endTime: true,
+            isOvernight: true,
+          },
+        },
+        ...(includeMultiPairRelations
+          ? {
+              intervals: { orderBy: { sequence: 'asc' as const } },
+              punchEvents: { orderBy: { punchTime: 'asc' as const } },
+            }
+          : {}),
       },
     });
 
@@ -192,6 +427,53 @@ export class AttendanceService {
       }
     }
 
+    const workDateStr = record.workDate.toISOString().split('T')[0];
+    const revisions = await WorkPolicyService.listRevisionsForEmployee(
+      actor.companyId,
+      record.employeeId,
+      prisma
+    );
+    const dailyPolicy = WorkPolicyService.resolvePolicyForDate({
+      date: workDateStr,
+      employee: record.employee || {},
+      revisions,
+      attendanceShiftOverride: (record.shift as ShiftDurationShape | null) || null,
+    });
+
+    const actualWorkedMinutes =
+      typeof record.actualWorkedMinutes === 'number'
+        ? record.actualWorkedMinutes
+        : record.checkIn && record.checkOut
+        ? Math.max(0, Math.round((record.checkOut.getTime() - record.checkIn.getTime()) / 60000))
+        : null;
+    const hasIncompletePunch =
+      typeof record.hasIncompletePunch === 'boolean'
+        ? record.hasIncompletePunch
+        : Boolean((record.checkIn && !record.checkOut) || (!record.checkIn && record.checkOut));
+    const punchPairsCount =
+      typeof record.punchPairsCount === 'number'
+        ? record.punchPairsCount
+        : record.checkIn && record.checkOut && record.checkOut.getTime() >= record.checkIn.getTime()
+        ? 1
+        : 0;
+
+    const requiredMinutes = dailyPolicy.effectiveDailyRequiredMinutes;
+    let shortTimeMinutes: number | null = 0;
+    let extraTimeMinutes: number | null = 0;
+    if (requiredMinutes === null) {
+      shortTimeMinutes = null;
+      extraTimeMinutes = null;
+    } else if (
+      !hasIncompletePunch &&
+      actualWorkedMinutes !== null &&
+      record.status !== 'ABSENT' &&
+      record.status !== 'ON_LEAVE' &&
+      record.status !== 'HALF_DAY'
+    ) {
+      shortTimeMinutes = Math.max(0, requiredMinutes - actualWorkedMinutes);
+      extraTimeMinutes = Math.max(0, actualWorkedMinutes - requiredMinutes);
+    }
+
     return {
       id: record.id,
       companyId: record.companyId,
@@ -200,12 +482,39 @@ export class AttendanceService {
       employeeName: record.employee.fullName,
       shiftId: record.shiftId,
       shiftName: record.shift?.name || null,
-      workDate: record.workDate.toISOString().split('T')[0],
+      workDate: workDateStr,
       checkIn: record.checkIn ? record.checkIn.toISOString() : null,
       checkOut: record.checkOut ? record.checkOut.toISOString() : null,
       status: record.status as AttendanceStatus,
       lateMinutes: record.lateMinutes,
       overtimeMinutes: record.overtimeMinutes,
+      actualWorkedMinutes,
+      hasIncompletePunch,
+      punchPairsCount,
+      requiredMinutes,
+      shortTimeMinutes,
+      extraTimeMinutes,
+      intervals: Array.isArray(record.intervals)
+        ? record.intervals.map((iv: any) => ({
+            id: iv.id,
+            sequence: iv.sequence,
+            inEventId: iv.inEventId ?? null,
+            outEventId: iv.outEventId ?? null,
+            checkIn: iv.checkIn ? new Date(iv.checkIn).toISOString() : null,
+            checkOut: iv.checkOut ? new Date(iv.checkOut).toISOString() : null,
+            durationMinutes: iv.durationMinutes,
+            isComplete: Boolean(iv.isComplete),
+          }))
+        : undefined,
+      punchEvents: Array.isArray(record.punchEvents)
+        ? record.punchEvents.map((ev: any) => ({
+            id: ev.id,
+            rawPunchLogId: ev.rawPunchLogId ?? null,
+            punchTime: new Date(ev.punchTime).toISOString(),
+            inOutMode: ev.inOutMode,
+            source: ev.source,
+          }))
+        : undefined,
       source: record.source as AttendanceSource,
       notes: record.notes,
       createdAt: record.createdAt.toISOString(),
@@ -276,6 +585,8 @@ export class AttendanceService {
       throw err;
     }
 
+    await this.assertPayrollPeriodUnlocked(actor.companyId, workDateObj, workDateStr);
+
     // Parse checkIn and checkOut
     let checkInDate: Date | null = null;
     let checkOutDate: Date | null = null;
@@ -336,8 +647,17 @@ export class AttendanceService {
       }
     }
 
-    // Calculate late minutes if applicable
-    const lateMinutes = this.calculateLateMinutes(checkInDate, workDateStr, shiftRecord);
+    // Calculate late minutes if applicable using the company's configured timezone
+    const companyTimezone =
+      checkInDate && shiftRecord
+        ? await WorkPolicyService.resolveCompanyTimezone(actor.companyId, prisma)
+        : 'UTC';
+    const lateMinutes = this.calculateLateMinutes(
+      checkInDate,
+      workDateStr,
+      shiftRecord,
+      companyTimezone
+    );
 
     // Validate status
     let status: AttendanceStatus = input.status || (lateMinutes > 0 ? 'LATE' : 'PRESENT');
@@ -358,6 +678,26 @@ export class AttendanceService {
       throw err;
     }
 
+    // Compute manual multi-pair summary fields
+    let actualWorkedMinutes: number | null = null;
+    let hasIncompletePunch = false;
+    let punchPairsCount = 0;
+
+    if (status !== 'ABSENT' && status !== 'ON_LEAVE') {
+      if (checkInDate && checkOutDate) {
+        actualWorkedMinutes = Math.max(
+          0,
+          Math.round((checkOutDate.getTime() - checkInDate.getTime()) / (1000 * 60))
+        );
+        hasIncompletePunch = false;
+        punchPairsCount = 1;
+      } else if (checkInDate || checkOutDate) {
+        actualWorkedMinutes = 0;
+        hasIncompletePunch = true;
+        punchPairsCount = 0;
+      }
+    }
+
     // Execute atomic transaction for record creation and audit log
     const created = await prisma.$transaction(async (tx) => {
       const att = await tx.attendance.create({
@@ -371,6 +711,9 @@ export class AttendanceService {
           status,
           lateMinutes,
           overtimeMinutes: 0, // Prompt: Do not calculate overtime pay or run payroll in this phase
+          actualWorkedMinutes,
+          hasIncompletePunch,
+          punchPairsCount,
           source,
           notes: input.notes?.trim() || null,
         },
@@ -413,6 +756,9 @@ export class AttendanceService {
       status: created.status as AttendanceStatus,
       lateMinutes: created.lateMinutes,
       overtimeMinutes: created.overtimeMinutes,
+      actualWorkedMinutes: (created as any).actualWorkedMinutes ?? actualWorkedMinutes,
+      hasIncompletePunch: (created as any).hasIncompletePunch ?? hasIncompletePunch,
+      punchPairsCount: (created as any).punchPairsCount ?? punchPairsCount,
       source: created.source as AttendanceSource,
       notes: created.notes,
       createdAt: created.createdAt.toISOString(),
@@ -443,12 +789,55 @@ export class AttendanceService {
       throw err;
     }
 
+    // Defense-in-depth: if EMPLOYEE role is granted ATTENDANCE:EDIT via RolePermission override,
+    // restrict updates strictly to the employee record linked to actor.userId in actor.companyId.
+    if (actor.role === 'EMPLOYEE') {
+      const actorUserId = actor.userId || actor.id;
+      if (!actorUserId) {
+        const err = new Error('Employees are only permitted to update their own attendance records.');
+        (err as { statusCode?: number }).statusCode = 403;
+        throw err;
+      }
+      const selfEmployeeId = await this.getEmployeeIdForUser(actor.companyId, actorUserId);
+      if (existing.employeeId !== selfEmployeeId) {
+        const err = new Error('Employees are only permitted to update their own attendance records.');
+        (err as { statusCode?: number }).statusCode = 403;
+        throw err;
+      }
+    }
+
+    const workDateStr = existing.workDate.toISOString().split('T')[0];
+    await this.assertPayrollPeriodUnlocked(actor.companyId, existing.workDate, workDateStr);
+
+    const existingPairsCount =
+      typeof (existing as any).punchPairsCount === 'number' ? (existing as any).punchPairsCount : 0;
+    const hasBiometricIntervalData =
+      existingPairsCount > 1 ||
+      (await this.hasBiometricEventsOrIntervals(actor.companyId, existing.id));
+
+    if (
+      hasBiometricIntervalData &&
+      (input.checkIn !== undefined ||
+        input.checkOut !== undefined ||
+        input.status === 'ABSENT' ||
+        input.status === 'ON_LEAVE')
+    ) {
+      const err = new Error(
+        'Cannot manually modify timestamps or change status to ABSENT/ON_LEAVE when biometric punch events or work intervals exist for this attendance record.'
+      );
+      (err as { statusCode?: number }).statusCode = 409;
+      throw err;
+    }
+
     const dataToUpdate: {
       checkIn?: Date | null;
       checkOut?: Date | null;
       shiftId?: string | null;
       status?: AttendanceStatus;
       lateMinutes?: number;
+      actualWorkedMinutes?: number | null;
+      hasIncompletePunch?: boolean;
+      punchPairsCount?: number;
       notes?: string | null;
     } = {};
 
@@ -512,12 +901,21 @@ export class AttendanceService {
       }
     }
 
-    // Recompute late minutes if check-in or shift changed
+    // Recompute late minutes if check-in or shift changed using the company's configured timezone
     if (input.checkIn !== undefined || input.shiftId !== undefined) {
-      const workDateStr = existing.workDate.toISOString().split('T')[0];
-      dataToUpdate.lateMinutes = this.calculateLateMinutes(effectiveCheckIn, workDateStr, effectiveShift);
+      const companyTimezone =
+        effectiveCheckIn && effectiveShift
+          ? await WorkPolicyService.resolveCompanyTimezone(actor.companyId, prisma)
+          : 'UTC';
+      dataToUpdate.lateMinutes = this.calculateLateMinutes(
+        effectiveCheckIn,
+        workDateStr,
+        effectiveShift,
+        companyTimezone
+      );
     }
 
+    let effectiveStatus = existing.status as AttendanceStatus;
     if (input.status !== undefined) {
       if (!VALID_STATUSES.includes(input.status)) {
         const err = new Error(`Invalid status '${input.status}'. Allowed: ${VALID_STATUSES.join(', ')}.`);
@@ -525,13 +923,44 @@ export class AttendanceService {
         throw err;
       }
       dataToUpdate.status = input.status;
+      effectiveStatus = input.status;
     }
 
     if (input.notes !== undefined) {
       dataToUpdate.notes = input.notes?.trim() || null;
     }
 
-    const updated = await prisma.attendance.update({
+    if (hasBiometricIntervalData) {
+      // Preserve biometric interval summary columns (actualWorkedMinutes, hasIncompletePunch, punchPairsCount)
+      // on allowed non-timestamp metadata updates (e.g. notes, shiftId, LATE/HALF_DAY/PRESENT).
+    } else if (effectiveStatus === 'ABSENT' || effectiveStatus === 'ON_LEAVE') {
+      dataToUpdate.actualWorkedMinutes = null;
+      dataToUpdate.hasIncompletePunch = false;
+      dataToUpdate.punchPairsCount = 0;
+    } else if (
+      input.checkIn !== undefined ||
+      input.checkOut !== undefined ||
+      input.status !== undefined
+    ) {
+      if (effectiveCheckIn && effectiveCheckOut) {
+        dataToUpdate.actualWorkedMinutes = Math.max(
+          0,
+          Math.round((effectiveCheckOut.getTime() - effectiveCheckIn.getTime()) / (1000 * 60))
+        );
+        dataToUpdate.hasIncompletePunch = false;
+        dataToUpdate.punchPairsCount = 1;
+      } else if (effectiveCheckIn || effectiveCheckOut) {
+        dataToUpdate.actualWorkedMinutes = 0;
+        dataToUpdate.hasIncompletePunch = true;
+        dataToUpdate.punchPairsCount = 0;
+      } else {
+        dataToUpdate.actualWorkedMinutes = null;
+        dataToUpdate.hasIncompletePunch = false;
+        dataToUpdate.punchPairsCount = 0;
+      }
+    }
+
+    const updated: any = await prisma.attendance.update({
       where: { id },
       data: dataToUpdate,
       include: {
@@ -564,6 +993,22 @@ export class AttendanceService {
       status: updated.status as AttendanceStatus,
       lateMinutes: updated.lateMinutes,
       overtimeMinutes: updated.overtimeMinutes,
+      actualWorkedMinutes:
+        typeof updated.actualWorkedMinutes === 'number'
+          ? updated.actualWorkedMinutes
+          : updated.checkIn && updated.checkOut
+          ? Math.max(0, Math.round((updated.checkOut.getTime() - updated.checkIn.getTime()) / 60000))
+          : null,
+      hasIncompletePunch:
+        typeof updated.hasIncompletePunch === 'boolean'
+          ? updated.hasIncompletePunch
+          : Boolean((updated.checkIn && !updated.checkOut) || (!updated.checkIn && updated.checkOut)),
+      punchPairsCount:
+        typeof updated.punchPairsCount === 'number'
+          ? updated.punchPairsCount
+          : updated.checkIn && updated.checkOut
+          ? 1
+          : 0,
       source: updated.source as AttendanceSource,
       notes: updated.notes,
       createdAt: updated.createdAt.toISOString(),
@@ -623,46 +1068,66 @@ export class AttendanceService {
       orderBy: { createdAt: 'desc' },
     });
 
-    // Overnight shift support: check if an active overnight shift started yesterday without a check-out
-    if (!attendance && employee.shift?.isOvernight) {
-      const yesterdayDate = new Date(todayDate);
-      yesterdayDate.setUTCDate(yesterdayDate.getUTCDate() - 1);
-      const yesterdayAtt = await prisma.attendance.findFirst({
-        where: {
-          companyId: actor.companyId,
-          employeeId: targetEmployeeId,
-          workDate: yesterdayDate,
-          checkIn: { not: null },
-        },
-        include: {
-          shift: { select: { id: true, name: true, startTime: true, endTime: true, isOvernight: true } },
-        },
-        orderBy: { createdAt: 'desc' },
+    const policyRevisions = await WorkPolicyService.listRevisionsForEmployee(
+      actor.companyId,
+      targetEmployeeId,
+      prisma
+    );
+
+    // Overnight shift support: resolve the effective-dated work policy applicable to the previous
+    // local work date (falling back to employee.shift when no policy revisions exist) instead of
+    // checking only the current employee.shift snapshot.
+    if (!attendance) {
+      const yesterdayStr = addCalendarDaysToDateStr(todayStr, -1);
+      const yesterdayPolicy = WorkPolicyService.resolvePolicyForDate({
+        date: yesterdayStr,
+        employee: employee as any,
+        revisions: policyRevisions,
       });
 
-      if (yesterdayAtt && (!yesterdayAtt.checkOut || (Date.now() - yesterdayAtt.checkIn!.getTime() < 24 * 60 * 60 * 1000))) {
-        attendance = yesterdayAtt;
+      if (yesterdayPolicy.shift?.isOvernight) {
+        const yesterdayDate = new Date(`${yesterdayStr}T00:00:00.000Z`);
+        const yesterdayAtt = await prisma.attendance.findFirst({
+          where: {
+            companyId: actor.companyId,
+            employeeId: targetEmployeeId,
+            workDate: yesterdayDate,
+            checkIn: { not: null },
+          },
+          include: {
+            shift: { select: { id: true, name: true, startTime: true, endTime: true, isOvernight: true } },
+          },
+          orderBy: { createdAt: 'desc' },
+        });
+
+        if (
+          yesterdayAtt &&
+          (!yesterdayAtt.checkOut || Date.now() - yesterdayAtt.checkIn!.getTime() < 24 * 60 * 60 * 1000)
+        ) {
+          attendance = yesterdayAtt;
+        }
       }
     }
 
-    const effectiveShift = attendance?.shift || employee.shift;
-    let expectedDurationHours: number | null = null;
-    let shiftSchedule: string | null = null;
-    let expectedMinutes = 0;
+    const referenceWorkDateStr = attendance
+      ? attendance.workDate.toISOString().split('T')[0]
+      : todayStr;
+    const effectivePolicy = WorkPolicyService.resolvePolicyForDate({
+      date: referenceWorkDateStr,
+      employee: employee as any,
+      revisions: policyRevisions,
+      attendanceShiftOverride: (attendance?.shift as ShiftDurationShape | null) || null,
+    });
 
-    if (effectiveShift) {
-      const startH = parseInt(effectiveShift.startTime.slice(0, 2), 10);
-      const startM = parseInt(effectiveShift.startTime.slice(3, 5), 10);
-      const endH = parseInt(effectiveShift.endTime.slice(0, 2), 10);
-      const endM = parseInt(effectiveShift.endTime.slice(3, 5), 10);
-      const startMin = startH * 60 + startM;
-      const endMin = endH * 60 + endM;
-      expectedMinutes = effectiveShift.isOvernight && endMin <= startMin
-        ? (endMin + 1440 - startMin)
-        : (endMin - startMin);
-      expectedDurationHours = Math.round((expectedMinutes / 60) * 100) / 100;
-      shiftSchedule = `${effectiveShift.name} (${effectiveShift.startTime} – ${effectiveShift.endTime}${effectiveShift.isOvernight ? ' +1d' : ''})`;
-    }
+    const effectiveShift =
+      effectivePolicy.shift ||
+      attendance?.shift ||
+      (effectivePolicy.source === 'EMPLOYEE_FALLBACK' ? employee.shift : null);
+    const expectedMinutes = effectivePolicy.effectiveDailyRequiredMinutes ?? 0;
+    const expectedDurationHours = effectivePolicy.effectiveDailyWorkingHours;
+    const shiftSchedule =
+      effectivePolicy.shiftSchedule ||
+      (expectedDurationHours !== null ? `Custom Schedule (${expectedDurationHours}h/day)` : null);
 
     let status: WorkingHoursStatus;
     let statusMessage: string;
@@ -671,22 +1136,54 @@ export class AttendanceService {
     let shortDurationMinutes = 0;
     let overtimeDurationMinutes = 0;
 
-    if (!effectiveShift) {
+    const punchPairsCount =
+      typeof (attendance as any)?.punchPairsCount === 'number'
+        ? (attendance as any).punchPairsCount
+        : attendance?.checkIn && attendance?.checkOut && attendance.checkOut.getTime() >= attendance.checkIn.getTime()
+        ? 1
+        : 0;
+    const hasIncompletePunch = attendance
+      ? typeof (attendance as any).hasIncompletePunch === 'boolean'
+        ? (attendance as any).hasIncompletePunch
+        : Boolean((attendance.checkIn && !attendance.checkOut) || (!attendance.checkIn && attendance.checkOut))
+      : false;
+    const actualWorkedMinutes = attendance
+      ? typeof (attendance as any).actualWorkedMinutes === 'number'
+        ? (attendance as any).actualWorkedMinutes
+        : attendance.checkIn && attendance.checkOut
+        ? Math.round((attendance.checkOut.getTime() - attendance.checkIn.getTime()) / (1000 * 60))
+        : null
+      : null;
+
+    if (effectivePolicy.effectiveDailyRequiredMinutes === null) {
       status = 'NO_SHIFT_ASSIGNED';
       statusMessage = 'No working shift is assigned to your employee account. Daily required working hours are unavailable. Logging out of CoreERP will NOT record attendance.';
-    } else if (!attendance || !attendance.checkIn) {
+    } else if (!attendance || (!attendance.checkIn && !attendance.checkOut)) {
       status = 'MISSING_CHECK_IN';
       statusMessage = 'No attendance check-in has been logged for your account today. Logging out of CoreERP will NOT record attendance.';
       requiresAttendanceAction = true;
-    } else if (attendance.checkIn && !attendance.checkOut) {
+    } else if (hasIncompletePunch || (attendance.checkIn && !attendance.checkOut) || (!attendance.checkIn && attendance.checkOut)) {
       status = 'INCOMPLETE_ATTENDANCE';
-      const checkInTime = attendance.checkIn.toISOString().substring(11, 16);
-      statusMessage = `Attendance Incomplete: You checked in today at ${checkInTime} UTC, but have not recorded a check-out punch. Logging out of CoreERP will NOT record your check-out. Please punch out on the Attendance page if your workday has ended.`;
+      if (attendance.checkIn && !attendance.checkOut && punchPairsCount === 0) {
+        const checkInTimeLocal = formatTimeInTimezone(attendance.checkIn, timezone, {
+          includeZoneAbbr: true,
+        });
+        statusMessage = `Attendance Incomplete: You checked in today at ${checkInTimeLocal}, but have not recorded a check-out punch. Logging out of CoreERP will NOT record your check-out. Please punch out on the Attendance page if your workday has ended.`;
+      } else {
+        const workedSoFarHours =
+          actualWorkedMinutes !== null ? Math.round((actualWorkedMinutes / 60) * 100) / 100 : null;
+        workedDurationHours = workedSoFarHours;
+        statusMessage = `Attendance Incomplete: You have an incomplete punch sequence recorded for today${
+          workedSoFarHours !== null ? ` (${workedSoFarHours}h completed in paired sessions)` : ''
+        }. Logging out of CoreERP will NOT close your punch sequence.`;
+      }
       requiresAttendanceAction = true;
-    } else if (attendance.checkIn && attendance.checkOut) {
-      const workedMs = attendance.checkOut.getTime() - attendance.checkIn.getTime();
-      const workedMinutes = Math.round(workedMs / (1000 * 60));
+    } else if (actualWorkedMinutes !== null) {
+      const workedMinutes = actualWorkedMinutes;
       workedDurationHours = Math.round((workedMinutes / 60) * 100) / 100;
+      const scheduleTargetLabel = effectiveShift
+        ? `your scheduled ${expectedDurationHours}h shift`
+        : `your ${expectedDurationHours}h daily working schedule`;
 
       if (workedMinutes < 0) {
         status = 'DATA_REQUIRES_REVIEW';
@@ -697,17 +1194,19 @@ export class AttendanceService {
         const shortH = Math.floor(shortDurationMinutes / 60);
         const shortM = shortDurationMinutes % 60;
         const shortDurationStr = shortH > 0 ? `${shortH}h ${shortM}m` : `${shortM}m`;
-        statusMessage = `Short Hours: You completed ${workedDurationHours}h of work today, which is short by ${shortDurationStr} of your scheduled ${expectedDurationHours}h shift.`;
+        statusMessage = `Short Hours: You completed ${workedDurationHours}h of work today, which is short by ${shortDurationStr} of ${scheduleTargetLabel}.`;
       } else if (workedMinutes > expectedMinutes) {
         status = 'OVERTIME';
         overtimeDurationMinutes = workedMinutes - expectedMinutes;
         const otH = Math.floor(overtimeDurationMinutes / 60);
         const otM = overtimeDurationMinutes % 60;
         const otStr = otH > 0 ? `${otH}h ${otM}m` : `${otM}m`;
-        statusMessage = `Overtime Recorded: You completed ${workedDurationHours}h of work today, exceeding your scheduled ${expectedDurationHours}h shift by ${otStr} of overtime.`;
+        statusMessage = `Overtime Recorded: You completed ${workedDurationHours}h of work today, exceeding ${scheduleTargetLabel} by ${otStr} of overtime.`;
       } else {
         status = 'HOURS_COMPLETED';
-        statusMessage = `Shift Complete: You have completed your scheduled ${expectedDurationHours}h working hours for today.`;
+        statusMessage = effectiveShift
+          ? `Shift Complete: You have completed your scheduled ${expectedDurationHours}h working hours for today.`
+          : `Workday Complete: You have completed your ${expectedDurationHours}h required working hours for today.`;
       }
     } else {
       status = 'DATA_REQUIRES_REVIEW';
@@ -727,6 +1226,9 @@ export class AttendanceService {
       checkIn: attendance?.checkIn ? attendance.checkIn.toISOString() : null,
       checkOut: attendance?.checkOut ? attendance.checkOut.toISOString() : null,
       workedDurationHours,
+      actualWorkedMinutes,
+      punchPairsCount,
+      hasIncompletePunch,
       shortDurationMinutes,
       overtimeDurationMinutes,
       status,
@@ -785,6 +1287,9 @@ export class AttendanceService {
             id: true,
             fullName: true,
             employeeCode: true,
+            dailyWorkingHours: true,
+            monthlyLeaveAllowance: true,
+            shiftId: true,
             shift: { select: { id: true, name: true, startTime: true, endTime: true, isOvernight: true } },
           },
         },
@@ -793,11 +1298,28 @@ export class AttendanceService {
       orderBy: [{ workDate: 'desc' }, { createdAt: 'desc' }],
     });
 
+    const allEmployeeIds = Array.from(
+      new Set([
+        ...activeEmployees.map((e) => e.id),
+        ...recentAttendances.map((a) => a.employeeId),
+      ])
+    );
+    const policyMap = await WorkPolicyService.listRevisionsForEmployees(
+      actor.companyId,
+      allEmployeeIds,
+      prisma
+    );
+
     const notificationsMap = new Map<string, AdminNotificationItem>();
 
-    // 1. Unassigned Shifts
+    // 1. Unassigned Working Schedules (only flag if neither Shift nor dailyWorkingHours is configured)
     for (const emp of activeEmployees) {
-      if (!emp.shiftId || !emp.shift) {
+      const todayPolicy = WorkPolicyService.resolvePolicyForDate({
+        date: todayStr,
+        employee: emp as any,
+        revisions: policyMap.get(emp.id) || [],
+      });
+      if (todayPolicy.effectiveDailyRequiredMinutes === null) {
         const id = `${emp.id}_NO_SHIFT_ASSIGNED_${todayStr}`;
         notificationsMap.set(id, {
           id,
@@ -819,9 +1341,26 @@ export class AttendanceService {
     // 2. Attendance Events (Incomplete Punch, Short Hours, Hours Completed, Data Review)
     for (const att of recentAttendances) {
       const workDateStr = att.workDate.toISOString().split('T')[0];
-      const shift = att.shift || att.employee.shift;
+      const dayPolicy = WorkPolicyService.resolvePolicyForDate({
+        date: workDateStr,
+        employee: (att.employee as any) || {},
+        revisions: policyMap.get(att.employee.id) || [],
+        attendanceShiftOverride: (att.shift as ShiftDurationShape | null) || null,
+      });
 
-      if (att.checkIn && !att.checkOut) {
+      const isIncomplete =
+        typeof (att as any).hasIncompletePunch === 'boolean'
+          ? (att as any).hasIncompletePunch
+          : Boolean((att.checkIn && !att.checkOut) || (!att.checkIn && att.checkOut));
+
+      const workedMin =
+        typeof (att as any).actualWorkedMinutes === 'number'
+          ? (att as any).actualWorkedMinutes
+          : att.checkIn && att.checkOut
+          ? Math.round((att.checkOut.getTime() - att.checkIn.getTime()) / (1000 * 60))
+          : null;
+
+      if (isIncomplete || (att.checkIn && !att.checkOut) || (!att.checkIn && att.checkOut)) {
         const id = `${att.employee.id}_INCOMPLETE_PUNCH_${workDateStr}`;
         if (!notificationsMap.has(id)) {
           notificationsMap.set(id, {
@@ -830,7 +1369,10 @@ export class AttendanceService {
             type: 'INCOMPLETE_PUNCH',
             severity: 'WARN',
             title: 'Missing Check-Out Punch',
-            message: `${att.employee.fullName} (${att.employee.employeeCode}) checked in on ${workDateStr} but has no check-out punch.`,
+            message:
+              !att.checkIn && att.checkOut
+                ? `${att.employee.fullName} (${att.employee.employeeCode}) recorded check-out on ${workDateStr} without matching check-in.`
+                : `${att.employee.fullName} (${att.employee.employeeCode}) checked in on ${workDateStr} but has no check-out punch.`,
             employeeId: att.employee.id,
             employeeName: att.employee.fullName,
             employeeCode: att.employee.employeeCode,
@@ -839,32 +1381,31 @@ export class AttendanceService {
             createdAt: att.updatedAt.toISOString(),
           });
         }
-      } else if (att.checkIn && att.checkOut && shift) {
-        const startMin = parseInt(shift.startTime.slice(0, 2), 10) * 60 + parseInt(shift.startTime.slice(3, 5), 10);
-        const endMin = parseInt(shift.endTime.slice(0, 2), 10) * 60 + parseInt(shift.endTime.slice(3, 5), 10);
-        const expectedMin = shift.isOvernight && endMin <= startMin ? endMin + 1440 - startMin : endMin - startMin;
-        const workedMs = att.checkOut.getTime() - att.checkIn.getTime();
-        const workedMin = Math.round(workedMs / (1000 * 60));
-
-        if (workedMin < 0) {
-          const id = `${att.employee.id}_ATTENDANCE_REVIEW_REQUIRED_${workDateStr}`;
-          if (!notificationsMap.has(id)) {
-            notificationsMap.set(id, {
-              id,
-              companyId: actor.companyId,
-              type: 'ATTENDANCE_REVIEW_REQUIRED',
-              severity: 'ERROR',
-              title: 'Attendance Punch Inversion',
-              message: `Check-out timestamp is earlier than check-in for ${att.employee.fullName} on ${workDateStr}.`,
-              employeeId: att.employee.id,
-              employeeName: att.employee.fullName,
-              employeeCode: att.employee.employeeCode,
-              workDate: workDateStr,
-              actionUrl: '/attendance',
-              createdAt: att.updatedAt.toISOString(),
-            });
-          }
-        } else if (workedMin < expectedMin) {
+      } else if (workedMin !== null && workedMin < 0) {
+        const id = `${att.employee.id}_ATTENDANCE_REVIEW_REQUIRED_${workDateStr}`;
+        if (!notificationsMap.has(id)) {
+          notificationsMap.set(id, {
+            id,
+            companyId: actor.companyId,
+            type: 'ATTENDANCE_REVIEW_REQUIRED',
+            severity: 'ERROR',
+            title: 'Attendance Punch Inversion',
+            message: `Check-out timestamp is earlier than check-in for ${att.employee.fullName} on ${workDateStr}.`,
+            employeeId: att.employee.id,
+            employeeName: att.employee.fullName,
+            employeeCode: att.employee.employeeCode,
+            workDate: workDateStr,
+            actionUrl: '/attendance',
+            createdAt: att.updatedAt.toISOString(),
+          });
+        }
+      } else if (
+        workedMin !== null &&
+        dayPolicy.effectiveDailyRequiredMinutes !== null &&
+        dayPolicy.effectiveDailyRequiredMinutes > 0
+      ) {
+        const expectedMin = dayPolicy.effectiveDailyRequiredMinutes;
+        if (workedMin < expectedMin) {
           const id = `${att.employee.id}_SHORT_HOURS_${workDateStr}`;
           if (!notificationsMap.has(id)) {
             const shortMin = expectedMin - workedMin;

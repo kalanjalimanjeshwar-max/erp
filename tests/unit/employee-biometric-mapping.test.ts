@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../../src/server/app.js';
 import { prisma } from '../../src/server/db/client.js';
@@ -873,6 +873,9 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
       expect(enrollRes.status).toBe(200);
       expect(enrollRes.body).toEqual([]);
 
+      vi.spyOn(prisma.biometricTerminal, 'findFirst').mockResolvedValueOnce({
+        id: esslTerminal.id,
+      } as any);
       const syncSpy = vi.spyOn(PunchReconciliationService, 'reconcilePendingPunches').mockResolvedValueOnce({
         success: true,
         totalEvaluated: 3,
@@ -935,4 +938,526 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
       expect(bioSource).toContain('Errors');
     });
   });
+
+  describe('8. P1-3: Today-Only Cutoff on Employee Activation & Biometric Mapping Reconciliation', () => {
+    const secondTerminal = {
+      id: 'term-essl-secondary',
+      companyId: companyAlphaId,
+      deviceSerialNumber: 'NFZ8252800999',
+      name: 'eSSL X2008 Back Gate',
+      terminalModel: 'eSSL X2008',
+      ipAddress: '192.168.1.202',
+      port: 4370,
+      location: 'Back Gate',
+      isActive: true,
+      status: 'ONLINE' as const,
+      lastHeartbeatAt: new Date(),
+      lastSyncAt: new Date(),
+    };
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function setupCutoffHarness(options: {
+      timezone: string;
+      initialStatus: 'ACTIVE' | 'INACTIVE';
+      initialMapped?: boolean;
+      punches: Array<{
+        id: string;
+        terminalId?: string;
+        userEnrollmentId: string;
+        punchTime: Date;
+        inOutMode: 'CHECK_IN' | 'CHECK_OUT';
+        syncStatus: 'PENDING' | 'ERROR';
+        errorMessage?: string | null;
+      }>;
+    }) {
+      const store = createInMemorySettingStore();
+      const emp: any = {
+        id: 'emp-p13-101',
+        companyId: companyAlphaId,
+        employeeCode: 'EMP-P13-101',
+        fullName: 'Cutoff Test Employee',
+        email: 'cutoff@alpha.local',
+        phone: null,
+        address: null,
+        photoUrl: null,
+        dateOfBirth: null,
+        dateOfJoining: new Date('2026-01-01T00:00:00.000Z'),
+        departmentId: null,
+        department: null,
+        designationId: null,
+        designation: null,
+        shiftId: standardShift.id,
+        shift: standardShift,
+        employmentType: 'FULL_TIME',
+        status: options.initialStatus,
+        notes: null,
+        biometricDeviceId: options.initialMapped ? '101' : null,
+        userId: null,
+        user: null,
+        ledgerId: null,
+        ledger: null,
+        salaryRevisions: [],
+        _count: { salaryRevisions: 0 },
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+        updatedAt: new Date('2026-10-01T00:00:00.000Z'),
+      };
+
+      if (options.initialMapped) {
+        store.set(
+          `${companyAlphaId}::${BIOMETRIC_MAPPINGS_SETTING_KEY}`,
+          JSON.stringify([
+            {
+              id: 'map-p13-101',
+              companyId: companyAlphaId,
+              employeeId: emp.id,
+              terminalId: esslTerminal.id,
+              enrollmentId: '101',
+              isActive: true,
+              source: 'EXPLICIT',
+              createdAt: '2026-10-01T00:00:00.000Z',
+              updatedAt: '2026-10-01T00:00:00.000Z',
+            },
+          ])
+        );
+      }
+
+      const rawPunches = options.punches.map((p) => ({
+        id: p.id,
+        companyId: companyAlphaId,
+        terminalId: p.terminalId || esslTerminal.id,
+        userEnrollmentId: p.userEnrollmentId,
+        punchTime: p.punchTime,
+        inOutMode: p.inOutMode,
+        syncStatus: p.syncStatus as 'PENDING' | 'ERROR' | 'PROCESSED' | 'IGNORED',
+        matchedEmployeeId: null as string | null,
+        errorMessage: p.errorMessage ?? null,
+      }));
+
+      const attendanceRecords: any[] = [];
+      const observedFindManyWheres: any[] = [];
+
+      vi.spyOn(prisma, '$transaction').mockImplementation((async (cb: any) => cb(prisma)) as any);
+      vi.spyOn(prisma.employee, 'findUnique').mockImplementation((async (args: any) => {
+        if (args.where.id === emp.id) return { ...emp };
+        return null;
+      }) as any);
+      vi.spyOn(prisma.employee, 'findFirst').mockResolvedValue(null);
+      vi.spyOn(prisma.employee, 'update').mockImplementation((async (args: any) => {
+        Object.assign(emp, args.data, { updatedAt: new Date() });
+        return { ...emp };
+      }) as any);
+      vi.spyOn(prisma.biometricTerminal, 'findMany').mockResolvedValue([
+        esslTerminal,
+        secondTerminal,
+      ] as any);
+      vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: options.timezone } as any);
+      vi.spyOn(prisma.payrollPeriod, 'findFirst').mockResolvedValue(null);
+      vi.spyOn(prisma.leaveRequest, 'findFirst').mockResolvedValue(null);
+
+      vi.spyOn(prisma.rawPunchLog, 'findMany').mockImplementation((async (args: any) => {
+        const where = args?.where || {};
+        observedFindManyWheres.push(where);
+        return rawPunches
+          .filter((p) => {
+            if (where.companyId && p.companyId !== where.companyId) return false;
+            if (where.terminalId && p.terminalId !== where.terminalId) return false;
+            if (where.userEnrollmentId && p.userEnrollmentId !== where.userEnrollmentId) return false;
+            if (where.syncStatus) {
+              if (typeof where.syncStatus === 'string' && p.syncStatus !== where.syncStatus) return false;
+              if (where.syncStatus.in && !where.syncStatus.in.includes(p.syncStatus)) return false;
+            }
+            if (where.punchTime?.gte) {
+              const cutoffMs = new Date(where.punchTime.gte).getTime();
+              if (p.punchTime.getTime() < cutoffMs) return false;
+            }
+            return true;
+          })
+          .sort((a, b) => a.punchTime.getTime() - b.punchTime.getTime());
+      }) as any);
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockImplementation((async (args: any) => {
+        const found = rawPunches.find((p) => p.id === args.where.id);
+        if (!found) return null as any;
+        const term = found.terminalId === secondTerminal.id ? secondTerminal : esslTerminal;
+        return {
+          ...found,
+          company: { id: companyAlphaId, timezone: options.timezone },
+          terminal: { id: term.id, name: term.name, location: term.location },
+          matchedEmployee: found.matchedEmployeeId === emp.id ? { ...emp } : null,
+        } as any;
+      }) as any);
+
+      vi.spyOn(prisma.rawPunchLog, 'update').mockImplementation((async (args: any) => {
+        const found = rawPunches.find((p) => p.id === args.where.id);
+        if (found) Object.assign(found, args.data);
+        return found as any;
+      }) as any);
+
+      vi.spyOn(prisma.attendance, 'findUnique').mockImplementation((async (args: any) => {
+        const key = args.where.companyId_employeeId_workDate;
+        const found = attendanceRecords.find(
+          (a) =>
+            a.companyId === key.companyId &&
+            a.employeeId === key.employeeId &&
+            a.workDate.getTime() === key.workDate.getTime()
+        );
+        return (found || null) as any;
+      }) as any);
+
+      vi.spyOn(prisma.attendance, 'create').mockImplementation((async (args: any) => {
+        const created = { id: `att-p13-${attendanceRecords.length + 1}`, ...args.data };
+        attendanceRecords.push(created);
+        return created as any;
+      }) as any);
+
+      vi.spyOn(prisma.attendance, 'update').mockImplementation((async (args: any) => {
+        const found = attendanceRecords.find((a) => a.id === args.where.id);
+        if (found) Object.assign(found, args.data);
+        return found as any;
+      }) as any);
+
+      return { emp, rawPunches, attendanceRecords, observedFindManyWheres };
+    }
+
+    it('employee activation does not implicitly process historical PENDING or ERROR punches while reconciling current-day punches and preserving targeted filters', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-11-20T12:00:00.000Z'));
+
+      const { emp, rawPunches, attendanceRecords, observedFindManyWheres } = setupCutoffHarness({
+        timezone: 'UTC',
+        initialStatus: 'INACTIVE',
+        initialMapped: true,
+        punches: [
+          {
+            id: 'hist-pending',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-19T09:00:00.000Z'),
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'hist-error',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-19T18:00:00.000Z'),
+            inOutMode: 'CHECK_OUT',
+            syncStatus: 'ERROR',
+            errorMessage: 'Historical failure',
+          },
+          {
+            id: 'today-in-101',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T09:05:00.000Z'),
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'today-err-101',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T11:30:00.000Z'),
+            inOutMode: 'CHECK_OUT',
+            syncStatus: 'ERROR',
+            errorMessage: 'Previously unmapped today',
+          },
+          {
+            id: 'today-other-terminal-101',
+            terminalId: secondTerminal.id,
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T09:05:00.000Z'),
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'today-other-enrollment-102',
+            userEnrollmentId: '102',
+            punchTime: new Date('2026-11-20T09:05:00.000Z'),
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+        ],
+      });
+
+      const activated = await EmployeeService.activateEmployee(adminActor, emp.id);
+      expect(activated.status).toBe('ACTIVE');
+
+      // Query strictly enforced tenant, terminal, enrollment, and start-of-today UTC cutoff
+      expect(observedFindManyWheres).toHaveLength(1);
+      expect(observedFindManyWheres[0]).toMatchObject({
+        companyId: companyAlphaId,
+        terminalId: esslTerminal.id,
+        userEnrollmentId: '101',
+        syncStatus: { in: ['PENDING', 'ERROR'] },
+      });
+      expect(new Date(observedFindManyWheres[0].punchTime.gte).toISOString()).toBe(
+        '2026-11-20T00:00:00.000Z'
+      );
+
+      // Historical PENDING & ERROR punches before cutoff remain completely untouched
+      expect(rawPunches.find((p) => p.id === 'hist-pending')?.syncStatus).toBe('PENDING');
+      expect(rawPunches.find((p) => p.id === 'hist-error')?.syncStatus).toBe('ERROR');
+
+      // Current-day targeted punches are processed
+      expect(rawPunches.find((p) => p.id === 'today-in-101')?.syncStatus).toBe('PROCESSED');
+      expect(rawPunches.find((p) => p.id === 'today-err-101')?.syncStatus).toBe('PROCESSED');
+      expect(attendanceRecords).toHaveLength(1);
+
+      // Unmapped terminal & other enrollment remain untouched PENDING
+      expect(rawPunches.find((p) => p.id === 'today-other-terminal-101')?.syncStatus).toBe('PENDING');
+      expect(rawPunches.find((p) => p.id === 'today-other-enrollment-102')?.syncStatus).toBe('PENDING');
+    });
+
+    it('biometric mapping update does not implicitly process historical PENDING or ERROR punches while reconciling current-day mapped punches', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-11-20T14:00:00.000Z'));
+
+      const { emp, rawPunches, observedFindManyWheres } = setupCutoffHarness({
+        timezone: 'UTC',
+        initialStatus: 'ACTIVE',
+        initialMapped: false,
+        punches: [
+          {
+            id: 'map-hist-pending',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-18T09:00:00.000Z'),
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'map-hist-error',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-19T23:59:59.000Z'),
+            inOutMode: 'CHECK_OUT',
+            syncStatus: 'ERROR',
+            errorMessage: 'Historical error',
+          },
+          {
+            id: 'map-today-pending',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T08:45:00.000Z'),
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'map-other-terminal',
+            terminalId: secondTerminal.id,
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T08:45:00.000Z'),
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+        ],
+      });
+
+      const res = await EmployeeService.updateEmployeeBiometricMappings(adminActor, emp.id, [
+        { terminalId: esslTerminal.id, enrollmentId: '101', source: 'EXPLICIT' },
+      ]);
+
+      expect(res.reconciliation.totalEvaluated).toBe(1);
+      expect(res.reconciliation.processed).toBe(1);
+      expect(observedFindManyWheres).toHaveLength(1);
+      expect(observedFindManyWheres[0]).toMatchObject({
+        companyId: companyAlphaId,
+        terminalId: esslTerminal.id,
+        userEnrollmentId: '101',
+      });
+      expect(new Date(observedFindManyWheres[0].punchTime.gte).toISOString()).toBe(
+        '2026-11-20T00:00:00.000Z'
+      );
+
+      expect(rawPunches.find((p) => p.id === 'map-hist-pending')?.syncStatus).toBe('PENDING');
+      expect(rawPunches.find((p) => p.id === 'map-hist-error')?.syncStatus).toBe('ERROR');
+      expect(rawPunches.find((p) => p.id === 'map-today-pending')?.syncStatus).toBe('PROCESSED');
+      expect(rawPunches.find((p) => p.id === 'map-other-terminal')?.syncStatus).toBe('PENDING');
+    });
+
+    it('calculates Asia/Kolkata (+05:30) cutoff accurately across the UTC date boundary', async () => {
+      // 2026-11-20T20:00:00Z is already 2026-11-21 01:30:00 IST -> start of IST today is 2026-11-20T18:30:00.000Z
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-11-20T20:00:00.000Z'));
+
+      const { emp, rawPunches, observedFindManyWheres } = setupCutoffHarness({
+        timezone: 'Asia/Kolkata',
+        initialStatus: 'INACTIVE',
+        initialMapped: true,
+        punches: [
+          {
+            id: 'ist-yesterday-last-sec',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T18:29:59.000Z'), // 2026-11-20 23:59:59 IST (yesterday local)
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'ist-yesterday-error',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T10:00:00.000Z'), // 2026-11-20 15:30:00 IST (yesterday local)
+            inOutMode: 'CHECK_OUT',
+            syncStatus: 'ERROR',
+            errorMessage: 'Old IST error',
+          },
+          {
+            id: 'ist-today-midnight',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T18:30:00.000Z'), // 2026-11-21 00:00:00 IST (today local)
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'ist-today-0100',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T19:30:00.000Z'), // 2026-11-21 01:00:00 IST (today local)
+            inOutMode: 'CHECK_OUT',
+            syncStatus: 'PENDING',
+          },
+        ],
+      });
+
+      await EmployeeService.activateEmployee(adminActor, emp.id);
+
+      expect(observedFindManyWheres).toHaveLength(1);
+      expect(new Date(observedFindManyWheres[0].punchTime.gte).toISOString()).toBe(
+        '2026-11-20T18:30:00.000Z'
+      );
+
+      expect(rawPunches.find((p) => p.id === 'ist-yesterday-last-sec')?.syncStatus).toBe('PENDING');
+      expect(rawPunches.find((p) => p.id === 'ist-yesterday-error')?.syncStatus).toBe('ERROR');
+      expect(rawPunches.find((p) => p.id === 'ist-today-midnight')?.syncStatus).toBe('PROCESSED');
+      expect(rawPunches.find((p) => p.id === 'ist-today-0100')?.syncStatus).toBe('PROCESSED');
+    });
+
+    it('calculates America/New_York (-05:00) cutoff accurately across the UTC date boundary', async () => {
+      // 2026-11-21T02:00:00Z is still 2026-11-20 21:00:00 EST -> start of EST today is 2026-11-20T05:00:00.000Z
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-11-21T02:00:00.000Z'));
+
+      const { emp, rawPunches, observedFindManyWheres } = setupCutoffHarness({
+        timezone: 'America/New_York',
+        initialStatus: 'ACTIVE',
+        initialMapped: false,
+        punches: [
+          {
+            id: 'ny-yesterday-last-sec',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T04:59:59.000Z'), // 2026-11-19 23:59:59 EST (yesterday local)
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'ny-yesterday-error',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-19T16:00:00.000Z'), // 2026-11-19 11:00:00 EST
+            inOutMode: 'CHECK_OUT',
+            syncStatus: 'ERROR',
+            errorMessage: 'Old EST error',
+          },
+          {
+            id: 'ny-today-midnight',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-20T05:00:00.000Z'), // 2026-11-20 00:00:00 EST (today local)
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'ny-today-evening',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-21T01:15:00.000Z'), // 2026-11-20 20:15:00 EST (today local)
+            inOutMode: 'CHECK_OUT',
+            syncStatus: 'PENDING',
+          },
+        ],
+      });
+
+      const res = await EmployeeService.updateEmployeeBiometricMappings(adminActor, emp.id, [
+        { terminalId: esslTerminal.id, enrollmentId: '101', source: 'EXPLICIT' },
+      ]);
+
+      expect(res.reconciliation.totalEvaluated).toBe(2);
+      expect(res.reconciliation.processed).toBe(2);
+      expect(observedFindManyWheres).toHaveLength(1);
+      expect(new Date(observedFindManyWheres[0].punchTime.gte).toISOString()).toBe(
+        '2026-11-20T05:00:00.000Z'
+      );
+
+      expect(rawPunches.find((p) => p.id === 'ny-yesterday-last-sec')?.syncStatus).toBe('PENDING');
+      expect(rawPunches.find((p) => p.id === 'ny-yesterday-error')?.syncStatus).toBe('ERROR');
+      expect(rawPunches.find((p) => p.id === 'ny-today-midnight')?.syncStatus).toBe('PROCESSED');
+      expect(rawPunches.find((p) => p.id === 'ny-today-evening')?.syncStatus).toBe('PROCESSED');
+    });
+
+    it('preserves explicitly authorized historical reconciliation when an explicit fromPunchTime is supplied', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-11-20T12:00:00.000Z'));
+
+      const { rawPunches, observedFindManyWheres } = setupCutoffHarness({
+        timezone: 'Asia/Kolkata',
+        initialStatus: 'ACTIVE',
+        initialMapped: true,
+        punches: [
+          {
+            id: 'explicit-hist-older',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-15T04:00:00.000Z'),
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'explicit-hist-in-range',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-18T04:00:00.000Z'),
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+          {
+            id: 'explicit-hist-error-in-range',
+            userEnrollmentId: '101',
+            punchTime: new Date('2026-11-18T12:30:00.000Z'),
+            inOutMode: 'CHECK_OUT',
+            syncStatus: 'ERROR',
+            errorMessage: 'Historical unmapped error',
+          },
+          {
+            id: 'explicit-other-enrollment',
+            userEnrollmentId: '102',
+            punchTime: new Date('2026-11-18T04:00:00.000Z'),
+            inOutMode: 'CHECK_IN',
+            syncStatus: 'PENDING',
+          },
+        ],
+      });
+
+      // Default mapping reconciliation without fromPunchTime skips all historical punches
+      const defaultRes = await PunchReconciliationService.reconcileForEmployeeMapping(
+        companyAlphaId,
+        esslTerminal.id,
+        '101',
+        adminActor.userId
+      );
+      expect(defaultRes.totalEvaluated).toBe(0);
+      expect(rawPunches.find((p) => p.id === 'explicit-hist-in-range')?.syncStatus).toBe('PENDING');
+      expect(rawPunches.find((p) => p.id === 'explicit-hist-error-in-range')?.syncStatus).toBe('ERROR');
+
+      // Explicit administrator historical reconciliation with fromPunchTime processes only punches >= cutoff for this mapping
+      const explicitRes = await PunchReconciliationService.reconcileForEmployeeMapping(
+        companyAlphaId,
+        esslTerminal.id,
+        '101',
+        adminActor.userId,
+        undefined,
+        { fromPunchTime: '2026-11-18T00:00:00.000Z' }
+      );
+      expect(explicitRes.totalEvaluated).toBe(2);
+      expect(explicitRes.processed).toBe(2);
+      expect(new Date(observedFindManyWheres[1].punchTime.gte).toISOString()).toBe(
+        '2026-11-18T00:00:00.000Z'
+      );
+
+      expect(rawPunches.find((p) => p.id === 'explicit-hist-older')?.syncStatus).toBe('PENDING');
+      expect(rawPunches.find((p) => p.id === 'explicit-hist-in-range')?.syncStatus).toBe('PROCESSED');
+      expect(rawPunches.find((p) => p.id === 'explicit-hist-error-in-range')?.syncStatus).toBe('PROCESSED');
+      expect(rawPunches.find((p) => p.id === 'explicit-other-enrollment')?.syncStatus).toBe('PENDING');
+    });
+  });
 });
+

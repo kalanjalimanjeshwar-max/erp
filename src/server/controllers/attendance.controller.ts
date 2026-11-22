@@ -43,7 +43,7 @@ export class AttendanceController {
       const status = (err as { statusCode?: number }).statusCode || 500;
       res.status(status).json({
         error: {
-          code: 'ATTENDANCE_NOT_FOUND',
+          code: status === 403 ? 'FORBIDDEN' : 'ATTENDANCE_NOT_FOUND',
           message: (err as Error).message,
         },
       });
@@ -59,7 +59,12 @@ export class AttendanceController {
       const status = (err as { statusCode?: number }).statusCode || 500;
       res.status(status).json({
         error: {
-          code: status === 409 ? 'ATTENDANCE_CONFLICT' : 'ATTENDANCE_CREATE_FAILED',
+          code:
+            status === 409
+              ? 'ATTENDANCE_CONFLICT'
+              : status === 403
+              ? 'FORBIDDEN'
+              : 'ATTENDANCE_CREATE_FAILED',
           message: (err as Error).message,
         },
       });
@@ -73,9 +78,17 @@ export class AttendanceController {
       res.json(record);
     } catch (err: unknown) {
       const status = (err as { statusCode?: number }).statusCode || 500;
+      const code =
+        status === 409
+          ? 'ATTENDANCE_CONFLICT'
+          : status === 404
+          ? 'ATTENDANCE_NOT_FOUND'
+          : status === 403
+          ? 'FORBIDDEN'
+          : 'ATTENDANCE_UPDATE_FAILED';
       res.status(status).json({
         error: {
-          code: 'ATTENDANCE_UPDATE_FAILED',
+          code,
           message: (err as Error).message,
         },
       });

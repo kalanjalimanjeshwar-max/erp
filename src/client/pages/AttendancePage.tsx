@@ -10,15 +10,17 @@ import {
   X,
   Edit2,
   PowerOff,
-  User,
-  Search,
+  Lock,
+  AlertTriangle,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
 import { LoadingSpinner } from '../components/common/LoadingSpinner.tsx';
 import { EmptyState } from '../components/common/EmptyState.tsx';
+import { ConfirmDialog, executeConfirmedAction } from '../components/common/ConfirmDialog.tsx';
 import {
   AuthUser,
   AttendanceItem,
+  AttendanceIntervalItem,
   AttendanceStatus,
   ShiftItem,
   EmployeeItem,
@@ -30,14 +32,559 @@ import {
 } from '../../shared/types.ts';
 import {
   formatTimeInTimezone,
+  formatTimeInputInTimezone,
+  formatDateInTimezone,
   formatUtcTimestamp,
   getEffectiveTimeZone,
+  getTimezoneShortName,
+  localDateTimeToUtcIso,
+  addCalendarDaysToDateStr,
 } from '../../shared/timezone.ts';
 
 interface AttendancePageProps {
   currentUser: AuthUser;
   companyProfile?: CompanyProfile | null;
 }
+
+export function formatMinutesDuration(minutes: number | null | undefined): string {
+  if (typeof minutes !== 'number' || Number.isNaN(minutes)) return '—';
+  const absMins = Math.max(0, Math.round(minutes));
+  const h = Math.floor(absMins / 60);
+  const m = absMins % 60;
+  if (h > 0) {
+    return `${absMins}m (${h}h ${m}m)`;
+  }
+  return `${absMins}m`;
+}
+
+export function resolveDefaultShiftIdForEmployee(
+  employee: EmployeeItem | null | undefined
+): string {
+  if (!employee) return '';
+  const configuredShiftId =
+    employee.effectiveWorkPolicy?.shiftId ?? employee.shiftId ?? null;
+  return configuredShiftId || '';
+}
+
+export function isBiometricIntervalLocked(
+  record: AttendanceItem | null | undefined
+): boolean {
+  if (!record) return false;
+  const hasIntervals = Array.isArray(record.intervals) && record.intervals.length > 0;
+  const hasPunchEvents = Array.isArray(record.punchEvents) && record.punchEvents.length > 0;
+  const hasMultiPairs =
+    typeof record.punchPairsCount === 'number' && record.punchPairsCount > 1;
+  return hasIntervals || hasPunchEvents || hasMultiPairs;
+}
+
+export function getSortedAttendanceIntervals(
+  record: AttendanceItem
+): AttendanceIntervalItem[] {
+  if (!Array.isArray(record.intervals) || record.intervals.length === 0) {
+    return [];
+  }
+  return [...record.intervals].sort((a, b) => {
+    if (a.sequence !== b.sequence) return a.sequence - b.sequence;
+    const aTime = a.checkIn ? new Date(a.checkIn).getTime() : 0;
+    const bTime = b.checkIn ? new Date(b.checkIn).getTime() : 0;
+    return aTime - bTime;
+  });
+}
+
+export function extractLocalTimesForAttendanceForm(
+  record: AttendanceItem,
+  timezone?: string | null
+): { workDate: string; checkIn: string; checkOut: string } {
+  return {
+    workDate: record.workDate.split('T')[0],
+    checkIn: formatTimeInputInTimezone(record.checkIn, timezone),
+    checkOut: formatTimeInputInTimezone(record.checkOut, timezone),
+  };
+}
+
+export function convertManualTimesToUtcIso(params: {
+  workDate: string;
+  checkIn: string;
+  checkOut: string;
+  timezone?: string | null;
+  isOvernightShift?: boolean;
+}): { checkIn: string | null; checkOut: string | null } {
+  const { workDate, checkIn, checkOut, timezone, isOvernightShift } = params;
+  const checkInIso = checkIn ? localDateTimeToUtcIso(workDate, checkIn, timezone) : null;
+
+  let checkOutDateStr = workDate;
+  if (isOvernightShift && checkIn && checkOut && checkOut < checkIn) {
+    checkOutDateStr = addCalendarDaysToDateStr(workDate, 1);
+  }
+  const checkOutIso = checkOut ? localDateTimeToUtcIso(checkOutDateStr, checkOut, timezone) : null;
+
+  return {
+    checkIn: checkInIso,
+    checkOut: checkOutIso,
+  };
+}
+
+export function buildAttendanceUpdatePayload(params: {
+  editingRecord: AttendanceItem;
+  formShiftId: string;
+  formStatus: AttendanceStatus;
+  formNotes: string;
+  formWorkDate: string;
+  formCheckIn: string;
+  formCheckOut: string;
+  timezone?: string | null;
+  isOvernightShift?: boolean;
+}): UpdateAttendanceRequest {
+  const {
+    editingRecord,
+    formShiftId,
+    formStatus,
+    formNotes,
+    formWorkDate,
+    formCheckIn,
+    formCheckOut,
+    timezone,
+    isOvernightShift,
+  } = params;
+
+  if (isBiometricIntervalLocked(editingRecord)) {
+    return {
+      shiftId: formShiftId || null,
+      status: formStatus,
+      notes: formNotes || null,
+    };
+  }
+
+  const { checkIn, checkOut } = convertManualTimesToUtcIso({
+    workDate: formWorkDate,
+    checkIn: formCheckIn,
+    checkOut: formCheckOut,
+    timezone,
+    isOvernightShift,
+  });
+
+  return {
+    checkIn,
+    checkOut,
+    shiftId: formShiftId || null,
+    status: formStatus,
+    notes: formNotes || null,
+  };
+}
+
+export function formatAttendanceSaveError(err: unknown): string {
+  if (err instanceof ApiError) {
+    return err.message || 'Failed to save attendance record.';
+  }
+  if (err instanceof Error) {
+    return err.message || 'Failed to save attendance record.';
+  }
+  return 'Failed to save attendance record.';
+}
+
+export const AttendanceIntervalsCell: React.FC<{
+  record: AttendanceItem;
+  timezone: string;
+}> = ({ record, timezone }) => {
+  const effectiveTz = getEffectiveTimeZone(timezone);
+  const sortedIntervals = getSortedAttendanceIntervals(record);
+  const formatTime = (iso: string | null) =>
+    formatTimeInTimezone(iso, effectiveTz, { hour12: true, includeZoneAbbr: true });
+
+  return (
+    <div className="space-y-1.5 min-w-[210px]">
+      {sortedIntervals.length > 0 ? (
+        <div className="space-y-1">
+          {typeof record.punchPairsCount === 'number' && (
+            <div className="text-[11px] font-mono text-indigo-300 font-medium">
+              {record.punchPairsCount} punch pair{record.punchPairsCount === 1 ? '' : 's'}
+            </div>
+          )}
+          {sortedIntervals.map((iv) => (
+            <div
+              key={iv.id}
+              className="text-[11px] font-mono tabular-nums bg-slate-950/70 border border-slate-800/80 rounded px-2 py-1 flex items-center justify-between gap-2"
+            >
+              <div className="flex items-center gap-1.5">
+                <span className="text-slate-500">#{iv.sequence}</span>
+                <span title={iv.checkIn ? `UTC: ${formatUtcTimestamp(iv.checkIn)}` : undefined}>
+                  IN {formatTime(iv.checkIn)}
+                </span>
+                <span className="text-slate-600">→</span>
+                <span
+                  className={iv.checkOut ? 'text-slate-200' : 'text-amber-400 font-semibold'}
+                  title={iv.checkOut ? `UTC: ${formatUtcTimestamp(iv.checkOut)}` : undefined}
+                >
+                  OUT {iv.checkOut ? formatTime(iv.checkOut) : 'Missing OUT'}
+                </span>
+              </div>
+              <span className="text-slate-400 shrink-0">
+                {iv.isComplete ? formatMinutesDuration(iv.durationMinutes) : 'Incomplete'}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="space-y-0.5 text-xs font-mono tabular-nums">
+          <div title={record.checkIn ? `UTC: ${formatUtcTimestamp(record.checkIn)}` : undefined}>
+            <span className="text-slate-500 mr-1">IN:</span>
+            <span className="text-slate-200">{formatTime(record.checkIn)}</span>
+          </div>
+          <div title={record.checkOut ? `UTC: ${formatUtcTimestamp(record.checkOut)}` : undefined}>
+            <span className="text-slate-500 mr-1">OUT:</span>
+            <span className="text-slate-200">{formatTime(record.checkOut)}</span>
+          </div>
+          {typeof record.punchPairsCount === 'number' && record.punchPairsCount > 0 && (
+            <div className="text-[11px] text-slate-400">
+              {record.punchPairsCount} punch pair{record.punchPairsCount === 1 ? '' : 's'}
+            </div>
+          )}
+        </div>
+      )}
+
+      {record.hasIncompletePunch === true && (
+        <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-amber-500/15 border border-amber-500/40 text-amber-300 text-[11px] font-medium">
+          <AlertTriangle className="w-3 h-3 shrink-0" />
+          <span>Incomplete punch</span>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export const AttendanceWorkedSummaryCell: React.FC<{
+  record: AttendanceItem;
+}> = ({ record }) => {
+  const actualWorked = record.actualWorkedMinutes;
+  const required = record.requiredMinutes;
+  const shortTime =
+    typeof (record.shortTimeMinutes as number | null | undefined) === 'number'
+      ? (record.shortTimeMinutes as number)
+      : null;
+  const extraTime =
+    typeof (record.extraTimeMinutes as number | null | undefined) === 'number'
+      ? (record.extraTimeMinutes as number)
+      : null;
+
+  return (
+    <div className="space-y-1 text-[11px] font-mono tabular-nums min-w-[190px]">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-slate-400">Worked:</span>
+        <span className="text-slate-100 font-semibold">
+          {actualWorked !== null && actualWorked !== undefined
+            ? formatMinutesDuration(actualWorked)
+            : '—'}
+        </span>
+      </div>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-slate-400">Required:</span>
+        <span className="text-slate-300">
+          {required !== null && required !== undefined
+            ? formatMinutesDuration(required)
+            : 'Unconfigured'}
+        </span>
+      </div>
+      {shortTime !== null && (
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-slate-400">Short Time:</span>
+          <span className={shortTime > 0 ? 'text-amber-400 font-semibold' : 'text-slate-500'}>
+            {shortTime}m
+          </span>
+        </div>
+      )}
+      {extraTime !== null && (
+        <div className="space-y-0.5">
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-slate-400">Extra Time:</span>
+            <span className={extraTime > 0 ? 'text-indigo-300 font-semibold' : 'text-slate-500'}>
+              {extraTime > 0 ? `+${extraTime}m` : '0m'}
+            </span>
+          </div>
+          <div className="text-[10px] font-sans text-slate-500">
+            Informational only (does not offset Short Time)
+          </div>
+        </div>
+      )}
+      {record.lateMinutes > 0 && (
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-slate-400">Late:</span>
+          <span className="text-amber-400">{record.lateMinutes}m</span>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export interface AttendanceFormModalProps {
+  isOpen: boolean;
+  editingAttendance: AttendanceItem | null;
+  employees: EmployeeItem[];
+  shifts: ShiftItem[];
+  timezone: string;
+  formEmployeeId: string;
+  formWorkDate: string;
+  formShiftId: string;
+  formCheckIn: string;
+  formCheckOut: string;
+  formStatus: AttendanceStatus;
+  formNotes: string;
+  attendanceFormError: string | null;
+  isSubmittingAttendance: boolean;
+  onClose: () => void;
+  onEmployeeChange: (employeeId: string) => void;
+  onWorkDateChange: (workDate: string) => void;
+  onShiftChange: (shiftId: string) => void;
+  onCheckInChange: (checkIn: string) => void;
+  onCheckOutChange: (checkOut: string) => void;
+  onStatusChange: (status: AttendanceStatus) => void;
+  onNotesChange: (notes: string) => void;
+  onSubmit: (e: React.FormEvent) => void;
+}
+
+export const AttendanceFormModal: React.FC<AttendanceFormModalProps> = ({
+  isOpen,
+  editingAttendance,
+  employees,
+  shifts,
+  timezone,
+  formEmployeeId,
+  formWorkDate,
+  formShiftId,
+  formCheckIn,
+  formCheckOut,
+  formStatus,
+  formNotes,
+  attendanceFormError,
+  isSubmittingAttendance,
+  onClose,
+  onEmployeeChange,
+  onWorkDateChange,
+  onShiftChange,
+  onCheckInChange,
+  onCheckOutChange,
+  onStatusChange,
+  onNotesChange,
+  onSubmit,
+}) => {
+  if (!isOpen) return null;
+
+  const effectiveTz = getEffectiveTimeZone(timezone);
+  const tzAbbr = getTimezoneShortName(effectiveTz);
+  const biometricLocked = isBiometricIntervalLocked(editingAttendance);
+  const sortedIntervals = editingAttendance ? getSortedAttendanceIntervals(editingAttendance) : [];
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+      <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-lg w-full p-6 space-y-5 shadow-2xl max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+          <div>
+            <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
+              <CalendarCheck className="w-4 h-4 text-indigo-400" />
+              <span>{editingAttendance ? 'Edit Attendance Record' : 'Record Manual Attendance'}</span>
+            </h3>
+            <p className="text-[11px] text-slate-400 mt-0.5">
+              Times interpreted in company timezone: <span className="font-mono text-slate-300">{effectiveTz} ({tzAbbr})</span>
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-slate-400 hover:text-slate-200"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {attendanceFormError && (
+          <div className="bg-rose-950/40 border border-rose-900 rounded-lg p-3 text-xs text-rose-300 flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{attendanceFormError}</span>
+          </div>
+        )}
+
+        {biometricLocked && editingAttendance && (
+          <div className="bg-amber-950/30 border border-amber-800/60 rounded-lg p-3 space-y-2.5 text-xs">
+            <div className="flex items-start gap-2 text-amber-200">
+              <Lock className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <div>
+                <div className="font-semibold">Biometric Punch Intervals Locked (Read-Only)</div>
+                <p className="text-[11px] text-amber-200/90 mt-0.5">
+                  Check-In/Check-Out timestamps and ABSENT/ON_LEAVE statuses are disabled because biometric punch events or work intervals exist for this record. You may still update Shift, permitted statuses (PRESENT, LATE, HALF_DAY), and Notes.
+                </p>
+              </div>
+            </div>
+
+            {sortedIntervals.length > 0 && (
+              <div className="bg-slate-950/70 border border-slate-800 rounded-lg p-2.5 space-y-1.5">
+                <div className="flex items-center justify-between text-[11px] text-slate-400 font-medium">
+                  <span>Recorded Chronological Intervals</span>
+                  {typeof editingAttendance.punchPairsCount === 'number' && (
+                    <span className="font-mono text-indigo-300">
+                      {editingAttendance.punchPairsCount} pair{editingAttendance.punchPairsCount === 1 ? '' : 's'}
+                    </span>
+                  )}
+                </div>
+                {sortedIntervals.map((iv) => (
+                  <div
+                    key={iv.id}
+                    className="flex items-center justify-between text-[11px] font-mono text-slate-300 border-t border-slate-800/60 pt-1"
+                  >
+                    <span>
+                      #{iv.sequence}:{' '}
+                      {formatTimeInTimezone(iv.checkIn, effectiveTz, {
+                        hour12: true,
+                        includeZoneAbbr: true,
+                      })}{' '}
+                      →{' '}
+                      {iv.checkOut
+                        ? formatTimeInTimezone(iv.checkOut, effectiveTz, {
+                            hour12: true,
+                            includeZoneAbbr: true,
+                          })
+                        : 'Missing OUT'}
+                    </span>
+                    <span className="text-slate-400">
+                      {iv.isComplete ? formatMinutesDuration(iv.durationMinutes) : 'Incomplete'}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        <form onSubmit={onSubmit} className="space-y-4">
+          {!editingAttendance && (
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1">Employee *</label>
+              <select
+                value={formEmployeeId}
+                onChange={(e) => onEmployeeChange(e.target.value)}
+                required
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+              >
+                <option value="" disabled>
+                  Select Employee
+                </option>
+                {employees.map((emp) => (
+                  <option key={emp.id} value={emp.id}>
+                    {emp.employeeCode} — {emp.fullName}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1">Work Date *</label>
+              <input
+                type="date"
+                value={formWorkDate}
+                onChange={(e) => onWorkDateChange(e.target.value)}
+                disabled={!!editingAttendance}
+                required
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono tabular-nums disabled:opacity-50"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1">Assigned Shift</label>
+              <select
+                value={formShiftId}
+                onChange={(e) => onShiftChange(e.target.value)}
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+              >
+                <option value="">No Shift / Default</option>
+                {shifts.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.code} ({s.startTime} - {s.endTime})
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1">
+                Check-In Time ({tzAbbr})
+              </label>
+              <input
+                type="time"
+                value={formCheckIn}
+                onChange={(e) => onCheckInChange(e.target.value)}
+                disabled={biometricLocked}
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1">
+                Check-Out Time ({tzAbbr})
+              </label>
+              <input
+                type="time"
+                value={formCheckOut}
+                onChange={(e) => onCheckOutChange(e.target.value)}
+                disabled={biometricLocked}
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono disabled:opacity-50 disabled:cursor-not-allowed"
+              />
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-slate-300 mb-1">Attendance Status *</label>
+            <select
+              value={formStatus}
+              onChange={(e) => onStatusChange(e.target.value as AttendanceStatus)}
+              required
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+            >
+              <option value="PRESENT">PRESENT (Full Day)</option>
+              <option value="LATE">LATE (Grace Period Exceeded)</option>
+              <option value="HALF_DAY">HALF_DAY (0.5 Day Attendance)</option>
+              <option value="ABSENT" disabled={biometricLocked}>
+                ABSENT (Unpaid Absence){biometricLocked ? ' — Disabled for biometric records' : ''}
+              </option>
+              <option value="ON_LEAVE" disabled={biometricLocked}>
+                ON_LEAVE (Approved Leave){biometricLocked ? ' — Disabled for biometric records' : ''}
+              </option>
+            </select>
+          </div>
+
+          <div>
+            <label className="block text-xs font-medium text-slate-300 mb-1">Notes / Justification</label>
+            <textarea
+              value={formNotes}
+              onChange={(e) => onNotesChange(e.target.value)}
+              placeholder="Optional manual attendance remarks..."
+              rows={2}
+              className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+            />
+          </div>
+
+          <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
+            <button
+              type="button"
+              onClick={onClose}
+              className="px-3.5 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 rounded-lg transition"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={isSubmittingAttendance}
+              className="px-4 py-2 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition disabled:opacity-50"
+            >
+              {isSubmittingAttendance ? 'Saving...' : editingAttendance ? 'Save Changes' : 'Record Attendance'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+};
 
 export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, companyProfile }) => {
   const timezone = getEffectiveTimeZone(companyProfile?.timezone);
@@ -82,6 +629,10 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
   const [formNotes, setFormNotes] = useState<string>('');
 
   // Shift Modals
+  const [pendingDeactivateShift, setPendingDeactivateShift] = useState<ShiftItem | null>(null);
+  const [isDeactivatingShift, setIsDeactivatingShift] = useState<boolean>(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [isShiftModalOpen, setIsShiftModalOpen] = useState<boolean>(false);
   const [editingShift, setEditingShift] = useState<ShiftItem | null>(null);
   const [shiftFormError, setShiftFormError] = useState<string | null>(null);
@@ -156,9 +707,12 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
   // Handle Open Create Attendance
   const handleOpenCreateAttendance = () => {
     setEditingAttendance(null);
-    setFormEmployeeId(employees.length > 0 ? employees[0].id : '');
-    setFormWorkDate(new Date().toISOString().split('T')[0]);
-    setFormShiftId(shifts.length > 0 ? shifts[0].id : '');
+    const defaultEmp = employees.length > 0 ? employees[0] : null;
+    setFormEmployeeId(defaultEmp ? defaultEmp.id : '');
+    setFormWorkDate(
+      formatDateInTimezone(new Date(), timezone, new Date().toISOString().split('T')[0])
+    );
+    setFormShiftId(resolveDefaultShiftIdForEmployee(defaultEmp));
     setFormCheckIn('');
     setFormCheckOut('');
     setFormStatus('PRESENT');
@@ -167,14 +721,22 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
     setIsAttendanceModalOpen(true);
   };
 
+  // Handle Employee selection change in Create Attendance Modal
+  const handleFormEmployeeChange = (employeeId: string) => {
+    setFormEmployeeId(employeeId);
+    const selectedEmp = employees.find((emp) => emp.id === employeeId) || null;
+    setFormShiftId(resolveDefaultShiftIdForEmployee(selectedEmp));
+  };
+
   // Handle Open Edit Attendance
   const handleOpenEditAttendance = (record: AttendanceItem) => {
+    const localTimes = extractLocalTimesForAttendanceForm(record, timezone);
     setEditingAttendance(record);
     setFormEmployeeId(record.employeeId);
-    setFormWorkDate(record.workDate.split('T')[0]);
+    setFormWorkDate(localTimes.workDate);
     setFormShiftId(record.shiftId || '');
-    setFormCheckIn(record.checkIn ? record.checkIn.substring(11, 16) : '');
-    setFormCheckOut(record.checkOut ? record.checkOut.substring(11, 16) : '');
+    setFormCheckIn(localTimes.checkIn);
+    setFormCheckOut(localTimes.checkOut);
     setFormStatus(record.status);
     setFormNotes(record.notes || '');
     setAttendanceFormError(null);
@@ -188,27 +750,30 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
     setIsSubmittingAttendance(true);
 
     try {
-      // Build ISO strings if time is provided
-      let checkInIso: string | null = null;
-      let checkOutIso: string | null = null;
-
-      if (formCheckIn) {
-        checkInIso = `${formWorkDate}T${formCheckIn}:00.000Z`;
-      }
-      if (formCheckOut) {
-        checkOutIso = `${formWorkDate}T${formCheckOut}:00.000Z`;
-      }
+      const selectedShift = shifts.find((s) => s.id === formShiftId) || null;
+      const isOvernightShift = Boolean(selectedShift?.isOvernight);
 
       if (editingAttendance) {
-        const updateData: UpdateAttendanceRequest = {
-          checkIn: checkInIso,
-          checkOut: checkOutIso,
-          shiftId: formShiftId || null,
-          status: formStatus,
-          notes: formNotes || null,
-        };
+        const updateData = buildAttendanceUpdatePayload({
+          editingRecord: editingAttendance,
+          formShiftId,
+          formStatus,
+          formNotes,
+          formWorkDate,
+          formCheckIn,
+          formCheckOut,
+          timezone,
+          isOvernightShift,
+        });
         await api.updateAttendance(editingAttendance.id, updateData);
       } else {
+        const { checkIn: checkInIso, checkOut: checkOutIso } = convertManualTimesToUtcIso({
+          workDate: formWorkDate,
+          checkIn: formCheckIn,
+          checkOut: formCheckOut,
+          timezone,
+          isOvernightShift,
+        });
         const createData: CreateAttendanceRequest = {
           employeeId: formEmployeeId,
           workDate: formWorkDate,
@@ -225,11 +790,7 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
       setIsAttendanceModalOpen(false);
       loadAttendance();
     } catch (err: unknown) {
-      if (err instanceof ApiError && err.statusCode === 409) {
-        setAttendanceFormError('An attendance record already exists for this employee on this date.');
-      } else {
-        setAttendanceFormError((err as Error).message || 'Failed to save attendance record.');
-      }
+      setAttendanceFormError(formatAttendanceSaveError(err));
     } finally {
       setIsSubmittingAttendance(false);
     }
@@ -305,20 +866,33 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
     }
   };
 
-  const handleDeactivateShift = async (shift: ShiftItem) => {
-    if (!confirm(`Are you sure you want to deactivate shift "${shift.name}" (${shift.code})? It can no longer be assigned to new records.`)) {
-      return;
-    }
-    try {
-      await api.deactivateShift(shift.id);
-      loadShifts();
-    } catch (err: unknown) {
-      alert((err as Error).message || 'Failed to deactivate shift.');
-    }
+  const handleDeactivateShift = (shift: ShiftItem) => {
+    setActionError(null);
+    setPendingDeactivateShift(shift);
   };
 
-  const formatTime = (isoString: string | null) => {
-    return formatTimeInTimezone(isoString, timezone, { hour12: true, includeZoneAbbr: true });
+  const handleConfirmDeactivateShift = async () => {
+    if (!pendingDeactivateShift) return;
+    const shift = pendingDeactivateShift;
+    setIsDeactivatingShift(true);
+    setActionError(null);
+    try {
+      const outcome = await executeConfirmedAction(
+        true,
+        () => api.deactivateShift(shift.id),
+        'Failed to deactivate shift.'
+      );
+      if (outcome?.ok) {
+        setActionSuccess(`Shift "${shift.name}" (${shift.code}) deactivated.`);
+        setPendingDeactivateShift(null);
+        loadShifts();
+      } else if (outcome?.errorMessage) {
+        setActionError(outcome.errorMessage);
+        setPendingDeactivateShift(null);
+      }
+    } finally {
+      setIsDeactivatingShift(false);
+    }
   };
 
   const getStatusTextClass = (status: AttendanceStatus) => {
@@ -402,6 +976,47 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
           )}
         </div>
       </div>
+
+      {/* Action Feedback Banners */}
+      {actionError && (
+        <div
+          role="alert"
+          className="p-4 rounded-xl bg-rose-950/50 border border-rose-800 text-rose-200 text-xs flex items-center justify-between"
+        >
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{actionError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActionError(null)}
+            aria-label="Dismiss error notification"
+            className="cursor-pointer text-rose-400 hover:text-white"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {actionSuccess && (
+        <div
+          role="status"
+          className="p-4 rounded-xl bg-emerald-950/50 border border-emerald-800 text-emerald-200 text-xs flex items-center justify-between"
+        >
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span>{actionSuccess}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActionSuccess(null)}
+            aria-label="Dismiss success notification"
+            className="cursor-pointer text-emerald-400 hover:text-white"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Main Tab Content */}
       {activeTab === 'attendance' && (
@@ -546,11 +1161,9 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
                       <th className="py-3 px-4 font-medium">Work Date</th>
                       {!isEmployee && <th className="py-3 px-4 font-medium">Employee</th>}
                       <th className="py-3 px-4 font-medium">Shift</th>
-                      <th className="py-3 px-4 font-medium">Check-In</th>
-                      <th className="py-3 px-4 font-medium">Check-Out</th>
+                      <th className="py-3 px-4 font-medium">Punches &amp; Intervals</th>
+                      <th className="py-3 px-4 font-medium">Worked vs Required</th>
                       <th className="py-3 px-4 font-medium">Status</th>
-                      <th className="py-3 px-4 font-medium">Late</th>
-                      <th className="py-3 px-4 font-medium">Overtime</th>
                       <th className="py-3 px-4 font-medium">Source</th>
                       <th className="py-3 px-4 font-medium">Notes</th>
                       {!isEmployee && <th className="py-3 px-4 font-medium text-right">Actions</th>}
@@ -558,8 +1171,8 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 text-slate-300">
                     {attendanceRecords.map((rec) => (
-                      <tr key={rec.id} className="hover:bg-slate-800/40 transition-colors">
-                        <td className="py-3 px-4 font-mono tabular-nums text-slate-200">
+                      <tr key={rec.id} className="hover:bg-slate-800/40 transition-colors align-top">
+                        <td className="py-3 px-4 font-mono tabular-nums text-slate-200 whitespace-nowrap">
                           {rec.workDate.split('T')[0]}
                         </td>
                         {!isEmployee && (
@@ -568,39 +1181,19 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
                             <div className="text-[11px] text-slate-500 font-mono">{rec.employeeCode}</div>
                           </td>
                         )}
-                        <td className="py-3 px-4 text-slate-400">{rec.shiftName || '—'}</td>
-                        <td
-                          className="py-3 px-4 font-mono tabular-nums text-slate-300"
-                          title={rec.checkIn ? `UTC: ${formatUtcTimestamp(rec.checkIn)}` : undefined}
-                        >
-                          {formatTime(rec.checkIn)}
-                        </td>
-                        <td
-                          className="py-3 px-4 font-mono tabular-nums text-slate-300"
-                          title={rec.checkOut ? `UTC: ${formatUtcTimestamp(rec.checkOut)}` : undefined}
-                        >
-                          {formatTime(rec.checkOut)}
+                        <td className="py-3 px-4 text-slate-400 whitespace-nowrap">{rec.shiftName || '—'}</td>
+                        <td className="py-3 px-4">
+                          <AttendanceIntervalsCell record={rec} timezone={timezone} />
                         </td>
                         <td className="py-3 px-4">
+                          <AttendanceWorkedSummaryCell record={rec} />
+                        </td>
+                        <td className="py-3 px-4 whitespace-nowrap">
                           <span className={`font-semibold ${getStatusTextClass(rec.status)}`}>
                             {rec.status}
                           </span>
                         </td>
-                        <td className="py-3 px-4 font-mono tabular-nums">
-                          {rec.lateMinutes > 0 ? (
-                            <span className="text-amber-400 font-medium">{rec.lateMinutes}m</span>
-                          ) : (
-                            <span className="text-slate-500">0</span>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 font-mono tabular-nums">
-                          {rec.overtimeMinutes > 0 ? (
-                            <span className="text-emerald-400 font-medium">+{rec.overtimeMinutes}m</span>
-                          ) : (
-                            <span className="text-slate-500">0</span>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-slate-400">{rec.source}</td>
+                        <td className="py-3 px-4 text-slate-400 whitespace-nowrap">{rec.source}</td>
                         <td className="py-3 px-4 text-slate-400 max-w-xs truncate" title={rec.notes || ''}>
                           {rec.notes || '—'}
                         </td>
@@ -765,150 +1358,31 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
       )}
 
       {/* Record/Edit Attendance Modal */}
-      {isAttendanceModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
-          <div className="bg-slate-900 border border-slate-800 rounded-xl max-w-lg w-full p-6 space-y-5 shadow-2xl">
-            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
-              <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
-                <CalendarCheck className="w-4 h-4 text-indigo-400" />
-                <span>{editingAttendance ? 'Edit Attendance Record' : 'Record Manual Attendance'}</span>
-              </h3>
-              <button
-                onClick={() => setIsAttendanceModalOpen(false)}
-                className="text-slate-400 hover:text-slate-200"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-
-            {attendanceFormError && (
-              <div className="bg-rose-950/40 border border-rose-900 rounded-lg p-3 text-xs text-rose-300 flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
-                <span>{attendanceFormError}</span>
-              </div>
-            )}
-
-            <form onSubmit={handleSaveAttendance} className="space-y-4">
-              {!editingAttendance && (
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Employee *</label>
-                  <select
-                    value={formEmployeeId}
-                    onChange={(e) => setFormEmployeeId(e.target.value)}
-                    required
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
-                  >
-                    <option value="" disabled>
-                      Select Employee
-                    </option>
-                    {employees.map((emp) => (
-                      <option key={emp.id} value={emp.id}>
-                        {emp.employeeCode} — {emp.fullName}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Work Date *</label>
-                  <input
-                    type="date"
-                    value={formWorkDate}
-                    onChange={(e) => setFormWorkDate(e.target.value)}
-                    disabled={!!editingAttendance}
-                    required
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono tabular-nums disabled:opacity-50"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Assigned Shift</label>
-                  <select
-                    value={formShiftId}
-                    onChange={(e) => setFormShiftId(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
-                  >
-                    <option value="">No Shift / Default</option>
-                    {shifts.map((s) => (
-                      <option key={s.id} value={s.id}>
-                        {s.code} ({s.startTime} - {s.endTime})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Check-In Time</label>
-                  <input
-                    type="time"
-                    value={formCheckIn}
-                    onChange={(e) => setFormCheckIn(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-medium text-slate-300 mb-1">Check-Out Time</label>
-                  <input
-                    type="time"
-                    value={formCheckOut}
-                    onChange={(e) => setFormCheckOut(e.target.value)}
-                    className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">Attendance Status *</label>
-                <select
-                  value={formStatus}
-                  onChange={(e) => setFormStatus(e.target.value as AttendanceStatus)}
-                  required
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
-                >
-                  <option value="PRESENT">PRESENT (Full Day)</option>
-                  <option value="LATE">LATE (Grace Period Exceeded)</option>
-                  <option value="HALF_DAY">HALF_DAY (0.5 Day Attendance)</option>
-                  <option value="ABSENT">ABSENT (Unpaid Absence)</option>
-                  <option value="ON_LEAVE">ON_LEAVE (Approved Leave)</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-xs font-medium text-slate-300 mb-1">Notes / Justification</label>
-                <textarea
-                  value={formNotes}
-                  onChange={(e) => setFormNotes(e.target.value)}
-                  placeholder="Optional manual attendance remarks..."
-                  rows={2}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
-                />
-              </div>
-
-              <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
-                <button
-                  type="button"
-                  onClick={() => setIsAttendanceModalOpen(false)}
-                  className="px-3.5 py-2 text-xs font-medium text-slate-300 hover:bg-slate-800 rounded-lg transition"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={isSubmittingAttendance}
-                  className="px-4 py-2 text-xs font-medium text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg transition disabled:opacity-50"
-                >
-                  {isSubmittingAttendance ? 'Saving...' : editingAttendance ? 'Save Changes' : 'Record Attendance'}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
+      <AttendanceFormModal
+        isOpen={isAttendanceModalOpen}
+        editingAttendance={editingAttendance}
+        employees={employees}
+        shifts={shifts}
+        timezone={timezone}
+        formEmployeeId={formEmployeeId}
+        formWorkDate={formWorkDate}
+        formShiftId={formShiftId}
+        formCheckIn={formCheckIn}
+        formCheckOut={formCheckOut}
+        formStatus={formStatus}
+        formNotes={formNotes}
+        attendanceFormError={attendanceFormError}
+        isSubmittingAttendance={isSubmittingAttendance}
+        onClose={() => setIsAttendanceModalOpen(false)}
+        onEmployeeChange={handleFormEmployeeChange}
+        onWorkDateChange={setFormWorkDate}
+        onShiftChange={setFormShiftId}
+        onCheckInChange={setFormCheckIn}
+        onCheckOutChange={setFormCheckOut}
+        onStatusChange={setFormStatus}
+        onNotesChange={setFormNotes}
+        onSubmit={handleSaveAttendance}
+      />
 
       {/* Create/Edit Shift Modal */}
       {isShiftModalOpen && (
@@ -1054,6 +1528,25 @@ export const AttendancePage: React.FC<AttendancePageProps> = ({ currentUser, com
           </div>
         </div>
       )}
+      <ConfirmDialog
+        isOpen={Boolean(pendingDeactivateShift)}
+        title="Deactivate Shift"
+        message={
+          pendingDeactivateShift
+            ? `Are you sure you want to deactivate shift "${pendingDeactivateShift.name}" (${pendingDeactivateShift.code})? It can no longer be assigned to new records.`
+            : ''
+        }
+        confirmLabel="Deactivate Shift"
+        confirmBusyLabel="Deactivating..."
+        variant="danger"
+        isSubmitting={isDeactivatingShift}
+        onConfirm={handleConfirmDeactivateShift}
+        onCancel={() => {
+          if (!isDeactivatingShift) {
+            setPendingDeactivateShift(null);
+          }
+        }}
+      />
     </div>
   );
 };

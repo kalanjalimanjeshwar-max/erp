@@ -94,7 +94,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       console.warn(
         `\n${blockedReason}` +
         '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
-        '\n  1. Start container: docker compose -f docker-compose.integration-test.yml up -d' +
+        '\n  1. Start container: docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d' +
         '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
         '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency\n'
       );
@@ -170,7 +170,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       console.warn(
         `\n${blockedReason}` +
         '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
-        '\n  1. Start container: docker compose -f docker-compose.integration-test.yml up -d' +
+        '\n  1. Start container: docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d' +
         '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
         '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency\n'
       );

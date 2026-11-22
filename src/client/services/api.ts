@@ -65,6 +65,8 @@ import {
   LinkEmployeeLedgerRequest,
   SalaryRevisionItem,
   CreateSalaryRevisionRequest,
+  EmployeeWorkPolicyRevisionItem,
+  CreateEmployeeWorkPolicyRevisionRequest,
   EmployeeStatus,
   PreviewLoginResponse,
   ShiftItem,
@@ -903,6 +905,18 @@ export const api = {
     request<SalaryRevisionItem[]>(`/api/employees/${id}/salaries`),
   createSalaryRevision: (id: string, data: CreateSalaryRevisionRequest) =>
     request<SalaryRevisionItem>(`/api/employees/${id}/salaries`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  getEmployeeWorkPolicies: (id: string) =>
+    request<EmployeeWorkPolicyRevisionItem[]>(`/api/employees/${id}/work-policies`),
+  createEmployeeWorkPolicyRevision: (id: string, data: CreateEmployeeWorkPolicyRevisionRequest) =>
+    request<{
+      employee: EmployeeItem;
+      revisions: EmployeeWorkPolicyRevisionItem[];
+      workPolicyEffectiveFrom: string | null;
+      allowanceEffectiveFrom: string | null;
+    }>(`/api/employees/${id}/work-policies`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),

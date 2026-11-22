@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { validateEnv, sanitizeDatabaseUrl } from '../../src/server/config/env.js';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import {
+  validateEnv,
+  sanitizeDatabaseUrl,
+  getConfig,
+  resetConfigForTesting,
+} from '../../src/server/config/env.js';
+import { AuthService } from '../../src/server/services/auth.service.js';
 
 describe('Environment Validation Unit Tests', () => {
   it('should successfully validate complete valid PostgreSQL environment', () => {
@@ -247,6 +253,276 @@ describe('Environment Validation Unit Tests', () => {
           }),
         });
       }).toThrowError(/conflicts with BANK_ACTIVE_KEY_ID but contains different key material/);
+    });
+  });
+
+  describe('Integration-Test Mode Environment Validation', () => {
+    const validIntegrationUrl =
+      'postgresql://erp_integration_user:super_secret_int_pw_987@localhost:5434/core_erp_integration_test?schema=public';
+    const validSessionSecret =
+      'c8f49b1368a27e059f13e7168d8cb5164d781b0a5381fbc947e2a9b3c4d5e6f7';
+    const validBankKey =
+      '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+    let savedEnv: NodeJS.ProcessEnv;
+
+    beforeEach(() => {
+      savedEnv = { ...process.env };
+      resetConfigForTesting();
+    });
+
+    afterEach(() => {
+      process.env = { ...savedEnv };
+      resetConfigForTesting();
+    });
+
+    it('accepts valid integration-test configuration with DATABASE_URL unset (localhost and 127.0.0.1)', () => {
+      const localhostConfig = validateEnv({
+        NODE_ENV: 'test',
+        COREERP_INTEGRATION_TEST_MODE: 'true',
+        DATABASE_URL: undefined,
+        TEST_DATABASE_URL: ` "${validIntegrationUrl}" `,
+        SESSION_SECRET: validSessionSecret,
+      });
+
+      expect(localhostConfig.NODE_ENV).toBe('test');
+      expect(localhostConfig.DATABASE_URL).toBeUndefined();
+      expect(localhostConfig.TEST_DATABASE_URL).toBe(validIntegrationUrl);
+
+      const loopbackUrl =
+        'postgres://erp_integration_user:another_secret@127.0.0.1:5434/core_erp_integration_test';
+      const loopbackConfig = validateEnv({
+        NODE_ENV: 'test',
+        COREERP_INTEGRATION_TEST_MODE: 'true',
+        DATABASE_URL: undefined,
+        TEST_DATABASE_URL: loopbackUrl,
+        SESSION_SECRET: validSessionSecret,
+      });
+
+      expect(loopbackConfig.DATABASE_URL).toBeUndefined();
+      expect(loopbackConfig.TEST_DATABASE_URL).toBe(loopbackUrl);
+    });
+
+    it('rejects missing or empty TEST_DATABASE_URL in integration mode', () => {
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'test',
+          COREERP_INTEGRATION_TEST_MODE: 'true',
+          DATABASE_URL: undefined,
+          TEST_DATABASE_URL: undefined,
+          SESSION_SECRET: validSessionSecret,
+        });
+      }).toThrowError(/TEST_DATABASE_URL is required/);
+
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'test',
+          COREERP_INTEGRATION_TEST_MODE: 'true',
+          DATABASE_URL: undefined,
+          TEST_DATABASE_URL: '   ',
+          SESSION_SECRET: validSessionSecret,
+        });
+      }).toThrowError(/TEST_DATABASE_URL is required/);
+    });
+
+    it('rejects wrong port, host, protocol, database name, or malformed TEST_DATABASE_URL without exposing credentials', () => {
+      const secretToken = 'never_leak_this_integration_secret_42';
+      const invalidCases: Array<{ url: string; expectedPattern: RegExp }> = [
+        {
+          url: `postgresql://erp_integration_user:${secretToken}@localhost:5432/core_erp_integration_test`,
+          expectedPattern: /port 5434/,
+        },
+        {
+          url: `postgresql://erp_integration_user:${secretToken}@localhost:5433/core_erp_integration_test`,
+          expectedPattern: /port 5434/,
+        },
+        {
+          url: `postgresql://erp_integration_user:${secretToken}@localhost/core_erp_integration_test`,
+          expectedPattern: /port 5434/,
+        },
+        {
+          url: `postgresql://erp_integration_user:${secretToken}@db.prod.internal:5434/core_erp_integration_test`,
+          expectedPattern: /localhost or 127\.0\.0\.1/,
+        },
+        {
+          url: `mysql://erp_integration_user:${secretToken}@localhost:5434/core_erp_integration_test`,
+          expectedPattern: /PostgreSQL protocol/,
+        },
+        {
+          url: `file:./${secretToken}.db`,
+          expectedPattern: /PostgreSQL protocol/,
+        },
+        {
+          url: `not-a-valid-url-${secretToken}`,
+          expectedPattern: /valid PostgreSQL connection string/,
+        },
+        {
+          url: `postgresql://erp_integration_user:${secretToken}@localhost:5434/core_erp`,
+          expectedPattern: /core_erp_integration_test/,
+        },
+        {
+          url: `postgresql://erp_integration_user:${secretToken}@localhost:5434/core_erp_test`,
+          expectedPattern: /core_erp_integration_test/,
+        },
+      ];
+
+      for (const { url, expectedPattern } of invalidCases) {
+        let caughtMessage = '';
+        try {
+          validateEnv({
+            NODE_ENV: 'test',
+            COREERP_INTEGRATION_TEST_MODE: 'true',
+            DATABASE_URL: undefined,
+            TEST_DATABASE_URL: url,
+            SESSION_SECRET: validSessionSecret,
+          });
+        } catch (err) {
+          caughtMessage = err instanceof Error ? err.message : String(err);
+        }
+
+        expect(caughtMessage).toMatch(expectedPattern);
+        expect(caughtMessage).not.toContain(secretToken);
+      }
+    });
+
+    it('rejects conflicting non-empty DATABASE_URL in integration mode', () => {
+      const secretPw = 'split_brain_secret_pw_999';
+      let caughtMessage = '';
+      try {
+        validateEnv({
+          NODE_ENV: 'test',
+          COREERP_INTEGRATION_TEST_MODE: 'true',
+          DATABASE_URL: `postgresql://erp_user:${secretPw}@localhost:5432/core_erp`,
+          TEST_DATABASE_URL: validIntegrationUrl,
+          SESSION_SECRET: validSessionSecret,
+        });
+      } catch (err) {
+        caughtMessage = err instanceof Error ? err.message : String(err);
+      }
+
+      expect(caughtMessage).toMatch(/Conflicting DATABASE_URL detected in integration test mode/);
+      expect(caughtMessage).not.toContain(secretPw);
+    });
+
+    it('rejects missing DATABASE_URL in production even if integration flag and port-5434 TEST_DATABASE_URL are set', () => {
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'production',
+          DATABASE_URL: undefined,
+          SESSION_SECRET: validSessionSecret,
+          BANK_ENCRYPTION_KEY: validBankKey,
+        });
+      }).toThrowError(/DATABASE_URL is required/);
+
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'production',
+          COREERP_INTEGRATION_TEST_MODE: 'true',
+          DATABASE_URL: undefined,
+          TEST_DATABASE_URL: validIntegrationUrl,
+          SESSION_SECRET: validSessionSecret,
+          BANK_ENCRYPTION_KEY: validBankKey,
+        });
+      }).toThrowError(/COREERP_INTEGRATION_TEST_MODE=true is only permitted when NODE_ENV=test/);
+
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'production',
+          COREERP_INTEGRATION_TEST_MODE: 'true',
+          DATABASE_URL: undefined,
+          TEST_DATABASE_URL: validIntegrationUrl,
+          SESSION_SECRET: validSessionSecret,
+          BANK_ENCRYPTION_KEY: validBankKey,
+        });
+      }).toThrowError(/DATABASE_URL is required/);
+    });
+
+    it('rejects COREERP_INTEGRATION_TEST_MODE=true in development mode', () => {
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'development',
+          COREERP_INTEGRATION_TEST_MODE: 'true',
+          DATABASE_URL: 'postgresql://erp_user:dev_pass@localhost:5432/core_erp',
+          TEST_DATABASE_URL: validIntegrationUrl,
+          SESSION_SECRET: validSessionSecret,
+        });
+      }).toThrowError(/COREERP_INTEGRATION_TEST_MODE=true is only permitted when NODE_ENV=test/);
+
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'development',
+          COREERP_INTEGRATION_TEST_MODE: 'true',
+          DATABASE_URL: undefined,
+          TEST_DATABASE_URL: validIntegrationUrl,
+          SESSION_SECRET: validSessionSecret,
+        });
+      }).toThrowError(/DATABASE_URL is required/);
+    });
+
+    it('rejects missing DATABASE_URL in ordinary unit-test mode without integration flag even when TEST_DATABASE_URL is valid', () => {
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'test',
+          DATABASE_URL: undefined,
+          TEST_DATABASE_URL: validIntegrationUrl,
+          SESSION_SECRET: validSessionSecret,
+        });
+      }).toThrowError(/DATABASE_URL is required/);
+
+      expect(() => {
+        validateEnv({
+          NODE_ENV: 'test',
+          COREERP_INTEGRATION_TEST_MODE: 'false',
+          DATABASE_URL: undefined,
+          TEST_DATABASE_URL: validIntegrationUrl,
+          SESSION_SECRET: validSessionSecret,
+        });
+      }).toThrowError(/DATABASE_URL is required/);
+    });
+
+    it('supports real AuthService token generation and verification in integration mode without DATABASE_URL or database access', () => {
+      process.env.NODE_ENV = 'test';
+      process.env.COREERP_INTEGRATION_TEST_MODE = 'true';
+      delete process.env.DATABASE_URL;
+      process.env.TEST_DATABASE_URL = validIntegrationUrl;
+      process.env.SESSION_SECRET = validSessionSecret;
+      resetConfigForTesting();
+
+      const config = getConfig();
+      expect(config.DATABASE_URL).toBeUndefined();
+      expect(config.TEST_DATABASE_URL).toBe(validIntegrationUrl);
+      expect(process.env.DATABASE_URL).toBeUndefined();
+
+      const token = AuthService.generateSessionToken({
+        userId: '11111111-1111-4111-8111-111111111111',
+        companyId: '22222222-2222-4222-8222-222222222222',
+        email: 'employee.integration@coreerp.local',
+        role: 'EMPLOYEE',
+        tokenVersion: 3,
+      });
+
+      const verified = AuthService.verifySessionToken(token);
+      expect(verified).not.toBeNull();
+      expect(verified?.userId).toBe('11111111-1111-4111-8111-111111111111');
+      expect(verified?.companyId).toBe('22222222-2222-4222-8222-222222222222');
+      expect(verified?.email).toBe('employee.integration@coreerp.local');
+      expect(verified?.role).toBe('EMPLOYEE');
+      expect(verified?.tokenVersion).toBe(3);
+
+      // Tampered signature must be rejected
+      const [h, p, s] = token.split('.');
+      const tamperedSig = s.slice(0, -1) + (s.endsWith('A') ? 'B' : 'A');
+      expect(AuthService.verifySessionToken(`${h}.${p}.${tamperedSig}`)).toBeNull();
+
+      // Confirm DATABASE_URL was never restored or populated
+      expect(process.env.DATABASE_URL).toBeUndefined();
+    });
+
+    it('forbids resetConfigForTesting in production mode', () => {
+      process.env.NODE_ENV = 'production';
+      expect(() => resetConfigForTesting()).toThrowError(
+        /resetConfigForTesting cannot be used in production mode/
+      );
     });
   });
 });

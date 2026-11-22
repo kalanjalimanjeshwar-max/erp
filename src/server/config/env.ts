@@ -3,11 +3,17 @@ import path from 'path';
 import { z } from 'zod';
 import dotenv from 'dotenv';
 
+const isIntegrationTestRuntime =
+  typeof process !== 'undefined' &&
+  process.env.NODE_ENV === 'test' &&
+  process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
+
 // In development, ensure default development .env file exists if missing
 if (
   typeof process !== 'undefined' &&
   process.env.NODE_ENV !== 'production' &&
   process.env.VITEST !== 'true' &&
+  process.env.COREERP_INTEGRATION_TEST_MODE !== 'true' &&
   !process.env.DATABASE_URL
 ) {
   try {
@@ -33,8 +39,51 @@ if (
   }
 }
 
-// Load environment variables from .env if present
-dotenv.config();
+// Load environment variables from .env if present (skipped in isolated integration-test mode)
+if (!isIntegrationTestRuntime) {
+  dotenv.config();
+}
+
+const APPROVED_INTEGRATION_TEST_HOSTS = new Set(['localhost', '127.0.0.1']);
+const INTEGRATION_TEST_DB_PORT = '5434';
+const INTEGRATION_TEST_DB_NAME = 'core_erp_integration_test';
+
+/**
+ * Independently validates TEST_DATABASE_URL for isolated PostgreSQL 16 integration-test mode.
+ * Credentials and raw connection strings are never included in returned error messages.
+ */
+function validateIntegrationTestDatabaseUrl(urlValue: string | undefined): string | null {
+  if (!urlValue || urlValue.trim() === '') {
+    return 'TEST_DATABASE_URL is required when NODE_ENV=test and COREERP_INTEGRATION_TEST_MODE=true.';
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(urlValue);
+  } catch {
+    return 'TEST_DATABASE_URL must be a valid PostgreSQL connection string in integration test mode.';
+  }
+
+  if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
+    return 'TEST_DATABASE_URL must use a PostgreSQL protocol ("postgresql://" or "postgres://") in integration test mode.';
+  }
+
+  const hostname = parsed.hostname.toLowerCase();
+  if (!APPROVED_INTEGRATION_TEST_HOSTS.has(hostname)) {
+    return 'TEST_DATABASE_URL must target localhost or 127.0.0.1 in integration test mode.';
+  }
+
+  if (parsed.port !== INTEGRATION_TEST_DB_PORT) {
+    return `TEST_DATABASE_URL must explicitly target port ${INTEGRATION_TEST_DB_PORT} in integration test mode.`;
+  }
+
+  const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
+  if (dbName !== INTEGRATION_TEST_DB_NAME) {
+    return `TEST_DATABASE_URL must target database "${INTEGRATION_TEST_DB_NAME}" in integration test mode.`;
+  }
+
+  return null;
+}
 
 const KNOWN_DEV_SECRETS = new Set([
   'dev_session_secret_min_32_characters_long_for_security',
@@ -61,19 +110,17 @@ export const envSchema = z
       }),
     DATABASE_URL: z
       .string()
-      .min(
-        1,
-        'DATABASE_URL is required. PostgreSQL is the sole operational database. Please configure a valid PostgreSQL connection string.'
-      )
-      .transform((val) => val.trim().replace(/^["']|["']$/g, ''))
-      .refine(
-        (url) => url.startsWith('postgresql://') || url.startsWith('postgres://'),
-        {
-          message:
-            'DATABASE_URL must be a valid PostgreSQL connection string starting with "postgresql://" or "postgres://". Other database providers or local file fallbacks are strictly prohibited.',
-        }
+      .optional()
+      .transform((val) =>
+        val === undefined ? undefined : val.trim().replace(/^["']|["']$/g, '')
       ),
-    TEST_DATABASE_URL: z.string().optional(),
+    TEST_DATABASE_URL: z
+      .string()
+      .optional()
+      .transform((val) =>
+        val === undefined ? undefined : val.trim().replace(/^["']|["']$/g, '')
+      ),
+    COREERP_INTEGRATION_TEST_MODE: z.string().optional(),
     SESSION_SECRET: z
       .string()
       .min(16, 'SESSION_SECRET must be at least 16 characters for security')
@@ -98,6 +145,56 @@ export const envSchema = z
     POSTGRES_DB: z.string().optional(),
   })
   .superRefine((data, ctx) => {
+    const isIntegrationFlagSet = data.COREERP_INTEGRATION_TEST_MODE === 'true';
+    const isIntegrationTestMode = data.NODE_ENV === 'test' && isIntegrationFlagSet;
+
+    if (isIntegrationFlagSet && data.NODE_ENV !== 'test') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['COREERP_INTEGRATION_TEST_MODE'],
+        message: 'COREERP_INTEGRATION_TEST_MODE=true is only permitted when NODE_ENV=test.',
+      });
+    }
+
+    if (isIntegrationTestMode) {
+      if (data.DATABASE_URL && data.DATABASE_URL.length > 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['DATABASE_URL'],
+          message:
+            'Conflicting DATABASE_URL detected in integration test mode. DATABASE_URL must remain unset when COREERP_INTEGRATION_TEST_MODE=true.',
+        });
+      }
+
+      const integrationUrlError = validateIntegrationTestDatabaseUrl(data.TEST_DATABASE_URL);
+      if (integrationUrlError) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['TEST_DATABASE_URL'],
+          message: integrationUrlError,
+        });
+      }
+    } else {
+      if (!data.DATABASE_URL || data.DATABASE_URL.length === 0) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['DATABASE_URL'],
+          message:
+            'DATABASE_URL is required. PostgreSQL is the sole operational database. Please configure a valid PostgreSQL connection string.',
+        });
+      } else if (
+        !data.DATABASE_URL.startsWith('postgresql://') &&
+        !data.DATABASE_URL.startsWith('postgres://')
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['DATABASE_URL'],
+          message:
+            'DATABASE_URL must be a valid PostgreSQL connection string starting with "postgresql://" or "postgres://". Other database providers or local file fallbacks are strictly prohibited.',
+        });
+      }
+    }
+
     // 0. Development Docker Compose / DATABASE_URL consistency check
     if (data.NODE_ENV === 'development' && data.POSTGRES_PASSWORD && data.DATABASE_URL) {
       try {
@@ -308,6 +405,15 @@ export function validateEnv(customEnv?: Record<string, string | undefined>): App
 
 // Cached singleton config
 let cachedConfig: AppConfig | null = null;
+
+export function resetConfigForTesting(): void {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      '[SECURITY FATAL] resetConfigForTesting cannot be used in production mode.'
+    );
+  }
+  cachedConfig = null;
+}
 
 export function getConfig(): AppConfig {
   if (!cachedConfig) {

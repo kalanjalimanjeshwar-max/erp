@@ -9,6 +9,8 @@ import {
   LinkEmployeeLedgerRequest,
   SalaryRevisionItem,
   CreateSalaryRevisionRequest,
+  EmployeeWorkPolicyRevisionItem,
+  CreateEmployeeWorkPolicyRevisionRequest,
   EmployeeStatus,
   EmploymentType,
   EmployeeBiometricMappingInput,
@@ -17,26 +19,149 @@ import {
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
 import { AuditService } from './audit.service.js';
 import { BiometricMappingService } from './biometric-mapping.service.js';
+import { CompanyService } from './company.service.js';
 import { PermissionService } from './permission.service.js';
 import { PunchReconciliationService } from './punch-reconciliation.service.js';
+import {
+  DEFAULT_MONTHLY_LEAVE_ALLOWANCE,
+  WorkPolicyService,
+  WorkPolicyRevisionRecord,
+  calculateShiftDurationHours,
+  formatUtcDateOnly,
+  getLocalCalendarDateStr,
+  parseUtcDateOnly,
+  toNullablePolicyNumber,
+} from './work-policy.service.js';
 import { getDefaultAccountNature } from '../../shared/account-nature.js';
 
 const VALID_EMPLOYEE_STATUSES: EmployeeStatus[] = ['ACTIVE', 'INACTIVE', 'EXITED'];
 
-export function calculateShiftDurationHours(shift: {
-  startTime: string;
-  endTime: string;
-  isOvernight: boolean;
-}): number {
-  const startMin = parseInt(shift.startTime.slice(0, 2), 10) * 60 + parseInt(shift.startTime.slice(3, 5), 10);
-  const endMin = parseInt(shift.endTime.slice(0, 2), 10) * 60 + parseInt(shift.endTime.slice(3, 5), 10);
-  const durationMin = shift.isOvernight && endMin <= startMin
-    ? (endMin + 1440 - startMin)
-    : (endMin - startMin);
-  return Math.round((durationMin / 60) * 100) / 100;
-}
+export { calculateShiftDurationHours };
 
 export class EmployeeService {
+  private static validateCompanyPermittedMonthlyLeaveAllowance(
+    value: unknown,
+    permittedOptions: number[],
+    options?: { requireIfDefaultDisallowed?: boolean }
+  ): number | undefined {
+    if (value === undefined) {
+      if (
+        options?.requireIfDefaultDisallowed &&
+        !permittedOptions.includes(DEFAULT_MONTHLY_LEAVE_ALLOWANCE)
+      ) {
+        const err = new Error(
+          `Monthly leave allowance is required because the default (${DEFAULT_MONTHLY_LEAVE_ALLOWANCE} days) is not permitted by company policy. Select one of the company-permitted options: ${permittedOptions.join(', ')} days.`
+        );
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+      return undefined;
+    }
+
+    if (value === null) {
+      const err = new Error(
+        `Monthly leave allowance cannot be null. It must be one of the company-permitted options: ${permittedOptions.join(', ')} days.`
+      );
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      const err = new Error(
+        `Field 'monthlyLeaveAllowance' must be a finite integer from the company-permitted options: ${permittedOptions.join(', ')} days.`
+      );
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (!Number.isInteger(value) || !permittedOptions.includes(value)) {
+      const err = new Error(
+        `Monthly leave allowance must be one of the company-permitted options: ${permittedOptions.join(', ')} days.`
+      );
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    const validated = WorkPolicyService.validateMonthlyLeaveAllowance(value);
+    return validated ?? value;
+  }
+
+  private static mapEmployeeToItem(
+    e: any,
+    biometricMappings: EmployeeItem['biometricMappings'],
+    policyRevisions: WorkPolicyRevisionRecord[],
+    todayStr: string
+  ): EmployeeItem {
+    const resolvedPolicy = WorkPolicyService.resolvePolicyForDate({
+      date: todayStr,
+      employee: e,
+      revisions: policyRevisions,
+    });
+    const effectiveShift = resolvedPolicy.shift || null;
+
+    return {
+      id: e.id,
+      companyId: e.companyId,
+      employeeCode: e.employeeCode,
+      fullName: e.fullName,
+      email: e.email,
+      phone: e.phone,
+      address: e.address,
+      photoUrl: e.photoUrl,
+      dateOfBirth: e.dateOfBirth ? e.dateOfBirth.toISOString().split('T')[0] : null,
+      dateOfJoining: e.dateOfJoining.toISOString().split('T')[0],
+      departmentId: e.departmentId,
+      departmentName: e.department?.name || null,
+      designationId: e.designationId,
+      designationName: e.designation?.name || null,
+      employmentType: e.employmentType,
+      status: e.status,
+      notes: e.notes,
+      biometricDeviceId: e.biometricDeviceId,
+      biometricMappings: biometricMappings || [],
+      userId: e.userId,
+      userEmail: e.user?.email || null,
+      userActive: e.user?.isActive ?? false,
+      ledgerId: e.ledgerId,
+      ledgerCode: e.ledger?.code || null,
+      ledgerName: e.ledger?.name || null,
+      currentSalary: e.salaryRevisions?.[0]
+        ? AccountingMath.format(e.salaryRevisions[0].fixedSalary, 2)
+        : null,
+      salaryRevisionsCount: e._count?.salaryRevisions ?? 0,
+      shiftId: resolvedPolicy.shiftId || null,
+      shiftName: effectiveShift?.name || null,
+      shiftStartTime: effectiveShift?.startTime || null,
+      shiftEndTime: effectiveShift?.endTime || null,
+      shiftIsOvernight: effectiveShift?.isOvernight ?? null,
+      configuredDailyWorkingHours: resolvedPolicy.effectiveDailyWorkingHours,
+      dailyWorkingHours: resolvedPolicy.configuredDailyWorkingHours,
+      monthlyLeaveAllowance: toNullablePolicyNumber(
+        resolvedPolicy.source === 'REVISION'
+          ? resolvedPolicy.monthlyLeaveAllowance
+          : e.monthlyLeaveAllowance
+      ),
+      effectiveWorkPolicy: resolvedPolicy.effectiveFrom
+        ? {
+            dailyWorkingHours: resolvedPolicy.effectiveDailyWorkingHours,
+            monthlyLeaveAllowance: resolvedPolicy.monthlyLeaveAllowance,
+            shiftId: resolvedPolicy.shiftId,
+            effectiveFrom: resolvedPolicy.effectiveFrom,
+            effectiveTo: resolvedPolicy.effectiveTo,
+            source: resolvedPolicy.source,
+          }
+        : {
+            dailyWorkingHours: resolvedPolicy.effectiveDailyWorkingHours,
+            monthlyLeaveAllowance: resolvedPolicy.monthlyLeaveAllowance,
+            shiftId: resolvedPolicy.shiftId,
+            effectiveFrom: e.dateOfJoining.toISOString().split('T')[0],
+            effectiveTo: null,
+            source: resolvedPolicy.source,
+          },
+      createdAt: e.createdAt.toISOString(),
+      updatedAt: e.updatedAt.toISOString(),
+    };
+  }
   /**
    * Helper: Validates safe photo URL (prevents javascript:, data:, or unsafe schemes)
    */
@@ -130,50 +255,23 @@ export class EmployeeService {
       }),
     ]);
 
-    const mappingsMap = await BiometricMappingService.getMappingsMapForEmployees(
-      companyId,
-      records.map((r) => r.id)
-    );
+    const [mappingsMap, policyRevsMap, timezone] = await Promise.all([
+      BiometricMappingService.getMappingsMapForEmployees(
+        companyId,
+        records.map((r) => r.id)
+      ),
+      WorkPolicyService.listRevisionsForEmployees(
+        companyId,
+        records.map((r) => r.id)
+      ),
+      WorkPolicyService.resolveCompanyTimezone(companyId),
+    ]);
 
-    const items: EmployeeItem[] = records.map((e) => ({
-      id: e.id,
-      companyId: e.companyId,
-      employeeCode: e.employeeCode,
-      fullName: e.fullName,
-      email: e.email,
-      phone: e.phone,
-      address: e.address,
-      photoUrl: e.photoUrl,
-      dateOfBirth: e.dateOfBirth ? e.dateOfBirth.toISOString().split('T')[0] : null,
-      dateOfJoining: e.dateOfJoining.toISOString().split('T')[0],
-      departmentId: e.departmentId,
-      departmentName: e.department?.name || null,
-      designationId: e.designationId,
-      designationName: e.designation?.name || null,
-      employmentType: e.employmentType,
-      status: e.status,
-      notes: e.notes,
-      biometricDeviceId: e.biometricDeviceId,
-      biometricMappings: mappingsMap.get(e.id) || [],
-      userId: e.userId,
-      userEmail: e.user?.email || null,
-      userActive: e.user?.isActive ?? false,
-      ledgerId: e.ledgerId,
-      ledgerCode: e.ledger?.code || null,
-      ledgerName: e.ledger?.name || null,
-      currentSalary: e.salaryRevisions[0]
-        ? AccountingMath.format(e.salaryRevisions[0].fixedSalary, 2)
-        : null,
-      salaryRevisionsCount: e._count.salaryRevisions,
-      shiftId: e.shiftId || null,
-      shiftName: e.shift?.name || null,
-      shiftStartTime: e.shift?.startTime || null,
-      shiftEndTime: e.shift?.endTime || null,
-      shiftIsOvernight: e.shift?.isOvernight ?? null,
-      configuredDailyWorkingHours: e.shift ? calculateShiftDurationHours(e.shift) : null,
-      createdAt: e.createdAt.toISOString(),
-      updatedAt: e.updatedAt.toISOString(),
-    }));
+    const todayStr = getLocalCalendarDateStr(timezone);
+
+    const items: EmployeeItem[] = records.map((e) =>
+      this.mapEmployeeToItem(e, mappingsMap.get(e.id) || [], policyRevsMap.get(e.id) || [], todayStr)
+    );
 
     return { items, total, page, limit };
   }
@@ -205,47 +303,14 @@ export class EmployeeService {
       throw err;
     }
 
-    const biometricMappings = await BiometricMappingService.listMappingsForEmployee(companyId, e.id);
+    const [biometricMappings, policyRevisions, timezone] = await Promise.all([
+      BiometricMappingService.listMappingsForEmployee(companyId, e.id),
+      WorkPolicyService.listRevisionsForEmployee(companyId, e.id),
+      WorkPolicyService.resolveCompanyTimezone(companyId),
+    ]);
 
-    return {
-      id: e.id,
-      companyId: e.companyId,
-      employeeCode: e.employeeCode,
-      fullName: e.fullName,
-      email: e.email,
-      phone: e.phone,
-      address: e.address,
-      photoUrl: e.photoUrl,
-      dateOfBirth: e.dateOfBirth ? e.dateOfBirth.toISOString().split('T')[0] : null,
-      dateOfJoining: e.dateOfJoining.toISOString().split('T')[0],
-      departmentId: e.departmentId,
-      departmentName: e.department?.name || null,
-      designationId: e.designationId,
-      designationName: e.designation?.name || null,
-      employmentType: e.employmentType,
-      status: e.status,
-      notes: e.notes,
-      biometricDeviceId: e.biometricDeviceId,
-      biometricMappings,
-      userId: e.userId,
-      userEmail: e.user?.email || null,
-      userActive: e.user?.isActive ?? false,
-      ledgerId: e.ledgerId,
-      ledgerCode: e.ledger?.code || null,
-      ledgerName: e.ledger?.name || null,
-      currentSalary: e.salaryRevisions[0]
-        ? AccountingMath.format(e.salaryRevisions[0].fixedSalary, 2)
-        : null,
-      salaryRevisionsCount: e._count.salaryRevisions,
-      shiftId: e.shiftId || null,
-      shiftName: e.shift?.name || null,
-      shiftStartTime: e.shift?.startTime || null,
-      shiftEndTime: e.shift?.endTime || null,
-      shiftIsOvernight: e.shift?.isOvernight ?? null,
-      configuredDailyWorkingHours: e.shift ? calculateShiftDurationHours(e.shift) : null,
-      createdAt: e.createdAt.toISOString(),
-      updatedAt: e.updatedAt.toISOString(),
-    };
+    const todayStr = getLocalCalendarDateStr(timezone);
+    return this.mapEmployeeToItem(e, biometricMappings, policyRevisions, todayStr);
   }
 
   /**
@@ -275,47 +340,14 @@ export class EmployeeService {
       throw err;
     }
 
-    const biometricMappings = await BiometricMappingService.listMappingsForEmployee(companyId, e.id);
+    const [biometricMappings, policyRevisions, timezone] = await Promise.all([
+      BiometricMappingService.listMappingsForEmployee(companyId, e.id),
+      WorkPolicyService.listRevisionsForEmployee(companyId, e.id),
+      WorkPolicyService.resolveCompanyTimezone(companyId),
+    ]);
 
-    return {
-      id: e.id,
-      companyId: e.companyId,
-      employeeCode: e.employeeCode,
-      fullName: e.fullName,
-      email: e.email,
-      phone: e.phone,
-      address: e.address,
-      photoUrl: e.photoUrl,
-      dateOfBirth: e.dateOfBirth ? e.dateOfBirth.toISOString().split('T')[0] : null,
-      dateOfJoining: e.dateOfJoining.toISOString().split('T')[0],
-      departmentId: e.departmentId,
-      departmentName: e.department?.name || null,
-      designationId: e.designationId,
-      designationName: e.designation?.name || null,
-      employmentType: e.employmentType,
-      status: e.status,
-      notes: e.notes,
-      biometricDeviceId: e.biometricDeviceId,
-      biometricMappings,
-      userId: e.userId,
-      userEmail: e.user?.email || null,
-      userActive: e.user?.isActive ?? false,
-      ledgerId: e.ledgerId,
-      ledgerCode: e.ledger?.code || null,
-      ledgerName: e.ledger?.name || null,
-      currentSalary: e.salaryRevisions[0]
-        ? AccountingMath.format(e.salaryRevisions[0].fixedSalary, 2)
-        : null,
-      salaryRevisionsCount: e._count.salaryRevisions,
-      shiftId: e.shiftId || null,
-      shiftName: e.shift?.name || null,
-      shiftStartTime: e.shift?.startTime || null,
-      shiftEndTime: e.shift?.endTime || null,
-      shiftIsOvernight: e.shift?.isOvernight ?? null,
-      configuredDailyWorkingHours: e.shift ? calculateShiftDurationHours(e.shift) : null,
-      createdAt: e.createdAt.toISOString(),
-      updatedAt: e.updatedAt.toISOString(),
-    };
+    const todayStr = getLocalCalendarDateStr(timezone);
+    return this.mapEmployeeToItem(e, biometricMappings, policyRevisions, todayStr);
   }
 
   /**
@@ -353,6 +385,24 @@ export class EmployeeService {
       const err = new Error('Invalid date of joining format.');
       (err as { statusCode?: number }).statusCode = 400;
       throw err;
+    }
+
+    let policyEffectiveFromDate: Date | undefined;
+    if (input.policyEffectiveFrom !== undefined) {
+      if (typeof input.policyEffectiveFrom !== 'string' || !input.policyEffectiveFrom.trim()) {
+        const err = new Error(`Field 'policyEffectiveFrom' must be a valid calendar date string (YYYY-MM-DD).`);
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+      const joiningDateOnly = parseUtcDateOnly(joiningDate, 'date of joining');
+      policyEffectiveFromDate = parseUtcDateOnly(input.policyEffectiveFrom, 'work policy effective date');
+      if (policyEffectiveFromDate.getTime() < joiningDateOnly.getTime()) {
+        const err = new Error(
+          `Work policy effective date (${formatUtcDateOnly(policyEffectiveFromDate)}) cannot be earlier than employee date of joining (${formatUtcDateOnly(joiningDateOnly)}).`
+        );
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
     }
 
     let birthDate: Date | null = null;
@@ -425,6 +475,21 @@ export class EmployeeService {
       }
     }
 
+    const dailyWorkingHoursToAssign =
+      input.dailyWorkingHours !== undefined
+        ? WorkPolicyService.validateDailyWorkingHours(input.dailyWorkingHours)
+        : null;
+    const permittedMonthlyLeaveAllowances = await CompanyService.getPermittedMonthlyLeaveAllowances(
+      actor.companyId
+    );
+    const validatedMonthlyLeaveAllowance = this.validateCompanyPermittedMonthlyLeaveAllowance(
+      input.monthlyLeaveAllowance,
+      permittedMonthlyLeaveAllowances,
+      { requireIfDefaultDisallowed: true }
+    );
+    const monthlyLeaveAllowanceToAssign =
+      validatedMonthlyLeaveAllowance !== undefined ? validatedMonthlyLeaveAllowance : null;
+
     // Validate initial status if provided (default ACTIVE)
     const initialStatus: EmployeeStatus = input.status || 'ACTIVE';
     if (!VALID_EMPLOYEE_STATUSES.includes(initialStatus)) {
@@ -449,11 +514,24 @@ export class EmployeeService {
           departmentId: input.departmentId || null,
           designationId: input.designationId || null,
           shiftId: shiftIdToAssign,
+          ...(dailyWorkingHoursToAssign !== null ? { dailyWorkingHours: dailyWorkingHoursToAssign } : {}),
+          ...(monthlyLeaveAllowanceToAssign !== null ? { monthlyLeaveAllowance: monthlyLeaveAllowanceToAssign } : {}),
           employmentType: input.employmentType || 'FULL_TIME',
           status: initialStatus,
           notes: input.notes?.trim() || null,
           biometricDeviceId: input.biometricDeviceId?.trim() || null,
         },
+      });
+
+      await WorkPolicyService.createInitialRevisionTx(tx, {
+        companyId: actor.companyId,
+        employeeId: emp.id,
+        dateOfJoining: joiningDate,
+        ...(policyEffectiveFromDate !== undefined ? { effectiveFrom: policyEffectiveFromDate } : {}),
+        shiftId: shiftIdToAssign,
+        dailyWorkingHours: dailyWorkingHoursToAssign,
+        monthlyLeaveAllowance: monthlyLeaveAllowanceToAssign,
+        createdByUserId: actor.userId || actor.id,
       });
 
       if (initialSalaryDecimal) {
@@ -673,9 +751,10 @@ export class EmployeeService {
       updateData.biometricDeviceId = input.biometricDeviceId?.trim() || null;
     }
 
+    let nextShiftIdParam: string | null | undefined = undefined;
     if (input.shiftId !== undefined) {
       if (input.shiftId === null || input.shiftId === '') {
-        updateData.shiftId = null;
+        nextShiftIdParam = null;
       } else {
         const trimmedShiftId = input.shiftId.trim();
         const s = await prisma.shift.findUnique({ where: { id: trimmedShiftId } });
@@ -684,11 +763,42 @@ export class EmployeeService {
           (err as { statusCode?: number }).statusCode = 400;
           throw err;
         }
-        updateData.shiftId = trimmedShiftId;
+        nextShiftIdParam = trimmedShiftId;
       }
     }
 
-    if (input.biometricMappings !== undefined) {
+    const nextDailyHoursParam =
+      input.dailyWorkingHours !== undefined
+        ? WorkPolicyService.validateDailyWorkingHours(input.dailyWorkingHours)
+        : undefined;
+    let nextMonthlyAllowanceParam: number | undefined = undefined;
+    if (input.monthlyLeaveAllowance !== undefined) {
+      const permittedMonthlyLeaveAllowances = await CompanyService.getPermittedMonthlyLeaveAllowances(
+        actor.companyId
+      );
+      nextMonthlyAllowanceParam = this.validateCompanyPermittedMonthlyLeaveAllowance(
+        input.monthlyLeaveAllowance,
+        permittedMonthlyLeaveAllowances,
+        { requireIfDefaultDisallowed: false }
+      );
+    }
+
+    const hasPolicyInput =
+      nextShiftIdParam !== undefined ||
+      nextDailyHoursParam !== undefined ||
+      nextMonthlyAllowanceParam !== undefined;
+
+    const isAllowanceOnlyUpdate =
+      nextMonthlyAllowanceParam !== undefined &&
+      nextShiftIdParam === undefined &&
+      nextDailyHoursParam === undefined &&
+      input.biometricMappings === undefined &&
+      Object.keys(updateData).length === 0 &&
+      input.employeeCode === undefined;
+
+    let policyResult: Awaited<ReturnType<typeof WorkPolicyService.applyWorkPolicyUpdateTx>> | null = null;
+
+    if (input.biometricMappings !== undefined || hasPolicyInput) {
       await prisma.$transaction(async (tx) => {
         if (Object.keys(updateData).length > 0) {
           await tx.employee.update({
@@ -696,17 +806,41 @@ export class EmployeeService {
             data: updateData,
           });
         }
-        await BiometricMappingService.replaceEmployeeMappings(
-          actor,
-          id,
-          input.biometricMappings!,
-          {
-            tx,
-            correlationId,
-            skipAudit: true,
-            syncEmployeeBiometricField: true,
-          }
-        );
+
+        if (hasPolicyInput) {
+          policyResult = await WorkPolicyService.applyWorkPolicyUpdateTx(tx, {
+            companyId: actor.companyId,
+            employee: {
+              id: existing.id,
+              dateOfJoining: updateData.dateOfJoining || existing.dateOfJoining,
+              shiftId: existing.shiftId,
+              dailyWorkingHours: (existing as any).dailyWorkingHours,
+              monthlyLeaveAllowance: (existing as any).monthlyLeaveAllowance,
+            },
+            nextShiftId: nextShiftIdParam,
+            nextDailyWorkingHours: nextDailyHoursParam,
+            nextMonthlyLeaveAllowance: nextMonthlyAllowanceParam,
+            allowAllowanceReversionToCurrent: isAllowanceOnlyUpdate,
+            workPolicyEffectiveFrom: input.policyEffectiveFrom,
+            revisionReason: input.policyRevisionReason,
+            notes: input.policyRevisionNotes,
+            createdByUserId: actor.userId || actor.id,
+          });
+        }
+
+        if (input.biometricMappings !== undefined) {
+          await BiometricMappingService.replaceEmployeeMappings(
+            actor,
+            id,
+            input.biometricMappings!,
+            {
+              tx,
+              correlationId,
+              skipAudit: true,
+              syncEmployeeBiometricField: true,
+            }
+          );
+        }
       });
     } else if (Object.keys(updateData).length > 0) {
       await prisma.employee.update({
@@ -733,6 +867,9 @@ export class EmployeeService {
         ...updateData,
         previousStatus: existing.status,
         biometricMappingsUpdated: input.biometricMappings !== undefined,
+        workPolicyUpdated: policyResult?.applied ?? false,
+        workPolicyEffectiveFrom: policyResult?.workPolicyEffectiveFrom ?? null,
+        allowanceEffectiveFrom: policyResult?.allowanceEffectiveFrom ?? null,
       },
     });
 
@@ -1320,6 +1457,147 @@ export class EmployeeService {
       createdByUserId: created.createdByUserId,
       createdByUserName: (created as unknown as { createdByUser?: { fullName: string } }).createdByUser?.fullName || actor.fullName,
       createdAt: created.createdAt.toISOString(),
+    };
+  }
+
+  /**
+   * Lists effective-dated work policy revisions (daily working hours, shift, monthly leave allowance)
+   * with strict tenant isolation.
+   */
+  static async listWorkPolicyRevisions(
+    actor: AuthUser,
+    employeeId: string
+  ): Promise<EmployeeWorkPolicyRevisionItem[]> {
+    const employee = await prisma.employee.findUnique({
+      where: { id: employeeId },
+      select: { id: true, companyId: true, userId: true },
+    });
+
+    if (!employee || employee.companyId !== actor.companyId) {
+      const err = new Error('Employee not found in this company.');
+      (err as { statusCode?: number }).statusCode = 404;
+      throw err;
+    }
+
+    if (actor.role === 'EMPLOYEE' && employee.userId !== (actor.userId || actor.id)) {
+      const err = new Error('Employees are only permitted to view their own work policy history.');
+      (err as { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
+    const revisions = await WorkPolicyService.listRevisionsForEmployee(actor.companyId, employeeId);
+    return revisions.map((rev) => WorkPolicyService.toRevisionItem(rev));
+  }
+
+  /**
+   * Creates an effective-dated work policy revision for an employee.
+   * Never modifies SalaryRevision and never triggers biometric punch reconciliation.
+   */
+  static async createWorkPolicyRevision(
+    actor: AuthUser,
+    employeeId: string,
+    input: CreateEmployeeWorkPolicyRevisionRequest,
+    correlationId?: string
+  ): Promise<{
+    employee: EmployeeItem;
+    revisions: EmployeeWorkPolicyRevisionItem[];
+    workPolicyEffectiveFrom: string | null;
+    allowanceEffectiveFrom: string | null;
+  }> {
+    if (actor.role === 'EMPLOYEE') {
+      const err = new Error('Employees are not authorized to modify work policy revisions.');
+      (err as { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
+    const employee = await prisma.employee.findUnique({ where: { id: employeeId } });
+    if (!employee || employee.companyId !== actor.companyId) {
+      const err = new Error('Employee not found in this company.');
+      (err as { statusCode?: number }).statusCode = 404;
+      throw err;
+    }
+
+    let nextShiftIdParam: string | null | undefined = undefined;
+    if (input.shiftId !== undefined) {
+      if (input.shiftId === null || input.shiftId === '') {
+        nextShiftIdParam = null;
+      } else {
+        const trimmedShiftId = input.shiftId.trim();
+        const s = await prisma.shift.findUnique({ where: { id: trimmedShiftId } });
+        if (!s || s.companyId !== actor.companyId) {
+          const err = new Error('Referenced shift is invalid or belongs to another company.');
+          (err as { statusCode?: number }).statusCode = 400;
+          throw err;
+        }
+        nextShiftIdParam = trimmedShiftId;
+      }
+    }
+
+    const nextDailyHoursParam =
+      input.dailyWorkingHours !== undefined
+        ? WorkPolicyService.validateDailyWorkingHours(input.dailyWorkingHours)
+        : undefined;
+    let nextMonthlyAllowanceParam: number | undefined = undefined;
+    if (input.monthlyLeaveAllowance !== undefined) {
+      const permittedMonthlyLeaveAllowances = await CompanyService.getPermittedMonthlyLeaveAllowances(
+        actor.companyId
+      );
+      nextMonthlyAllowanceParam = this.validateCompanyPermittedMonthlyLeaveAllowance(
+        input.monthlyLeaveAllowance,
+        permittedMonthlyLeaveAllowances,
+        { requireIfDefaultDisallowed: false }
+      );
+    }
+
+    const result = await prisma.$transaction(async (tx) => {
+      return WorkPolicyService.applyWorkPolicyUpdateTx(tx, {
+        companyId: actor.companyId,
+        employee: {
+          id: employee.id,
+          dateOfJoining: employee.dateOfJoining,
+          shiftId: employee.shiftId,
+          dailyWorkingHours: (employee as any).dailyWorkingHours,
+          monthlyLeaveAllowance: (employee as any).monthlyLeaveAllowance,
+        },
+        nextShiftId: nextShiftIdParam,
+        nextDailyWorkingHours: nextDailyHoursParam,
+        nextMonthlyLeaveAllowance: nextMonthlyAllowanceParam,
+        allowAllowanceReversionToCurrent: true,
+        workPolicyEffectiveFrom: input.effectiveFrom,
+        revisionReason: input.revisionReason,
+        notes: input.notes,
+        createdByUserId: actor.userId || actor.id,
+      });
+    });
+
+    if (result.applied) {
+      await AuditService.log({
+        companyId: actor.companyId,
+        userId: actor.userId || actor.id,
+        action: 'EMPLOYEE_WORK_POLICY_REVISION_CREATE',
+        entity: 'EmployeeWorkPolicyRevision',
+        entityId: employeeId,
+        correlationId,
+        details: {
+          shiftId: nextShiftIdParam,
+          dailyWorkingHours: nextDailyHoursParam,
+          monthlyLeaveAllowance: nextMonthlyAllowanceParam,
+          workPolicyEffectiveFrom: result.workPolicyEffectiveFrom,
+          allowanceEffectiveFrom: result.allowanceEffectiveFrom,
+        },
+      });
+    }
+
+    const [updatedEmployee, revisions] = await Promise.all([
+      this.getEmployeeById(actor.companyId, employeeId),
+      this.listWorkPolicyRevisions(actor, employeeId),
+    ]);
+
+    return {
+      employee: updatedEmployee,
+      revisions,
+      workPolicyEffectiveFrom: result.workPolicyEffectiveFrom,
+      allowanceEffectiveFrom: result.allowanceEffectiveFrom,
     };
   }
 }

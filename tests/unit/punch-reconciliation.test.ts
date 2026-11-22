@@ -80,7 +80,7 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
   };
 
   beforeEach(() => {
-    vi.clearAllMocks();
+    vi.restoreAllMocks();
     vi.spyOn(prisma.leaveRequest, 'findFirst').mockResolvedValue(null as any);
     vi.spyOn(prisma, '$transaction').mockImplementation(async (callback: any) => {
       if (typeof callback === 'function') {
@@ -413,7 +413,7 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
       );
     });
 
-    it('should reject invalid sequence where checkout is earlier than checkin', async () => {
+    it('should handle an earlier or orphan CHECK_OUT as PROCESSED incomplete pending matching earlier CHECK_IN', async () => {
       const existingAttendance = {
         id: 'att-uuid-1',
         companyId: companyAlphaId,
@@ -423,9 +423,9 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         checkOut: null,
       };
 
-      // Corrupt/invalid punch: checkout timestamp is 07:00 (earlier than 09:00 checkin)
-      const invalidPunch = {
-        id: 'punch-invalid-seq',
+      // Out-of-order / earlier checkout timestamp 07:00 before 09:00 checkin
+      const earlierOutPunch = {
+        id: 'punch-earlier-out',
         companyId: companyAlphaId,
         userEnrollmentId: 'BIO-1001',
         punchTime: new Date('2026-10-19T07:00:00.000Z'),
@@ -434,21 +434,30 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         matchedEmployee: mockEmployee,
       };
 
-      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(invalidPunch as any);
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(earlierOutPunch as any);
       vi.spyOn(prisma.company, 'findUnique').mockResolvedValueOnce({ timezone: 'UTC' } as any);
       vi.spyOn(prisma.payrollPeriod, 'findFirst').mockResolvedValueOnce(null);
       vi.spyOn(prisma.attendance, 'findUnique').mockResolvedValueOnce(existingAttendance as any);
+      const updateAttSpy = vi.spyOn(prisma.attendance, 'update').mockResolvedValueOnce({} as any);
       const updateRawSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
 
-      const result = await PunchReconciliationService.reconcilePunch('punch-invalid-seq');
+      const result = await PunchReconciliationService.reconcilePunch('punch-earlier-out');
 
-      expect(result.status).toBe('ERROR');
-      expect(result.message).toContain('earlier than check-in time');
+      expect(result.status).toBe('PROCESSED');
+      expect(result.message).toContain('Incomplete check-out recorded as PROCESSED');
+      expect(updateAttSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'att-uuid-1' },
+          data: expect.objectContaining({
+            hasIncompletePunch: true,
+          }),
+        })
+      );
       expect(updateRawSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
-            syncStatus: 'ERROR',
-            errorMessage: expect.stringContaining('earlier than check-in time'),
+            syncStatus: 'PROCESSED',
+            errorMessage: null,
           }),
         })
       );

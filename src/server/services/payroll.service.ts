@@ -3,6 +3,7 @@ import {
   AuthUser,
   PayrollPeriodItem,
   PayslipItem,
+  PayslipReconciliationBreakdown,
   CreatePayrollPeriodRequest,
   PostPayrollRequest,
   PayrollStatus,
@@ -17,7 +18,133 @@ import { AuditService } from './audit.service.js';
 import { PermissionService } from './permission.service.js';
 import { CompanyService } from './company.service.js';
 
+/**
+ * Pure read-only parser that derives structured reconciliation metadata from persisted payslip.notes.
+ * Never throws; returns null when notes are empty or do not match the reconciled summary format.
+ */
+export function parsePayslipReconciliationBreakdown(
+  notes: string | null | undefined
+): PayslipReconciliationBreakdown | null {
+  if (!notes || typeof notes !== 'string') return null;
+  const trimmed = notes.trim();
+  if (!trimmed) return null;
+
+  const pattern =
+    /^Reconciled:\s*Excess Leave\s*-\s*([A-Za-z]{2,10})\s+(\d+(?:\.\d+)?)(?:\s*\(Allowance\s+(\d+(?:\.\d+)?)d\))?,\s*Short Hours\s*-\s*([A-Za-z]{2,10})\s+(\d+(?:\.\d+)?)(?:\s*\((\d+(?:\.\d+)?)h short,\s*(\d+(?:\.\d+)?)h extra informational only\))?\.(?:\s*(.*))?$/s;
+
+  const match = trimmed.match(pattern);
+  if (!match) return null;
+
+  const [
+    ,
+    excessCurrency,
+    excessAmtRaw,
+    allowanceRaw,
+    shortCurrency,
+    shortAmtRaw,
+    shortHoursRaw,
+    extraHoursRaw,
+    trailingWarningsRaw,
+  ] = match;
+
+  const parseFiniteNonNeg = (raw: string | undefined): number | null => {
+    if (raw === undefined || raw === '') return null;
+    const n = Number(raw);
+    return Number.isFinite(n) && n >= 0 ? n : null;
+  };
+
+  const excessAmtNum = parseFiniteNonNeg(excessAmtRaw);
+  const shortAmtNum = parseFiniteNonNeg(shortAmtRaw);
+  if (excessAmtNum === null || shortAmtNum === null) return null;
+
+  const monthlyLeaveAllowance = parseFiniteNonNeg(allowanceRaw);
+  const shortTimeHours = parseFiniteNonNeg(shortHoursRaw);
+  const extraTimeHours = parseFiniteNonNeg(extraHoursRaw);
+
+  const warnings: string[] = [];
+  const trailing = (trailingWarningsRaw || '').trim();
+  if (trailing) {
+    const knownWarningStarts =
+      /(?=(?:No assigned working schedule\/shift found|Detected \d+ incomplete attendance record|Detected \d+(?:\.\d+)? overlapping approved leave day|No active shift|Missing configured daily working hours|No active salary revision|Monthly leave allowance))/;
+    const parts = trailing
+      .split(knownWarningStarts)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+    warnings.push(...(parts.length > 0 ? parts : [trailing]));
+  }
+
+  return {
+    currency: excessCurrency || shortCurrency || null,
+    monthlyLeaveAllowance,
+    excessLeaveDeduction: excessAmtNum.toFixed(2),
+    shortHoursDeduction: shortAmtNum.toFixed(2),
+    shortTimeHours,
+    extraTimeHours,
+    extraTimeInformationalOnly: true,
+    warnings,
+  };
+}
+
 export class PayrollService {
+  /**
+   * Maps a persisted Prisma Payslip record into a PayslipItem DTO, preserving raw notes
+   * and attaching a read-only reconciliationBreakdown derived from notes when available.
+   */
+  private static mapPayslipToDto(ps: {
+    id: string;
+    companyId: string;
+    payrollPeriodId: string;
+    payrollPeriod: { name: string; month: number; year: number };
+    employeeId: string;
+    employee: { employeeCode: string; fullName: string };
+    basicSalary: string | number | Decimal;
+    allowances: string | number | Decimal;
+    overtimePay: string | number | Decimal;
+    grossSalary: string | number | Decimal;
+    deductions: string | number | Decimal;
+    lossOfPayDeduction: string | number | Decimal;
+    netSalary: string | number | Decimal;
+    status: string;
+    paymentMethod: string | null;
+    paymentDate: Date | null;
+    ledgerId: string | null;
+    ledger?: { name: string } | null;
+    journalEntryId: string | null;
+    journalEntry?: { voucherNumber: string } | null;
+    notes: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+  }): PayslipItem {
+    return {
+      id: ps.id,
+      companyId: ps.companyId,
+      payrollPeriodId: ps.payrollPeriodId,
+      payrollPeriodName: ps.payrollPeriod.name,
+      payrollPeriodMonth: ps.payrollPeriod.month,
+      payrollPeriodYear: ps.payrollPeriod.year,
+      employeeId: ps.employeeId,
+      employeeCode: ps.employee.employeeCode,
+      employeeName: ps.employee.fullName,
+      basicSalary: AccountingMath.format(ps.basicSalary, 2),
+      allowances: AccountingMath.format(ps.allowances, 2),
+      overtimePay: AccountingMath.format(ps.overtimePay, 2),
+      grossSalary: AccountingMath.format(ps.grossSalary, 2),
+      deductions: AccountingMath.format(ps.deductions, 2),
+      lossOfPayDeduction: AccountingMath.format(ps.lossOfPayDeduction, 2),
+      netSalary: AccountingMath.format(ps.netSalary, 2),
+      status: ps.status as PayslipStatus,
+      paymentMethod: ps.paymentMethod,
+      paymentDate: ps.paymentDate ? ps.paymentDate.toISOString().split('T')[0] : null,
+      ledgerId: ps.ledgerId,
+      ledgerName: ps.ledger?.name || null,
+      journalEntryId: ps.journalEntryId,
+      journalVoucherNumber: ps.journalEntry?.voucherNumber || null,
+      notes: ps.notes,
+      reconciliationBreakdown: parsePayslipReconciliationBreakdown(ps.notes),
+      createdAt: ps.createdAt.toISOString(),
+      updatedAt: ps.updatedAt.toISOString(),
+    };
+  }
   /**
    * Helper: Resolves employee ID for self-service employee queries
    */
@@ -217,34 +344,7 @@ export class PayrollService {
       },
     });
 
-    return payslips.map((ps) => ({
-      id: ps.id,
-      companyId: ps.companyId,
-      payrollPeriodId: ps.payrollPeriodId,
-      payrollPeriodName: ps.payrollPeriod.name,
-      payrollPeriodMonth: ps.payrollPeriod.month,
-      payrollPeriodYear: ps.payrollPeriod.year,
-      employeeId: ps.employeeId,
-      employeeCode: ps.employee.employeeCode,
-      employeeName: ps.employee.fullName,
-      basicSalary: AccountingMath.format(ps.basicSalary, 2),
-      allowances: AccountingMath.format(ps.allowances, 2),
-      overtimePay: AccountingMath.format(ps.overtimePay, 2),
-      grossSalary: AccountingMath.format(ps.grossSalary, 2),
-      deductions: AccountingMath.format(ps.deductions, 2),
-      lossOfPayDeduction: AccountingMath.format(ps.lossOfPayDeduction, 2),
-      netSalary: AccountingMath.format(ps.netSalary, 2),
-      status: ps.status as PayslipStatus,
-      paymentMethod: ps.paymentMethod,
-      paymentDate: ps.paymentDate ? ps.paymentDate.toISOString().split('T')[0] : null,
-      ledgerId: ps.ledgerId,
-      ledgerName: ps.ledger?.name || null,
-      journalEntryId: ps.journalEntryId,
-      journalVoucherNumber: ps.journalEntry?.voucherNumber || null,
-      notes: ps.notes,
-      createdAt: ps.createdAt.toISOString(),
-      updatedAt: ps.updatedAt.toISOString(),
-    }));
+    return payslips.map((ps) => this.mapPayslipToDto(ps));
   }
 
   /**
@@ -558,6 +658,7 @@ export class PayrollService {
 
         const calc = PayrollCalculationService.calculatePayslip({
           basicSalary: calculatedBasicSalary,
+          overtimePay: '0.0000', // Policy: Extra Time is informational only and never automatically added to salary
           lossOfPayDeduction: totalReconciledLossOfPay,
           excessLeaveDeduction,
           shortHoursDeduction,
@@ -573,9 +674,14 @@ export class PayrollService {
         }
 
         const baseCurrency = await CompanyService.getBaseCurrency(actor.companyId);
-        const payslipNotes = leaveSummary.warnings && leaveSummary.warnings.length > 0
-          ? `Reconciled: Excess Leave -${baseCurrency} ${leaveSummary.excessLeaveDeduction}, Short Hours -${baseCurrency} ${leaveSummary.shortHoursDeduction}. ${leaveSummary.warnings.join(' ')}`
-          : `Reconciled: Excess Leave -${baseCurrency} ${leaveSummary.excessLeaveDeduction}, Short Hours -${baseCurrency} ${leaveSummary.shortHoursDeduction}.`;
+        const shortHoursVal = leaveSummary.shortTimeHours ?? leaveSummary.deductibleShortHours ?? 0;
+        const extraHoursVal = leaveSummary.extraTimeHours ?? 0;
+        const allowanceVal = leaveSummary.monthlyLeaveAllowance ?? 4;
+        const summaryNote = `Reconciled: Excess Leave -${baseCurrency} ${leaveSummary.excessLeaveDeduction} (Allowance ${allowanceVal}d), Short Hours -${baseCurrency} ${leaveSummary.shortHoursDeduction} (${shortHoursVal}h short, ${extraHoursVal}h extra informational only).`;
+        const payslipNotes =
+          leaveSummary.warnings && leaveSummary.warnings.length > 0
+            ? `${summaryNote} ${leaveSummary.warnings.join(' ')}`
+            : summaryNote;
 
         await tx.payslip.create({
           data: {
@@ -672,34 +778,7 @@ export class PayrollService {
       },
     });
 
-    return payslips.map((ps) => ({
-      id: ps.id,
-      companyId: ps.companyId,
-      payrollPeriodId: ps.payrollPeriodId,
-      payrollPeriodName: ps.payrollPeriod.name,
-      payrollPeriodMonth: ps.payrollPeriod.month,
-      payrollPeriodYear: ps.payrollPeriod.year,
-      employeeId: ps.employeeId,
-      employeeCode: ps.employee.employeeCode,
-      employeeName: ps.employee.fullName,
-      basicSalary: AccountingMath.format(ps.basicSalary, 2),
-      allowances: AccountingMath.format(ps.allowances, 2),
-      overtimePay: AccountingMath.format(ps.overtimePay, 2),
-      grossSalary: AccountingMath.format(ps.grossSalary, 2),
-      deductions: AccountingMath.format(ps.deductions, 2),
-      lossOfPayDeduction: AccountingMath.format(ps.lossOfPayDeduction, 2),
-      netSalary: AccountingMath.format(ps.netSalary, 2),
-      status: ps.status as PayslipStatus,
-      paymentMethod: ps.paymentMethod,
-      paymentDate: ps.paymentDate ? ps.paymentDate.toISOString().split('T')[0] : null,
-      ledgerId: ps.ledgerId,
-      ledgerName: ps.ledger?.name || null,
-      journalEntryId: ps.journalEntryId,
-      journalVoucherNumber: ps.journalEntry?.voucherNumber || null,
-      notes: ps.notes,
-      createdAt: ps.createdAt.toISOString(),
-      updatedAt: ps.updatedAt.toISOString(),
-    }));
+    return payslips.map((ps) => this.mapPayslipToDto(ps));
   }
 
   /**
@@ -732,34 +811,7 @@ export class PayrollService {
       }
     }
 
-    return {
-      id: ps.id,
-      companyId: ps.companyId,
-      payrollPeriodId: ps.payrollPeriodId,
-      payrollPeriodName: ps.payrollPeriod.name,
-      payrollPeriodMonth: ps.payrollPeriod.month,
-      payrollPeriodYear: ps.payrollPeriod.year,
-      employeeId: ps.employeeId,
-      employeeCode: ps.employee.employeeCode,
-      employeeName: ps.employee.fullName,
-      basicSalary: AccountingMath.format(ps.basicSalary, 2),
-      allowances: AccountingMath.format(ps.allowances, 2),
-      overtimePay: AccountingMath.format(ps.overtimePay, 2),
-      grossSalary: AccountingMath.format(ps.grossSalary, 2),
-      deductions: AccountingMath.format(ps.deductions, 2),
-      lossOfPayDeduction: AccountingMath.format(ps.lossOfPayDeduction, 2),
-      netSalary: AccountingMath.format(ps.netSalary, 2),
-      status: ps.status as PayslipStatus,
-      paymentMethod: ps.paymentMethod,
-      paymentDate: ps.paymentDate ? ps.paymentDate.toISOString().split('T')[0] : null,
-      ledgerId: ps.ledgerId,
-      ledgerName: ps.ledger?.name || null,
-      journalEntryId: ps.journalEntryId,
-      journalVoucherNumber: ps.journalEntry?.voucherNumber || null,
-      notes: ps.notes,
-      createdAt: ps.createdAt.toISOString(),
-      updatedAt: ps.updatedAt.toISOString(),
-    };
+    return this.mapPayslipToDto(ps);
   }
 
   /**

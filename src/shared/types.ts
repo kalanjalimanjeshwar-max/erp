@@ -259,6 +259,7 @@ export interface CompanyProfile {
   roundingPrecision?: number;
   defaultDocumentLanguage?: string;
   printSettings?: DocumentPrintSettings;
+  permittedMonthlyLeaveAllowances?: number[];
   pendingApproval?: boolean;
   changeRequest?: CompanySettingsChangeRequestItem;
 }
@@ -363,6 +364,7 @@ export interface UpdateCompanyProfileRequest {
   appHeaderTitle?: string | null;
   salesInvoiceEnabled?: boolean;
   defaultDocumentLanguage?: string;
+  permittedMonthlyLeaveAllowances?: number[];
 }
 
 export interface RolePermissionRule {
@@ -1257,8 +1259,51 @@ export interface EmployeeItem {
   shiftEndTime?: string | null;
   shiftIsOvernight?: boolean | null;
   configuredDailyWorkingHours?: number | null;
+  dailyWorkingHours?: number | null;
+  monthlyLeaveAllowance?: number | null;
+  effectiveWorkPolicy?: {
+    dailyWorkingHours: number | null;
+    monthlyLeaveAllowance: number;
+    shiftId: string | null;
+    effectiveFrom: string;
+    effectiveTo: string | null;
+    source: 'REVISION' | 'EMPLOYEE_FALLBACK';
+  } | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface EmployeeWorkPolicyRevisionItem {
+  id: string;
+  companyId: string;
+  employeeId: string;
+  shiftId: string | null;
+  shiftName?: string | null;
+  shiftCode?: string | null;
+  shiftStartTime?: string | null;
+  shiftEndTime?: string | null;
+  shiftIsOvernight?: boolean | null;
+  dailyWorkingHours: number | null;
+  monthlyLeaveAllowance: number | null;
+  effectiveDailyWorkingHours: number | null;
+  effectiveMonthlyLeaveAllowance: number;
+  effectiveFrom: string; // YYYY-MM-DD
+  effectiveTo: string | null; // YYYY-MM-DD
+  revisionReason: string | null;
+  notes: string | null;
+  createdByUserId: string;
+  createdByUserName?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateEmployeeWorkPolicyRevisionRequest {
+  shiftId?: string | null;
+  dailyWorkingHours?: number | null;
+  monthlyLeaveAllowance?: number | null;
+  effectiveFrom?: string; // YYYY-MM-DD (used for shiftId / dailyWorkingHours; monthlyLeaveAllowance always starts 1st of next month)
+  revisionReason?: string | null;
+  notes?: string | null;
 }
 
 export interface CreateEmployeeRequest {
@@ -1279,6 +1324,9 @@ export interface CreateEmployeeRequest {
   biometricMappings?: EmployeeBiometricMappingInput[];
   initialSalary?: string | number;
   shiftId?: string | null;
+  dailyWorkingHours?: number | null;
+  monthlyLeaveAllowance?: number | null;
+  policyEffectiveFrom?: string; // YYYY-MM-DD
 }
 
 export interface UpdateEmployeeRequest {
@@ -1298,6 +1346,11 @@ export interface UpdateEmployeeRequest {
   biometricDeviceId?: string | null;
   biometricMappings?: EmployeeBiometricMappingInput[];
   shiftId?: string | null;
+  dailyWorkingHours?: number | null;
+  monthlyLeaveAllowance?: number | null;
+  policyEffectiveFrom?: string; // YYYY-MM-DD
+  policyRevisionReason?: string | null;
+  policyRevisionNotes?: string | null;
 }
 
 export interface CreateEmployeeLoginRequest {
@@ -1363,6 +1416,27 @@ export interface UpdateShiftRequest {
 }
 
 // Attendance Types
+export interface AttendancePunchEventItem {
+  id: string;
+  attendanceId: string;
+  rawPunchLogId: string | null;
+  punchTime: string; // ISO
+  inOutMode: PunchInOutMode;
+  source: AttendanceSource;
+}
+
+export interface AttendanceIntervalItem {
+  id: string;
+  attendanceId: string;
+  sequence: number;
+  inEventId: string | null;
+  outEventId: string | null;
+  checkIn: string | null; // ISO
+  checkOut: string | null; // ISO
+  durationMinutes: number;
+  isComplete: boolean;
+}
+
 export interface AttendanceItem {
   id: string;
   companyId: string;
@@ -1377,6 +1451,14 @@ export interface AttendanceItem {
   status: AttendanceStatus;
   lateMinutes: number;
   overtimeMinutes: number;
+  actualWorkedMinutes?: number | null;
+  hasIncompletePunch?: boolean;
+  punchPairsCount?: number;
+  requiredMinutes?: number | null;
+  shortTimeMinutes?: number;
+  extraTimeMinutes?: number;
+  intervals?: AttendanceIntervalItem[];
+  punchEvents?: AttendancePunchEventItem[];
   source: AttendanceSource;
   notes: string | null;
   createdAt: string;
@@ -1509,6 +1591,12 @@ export interface MonthlyLeaveSummary {
   configuredDailyWorkingHours: number | null;
   shiftSchedule: string | null;
   deductibleShortHours: number;
+  shortTimeMinutes?: number;
+  extraTimeMinutes?: number;
+  shortTimeHours?: number;
+  extraTimeHours?: number;
+  totalRequiredMinutes?: number;
+  totalActualWorkedMinutes?: number;
   incompleteAttendanceCount: number;
   excessLeaveDeduction: string;
   shortHoursDeduction: string;
@@ -1562,6 +1650,17 @@ export interface CreatePayrollPeriodRequest {
   name?: string | null;
 }
 
+export interface PayslipReconciliationBreakdown {
+  currency: string | null;
+  monthlyLeaveAllowance: number | null;
+  excessLeaveDeduction: string | null;
+  shortHoursDeduction: string | null;
+  shortTimeHours: number | null;
+  extraTimeHours: number | null;
+  extraTimeInformationalOnly: boolean;
+  warnings: string[];
+}
+
 export interface PayslipItem {
   id: string;
   companyId: string;
@@ -1587,6 +1686,7 @@ export interface PayslipItem {
   journalEntryId: string | null;
   journalVoucherNumber?: string | null;
   notes: string | null;
+  reconciliationBreakdown?: PayslipReconciliationBreakdown | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -1833,6 +1933,7 @@ export interface PunchReconciliationOptions {
   batchSize?: number;
   retryErrors?: boolean;
   keepUnmappedPending?: boolean;
+  fromPunchTime?: string | Date;
 }
 
 export interface PunchReconciliationItemResult {
@@ -1889,6 +1990,9 @@ export interface WorkingHoursSummary {
   checkIn: string | null;
   checkOut: string | null;
   workedDurationHours: number | null;
+  actualWorkedMinutes?: number | null;
+  punchPairsCount?: number;
+  hasIncompletePunch?: boolean;
   shortDurationMinutes: number;
   overtimeDurationMinutes: number;
   status: WorkingHoursStatus;

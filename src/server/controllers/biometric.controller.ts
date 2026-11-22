@@ -1,9 +1,33 @@
 import { Request, Response } from 'express';
+import { prisma } from '../db/client.js';
 import { BiometricService } from '../services/biometric.service.js';
 import { BiometricMappingService } from '../services/biometric-mapping.service.js';
 import { PunchReconciliationService } from '../services/punch-reconciliation.service.js';
+import { WorkPolicyService, getStartOfLocalDayUtc } from '../services/work-policy.service.js';
+import { localDateTimeToUtcIso } from '../../shared/timezone.js';
 import { AuthUser, BiometricTerminalStatus } from '../../shared/types.js';
 import { AuthenticatedDeviceRequest } from '../middleware/device-auth.middleware.js';
+
+const CALENDAR_DATE_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/;
+const ISO_DATETIME_WITH_TZ_REGEX =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-]\d{2}:\d{2})$/;
+
+function createControllerError(message: string, statusCode: number, code: string): Error {
+  const err = new Error(message) as Error & { statusCode?: number; code?: string };
+  err.statusCode = statusCode;
+  err.code = code;
+  return err;
+}
+
+function isValidCalendarDateParts(year: number, month: number, day: number): boolean {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  return (
+    probe.getUTCFullYear() === year &&
+    probe.getUTCMonth() === month - 1 &&
+    probe.getUTCDate() === day
+  );
+}
 
 export class BiometricController {
   /**
@@ -122,14 +146,143 @@ export class BiometricController {
     }
   }
 
+  private static parseSyncRequestBody(body: unknown): Record<string, unknown> {
+    if (body === undefined) return {};
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      throw createControllerError(
+        'Invalid request payload: expected a JSON object.',
+        400,
+        'VALIDATION_ERROR'
+      );
+    }
+    return body as Record<string, unknown>;
+  }
+
   private static parseTargetedFilter(value: unknown, fieldName: string): string | undefined {
     if (value === undefined) return undefined;
     if (typeof value !== 'string' || !value.trim()) {
-      const err = new Error(`Invalid targeted reconciliation filter '${fieldName}': value must be a non-empty string.`);
-      (err as { statusCode?: number }).statusCode = 400;
-      throw err;
+      throw createControllerError(
+        `Invalid targeted reconciliation filter '${fieldName}': value must be a non-empty string.`,
+        400,
+        'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+      );
     }
     return value.trim();
+  }
+
+  private static parseBatchSize(value: unknown): number | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+      throw createControllerError(
+        "Invalid 'batchSize': value must be a positive integer.",
+        400,
+        'VALIDATION_ERROR'
+      );
+    }
+    return value;
+  }
+
+  private static parseOptionalBoolean(value: unknown, fieldName: string): boolean | undefined {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'boolean') {
+      throw createControllerError(
+        `Invalid '${fieldName}': value must be a boolean.`,
+        400,
+        'VALIDATION_ERROR'
+      );
+    }
+    return value;
+  }
+
+  /**
+   * Validates and normalizes optional `fromPunchTime`:
+   * - `undefined`: returns `undefined` so Step 2 preserves its company-local today-only default cutoff.
+   * - `YYYY-MM-DD`: normalized to the start of that calendar day in the company's configured timezone
+   *   via `WorkPolicyService.resolveCompanyTimezone` + `getStartOfLocalDayUtc`.
+   * - ISO-8601 datetime with explicit `Z` or `±HH:MM` offset: preserves the explicitly supplied instant.
+   */
+  static async parseFromPunchTime(value: unknown, companyId: string): Promise<Date | undefined> {
+    if (value === undefined) return undefined;
+    if (typeof value !== 'string' || !value.trim()) {
+      throw createControllerError(
+        "Invalid 'fromPunchTime': expected a valid YYYY-MM-DD calendar date or ISO-8601 datetime string with timezone offset.",
+        400,
+        'VALIDATION_ERROR'
+      );
+    }
+
+    const trimmed = value.trim();
+
+    const dateMatch = CALENDAR_DATE_REGEX.exec(trimmed);
+    if (dateMatch) {
+      const year = Number(dateMatch[1]);
+      const month = Number(dateMatch[2]);
+      const day = Number(dateMatch[3]);
+      if (!isValidCalendarDateParts(year, month, day)) {
+        throw createControllerError(
+          `Invalid 'fromPunchTime' calendar date '${trimmed}'.`,
+          400,
+          'VALIDATION_ERROR'
+        );
+      }
+
+      const companyTimezone = await WorkPolicyService.resolveCompanyTimezone(companyId, prisma);
+      const localNoonUtcIso = localDateTimeToUtcIso(trimmed, '12:00:00', companyTimezone);
+      return getStartOfLocalDayUtc(companyTimezone, new Date(localNoonUtcIso));
+    }
+
+    const isoMatch = ISO_DATETIME_WITH_TZ_REGEX.exec(trimmed);
+    if (isoMatch) {
+      const year = Number(isoMatch[1]);
+      const month = Number(isoMatch[2]);
+      const day = Number(isoMatch[3]);
+      const hour = Number(isoMatch[4]);
+      const minute = Number(isoMatch[5]);
+      const second = isoMatch[6] !== undefined ? Number(isoMatch[6]) : 0;
+      const tzPart = isoMatch[8];
+
+      if (!isValidCalendarDateParts(year, month, day)) {
+        throw createControllerError(
+          `Invalid 'fromPunchTime' calendar date in '${trimmed}'.`,
+          400,
+          'VALIDATION_ERROR'
+        );
+      }
+      if (hour > 23 || minute > 59 || second > 59) {
+        throw createControllerError(
+          `Invalid 'fromPunchTime' time component in '${trimmed}'.`,
+          400,
+          'VALIDATION_ERROR'
+        );
+      }
+      if (tzPart !== 'Z') {
+        const offsetHour = Number(tzPart.slice(1, 3));
+        const offsetMinute = Number(tzPart.slice(4, 6));
+        if (offsetHour > 23 || offsetMinute > 59) {
+          throw createControllerError(
+            `Invalid 'fromPunchTime' timezone offset in '${trimmed}'.`,
+            400,
+            'VALIDATION_ERROR'
+          );
+        }
+      }
+
+      const parsed = new Date(trimmed);
+      if (Number.isNaN(parsed.getTime())) {
+        throw createControllerError(
+          `Invalid 'fromPunchTime' ISO-8601 timestamp '${trimmed}'.`,
+          400,
+          'VALIDATION_ERROR'
+        );
+      }
+      return parsed;
+    }
+
+    throw createControllerError(
+      "Invalid 'fromPunchTime': expected a valid YYYY-MM-DD calendar date or ISO-8601 datetime string with timezone offset (Z or ±HH:MM).",
+      400,
+      'VALIDATION_ERROR'
+    );
   }
 
   /**
@@ -140,25 +293,61 @@ export class BiometricController {
     try {
       const actor = req.user as AuthUser;
       const { id } = req.params;
-      const { batchSize, retryErrors, userEnrollmentId, employeeId, punchId } = req.body || {};
+      const body = BiometricController.parseSyncRequestBody(req.body);
+      const {
+        batchSize,
+        retryErrors,
+        keepUnmappedPending,
+        fromPunchTime,
+        userEnrollmentId,
+        employeeId,
+        punchId,
+      } = body;
+
+      const parsedBatchSize = BiometricController.parseBatchSize(batchSize);
+      const parsedRetryErrors = BiometricController.parseOptionalBoolean(retryErrors, 'retryErrors');
+      const parsedKeepUnmappedPending = BiometricController.parseOptionalBoolean(
+        keepUnmappedPending,
+        'keepUnmappedPending'
+      );
+      const parsedEnrollmentId = BiometricController.parseTargetedFilter(
+        userEnrollmentId,
+        'userEnrollmentId'
+      );
+      const parsedEmployeeId = BiometricController.parseTargetedFilter(employeeId, 'employeeId');
+      const parsedPunchId = BiometricController.parseTargetedFilter(punchId, 'punchId');
+      const parsedFromPunchTime = await BiometricController.parseFromPunchTime(
+        fromPunchTime,
+        actor.companyId
+      );
+
       const result = await BiometricService.triggerTerminalSync(
         actor,
         id,
         {
-          batchSize: typeof batchSize === 'number' ? batchSize : undefined,
-          retryErrors: retryErrors === true,
-          userEnrollmentId: BiometricController.parseTargetedFilter(userEnrollmentId, 'userEnrollmentId'),
-          employeeId: BiometricController.parseTargetedFilter(employeeId, 'employeeId'),
-          punchId: BiometricController.parseTargetedFilter(punchId, 'punchId'),
+          batchSize: parsedBatchSize,
+          retryErrors: parsedRetryErrors ?? false,
+          keepUnmappedPending: parsedKeepUnmappedPending,
+          fromPunchTime: parsedFromPunchTime,
+          userEnrollmentId: parsedEnrollmentId,
+          employeeId: parsedEmployeeId,
+          punchId: parsedPunchId,
         },
         req.correlationId
       );
       res.status(200).json(result);
     } catch (err: unknown) {
       const status = (err as { statusCode?: number }).statusCode || 500;
+      const explicitCode = (err as { code?: string }).code;
       res.status(status).json({
         error: {
-          code: status === 404 ? 'TERMINAL_NOT_FOUND' : status === 400 ? 'BIOMETRIC_INVALID_RECONCILIATION_FILTER' : 'BIOMETRIC_TERMINAL_SYNC_FAILED',
+          code:
+            explicitCode ||
+            (status === 404
+              ? 'TERMINAL_NOT_FOUND'
+              : status === 400
+              ? 'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+              : 'BIOMETRIC_TERMINAL_SYNC_FAILED'),
           message: (err as Error).message || 'Failed to sync biometric terminal.',
         },
       });
@@ -335,6 +524,7 @@ export class BiometricController {
   static async triggerSync(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;
+      const body = BiometricController.parseSyncRequestBody(req.body);
       const {
         batchSize,
         terminalId,
@@ -343,23 +533,52 @@ export class BiometricController {
         punchId,
         retryErrors,
         keepUnmappedPending,
-      } = req.body || {};
+        fromPunchTime,
+      } = body;
 
+      const parsedBatchSize = BiometricController.parseBatchSize(batchSize);
+      const parsedRetryErrors = BiometricController.parseOptionalBoolean(retryErrors, 'retryErrors');
+      const parsedKeepUnmappedPending = BiometricController.parseOptionalBoolean(
+        keepUnmappedPending,
+        'keepUnmappedPending'
+      );
       const parsedTerminalId = BiometricController.parseTargetedFilter(terminalId, 'terminalId');
-      const parsedEnrollmentId = BiometricController.parseTargetedFilter(userEnrollmentId, 'userEnrollmentId');
+      const parsedEnrollmentId = BiometricController.parseTargetedFilter(
+        userEnrollmentId,
+        'userEnrollmentId'
+      );
       const parsedEmployeeId = BiometricController.parseTargetedFilter(employeeId, 'employeeId');
       const parsedPunchId = BiometricController.parseTargetedFilter(punchId, 'punchId');
+      const parsedFromPunchTime = await BiometricController.parseFromPunchTime(
+        fromPunchTime,
+        actor.companyId
+      );
+
+      if (parsedTerminalId) {
+        const ownedTerminal = await prisma.biometricTerminal.findFirst({
+          where: { id: parsedTerminalId, companyId: actor.companyId },
+          select: { id: true },
+        });
+        if (!ownedTerminal) {
+          throw createControllerError(
+            'Biometric terminal not found for this company.',
+            404,
+            'TERMINAL_NOT_FOUND'
+          );
+        }
+      }
 
       const result = await PunchReconciliationService.reconcilePendingPunches(
         actor.companyId,
         {
-          batchSize: typeof batchSize === 'number' ? batchSize : undefined,
+          batchSize: parsedBatchSize,
           terminalId: parsedTerminalId,
           userEnrollmentId: parsedEnrollmentId,
           employeeId: parsedEmployeeId,
           punchId: parsedPunchId,
-          retryErrors: retryErrors === true,
-          keepUnmappedPending: typeof keepUnmappedPending === 'boolean' ? keepUnmappedPending : undefined,
+          retryErrors: parsedRetryErrors ?? false,
+          keepUnmappedPending: parsedKeepUnmappedPending,
+          fromPunchTime: parsedFromPunchTime,
         },
         actor.userId || actor.id,
         req.correlationId
@@ -368,14 +587,16 @@ export class BiometricController {
       res.json(result);
     } catch (err: unknown) {
       const status = (err as { statusCode?: number }).statusCode || 500;
+      const explicitCode = (err as { code?: string }).code;
       res.status(status).json({
         error: {
           code:
-            status === 400
+            explicitCode ||
+            (status === 400
               ? 'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
               : status === 404
               ? 'BIOMETRIC_TARGET_NOT_FOUND'
-              : 'BIOMETRIC_SYNC_FAILED',
+              : 'BIOMETRIC_SYNC_FAILED'),
           message: (err as Error).message,
         },
       });

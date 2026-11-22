@@ -185,6 +185,8 @@ apiRouter.patch('/employees/:id/login/status', requireAuth, requirePermission('U
 apiRouter.post('/employees/:id/ledger', requireAuth, requirePermission('ACCOUNTING', 'CREATE'), EmployeeController.linkLedger);
 apiRouter.get('/employees/:id/salaries', requireAuth, EmployeeController.listSalaries);
 apiRouter.post('/employees/:id/salaries', requireAuth, requirePermission('EMPLOYEE', 'EDIT'), EmployeeController.createSalaryRevision);
+apiRouter.get('/employees/:id/work-policies', requireAuth, EmployeeController.listWorkPolicies);
+apiRouter.post('/employees/:id/work-policies', requireAuth, requirePermission('EMPLOYEE', 'EDIT'), EmployeeController.createWorkPolicyRevision);
 
 // 16. Shift Management Endpoints (Phase 7.2)
 apiRouter.get('/shifts', requireAuth, requirePermission('ATTENDANCE', 'VIEW'), ShiftController.list);

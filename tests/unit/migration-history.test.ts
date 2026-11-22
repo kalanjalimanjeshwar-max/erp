@@ -258,6 +258,7 @@ describe('Database Migration History & Integrity Tests', () => {
       '20261105120000_phase2_2_document_sequence_padding',
       '20261106000000_phase2_3_bank_account_encryption_capacity',
       '20261112000000_employee_expense_claims_reimbursement',
+      '20261119000000_employee_work_policy_and_multi_pair_attendance',
     ]);
   });
 
@@ -335,6 +336,69 @@ describe('Database Migration History & Integrity Tests', () => {
     expect(content).toContain('CREATE TABLE "ExpenseClaimAttachment"');
     expect(content).toContain('CREATE TABLE "ExpenseClaimEvent"');
     expect(content).toContain('"ExpenseClaim_companyId_claimNumber_key"');
+  });
+
+  it('should include version-controlled additive Employee Work Policy & Multi-Pair Attendance migration', () => {
+    const migration16Dir = path.join(
+      migrationsDir,
+      '20261119000000_employee_work_policy_and_multi_pair_attendance'
+    );
+    expect(fs.existsSync(migration16Dir)).toBe(true);
+
+    const migration16Sql = path.join(migration16Dir, 'migration.sql');
+    expect(fs.existsSync(migration16Sql)).toBe(true);
+
+    const content = fs.readFileSync(migration16Sql, 'utf-8');
+    expect(content).toContain("SET lock_timeout = '3s';");
+    expect(content).toContain('RESET lock_timeout;');
+    expect(content).not.toMatch(/^\s*(BEGIN|COMMIT)\s*;/m);
+    expect(content).toContain('"User_id_companyId_key"');
+    expect(content).toContain('"Employee_id_companyId_key"');
+    expect(content).toContain('"Shift_id_companyId_key"');
+    expect(content).toContain('"Attendance_id_companyId_key"');
+    expect(content).toContain('"RawPunchLog_id_companyId_key"');
+    expect(content).toContain('ALTER TABLE "Employee"');
+    expect(content).toContain('ADD COLUMN IF NOT EXISTS "dailyWorkingHours" DECIMAL(4, 2)');
+    expect(content).toContain('ADD COLUMN IF NOT EXISTS "monthlyLeaveAllowance" DECIMAL(5, 2)');
+    expect(content).toContain('"Employee_dailyWorkingHours_chk"');
+    expect(content).toContain('"Employee_monthlyLeaveAllowance_chk"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "EmployeeWorkPolicyRevision"');
+    expect(content).toContain('"EmployeeWorkPolicyRevision_comp_emp_effFrom_key"');
+    expect(content).toContain('"EmployeeWorkPolicyRevision_companyId_employeeId_open_key"');
+    expect(content).toContain('"EmployeeWorkPolicyRevision_comp_emp_range_idx"');
+    expect(content).toContain('"EmployeeWorkPolicyRevision_employeeId_companyId_fkey"');
+    expect(content).toContain('"EmployeeWorkPolicyRevision_shiftId_companyId_fkey"');
+    expect(content).toContain('"EmployeeWorkPolicyRevision_createdByUserId_companyId_fkey"');
+    expect(content).toContain('"EmployeeWorkPolicyRevision_effective_dates_chk"');
+    expect(content).toContain('"EmployeeWorkPolicyRevision_dailyWorkingHours_chk"');
+    expect(content).toContain('"EmployeeWorkPolicyRevision_monthlyLeaveAllowance_chk"');
+    expect(content).toContain('"enforce_employee_work_policy_no_overlap"');
+    expect(content).toContain('"EmployeeWorkPolicyRevision_no_overlap_trg"');
+    expect(content).toContain('ALTER TABLE "Attendance"');
+    expect(content).toContain('ADD COLUMN IF NOT EXISTS "actualWorkedMinutes" INTEGER');
+    expect(content).toContain('ADD COLUMN IF NOT EXISTS "hasIncompletePunch" BOOLEAN NOT NULL DEFAULT false');
+    expect(content).toContain('ADD COLUMN IF NOT EXISTS "punchPairsCount" INTEGER NOT NULL DEFAULT 0');
+    expect(content).toContain('"Attendance_actualWorkedMinutes_chk"');
+    expect(content).toContain('"Attendance_punchPairsCount_chk"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "AttendancePunchEvent"');
+    expect(content).toContain('"AttendancePunchEvent_rawPunchLogId_companyId_key"');
+    expect(content).toContain('"AttendancePunchEvent_id_attendanceId_companyId_key"');
+    expect(content).toContain('"AttendancePunchEvent_attendanceId_companyId_fkey"');
+    expect(content).toContain('"AttendancePunchEvent_rawPunchLogId_companyId_fkey"');
+    expect(content).toContain('CREATE TABLE IF NOT EXISTS "AttendanceInterval"');
+    expect(content).toContain('"AttendanceInterval_attendanceId_sequence_key"');
+    expect(content).not.toContain('"AttendanceInterval_attendanceId_sequence_idx"');
+    expect(content).toContain('"AttendanceInterval_inEventId_idx"');
+    expect(content).toContain('"AttendanceInterval_outEventId_idx"');
+    expect(content).toContain('"AttendanceInterval_attendanceId_companyId_fkey"');
+    expect(content).toContain('"AttendanceInterval_inEventId_attendanceId_companyId_fkey"');
+    expect(content).toContain('"AttendanceInterval_outEventId_attendanceId_companyId_fkey"');
+    expect(content).toMatch(/ADD CONSTRAINT "AttendanceInterval_inEventId_attendanceId_companyId_fkey"[^;]*ON DELETE NO ACTION[^;]*DEFERRABLE INITIALLY DEFERRED;/);
+    expect(content).toMatch(/ADD CONSTRAINT "AttendanceInterval_outEventId_attendanceId_companyId_fkey"[^;]*ON DELETE NO ACTION[^;]*DEFERRABLE INITIALLY DEFERRED;/);
+    expect(content).toContain('"AttendanceInterval_sequence_chk"');
+    expect(content).toContain('"AttendanceInterval_durationMinutes_chk"');
+    expect(content).toContain('"AttendanceInterval_check_order_chk"');
+    expect(content).not.toMatch(/^\s*(UPDATE|DELETE|DROP|TRUNCATE)\b/im);
   });
 });
 

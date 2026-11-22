@@ -8,13 +8,166 @@ import {
   PunchReconciliationItemResult,
   PunchSyncSummaryResponse,
   AttendanceStatus,
+  PunchInOutMode,
 } from '../../shared/types.js';
 import { AuditService } from './audit.service.js';
 import { BiometricMappingService } from './biometric-mapping.service.js';
+import {
+  WorkPolicyService,
+  canUsePrismaDelegate,
+  getStartOfLocalDayUtc,
+  ShiftDurationShape,
+} from './work-policy.service.js';
 
 const DEBOUNCE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export interface PairablePunchEvent {
+  id: string;
+  rawPunchLogId?: string | null;
+  punchTime: Date;
+  inOutMode: PunchInOutMode;
+  createdAt?: Date;
+}
+
+export interface PairedAttendanceInterval {
+  sequence: number;
+  inEventId: string | null;
+  outEventId: string | null;
+  checkIn: Date | null;
+  checkOut: Date | null;
+  durationMinutes: number;
+  isComplete: boolean;
+}
+
+export interface ChronologicalPairingResult {
+  intervals: PairedAttendanceInterval[];
+  actualWorkedMinutes: number | null;
+  punchPairsCount: number;
+  hasIncompletePunch: boolean;
+  earliestCheckIn: Date | null;
+  latestCheckOut: Date | null;
+}
+
+/**
+ * Pure deterministic chronological pairing state machine for a single workday's IN/OUT events.
+ * Handles multi-pair IN->OUT sequences, orphan/earlier CHECK_OUTs, consecutive CHECK_INs,
+ * and automatic re-pairing when late or out-of-order punches arrive.
+ */
+export function pairAttendanceEventsChronologically(
+  events: PairablePunchEvent[]
+): ChronologicalPairingResult {
+  const inOutEvents = events
+    .filter((ev) => ev.inOutMode === 'CHECK_IN' || ev.inOutMode === 'CHECK_OUT')
+    .slice()
+    .sort((a, b) => {
+      const timeDiff = a.punchTime.getTime() - b.punchTime.getTime();
+      if (timeDiff !== 0) return timeDiff;
+      if (a.inOutMode !== b.inOutMode) {
+        return a.inOutMode === 'CHECK_IN' ? -1 : 1;
+      }
+      const createdDiff =
+        (a.createdAt ? a.createdAt.getTime() : 0) - (b.createdAt ? b.createdAt.getTime() : 0);
+      if (createdDiff !== 0) return createdDiff;
+      return a.id.localeCompare(b.id);
+    });
+
+  if (inOutEvents.length === 0) {
+    return {
+      intervals: [],
+      actualWorkedMinutes: null,
+      punchPairsCount: 0,
+      hasIncompletePunch: false,
+      earliestCheckIn: null,
+      latestCheckOut: null,
+    };
+  }
+
+  const intervals: PairedAttendanceInterval[] = [];
+  let openIn: PairablePunchEvent | null = null;
+  let earliestCheckIn: Date | null = null;
+  let latestCheckOut: Date | null = null;
+
+  for (const ev of inOutEvents) {
+    if (ev.inOutMode === 'CHECK_IN') {
+      if (!earliestCheckIn || ev.punchTime.getTime() < earliestCheckIn.getTime()) {
+        earliestCheckIn = ev.punchTime;
+      }
+      if (openIn !== null) {
+        // Consecutive CHECK_IN before closing previous CHECK_IN -> previous IN is incomplete
+        intervals.push({
+          sequence: intervals.length + 1,
+          inEventId: openIn.id,
+          outEventId: null,
+          checkIn: openIn.punchTime,
+          checkOut: null,
+          durationMinutes: 0,
+          isComplete: false,
+        });
+      }
+      openIn = ev;
+    } else {
+      // CHECK_OUT
+      if (!latestCheckOut || ev.punchTime.getTime() > latestCheckOut.getTime()) {
+        latestCheckOut = ev.punchTime;
+      }
+      if (openIn !== null) {
+        const durationMinutes = Math.max(
+          0,
+          Math.round((ev.punchTime.getTime() - openIn.punchTime.getTime()) / (1000 * 60))
+        );
+        intervals.push({
+          sequence: intervals.length + 1,
+          inEventId: openIn.id,
+          outEventId: ev.id,
+          checkIn: openIn.punchTime,
+          checkOut: ev.punchTime,
+          durationMinutes,
+          isComplete: true,
+        });
+        openIn = null;
+      } else {
+        // Orphan or earlier CHECK_OUT -> PROCESSED incomplete event (never ERROR)
+        intervals.push({
+          sequence: intervals.length + 1,
+          inEventId: null,
+          outEventId: ev.id,
+          checkIn: null,
+          checkOut: ev.punchTime,
+          durationMinutes: 0,
+          isComplete: false,
+        });
+      }
+    }
+  }
+
+  if (openIn !== null) {
+    intervals.push({
+      sequence: intervals.length + 1,
+      inEventId: openIn.id,
+      outEventId: null,
+      checkIn: openIn.punchTime,
+      checkOut: null,
+      durationMinutes: 0,
+      isComplete: false,
+    });
+  }
+
+  const completeIntervals = intervals.filter((iv) => iv.isComplete);
+  const punchPairsCount = completeIntervals.length;
+  const hasIncompletePunch = intervals.some((iv) => !iv.isComplete);
+  const actualWorkedMinutes = completeIntervals.reduce((sum, iv) => sum + iv.durationMinutes, 0);
+
+  return {
+    intervals,
+    actualWorkedMinutes,
+    punchPairsCount,
+    hasIncompletePunch,
+    earliestCheckIn,
+    latestCheckOut,
+  };
+}
 
 /**
  * Derives a deterministic pair of signed 32-bit integers for PostgreSQL
@@ -226,7 +379,7 @@ export class PunchReconciliationService {
   static async reconcilePunch(
     punchId: string,
     correlationId?: string,
-    options?: { keepUnmappedPending?: boolean; expectedCompanyId?: string }
+    options?: { keepUnmappedPending?: boolean; expectedCompanyId?: string; companyTimezone?: string }
   ): Promise<PunchReconciliationItemResult> {
     return prisma.$transaction(async (tx) => {
       // Acquire an exclusive PostgreSQL row-level lock on RawPunchLog BEFORE reading syncStatus
@@ -412,11 +565,36 @@ export class PunchReconciliationService {
         };
       }
 
-      // B. Resolve Timezone and Work Date
-      const timeZone = await this.resolveCompanyTimezone(punch.companyId, tx);
-      const shift = employee.shift;
+      // B. Resolve Timezone, Work Date, and Effective-Dated Work Policy
+      const timeZone =
+        options?.companyTimezone ||
+        (await this.resolveCompanyTimezone(punch.companyId, tx));
+      let shift: ShiftDurationShape | null = employee.shift || null;
+      let policyRevisions = await WorkPolicyService.listRevisionsForEmployee(
+        punch.companyId,
+        employee.id,
+        tx
+      );
+      if (policyRevisions.length > 0) {
+        const provisionalLocalStr = this.getLocalDateTime(punch.punchTime, timeZone).dateStr;
+        const provisionalPolicy = WorkPolicyService.resolvePolicyForDate({
+          date: provisionalLocalStr,
+          employee,
+          revisions: policyRevisions,
+        });
+        if (provisionalPolicy.shift) {
+          shift = provisionalPolicy.shift;
+        }
+      }
+
       const workDateStr = this.determineWorkDate(punch.punchTime, timeZone, shift);
       const workDateObj = new Date(`${workDateStr}T00:00:00.000Z`);
+      const effectiveDailyPolicy = WorkPolicyService.resolvePolicyForDate({
+        date: workDateObj,
+        employee,
+        revisions: policyRevisions,
+      });
+      const effectiveShift = effectiveDailyPolicy.shift || shift || null;
 
       // B2. Acquire a PostgreSQL transaction-scoped advisory lock keyed by
       // (companyId, employeeId, workDateStr) BEFORE checking/creating Attendance.
@@ -436,13 +614,13 @@ export class PunchReconciliationService {
         `;
       }
 
-      // C. Data & Payroll Integrity: Protect Finalized / Processed / Posted Payroll Periods
+      // C. Data & Payroll Integrity: Protect Finalized / Processed / Accounts-Approved / Posted Payroll Periods
       const lockedPayroll = await tx.payrollPeriod.findFirst({
         where: {
           companyId: punch.companyId,
           startDate: { lte: workDateObj },
           endDate: { gte: workDateObj },
-          status: { in: ['PROCESSED', 'POSTED'] },
+          status: { in: ['PROCESSED', 'ACCOUNTS_APPROVED', 'POSTED'] },
         },
         select: { id: true, name: true, status: true },
       });
@@ -521,93 +699,107 @@ export class PunchReconciliationService {
       const punchTime = punch.punchTime;
       const mode = punch.inOutMode;
 
-      if (mode === 'CHECK_IN') {
-        if (!existingAttendance) {
-          // Normal first check-in: create attendance record
-          const lateMinutes = this.calculateLateMinutes(punchTime, workDateStr, shift, timeZone);
-          const status: AttendanceStatus = lateMinutes > 0 ? 'LATE' : 'PRESENT';
+      if (mode === 'CHECK_IN' || mode === 'CHECK_OUT') {
+        const useMultiPairPipeline = canUsePrismaDelegate(tx, 'attendancePunchEvent', 'findMany');
 
-          await tx.attendance.create({
-            data: {
-              companyId: punch.companyId,
-              employeeId: employee.id,
-              shiftId: shift?.id || null,
-              workDate: workDateObj,
-              checkIn: punchTime,
-              checkOut: null,
-              status,
-              lateMinutes,
-              overtimeMinutes: 0,
-              source: 'BIOMETRIC',
-              notes: `Biometric Check-In at ${punchTime.toISOString()}`,
-            },
-          });
-
-          await tx.rawPunchLog.update({
-            where: { id: punch.id },
-            data: { syncStatus: 'PROCESSED', errorMessage: null },
-          });
-
-          return {
-            punchId: punch.id,
-            userEnrollmentId: punch.userEnrollmentId,
-            matchedEmployeeId: employee.id,
-            workDate: workDateStr,
-            status: 'PROCESSED',
-            message: 'Check-in recorded successfully.',
-          };
-        } else {
-          // Existing attendance record exists
-          if (!existingAttendance.checkIn) {
-            // Check-out was previously recorded first (out-of-order punch); now assign check-in
-            if (existingAttendance.checkOut && punchTime.getTime() > existingAttendance.checkOut.getTime()) {
-              const reason = 'Invalid sequence: Incoming check-in time is later than existing check-out time.';
-              await tx.rawPunchLog.update({
-                where: { id: punch.id },
-                data: { syncStatus: 'ERROR', errorMessage: reason },
-              });
-              return {
-                punchId: punch.id,
-                userEnrollmentId: punch.userEnrollmentId,
-                matchedEmployeeId: employee.id,
-                workDate: workDateStr,
-                status: 'ERROR',
-                message: reason,
-              };
-            }
-
-            const lateMinutes = this.calculateLateMinutes(punchTime, workDateStr, shift, timeZone);
-            const status: AttendanceStatus = lateMinutes > 0 ? 'LATE' : 'PRESENT';
-
-            await tx.attendance.update({
-              where: { id: existingAttendance.id },
+        if (useMultiPairPipeline) {
+          let attendanceRecord = existingAttendance;
+          if (!attendanceRecord) {
+            const initialNote =
+              mode === 'CHECK_IN'
+                ? `Biometric Check-In at ${punchTime.toISOString()}`
+                : 'Biometric check-out recorded without matching check-in.';
+            attendanceRecord = await tx.attendance.create({
               data: {
-                checkIn: punchTime,
-                lateMinutes,
-                status,
+                companyId: punch.companyId,
+                employeeId: employee.id,
+                shiftId: effectiveDailyPolicy.shiftId || effectiveShift?.id || null,
+                workDate: workDateObj,
+                checkIn: mode === 'CHECK_IN' ? punchTime : null,
+                checkOut: mode === 'CHECK_OUT' ? punchTime : null,
+                status: 'PRESENT',
+                lateMinutes: 0,
+                overtimeMinutes: 0,
+                actualWorkedMinutes: 0,
+                hasIncompletePunch: true,
+                punchPairsCount: 0,
                 source: 'BIOMETRIC',
+                notes: initialNote,
               },
             });
+          }
 
+          let existingEvents = (await tx.attendancePunchEvent.findMany({
+            where: {
+              attendanceId: attendanceRecord.id,
+              companyId: punch.companyId,
+            },
+            orderBy: [{ punchTime: 'asc' }, { createdAt: 'asc' }],
+          })) as PairablePunchEvent[];
+
+          // Legacy pre-migration Attendance compatibility: seed unlinked punch events
+          // if the Attendance row already existed with checkIn/checkOut timestamps and 0 events
+          if (
+            existingAttendance &&
+            existingEvents.length === 0 &&
+            canUsePrismaDelegate(tx, 'attendancePunchEvent', 'create')
+          ) {
+            const legacySource = existingAttendance.source || 'MANUAL';
+            if (existingAttendance.checkIn) {
+              const seededIn = await tx.attendancePunchEvent.create({
+                data: {
+                  companyId: punch.companyId,
+                  attendanceId: attendanceRecord.id,
+                  rawPunchLogId: null,
+                  punchTime: existingAttendance.checkIn,
+                  inOutMode: 'CHECK_IN',
+                  source: legacySource,
+                },
+              });
+              existingEvents.push(seededIn);
+            }
+            if (existingAttendance.checkOut) {
+              const seededOut = await tx.attendancePunchEvent.create({
+                data: {
+                  companyId: punch.companyId,
+                  attendanceId: attendanceRecord.id,
+                  rawPunchLogId: null,
+                  punchTime: existingAttendance.checkOut,
+                  inOutMode: 'CHECK_OUT',
+                  source: legacySource,
+                },
+              });
+              existingEvents.push(seededOut);
+            }
+          }
+
+          // Safeguard: if this raw punch already created an AttendancePunchEvent, remain idempotent
+          if (existingEvents.some((ev) => ev.rawPunchLogId === punch.id)) {
             await tx.rawPunchLog.update({
               where: { id: punch.id },
               data: { syncStatus: 'PROCESSED', errorMessage: null },
             });
-
             return {
               punchId: punch.id,
               userEnrollmentId: punch.userEnrollmentId,
               matchedEmployeeId: employee.id,
               workDate: workDateStr,
               status: 'PROCESSED',
-              message: 'Check-in assigned to existing record.',
+              message: 'Punch was already linked to attendance events.',
             };
           }
 
-          // Debounce check: if duplicate within DEBOUNCE_THRESHOLD_MS
-          const diffMs = Math.abs(punchTime.getTime() - existingAttendance.checkIn.getTime());
-          if (diffMs <= DEBOUNCE_THRESHOLD_MS) {
-            const reason = 'Duplicate check-in punch debounced within 2 minutes.';
+          // Duplicate debounce check against ALL existing workday events of the SAME inOutMode
+          const duplicateSameMode = existingEvents.find(
+            (ev) =>
+              ev.inOutMode === mode &&
+              Math.abs(punchTime.getTime() - ev.punchTime.getTime()) <= DEBOUNCE_THRESHOLD_MS
+          );
+          if (duplicateSameMode) {
+            const reason =
+              mode === 'CHECK_IN'
+                ? 'Duplicate check-in punch debounced within 2 minutes.'
+                : 'Duplicate check-out punch debounced within 2 minutes.';
             await tx.rawPunchLog.update({
               where: { id: punch.id },
               data: { syncStatus: 'IGNORED', errorMessage: reason },
@@ -622,17 +814,136 @@ export class PunchReconciliationService {
             };
           }
 
-          // If incoming check-in is earlier than existing check-in, update to earliest in
-          if (punchTime.getTime() < existingAttendance.checkIn.getTime()) {
-            const lateMinutes = this.calculateLateMinutes(punchTime, workDateStr, shift, timeZone);
+          // Insert new chronological punch event linked to RawPunchLog
+          const createdEvent = await tx.attendancePunchEvent.create({
+            data: {
+              companyId: punch.companyId,
+              attendanceId: attendanceRecord.id,
+              rawPunchLogId: punch.id,
+              punchTime,
+              inOutMode: mode,
+              source: 'BIOMETRIC',
+            },
+          });
+          existingEvents.push(createdEvent);
+
+          // Re-pair entire workday chronologically (handles earlier CHECK_OUT, out-of-order CHECK_IN, multi-pair)
+          const pairing = pairAttendanceEventsChronologically(existingEvents);
+
+          if (canUsePrismaDelegate(tx, 'attendanceInterval', 'deleteMany')) {
+            await tx.attendanceInterval.deleteMany({
+              where: {
+                attendanceId: attendanceRecord.id,
+                companyId: punch.companyId,
+              },
+            });
+          }
+
+          if (canUsePrismaDelegate(tx, 'attendanceInterval', 'create')) {
+            for (const interval of pairing.intervals) {
+              await tx.attendanceInterval.create({
+                data: {
+                  companyId: punch.companyId,
+                  attendanceId: attendanceRecord.id,
+                  sequence: interval.sequence,
+                  inEventId: interval.inEventId,
+                  outEventId: interval.outEventId,
+                  checkIn: interval.checkIn,
+                  checkOut: interval.checkOut,
+                  durationMinutes: interval.durationMinutes,
+                  isComplete: interval.isComplete,
+                },
+              });
+            }
+          }
+
+          const shiftForLate =
+            effectiveShift && effectiveShift.graceMinutes !== undefined
+              ? { startTime: effectiveShift.startTime, graceMinutes: effectiveShift.graceMinutes }
+              : null;
+          const lateMinutes = this.calculateLateMinutes(
+            pairing.earliestCheckIn,
+            workDateStr,
+            shiftForLate,
+            timeZone
+          );
+          const nextStatus: AttendanceStatus =
+            attendanceRecord.status === 'HALF_DAY'
+              ? 'HALF_DAY'
+              : lateMinutes > 0
+              ? 'LATE'
+              : 'PRESENT';
+
+          const dailyRequiredMin = effectiveDailyPolicy.effectiveDailyRequiredMinutes;
+          const computedWorkedMin = pairing.actualWorkedMinutes ?? 0;
+          const overtimeMinutes =
+            dailyRequiredMin !== null ? Math.max(0, computedWorkedMin - dailyRequiredMin) : 0;
+
+          await tx.attendance.update({
+            where: { id: attendanceRecord.id },
+            data: {
+              shiftId: effectiveDailyPolicy.shiftId || effectiveShift?.id || null,
+              checkIn: pairing.earliestCheckIn,
+              checkOut: pairing.latestCheckOut,
+              status: nextStatus,
+              lateMinutes,
+              overtimeMinutes,
+              actualWorkedMinutes: pairing.actualWorkedMinutes,
+              hasIncompletePunch: pairing.hasIncompletePunch,
+              punchPairsCount: pairing.punchPairsCount,
+              source: 'BIOMETRIC',
+            },
+          });
+
+          await tx.rawPunchLog.update({
+            where: { id: punch.id },
+            data: { syncStatus: 'PROCESSED', errorMessage: null },
+          });
+
+          const isUnmatchedCreatedEvent = pairing.intervals.some(
+            (iv) => !iv.isComplete && (iv.inEventId === createdEvent.id || iv.outEventId === createdEvent.id)
+          );
+
+          return {
+            punchId: punch.id,
+            userEnrollmentId: punch.userEnrollmentId,
+            matchedEmployeeId: employee.id,
+            workDate: workDateStr,
+            status: 'PROCESSED',
+            message: isUnmatchedCreatedEvent
+              ? mode === 'CHECK_OUT'
+                ? 'Incomplete check-out recorded as PROCESSED pending matching check-in.'
+                : 'Check-in recorded as open punch pending check-out.'
+              : `${mode === 'CHECK_IN' ? 'Check-in' : 'Check-out'} paired chronologically (${pairing.punchPairsCount} pair${pairing.punchPairsCount === 1 ? '' : 's'}).`,
+          };
+        }
+
+        // Legacy fallback when unit-test Prisma spies omit AttendancePunchEvent/AttendanceInterval
+        if (mode === 'CHECK_IN') {
+          if (!existingAttendance) {
+            const shiftForLate =
+              effectiveShift && effectiveShift.graceMinutes !== undefined
+                ? { startTime: effectiveShift.startTime, graceMinutes: effectiveShift.graceMinutes }
+                : null;
+            const lateMinutes = this.calculateLateMinutes(punchTime, workDateStr, shiftForLate, timeZone);
             const status: AttendanceStatus = lateMinutes > 0 ? 'LATE' : 'PRESENT';
 
-            await tx.attendance.update({
-              where: { id: existingAttendance.id },
+            await tx.attendance.create({
               data: {
+                companyId: punch.companyId,
+                employeeId: employee.id,
+                shiftId: effectiveDailyPolicy.shiftId || effectiveShift?.id || null,
+                workDate: workDateObj,
                 checkIn: punchTime,
-                lateMinutes,
+                checkOut: null,
                 status,
+                lateMinutes,
+                overtimeMinutes: 0,
+                actualWorkedMinutes: 0,
+                hasIncompletePunch: true,
+                punchPairsCount: 0,
+                source: 'BIOMETRIC',
+                notes: `Biometric Check-In at ${punchTime.toISOString()}`,
               },
             });
 
@@ -647,139 +958,238 @@ export class PunchReconciliationService {
               matchedEmployeeId: employee.id,
               workDate: workDateStr,
               status: 'PROCESSED',
-              message: 'Earlier check-in updated.',
+              message: 'Check-in recorded successfully.',
             };
-          }
+          } else {
+            const shiftForLate =
+              effectiveShift && effectiveShift.graceMinutes !== undefined
+                ? { startTime: effectiveShift.startTime, graceMinutes: effectiveShift.graceMinutes }
+                : null;
 
-          // Subsequent check-in ignored to prevent overwriting genuine start of day
-          const reason = `Subsequent check-in ignored: Employee already checked in at ${existingAttendance.checkIn.toISOString()}.`;
-          await tx.rawPunchLog.update({
-            where: { id: punch.id },
-            data: { syncStatus: 'IGNORED', errorMessage: reason },
-          });
+            if (!existingAttendance.checkIn) {
+              const lateMinutes = this.calculateLateMinutes(punchTime, workDateStr, shiftForLate, timeZone);
+              const status: AttendanceStatus = lateMinutes > 0 ? 'LATE' : 'PRESENT';
+              const isValidPair =
+                existingAttendance.checkOut && punchTime.getTime() <= existingAttendance.checkOut.getTime();
+              const workedMin = isValidPair
+                ? Math.max(0, Math.round((existingAttendance.checkOut!.getTime() - punchTime.getTime()) / 60000))
+                : 0;
 
-          return {
-            punchId: punch.id,
-            userEnrollmentId: punch.userEnrollmentId,
-            matchedEmployeeId: employee.id,
-            workDate: workDateStr,
-            status: 'IGNORED',
-            message: reason,
-          };
-        }
-      } else if (mode === 'CHECK_OUT') {
-        if (!existingAttendance) {
-          // Missing check-in scenario: record check-out gracefully
-          const overtimeMinutes = this.calculateOvertimeMinutes(punchTime, workDateStr, shift, timeZone);
+              await tx.attendance.update({
+                where: { id: existingAttendance.id },
+                data: {
+                  checkIn: punchTime,
+                  lateMinutes,
+                  status,
+                  actualWorkedMinutes: workedMin,
+                  hasIncompletePunch: !isValidPair,
+                  punchPairsCount: isValidPair ? 1 : 0,
+                  source: 'BIOMETRIC',
+                },
+              });
 
-          await tx.attendance.create({
-            data: {
-              companyId: punch.companyId,
-              employeeId: employee.id,
-              shiftId: shift?.id || null,
-              workDate: workDateObj,
-              checkIn: null,
-              checkOut: punchTime,
-              status: 'PRESENT',
-              lateMinutes: 0,
-              overtimeMinutes,
-              source: 'BIOMETRIC',
-              notes: 'Biometric check-out recorded without matching check-in.',
-            },
-          });
+              await tx.rawPunchLog.update({
+                where: { id: punch.id },
+                data: { syncStatus: 'PROCESSED', errorMessage: null },
+              });
 
-          await tx.rawPunchLog.update({
-            where: { id: punch.id },
-            data: { syncStatus: 'PROCESSED', errorMessage: null },
-          });
+              return {
+                punchId: punch.id,
+                userEnrollmentId: punch.userEnrollmentId,
+                matchedEmployeeId: employee.id,
+                workDate: workDateStr,
+                status: 'PROCESSED',
+                message: isValidPair
+                  ? 'Check-in paired with previously recorded check-out.'
+                  : 'Check-in recorded as open punch.',
+              };
+            }
 
-          return {
-            punchId: punch.id,
-            userEnrollmentId: punch.userEnrollmentId,
-            matchedEmployeeId: employee.id,
-            workDate: workDateStr,
-            status: 'PROCESSED',
-            message: 'Check-out recorded without check-in.',
-          };
-        } else {
-          // Validate checkOut >= checkIn
-          if (existingAttendance.checkIn && punchTime.getTime() < existingAttendance.checkIn.getTime()) {
-            const reason = 'Invalid sequence: Check-out time is earlier than check-in time.';
+            const diffMs = Math.abs(punchTime.getTime() - existingAttendance.checkIn.getTime());
+            if (diffMs <= DEBOUNCE_THRESHOLD_MS) {
+              const reason = 'Duplicate check-in punch debounced within 2 minutes.';
+              await tx.rawPunchLog.update({
+                where: { id: punch.id },
+                data: { syncStatus: 'IGNORED', errorMessage: reason },
+              });
+              return {
+                punchId: punch.id,
+                userEnrollmentId: punch.userEnrollmentId,
+                matchedEmployeeId: employee.id,
+                workDate: workDateStr,
+                status: 'IGNORED',
+                message: reason,
+              };
+            }
+
+            if (punchTime.getTime() < existingAttendance.checkIn.getTime()) {
+              const lateMinutes = this.calculateLateMinutes(punchTime, workDateStr, shiftForLate, timeZone);
+              const status: AttendanceStatus = lateMinutes > 0 ? 'LATE' : 'PRESENT';
+
+              await tx.attendance.update({
+                where: { id: existingAttendance.id },
+                data: {
+                  checkIn: punchTime,
+                  lateMinutes,
+                  status,
+                },
+              });
+
+              await tx.rawPunchLog.update({
+                where: { id: punch.id },
+                data: { syncStatus: 'PROCESSED', errorMessage: null },
+              });
+
+              return {
+                punchId: punch.id,
+                userEnrollmentId: punch.userEnrollmentId,
+                matchedEmployeeId: employee.id,
+                workDate: workDateStr,
+                status: 'PROCESSED',
+                message: 'Earlier check-in updated.',
+              };
+            }
+
+            const reason = `Subsequent check-in ignored: Employee already checked in at ${existingAttendance.checkIn.toISOString()}.`;
             await tx.rawPunchLog.update({
               where: { id: punch.id },
-              data: { syncStatus: 'ERROR', errorMessage: reason },
+              data: { syncStatus: 'IGNORED', errorMessage: reason },
             });
+
             return {
               punchId: punch.id,
               userEnrollmentId: punch.userEnrollmentId,
               matchedEmployeeId: employee.id,
               workDate: workDateStr,
-              status: 'ERROR',
+              status: 'IGNORED',
               message: reason,
             };
           }
+        } else {
+          // Legacy spy path: CHECK_OUT
+          if (!existingAttendance) {
+            const overtimeMinutes = this.calculateOvertimeMinutes(punchTime, workDateStr, effectiveShift, timeZone);
 
-          // Debounce check: if duplicate within DEBOUNCE_THRESHOLD_MS of existing checkout
-          if (existingAttendance.checkOut) {
-            const diffMs = Math.abs(punchTime.getTime() - existingAttendance.checkOut.getTime());
-            if (diffMs <= DEBOUNCE_THRESHOLD_MS) {
-              const reason = 'Duplicate check-out punch debounced within 2 minutes.';
+            await tx.attendance.create({
+              data: {
+                companyId: punch.companyId,
+                employeeId: employee.id,
+                shiftId: effectiveDailyPolicy.shiftId || effectiveShift?.id || null,
+                workDate: workDateObj,
+                checkIn: null,
+                checkOut: punchTime,
+                status: 'PRESENT',
+                lateMinutes: 0,
+                overtimeMinutes,
+                actualWorkedMinutes: 0,
+                hasIncompletePunch: true,
+                punchPairsCount: 0,
+                source: 'BIOMETRIC',
+                notes: 'Biometric check-out recorded without matching check-in.',
+              },
+            });
+
+            await tx.rawPunchLog.update({
+              where: { id: punch.id },
+              data: { syncStatus: 'PROCESSED', errorMessage: null },
+            });
+
+            return {
+              punchId: punch.id,
+              userEnrollmentId: punch.userEnrollmentId,
+              matchedEmployeeId: employee.id,
+              workDate: workDateStr,
+              status: 'PROCESSED',
+              message: 'Check-out recorded without check-in.',
+            };
+          } else {
+            // Orphan/earlier CHECK_OUT than existing checkIn -> PROCESSED incomplete (NOT ERROR)
+            if (existingAttendance.checkIn && punchTime.getTime() < existingAttendance.checkIn.getTime()) {
+              await tx.attendance.update({
+                where: { id: existingAttendance.id },
+                data: {
+                  hasIncompletePunch: true,
+                },
+              });
               await tx.rawPunchLog.update({
                 where: { id: punch.id },
-                data: { syncStatus: 'IGNORED', errorMessage: reason },
+                data: { syncStatus: 'PROCESSED', errorMessage: null },
               });
               return {
                 punchId: punch.id,
                 userEnrollmentId: punch.userEnrollmentId,
                 matchedEmployeeId: employee.id,
                 workDate: workDateStr,
-                status: 'IGNORED',
-                message: reason,
+                status: 'PROCESSED',
+                message: 'Incomplete check-out recorded as PROCESSED pending matching earlier check-in.',
               };
             }
 
-            // If incoming checkout is earlier than existing checkout, do not regress checkout time
-            if (punchTime.getTime() < existingAttendance.checkOut.getTime()) {
-              const reason = `Earlier check-out ignored: Later check-out already recorded at ${existingAttendance.checkOut.toISOString()}.`;
-              await tx.rawPunchLog.update({
-                where: { id: punch.id },
-                data: { syncStatus: 'IGNORED', errorMessage: reason },
-              });
-              return {
-                punchId: punch.id,
-                userEnrollmentId: punch.userEnrollmentId,
-                matchedEmployeeId: employee.id,
-                workDate: workDateStr,
-                status: 'IGNORED',
-                message: reason,
-              };
+            if (existingAttendance.checkOut) {
+              const diffMs = Math.abs(punchTime.getTime() - existingAttendance.checkOut.getTime());
+              if (diffMs <= DEBOUNCE_THRESHOLD_MS) {
+                const reason = 'Duplicate check-out punch debounced within 2 minutes.';
+                await tx.rawPunchLog.update({
+                  where: { id: punch.id },
+                  data: { syncStatus: 'IGNORED', errorMessage: reason },
+                });
+                return {
+                  punchId: punch.id,
+                  userEnrollmentId: punch.userEnrollmentId,
+                  matchedEmployeeId: employee.id,
+                  workDate: workDateStr,
+                  status: 'IGNORED',
+                  message: reason,
+                };
+              }
+
+              if (punchTime.getTime() < existingAttendance.checkOut.getTime()) {
+                const reason = `Earlier check-out ignored: Later check-out already recorded at ${existingAttendance.checkOut.toISOString()}.`;
+                await tx.rawPunchLog.update({
+                  where: { id: punch.id },
+                  data: { syncStatus: 'IGNORED', errorMessage: reason },
+                });
+                return {
+                  punchId: punch.id,
+                  userEnrollmentId: punch.userEnrollmentId,
+                  matchedEmployeeId: employee.id,
+                  workDate: workDateStr,
+                  status: 'IGNORED',
+                  message: reason,
+                };
+              }
             }
+
+            const overtimeMinutes = this.calculateOvertimeMinutes(punchTime, workDateStr, effectiveShift, timeZone);
+            const workedMin = existingAttendance.checkIn
+              ? Math.max(0, Math.round((punchTime.getTime() - existingAttendance.checkIn.getTime()) / 60000))
+              : 0;
+
+            await tx.attendance.update({
+              where: { id: existingAttendance.id },
+              data: {
+                checkOut: punchTime,
+                overtimeMinutes,
+                actualWorkedMinutes: workedMin,
+                hasIncompletePunch: !existingAttendance.checkIn,
+                punchPairsCount: existingAttendance.checkIn ? 1 : 0,
+              },
+            });
+
+            await tx.rawPunchLog.update({
+              where: { id: punch.id },
+              data: { syncStatus: 'PROCESSED', errorMessage: null },
+            });
+
+            return {
+              punchId: punch.id,
+              userEnrollmentId: punch.userEnrollmentId,
+              matchedEmployeeId: employee.id,
+              workDate: workDateStr,
+              status: 'PROCESSED',
+              message: 'Check-out updated successfully.',
+            };
           }
-
-          // Update check-out timestamp and recalculate overtime minutes
-          const overtimeMinutes = this.calculateOvertimeMinutes(punchTime, workDateStr, shift, timeZone);
-
-          await tx.attendance.update({
-            where: { id: existingAttendance.id },
-            data: {
-              checkOut: punchTime,
-              overtimeMinutes,
-            },
-          });
-
-          await tx.rawPunchLog.update({
-            where: { id: punch.id },
-            data: { syncStatus: 'PROCESSED', errorMessage: null },
-          });
-
-          return {
-            punchId: punch.id,
-            userEnrollmentId: punch.userEnrollmentId,
-            matchedEmployeeId: employee.id,
-            workDate: workDateStr,
-            status: 'PROCESSED',
-            message: 'Check-out updated successfully.',
-          };
         }
       } else {
         // BREAK_OUT or BREAK_IN
@@ -878,6 +1288,7 @@ export class PunchReconciliationService {
       syncStatus: PunchSyncStatus | { in: PunchSyncStatus[] };
       terminalId?: string;
       userEnrollmentId?: string;
+      punchTime?: { gte?: Date };
       OR?: Array<Record<string, unknown>>;
     } = {
       companyId,
@@ -894,6 +1305,22 @@ export class PunchReconciliationService {
     }
     if (targetEnrollmentId) {
       where.userEnrollmentId = targetEnrollmentId;
+    }
+    let resolvedCompanyTimezone: string | undefined;
+    if (options?.fromPunchTime !== undefined && options?.fromPunchTime !== null) {
+      const fromDate =
+        options.fromPunchTime instanceof Date
+          ? options.fromPunchTime
+          : new Date(options.fromPunchTime);
+      if (isNaN(fromDate.getTime())) {
+        const err = new Error('Invalid fromPunchTime filter format.');
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+      where.punchTime = { gte: fromDate };
+    } else if (!targetPunchId && !targetEmployeeId && !targetEnrollmentId) {
+      resolvedCompanyTimezone = await WorkPolicyService.resolveCompanyTimezone(companyId, prisma);
+      where.punchTime = { gte: getStartOfLocalDayUtc(resolvedCompanyTimezone) };
     }
 
     if (targetEmployeeId) {
@@ -956,6 +1383,7 @@ export class PunchReconciliationService {
         const itemResult = await this.reconcilePunch(punch.id, correlationId, {
           keepUnmappedPending,
           expectedCompanyId: companyId,
+          companyTimezone: resolvedCompanyTimezone,
         });
         results.push(itemResult);
 
@@ -1039,15 +1467,17 @@ export class PunchReconciliationService {
   }
 
   /**
-   * Reconciles eligible pending (and previously unmapped error) punches strictly for an exact
-   * (terminalId, userEnrollmentId) mapping without touching other unmapped enrollment IDs.
+   * Reconciles eligible current-day pending (and previously unmapped error) punches strictly for an exact
+   * (terminalId, userEnrollmentId) mapping without touching other unmapped enrollment IDs or historical punches.
+   * Defaults to the start of the current company-local calendar day (UTC) unless an explicit fromPunchTime is supplied.
    */
   static async reconcileForEmployeeMapping(
     companyId: string,
     terminalId: string,
     userEnrollmentId: string,
     actorUserId?: string,
-    correlationId?: string
+    correlationId?: string,
+    options?: { fromPunchTime?: Date | string }
   ): Promise<PunchReconciliationResponse> {
     const trimmedEnrollmentId = userEnrollmentId.trim();
     if (!terminalId || !trimmedEnrollmentId) {
@@ -1062,6 +1492,14 @@ export class PunchReconciliationService {
       };
     }
 
+    let effectiveFromPunchTime: Date | string;
+    if (options?.fromPunchTime !== undefined && options?.fromPunchTime !== null) {
+      effectiveFromPunchTime = options.fromPunchTime;
+    } else {
+      const companyTimezone = await WorkPolicyService.resolveCompanyTimezone(companyId, prisma);
+      effectiveFromPunchTime = getStartOfLocalDayUtc(companyTimezone);
+    }
+
     return this.reconcilePendingPunches(
       companyId,
       {
@@ -1070,6 +1508,7 @@ export class PunchReconciliationService {
         batchSize: 500,
         retryErrors: true,
         keepUnmappedPending: true,
+        fromPunchTime: effectiveFromPunchTime,
       },
       actorUserId,
       correlationId

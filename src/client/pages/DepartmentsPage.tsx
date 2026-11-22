@@ -13,6 +13,7 @@ import {
   Layers,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
+import { ConfirmDialog, executeConfirmedAction } from '../components/common/ConfirmDialog.tsx';
 import {
   DepartmentItem,
   DesignationItem,
@@ -51,6 +52,14 @@ export const DepartmentsPage: React.FC<DepartmentsPageProps> = ({ currentUser })
   const [desigDesc, setDesigDesc] = useState('');
 
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  // Deactivation Confirmation Dialog State
+  const [pendingConfirm, setPendingConfirm] = useState<
+    | { kind: 'department'; item: DepartmentItem }
+    | { kind: 'designation'; item: DesignationItem }
+    | null
+  >(null);
+  const [isConfirmSubmitting, setIsConfirmSubmitting] = useState(false);
 
   const isEmployee = currentUser.role === 'EMPLOYEE';
 
@@ -121,21 +130,9 @@ export const DepartmentsPage: React.FC<DepartmentsPageProps> = ({ currentUser })
     }
   };
 
-  const handleDeactivateDept = async (dept: DepartmentItem) => {
-    if (!confirm(`Are you sure you want to deactivate department '${dept.name}'? Existing employee records will be preserved.`)) {
-      return;
-    }
-    try {
-      await api.deactivateDepartment(dept.id);
-      setSuccessMessage(`Department '${dept.name}' deactivated.`);
-      loadData();
-    } catch (err: unknown) {
-      if (err instanceof ApiError) {
-        setErrorMessage(err.message);
-      } else {
-        setErrorMessage('Failed to deactivate department.');
-      }
-    }
+  const handleDeactivateDept = (dept: DepartmentItem) => {
+    setErrorMessage(null);
+    setPendingConfirm({ kind: 'department', item: dept });
   };
 
   const resetDeptForm = () => {
@@ -195,20 +192,50 @@ export const DepartmentsPage: React.FC<DepartmentsPageProps> = ({ currentUser })
     }
   };
 
-  const handleDeactivateDesig = async (desig: DesignationItem) => {
-    if (!confirm(`Are you sure you want to deactivate designation '${desig.name}'? Existing employee records will be preserved.`)) {
-      return;
-    }
+  const handleDeactivateDesig = (desig: DesignationItem) => {
+    setErrorMessage(null);
+    setPendingConfirm({ kind: 'designation', item: desig });
+  };
+
+  const handleConfirmDeactivation = async () => {
+    if (!pendingConfirm) return;
+    setIsConfirmSubmitting(true);
+    setErrorMessage(null);
+
     try {
-      await api.deactivateDesignation(desig.id);
-      setSuccessMessage(`Designation '${desig.name}' deactivated.`);
-      loadData();
-    } catch (err: unknown) {
-      if (err instanceof ApiError) {
-        setErrorMessage(err.message);
+      if (pendingConfirm.kind === 'department') {
+        const dept = pendingConfirm.item;
+        const outcome = await executeConfirmedAction(
+          true,
+          () => api.deactivateDepartment(dept.id),
+          'Failed to deactivate department.'
+        );
+        if (outcome?.ok) {
+          setSuccessMessage(`Department '${dept.name}' deactivated.`);
+          setPendingConfirm(null);
+          loadData();
+        } else if (outcome?.errorMessage) {
+          setErrorMessage(outcome.errorMessage);
+          setPendingConfirm(null);
+        }
       } else {
-        setErrorMessage('Failed to deactivate designation.');
+        const desig = pendingConfirm.item;
+        const outcome = await executeConfirmedAction(
+          true,
+          () => api.deactivateDesignation(desig.id),
+          'Failed to deactivate designation.'
+        );
+        if (outcome?.ok) {
+          setSuccessMessage(`Designation '${desig.name}' deactivated.`);
+          setPendingConfirm(null);
+          loadData();
+        } else if (outcome?.errorMessage) {
+          setErrorMessage(outcome.errorMessage);
+          setPendingConfirm(null);
+        }
       }
+    } finally {
+      setIsConfirmSubmitting(false);
     }
   };
 
@@ -653,6 +680,31 @@ export const DepartmentsPage: React.FC<DepartmentsPageProps> = ({ currentUser })
           </div>
         </div>
       )}
+      <ConfirmDialog
+        isOpen={Boolean(pendingConfirm)}
+        title={
+          pendingConfirm?.kind === 'department'
+            ? 'Deactivate Department'
+            : 'Deactivate Designation'
+        }
+        message={
+          pendingConfirm?.kind === 'department'
+            ? `Are you sure you want to deactivate department '${pendingConfirm.item.name}'? Existing employee records will be preserved.`
+            : pendingConfirm?.kind === 'designation'
+            ? `Are you sure you want to deactivate designation '${pendingConfirm.item.name}'? Existing employee records will be preserved.`
+            : ''
+        }
+        confirmLabel="Deactivate"
+        confirmBusyLabel="Deactivating..."
+        variant="danger"
+        isSubmitting={isConfirmSubmitting}
+        onConfirm={handleConfirmDeactivation}
+        onCancel={() => {
+          if (!isConfirmSubmitting) {
+            setPendingConfirm(null);
+          }
+        }}
+      />
     </div>
   );
 };

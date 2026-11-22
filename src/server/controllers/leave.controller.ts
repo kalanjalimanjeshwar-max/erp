@@ -1,4 +1,5 @@
 import { Request, Response } from 'express';
+import { prisma } from '../db/client.js';
 import { LeaveService } from '../services/leave.service.js';
 import { AuthUser, LeaveStatus } from '../../shared/types.js';
 
@@ -194,11 +195,92 @@ export class LeaveController {
       const actor = req.user as AuthUser;
       const { employeeId, year, month } = req.query;
       const now = new Date();
-      const parsedYear = typeof year === "string" ? parseInt(year, 10) : now.getUTCFullYear();
-      const parsedMonth = typeof month === "string" ? parseInt(month, 10) : now.getUTCMonth() + 1;
+
+      // Validate year (optional; integer 2000-2100)
+      let parsedYear = now.getUTCFullYear();
+      if (year !== undefined) {
+        if (typeof year !== 'string' || !/^\d{4}$/.test(year.trim())) {
+          res.status(400).json({
+            error: {
+              code: 'VALIDATION_ERROR',
+              message: 'Query parameter "year" must be an integer between 2000 and 2100.',
+            },
+          });
+          return;
+        }
+        parsedYear = Number(year.trim());
+        if (!Number.isInteger(parsedYear) || parsedYear < 2000 || parsedYear > 2100) {
+          res.status(400).json({
+            error: {
+              code: 'VALIDATION_ERROR',
+              message: 'Query parameter "year" must be an integer between 2000 and 2100.',
+            },
+          });
+          return;
+        }
+      }
+
+      // Validate month (optional; integer 1-12)
+      let parsedMonth = now.getUTCMonth() + 1;
+      if (month !== undefined) {
+        if (typeof month !== 'string' || !/^\d{1,2}$/.test(month.trim())) {
+          res.status(400).json({
+            error: {
+              code: 'VALIDATION_ERROR',
+              message: 'Query parameter "month" must be an integer between 1 and 12.',
+            },
+          });
+          return;
+        }
+        parsedMonth = Number(month.trim());
+        if (!Number.isInteger(parsedMonth) || parsedMonth < 1 || parsedMonth > 12) {
+          res.status(400).json({
+            error: {
+              code: 'VALIDATION_ERROR',
+              message: 'Query parameter "month" must be an integer between 1 and 12.',
+            },
+          });
+          return;
+        }
+      }
+
+      // Validate optional employeeId
+      let validatedEmployeeId: string | undefined;
+      if (employeeId !== undefined) {
+        if (typeof employeeId !== 'string' || employeeId.trim().length === 0 || employeeId.trim().length > 128) {
+          res.status(400).json({
+            error: {
+              code: 'VALIDATION_ERROR',
+              message: 'Query parameter "employeeId" must be a non-empty string.',
+            },
+          });
+          return;
+        }
+        validatedEmployeeId = employeeId.trim();
+      }
+
+      // Enforce strict self-access for EMPLOYEE users: forbid inspecting another employee's summary
+      if (actor.role === 'EMPLOYEE' && validatedEmployeeId) {
+        const ownEmployee = await prisma.employee.findFirst({
+          where: {
+            companyId: actor.companyId,
+            userId: actor.userId || actor.id,
+          },
+          select: { id: true },
+        });
+        if (!ownEmployee || ownEmployee.id !== validatedEmployeeId) {
+          res.status(403).json({
+            error: {
+              code: 'FORBIDDEN',
+              message: 'Employees are only permitted to view their own monthly leave summary.',
+            },
+          });
+          return;
+        }
+      }
 
       const summary = await LeaveService.getMonthlyLeaveSummary(actor, {
-        employeeId: typeof employeeId === "string" ? employeeId : undefined,
+        employeeId: actor.role === 'EMPLOYEE' ? undefined : validatedEmployeeId,
         year: parsedYear,
         month: parsedMonth,
       });
@@ -206,9 +288,17 @@ export class LeaveController {
       res.json(summary);
     } catch (err: unknown) {
       const status = (err as { statusCode?: number }).statusCode || 500;
+      const code =
+        status === 400
+          ? 'VALIDATION_ERROR'
+          : status === 403
+          ? 'FORBIDDEN'
+          : status === 404
+          ? 'NOT_FOUND'
+          : 'LEAVE_SUMMARY_FAILED';
       res.status(status).json({
         error: {
-          code: "LEAVE_SUMMARY_FAILED",
+          code,
           message: (err as Error).message,
         },
       });

@@ -29,6 +29,105 @@ import { SUPPORTED_CURRENCIES, COMMON_TIMEZONES } from '../../shared/constants.t
 import { DocumentPrintSettingsSection } from '../components/company/DocumentPrintSettingsSection.tsx';
 import { BrandingAssetCard } from '../components/company/BrandingAssetCard.tsx';
 
+export const STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS = [4, 5, 6] as const;
+
+export function normalizePermittedMonthlyLeaveAllowances(raw?: number[] | null): number[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
+  }
+  const valid = Array.from(
+    new Set(
+      raw
+        .map((v) => Number(v))
+        .filter(
+          (n) =>
+            Number.isInteger(n) &&
+            (STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS as readonly number[]).includes(n)
+        )
+    )
+  ).sort((a, b) => a - b);
+  return valid.length > 0 ? valid : [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
+}
+
+export function validatePermittedMonthlyLeaveAllowancesSelection(selected: number[]): string | null {
+  if (!Array.isArray(selected) || selected.length === 0) {
+    return 'Select at least one permitted monthly leave allowance option (4, 5, or 6 days).';
+  }
+  const hasInvalid = selected.some(
+    (n) =>
+      !Number.isInteger(n) ||
+      !(STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS as readonly number[]).includes(n)
+  );
+  if (hasInvalid) {
+    return 'Permitted monthly leave allowances may only include 4, 5, or 6 days.';
+  }
+  return null;
+}
+
+export interface PermittedMonthlyLeaveAllowancesCardProps {
+  selectedAllowances: number[];
+  isSuperAdmin: boolean;
+  onToggle: (days: number) => void;
+}
+
+export const PermittedMonthlyLeaveAllowancesCard: React.FC<
+  PermittedMonthlyLeaveAllowancesCardProps
+> = ({ selectedAllowances, isSuperAdmin, onToggle }) => (
+  <div className="p-4 rounded-xl bg-slate-950 border border-slate-800 space-y-3">
+    <div className="flex flex-wrap items-start justify-between gap-2">
+      <div className="space-y-1">
+        <div className="text-xs font-semibold text-slate-200">
+          Permitted Monthly Leave Allowance Options (Days / Month)
+        </div>
+        <p className="text-[11px] text-slate-400 max-w-2xl">
+          Select which monthly leave allowance options (4, 5, or 6 days) administrators can assign to employees. Defaults to 4, 5, and 6 days when unconfigured. Employee monthly leave allowance changes always take effect from the 1st day of the next company-local calendar month.
+        </p>
+      </div>
+      <span className="text-[11px] text-slate-400">
+        {isSuperAdmin
+          ? 'Super Admin changes apply immediately'
+          : 'Admin changes require Super Admin approval'}
+      </span>
+    </div>
+
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      {STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS.map((days) => {
+        const isSelected = selectedAllowances.includes(days);
+        return (
+          <label
+            key={days}
+            className={`flex items-center justify-between gap-3 p-3 rounded-lg border text-xs cursor-pointer transition ${
+              isSelected
+                ? 'bg-indigo-950/40 border-indigo-600 text-slate-100'
+                : 'bg-slate-900 border-slate-800 text-slate-400 hover:border-slate-700'
+            }`}
+          >
+            <div>
+              <div className="font-semibold">{days} Days / Month</div>
+              <div className="text-[11px] text-slate-400">
+                {isSelected ? 'Permitted for employee assignment' : 'Disabled for this company'}
+              </div>
+            </div>
+            <input
+              type="checkbox"
+              aria-label={`Permit ${days} days monthly leave allowance`}
+              checked={isSelected}
+              onChange={() => onToggle(days)}
+              className="h-4 w-4 rounded border-slate-700 bg-slate-900 text-indigo-600 focus:ring-indigo-500 cursor-pointer"
+            />
+          </label>
+        );
+      })}
+    </div>
+
+    {selectedAllowances.length === 0 && (
+      <div className="text-[11px] text-rose-300">
+        Select at least one permitted monthly leave allowance option (4, 5, or 6 days).
+      </div>
+    )}
+  </div>
+);
+
 interface CompanyAdminPageProps {
   currentUser?: AuthUser | null;
   onProfileUpdated?: (updated: CompanyProfile) => void;
@@ -56,6 +155,9 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
   const [website, setWebsite] = useState('');
   const [appHeaderTitle, setAppHeaderTitle] = useState('');
   const [salesInvoiceEnabled, setSalesInvoiceEnabled] = useState(false);
+  const [permittedMonthlyLeaveAllowances, setPermittedMonthlyLeaveAllowances] = useState<number[]>([
+    ...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS,
+  ]);
   const [changeRequests, setChangeRequests] = useState<CompanySettingsChangeRequestItem[]>([]);
 
   const isSuperAdmin = currentUser?.role === 'SUPER_ADMIN';
@@ -75,6 +177,9 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
     setWebsite(data.website || '');
     setAppHeaderTitle(data.appHeaderTitle || '');
     setSalesInvoiceEnabled(Boolean(data.salesInvoiceEnabled));
+    setPermittedMonthlyLeaveAllowances(
+      normalizePermittedMonthlyLeaveAllowances(data.permittedMonthlyLeaveAllowances)
+    );
   };
 
   useEffect(() => {
@@ -96,6 +201,7 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
           setTimezone('UTC');
           setAppHeaderTitle('CoreERP Enterprise (Preview)');
           setSalesInvoiceEnabled(true);
+          setPermittedMonthlyLeaveAllowances([...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS]);
         } else if (err instanceof ApiError) {
           setErrorMessage(err.message);
         } else {
@@ -254,6 +360,13 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
     }
   };
 
+  const handleTogglePermittedAllowance = (days: number) => {
+    setPermittedMonthlyLeaveAllowances((prev) => {
+      const next = prev.includes(days) ? prev.filter((item) => item !== days) : [...prev, days];
+      return next.sort((a, b) => a - b);
+    });
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMessage(null);
@@ -264,6 +377,16 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
       setErrorMessage('Company display name is required.');
       return;
     }
+
+    const allowanceValidationError = validatePermittedMonthlyLeaveAllowancesSelection(
+      permittedMonthlyLeaveAllowances
+    );
+    if (allowanceValidationError) {
+      setErrorMessage(allowanceValidationError);
+      return;
+    }
+
+    const sortedAllowances = [...permittedMonthlyLeaveAllowances].sort((a, b) => a - b);
 
     if (currentUser?.isPreview) {
       const mockUpdated: CompanyProfile = {
@@ -281,9 +404,10 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
         website: website.trim() || null,
         appHeaderTitle: appHeaderTitle.trim() || null,
         salesInvoiceEnabled,
+        permittedMonthlyLeaveAllowances: sortedAllowances,
       };
       setProfile(mockUpdated);
-      setSuccessMessage('Preview Mode: Company feature settings and Sales Invoice policy updated in-memory for this UI exploration session.');
+      setSuccessMessage('Preview Mode: Company feature settings and leave allowance policy updated in-memory for this UI exploration session.');
       if (onProfileUpdated) {
         onProfileUpdated(mockUpdated);
       }
@@ -305,13 +429,16 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
         website: website.trim() || null,
         appHeaderTitle: appHeaderTitle.trim() || null,
         salesInvoiceEnabled,
+        permittedMonthlyLeaveAllowances: sortedAllowances,
       });
 
-      setProfile(updated);
+      applyLoadedProfile(updated);
       if (updated.pendingApproval) {
         setPendingMessage(
           'Protected company settings changes were submitted for Super Admin approval (Maker-Checker).'
         );
+        const reqs = await api.getCompanySettingsChangeRequests('PENDING').catch(() => []);
+        setChangeRequests(reqs);
       } else {
         setSuccessMessage('Company profile and settings updated successfully.');
         if (onProfileUpdated) {
@@ -430,6 +557,7 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
                     type?: string;
                     operation?: string;
                     assetType?: string;
+                    permittedMonthlyLeaveAllowances?: number[];
                   };
                   const label =
                     payloadObj?.type === 'COMPANY_BRANDING_ASSET'
@@ -445,6 +573,13 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
                         <span className="text-slate-400 ml-2">
                           requested by {req.requestedByName || req.requestedByEmail || 'Admin'}
                         </span>
+                        {Array.isArray(payloadObj?.permittedMonthlyLeaveAllowances) &&
+                          payloadObj.permittedMonthlyLeaveAllowances.length > 0 && (
+                            <div className="text-[11px] text-amber-300 mt-0.5">
+                              Permitted monthly leave allowances:{' '}
+                              {payloadObj.permittedMonthlyLeaveAllowances.join(', ')} days
+                            </div>
+                          )}
                       </div>
                       {isSuperAdmin && (
                         <div className="flex items-center gap-2">
@@ -796,6 +931,12 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
               <div className="w-11 h-6 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-slate-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
             </label>
           </div>
+
+          <PermittedMonthlyLeaveAllowancesCard
+            selectedAllowances={permittedMonthlyLeaveAllowances}
+            isSuperAdmin={isSuperAdmin}
+            onToggle={handleTogglePermittedAllowance}
+          />
         </div>
 
         {/* Save Button */}

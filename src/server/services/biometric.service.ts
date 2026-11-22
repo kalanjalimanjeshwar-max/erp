@@ -27,6 +27,7 @@ import { isValidLanHost, redactSensitiveText } from '../../shared/biometric.js';
 import { AuditService } from './audit.service.js';
 import { BiometricMappingService } from './biometric-mapping.service.js';
 import { PunchReconciliationService } from './punch-reconciliation.service.js';
+import { WorkPolicyService, getStartOfLocalDayUtc } from './work-policy.service.js';
 
 const VALID_VERIFY_TYPES: BiometricVerifyType[] = ['FINGERPRINT', 'CARD', 'PASSWORD', 'FACE'];
 const VALID_IN_OUT_MODES: PunchInOutMode[] = ['CHECK_IN', 'CHECK_OUT', 'BREAK_OUT', 'BREAK_IN'];
@@ -915,15 +916,32 @@ export class BiometricService {
       syncRequestedAt,
     });
 
+    const hasTargetedFilter = Boolean(
+      options?.punchId?.trim() ||
+        options?.employeeId?.trim() ||
+        options?.userEnrollmentId?.trim()
+    );
+
+    let effectiveFromPunchTime = options?.fromPunchTime;
+    if (effectiveFromPunchTime === undefined && !hasTargetedFilter) {
+      const companyTimezone = await WorkPolicyService.resolveCompanyTimezone(
+        actor.companyId,
+        prisma
+      );
+      effectiveFromPunchTime = getStartOfLocalDayUtc(companyTimezone);
+    }
+
     const reconciliation = await PunchReconciliationService.reconcilePendingPunches(
       actor.companyId,
       {
         terminalId: terminal.id,
         batchSize: options?.batchSize,
         retryErrors: options?.retryErrors,
+        keepUnmappedPending: options?.keepUnmappedPending,
         userEnrollmentId: options?.userEnrollmentId,
         employeeId: options?.employeeId,
         punchId: options?.punchId,
+        fromPunchTime: effectiveFromPunchTime,
       },
       actor.userId || actor.id,
       correlationId

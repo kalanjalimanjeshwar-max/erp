@@ -20,6 +20,8 @@ import {
   Trash2,
   ChevronDown,
   RefreshCw,
+  Clock,
+  Calendar,
 } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
 import {
@@ -38,8 +40,704 @@ import {
   CompanyProfile,
   BiometricTerminalEnrollmentOptionsResponse,
   EmployeeBiometricMappingInput,
+  ShiftItem,
+  EmployeeWorkPolicyRevisionItem,
+  CreateEmployeeWorkPolicyRevisionRequest,
 } from '../../shared/types.ts';
 import { formatMoney, getCurrencySymbol } from '../../shared/currency.ts';
+
+export const DEFAULT_PERMITTED_MONTHLY_LEAVE_ALLOWANCES = [4, 5, 6] as const;
+
+export function resolvePermittedLeaveAllowanceOptions(profile?: CompanyProfile | null): number[] {
+  const raw = profile?.permittedMonthlyLeaveAllowances;
+  if (!Array.isArray(raw) || raw.length === 0) {
+    return [...DEFAULT_PERMITTED_MONTHLY_LEAVE_ALLOWANCES];
+  }
+  const normalized = Array.from(
+    new Set(
+      raw
+        .map((n) => Number(n))
+        .filter(
+          (n) =>
+            Number.isInteger(n) &&
+            (DEFAULT_PERMITTED_MONTHLY_LEAVE_ALLOWANCES as readonly number[]).includes(n)
+        )
+    )
+  ).sort((a, b) => a - b);
+  return normalized.length > 0 ? normalized : [...DEFAULT_PERMITTED_MONTHLY_LEAVE_ALLOWANCES];
+}
+
+export function isValidCalendarDateString(value: string): boolean {
+  const trimmed = value.trim();
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(trimmed);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const parsed = new Date(Date.UTC(year, month - 1, day));
+  return (
+    parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month - 1 &&
+    parsed.getUTCDate() === day
+  );
+}
+
+export function sortWorkPolicyRevisionsChronologically(
+  revisions: EmployeeWorkPolicyRevisionItem[]
+): EmployeeWorkPolicyRevisionItem[] {
+  return [...revisions].sort((a, b) => {
+    const byEffectiveFrom = a.effectiveFrom.localeCompare(b.effectiveFrom);
+    if (byEffectiveFrom !== 0) return byEffectiveFrom;
+    return a.createdAt.localeCompare(b.createdAt);
+  });
+}
+
+export function resolveExplicitDailyWorkingHoursInput(
+  emp: Pick<EmployeeItem, 'dailyWorkingHours'>
+): string {
+  return emp.dailyWorkingHours !== null && emp.dailyWorkingHours !== undefined
+    ? String(emp.dailyWorkingHours)
+    : '';
+}
+
+export function getInitialWorkPolicyRevisionFormValues(
+  emp: EmployeeItem,
+  todayDateStr: string = new Date().toISOString().split('T')[0]
+): {
+  shiftId: string;
+  dailyWorkingHours: string;
+  monthlyLeaveAllowance: string;
+  effectiveFrom: string;
+  revisionReason: string;
+  notes: string;
+} {
+  const activeShiftId = emp.effectiveWorkPolicy?.shiftId ?? emp.shiftId ?? '';
+  return {
+    shiftId: activeShiftId || '',
+    dailyWorkingHours: resolveExplicitDailyWorkingHoursInput(emp),
+    monthlyLeaveAllowance: '',
+    effectiveFrom: todayDateStr,
+    revisionReason: '',
+    notes: '',
+  };
+}
+
+export function buildEmployeePolicyFieldsForCreate(params: {
+  shiftId: string;
+  dailyWorkingHours: string;
+  monthlyLeaveAllowance: string;
+  policyEffectiveFrom: string;
+  dateOfJoining: string;
+  permittedAllowances: number[];
+}): {
+  error?: string;
+  fields: Pick<
+    CreateEmployeeRequest,
+    'shiftId' | 'dailyWorkingHours' | 'monthlyLeaveAllowance' | 'policyEffectiveFrom'
+  >;
+} {
+  const fields: Pick<
+    CreateEmployeeRequest,
+    'shiftId' | 'dailyWorkingHours' | 'monthlyLeaveAllowance' | 'policyEffectiveFrom'
+  > = {
+    shiftId: params.shiftId.trim() || null,
+  };
+
+  const hoursTrimmed = params.dailyWorkingHours.trim();
+  if (hoursTrimmed) {
+    const parsedHours = Number(hoursTrimmed);
+    if (!Number.isFinite(parsedHours) || parsedHours <= 0 || parsedHours > 24) {
+      return {
+        error: 'Daily required working hours must be greater than 0 and at most 24 hours.',
+        fields,
+      };
+    }
+    fields.dailyWorkingHours = parsedHours;
+  } else {
+    fields.dailyWorkingHours = null;
+  }
+
+  const allowanceTrimmed = params.monthlyLeaveAllowance.trim();
+  if (allowanceTrimmed) {
+    const parsedAllowance = Number(allowanceTrimmed);
+    if (!Number.isInteger(parsedAllowance) || !params.permittedAllowances.includes(parsedAllowance)) {
+      return {
+        error: `Monthly leave allowance must be one of the company-permitted options: ${params.permittedAllowances.join(', ')} days.`,
+        fields,
+      };
+    }
+    fields.monthlyLeaveAllowance = parsedAllowance;
+  }
+
+  const effectiveTrimmed = params.policyEffectiveFrom.trim();
+  if (effectiveTrimmed) {
+    if (!isValidCalendarDateString(effectiveTrimmed)) {
+      return {
+        error: 'Work policy effective date must be a valid calendar date (YYYY-MM-DD).',
+        fields,
+      };
+    }
+    if (params.dateOfJoining && effectiveTrimmed < params.dateOfJoining) {
+      return {
+        error: 'Work policy effective date cannot be earlier than employee date of joining.',
+        fields,
+      };
+    }
+    fields.policyEffectiveFrom = effectiveTrimmed;
+  }
+
+  return { fields };
+}
+
+export function buildEmployeePolicyFieldsForUpdate(params: {
+  employee: EmployeeItem;
+  shiftId: string;
+  dailyWorkingHours: string;
+  monthlyLeaveAllowance: string;
+  policyEffectiveFrom: string;
+  policyRevisionReason: string;
+  policyRevisionNotes: string;
+  permittedAllowances: number[];
+}): {
+  error?: string;
+  fields: Pick<
+    UpdateEmployeeRequest,
+    | 'shiftId'
+    | 'dailyWorkingHours'
+    | 'monthlyLeaveAllowance'
+    | 'policyEffectiveFrom'
+    | 'policyRevisionReason'
+    | 'policyRevisionNotes'
+  >;
+} {
+  const fields: Pick<
+    UpdateEmployeeRequest,
+    | 'shiftId'
+    | 'dailyWorkingHours'
+    | 'monthlyLeaveAllowance'
+    | 'policyEffectiveFrom'
+    | 'policyRevisionReason'
+    | 'policyRevisionNotes'
+  > = {};
+
+  const initialShiftId = params.employee.effectiveWorkPolicy?.shiftId ?? params.employee.shiftId ?? null;
+  const initialDailyHours =
+    params.employee.dailyWorkingHours !== undefined ? params.employee.dailyWorkingHours : null;
+  const initialAllowance =
+    params.employee.effectiveWorkPolicy?.monthlyLeaveAllowance ??
+    params.employee.monthlyLeaveAllowance ??
+    null;
+
+  const nextShiftId = params.shiftId.trim() || null;
+
+  const hoursTrimmed = params.dailyWorkingHours.trim();
+  let nextDailyHours: number | null = null;
+  if (hoursTrimmed) {
+    const parsedHours = Number(hoursTrimmed);
+    if (!Number.isFinite(parsedHours) || parsedHours <= 0 || parsedHours > 24) {
+      return {
+        error: 'Daily required working hours must be greater than 0 and at most 24 hours.',
+        fields,
+      };
+    }
+    nextDailyHours = parsedHours;
+  }
+
+  const allowanceTrimmed = params.monthlyLeaveAllowance.trim();
+  let nextAllowance: number | null = null;
+  if (allowanceTrimmed) {
+    const parsedAllowance = Number(allowanceTrimmed);
+    if (!Number.isInteger(parsedAllowance)) {
+      return {
+        error: `Monthly leave allowance must be one of the company-permitted options: ${params.permittedAllowances.join(', ')} days.`,
+        fields,
+      };
+    }
+    if (
+      parsedAllowance !== initialAllowance &&
+      !params.permittedAllowances.includes(parsedAllowance)
+    ) {
+      return {
+        error: `Monthly leave allowance must be one of the company-permitted options: ${params.permittedAllowances.join(', ')} days.`,
+        fields,
+      };
+    }
+    nextAllowance = parsedAllowance;
+  }
+
+  const shiftChanged = (initialShiftId || null) !== nextShiftId;
+  const hoursChanged = initialDailyHours !== nextDailyHours;
+  const allowanceChanged =
+    nextAllowance !== null &&
+    nextAllowance !== initialAllowance &&
+    params.permittedAllowances.includes(nextAllowance);
+
+  if (shiftChanged) {
+    fields.shiftId = nextShiftId;
+  }
+  if (hoursChanged) {
+    fields.dailyWorkingHours = nextDailyHours;
+  }
+  if (allowanceChanged && nextAllowance !== null) {
+    fields.monthlyLeaveAllowance = nextAllowance;
+  }
+
+  const effectiveTrimmed = params.policyEffectiveFrom.trim();
+  if (effectiveTrimmed) {
+    if (!isValidCalendarDateString(effectiveTrimmed)) {
+      return {
+        error: 'Work policy effective date must be a valid calendar date (YYYY-MM-DD).',
+        fields,
+      };
+    }
+    if (shiftChanged || hoursChanged || allowanceChanged) {
+      fields.policyEffectiveFrom = effectiveTrimmed;
+    }
+  }
+
+  if (shiftChanged || hoursChanged || allowanceChanged) {
+    if (params.policyRevisionReason.trim()) {
+      fields.policyRevisionReason = params.policyRevisionReason.trim();
+    }
+    if (params.policyRevisionNotes.trim()) {
+      fields.policyRevisionNotes = params.policyRevisionNotes.trim();
+    }
+  }
+
+  return { fields };
+}
+
+export function buildWorkPolicyRevisionPayload(params: {
+  shiftId: string;
+  dailyWorkingHours: string;
+  monthlyLeaveAllowance: string;
+  effectiveFrom: string;
+  revisionReason: string;
+  notes: string;
+  permittedAllowances: number[];
+  initialDailyWorkingHours?: number | null;
+}): {
+  error?: string;
+  payload?: CreateEmployeeWorkPolicyRevisionRequest;
+} {
+  const payload: CreateEmployeeWorkPolicyRevisionRequest = {
+    shiftId: params.shiftId.trim() || null,
+  };
+
+  const hoursTrimmed = params.dailyWorkingHours.trim();
+  if (hoursTrimmed) {
+    const parsedHours = Number(hoursTrimmed);
+    if (!Number.isFinite(parsedHours) || parsedHours <= 0 || parsedHours > 24) {
+      return {
+        error: 'Daily required working hours must be greater than 0 and at most 24 hours.',
+      };
+    }
+    payload.dailyWorkingHours = parsedHours;
+  } else if (
+    params.initialDailyWorkingHours !== null &&
+    params.initialDailyWorkingHours !== undefined
+  ) {
+    // Clearing a previously explicit dailyWorkingHours override sends null per API contract
+    // so the employee reverts to shift-derived hours.
+    payload.dailyWorkingHours = null;
+  }
+
+  const allowanceTrimmed = params.monthlyLeaveAllowance.trim();
+  if (allowanceTrimmed) {
+    const parsedAllowance = Number(allowanceTrimmed);
+    if (!Number.isInteger(parsedAllowance) || !params.permittedAllowances.includes(parsedAllowance)) {
+      return {
+        error: `Monthly leave allowance must be one of the company-permitted options: ${params.permittedAllowances.join(', ')} days.`,
+      };
+    }
+    payload.monthlyLeaveAllowance = parsedAllowance;
+  }
+
+  const effectiveTrimmed = params.effectiveFrom.trim();
+  if (effectiveTrimmed) {
+    if (!isValidCalendarDateString(effectiveTrimmed)) {
+      return {
+        error: 'Effective From must be a valid calendar date (YYYY-MM-DD).',
+      };
+    }
+    payload.effectiveFrom = effectiveTrimmed;
+  }
+
+  payload.revisionReason = params.revisionReason.trim() || null;
+  payload.notes = params.notes.trim() || null;
+
+  return { payload };
+}
+
+export interface WorkPolicyHistoryPanelProps {
+  employee: EmployeeItem;
+  revisions: EmployeeWorkPolicyRevisionItem[];
+  isLoading: boolean;
+  errorMessage: string | null;
+  canEdit: boolean;
+  shifts?: ShiftItem[];
+  permittedAllowances?: number[];
+  shiftId?: string;
+  onShiftIdChange?: (value: string) => void;
+  dailyWorkingHours?: string;
+  onDailyWorkingHoursChange?: (value: string) => void;
+  monthlyLeaveAllowance?: string;
+  onMonthlyLeaveAllowanceChange?: (value: string) => void;
+  effectiveFrom?: string;
+  onEffectiveFromChange?: (value: string) => void;
+  revisionReason?: string;
+  onRevisionReasonChange?: (value: string) => void;
+  notes?: string;
+  onNotesChange?: (value: string) => void;
+  isSubmitting?: boolean;
+  revisionSuccess?: {
+    message: string;
+    workPolicyEffectiveFrom: string | null;
+    allowanceEffectiveFrom: string | null;
+  } | null;
+  onSubmitRevision?: (e: React.FormEvent) => void;
+}
+
+export const WorkPolicyHistoryPanel: React.FC<WorkPolicyHistoryPanelProps> = ({
+  employee,
+  revisions,
+  isLoading,
+  errorMessage,
+  canEdit,
+  shifts = [],
+  permittedAllowances = [...DEFAULT_PERMITTED_MONTHLY_LEAVE_ALLOWANCES],
+  shiftId = '',
+  onShiftIdChange,
+  dailyWorkingHours = '',
+  onDailyWorkingHoursChange,
+  monthlyLeaveAllowance = '',
+  onMonthlyLeaveAllowanceChange,
+  effectiveFrom = '',
+  onEffectiveFromChange,
+  revisionReason = '',
+  onRevisionReasonChange,
+  notes = '',
+  onNotesChange,
+  isSubmitting = false,
+  revisionSuccess = null,
+  onSubmitRevision,
+}) => {
+  const orderedRevisions = sortWorkPolicyRevisionsChronologically(revisions);
+  const currentHours =
+    employee.effectiveWorkPolicy?.dailyWorkingHours ??
+    employee.dailyWorkingHours ??
+    employee.configuredDailyWorkingHours ??
+    null;
+  const currentAllowance =
+    employee.effectiveWorkPolicy?.monthlyLeaveAllowance ??
+    employee.monthlyLeaveAllowance ??
+    4;
+  const currentShiftId = employee.effectiveWorkPolicy?.shiftId ?? employee.shiftId ?? null;
+  const currentShiftLabel = currentShiftId
+    ? employee.shiftName
+      ? `${employee.shiftName}${
+          employee.shiftStartTime && employee.shiftEndTime
+            ? ` (${employee.shiftStartTime}–${employee.shiftEndTime})`
+            : ''
+        }`
+      : currentShiftId
+    : 'No Shift Assigned';
+
+  return (
+    <div className="space-y-5 text-xs">
+      {/* Current Effective Policy Summary */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div className="p-3.5 rounded-xl bg-slate-800/40 border border-slate-800 space-y-1">
+          <span className="text-slate-400 text-[10px] uppercase font-semibold">
+            Daily Working Hours
+          </span>
+          <div className="font-mono font-bold text-slate-100 text-sm">
+            {currentHours !== null && currentHours !== undefined
+              ? `${currentHours} hrs / day`
+              : 'Uses Shift Duration'}
+          </div>
+          <div className="text-[11px] text-slate-400">
+            {employee.dailyWorkingHours === null && currentHours !== null
+              ? 'Derived from assigned shift'
+              : employee.effectiveWorkPolicy?.effectiveFrom
+              ? `Effective since ${employee.effectiveWorkPolicy.effectiveFrom}`
+              : 'Company / employee policy'}
+          </div>
+        </div>
+
+        <div className="p-3.5 rounded-xl bg-slate-800/40 border border-slate-800 space-y-1">
+          <span className="text-slate-400 text-[10px] uppercase font-semibold">
+            Assigned Shift
+          </span>
+          <div className="font-semibold text-slate-100 text-sm">{currentShiftLabel}</div>
+          <div className="text-[11px] text-slate-400">
+            {currentShiftId
+              ? 'Optional schedule attached'
+              : 'Shift optional when explicit hours are set'}
+          </div>
+        </div>
+
+        <div className="p-3.5 rounded-xl bg-indigo-950/20 border border-indigo-900/60 space-y-1">
+          <span className="text-indigo-300 text-[10px] uppercase font-semibold">
+            Monthly Leave Allowance
+          </span>
+          <div className="font-mono font-bold text-indigo-200 text-sm">
+            {currentAllowance} days / month
+          </div>
+          <div className="text-[11px] text-slate-400">
+            Updates take effect 1st of next calendar month
+          </div>
+        </div>
+      </div>
+
+      {/* Revision Creation Form (Admin / HR only; never shown to EMPLOYEE self-service) */}
+      {canEdit && onSubmitRevision && (
+        <div className="p-4 rounded-xl bg-slate-800/40 border border-slate-800 space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300 flex items-center gap-1.5">
+              <Clock className="w-3.5 h-3.5 text-indigo-400" />
+              Create Work Policy Revision
+            </h4>
+            <span className="text-[11px] text-slate-400">
+              Permitted allowances: {permittedAllowances.join(', ')} days/month
+            </span>
+          </div>
+
+          <div className="p-2.5 rounded-lg bg-indigo-950/30 border border-indigo-800/50 text-[11px] text-indigo-200 flex items-start gap-2">
+            <Calendar className="w-3.5 h-3.5 text-indigo-400 shrink-0 mt-0.5" />
+            <span>
+              Daily working hours and shift assignments take effect on the selected Effective From date. Any monthly leave allowance change always takes effect on the 1st day of the next company-local calendar month regardless of the submission date.
+            </span>
+          </div>
+
+          {revisionSuccess && (
+            <div className="p-3 rounded-lg bg-emerald-950/50 border border-emerald-800 text-emerald-200 text-[11px] space-y-1">
+              <div className="font-semibold flex items-center gap-1.5">
+                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                <span>{revisionSuccess.message}</span>
+              </div>
+              <div className="flex flex-wrap gap-4 font-mono text-emerald-300">
+                <span>
+                  Work Hours / Shift Effective From:{' '}
+                  {revisionSuccess.workPolicyEffectiveFrom || 'Unchanged'}
+                </span>
+                <span>
+                  Monthly Allowance Effective From:{' '}
+                  {revisionSuccess.allowanceEffectiveFrom || 'Unchanged'}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {errorMessage && (
+            <div className="p-2.5 rounded-lg bg-rose-950/50 border border-rose-800 text-rose-200 text-[11px] flex items-center gap-2">
+              <AlertCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+              <span>{errorMessage}</span>
+            </div>
+          )}
+
+          <form onSubmit={onSubmitRevision} className="space-y-3">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+              <div>
+                <label className="block text-slate-400 mb-1">
+                  Daily Working Hours
+                </label>
+                <input
+                  type="number"
+                  step="0.25"
+                  min="0.25"
+                  max="24"
+                  placeholder="Blank = use shift duration"
+                  aria-label="Revision Daily Working Hours"
+                  value={dailyWorkingHours}
+                  onChange={(e) => onDailyWorkingHoursChange?.(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-400 mb-1">
+                  Shift Assignment (Optional)
+                </label>
+                <select
+                  aria-label="Revision Shift Assignment"
+                  value={shiftId}
+                  onChange={(e) => onShiftIdChange?.(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="">No Shift Assigned</option>
+                  {shifts.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.name} ({s.startTime}–{s.endTime})
+                    </option>
+                  ))}
+                  {shiftId && !shifts.some((s) => s.id === shiftId) && (
+                    <option value={shiftId}>{employee.shiftName || shiftId}</option>
+                  )}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-400 mb-1">
+                  Monthly Leave Allowance
+                </label>
+                <select
+                  aria-label="Revision Monthly Leave Allowance"
+                  value={monthlyLeaveAllowance}
+                  onChange={(e) => onMonthlyLeaveAllowanceChange?.(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="">Keep Current ({currentAllowance} days)</option>
+                  {permittedAllowances.map((days) => (
+                    <option key={days} value={String(days)}>
+                      {days} days / month
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-slate-400 mb-1">
+                  Effective From (Hours / Shift)
+                </label>
+                <input
+                  type="date"
+                  aria-label="Revision Effective From"
+                  value={effectiveFrom}
+                  onChange={(e) => onEffectiveFromChange?.(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div>
+                <label className="block text-slate-400 mb-1">Revision Reason</label>
+                <input
+                  type="text"
+                  placeholder="e.g. Schedule adjustment, Role change"
+                  aria-label="Revision Reason"
+                  value={revisionReason}
+                  onChange={(e) => onRevisionReasonChange?.(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div>
+                <label className="block text-slate-400 mb-1">Notes</label>
+                <input
+                  type="text"
+                  placeholder="Optional policy notes"
+                  aria-label="Revision Notes"
+                  value={notes}
+                  onChange={(e) => onNotesChange?.(e.target.value)}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                />
+              </div>
+
+              <div className="flex items-end">
+                <button
+                  type="submit"
+                  disabled={isSubmitting}
+                  className="w-full px-3 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-lg text-xs cursor-pointer disabled:opacity-50"
+                >
+                  {isSubmitting ? 'Saving Revision...' : 'Save Work Policy Revision'}
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      )}
+
+      {!canEdit && errorMessage && (
+        <div className="p-2.5 rounded-lg bg-rose-950/50 border border-rose-800 text-rose-200 text-[11px] flex items-center gap-2">
+          <AlertCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+          <span>{errorMessage}</span>
+        </div>
+      )}
+
+      {/* Chronological Work Policy Revision History Table */}
+      <div className="space-y-2">
+        <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+          <History className="w-4 h-4 text-indigo-400" />
+          {canEdit ? 'Work Policy Revision History' : 'My Work Policy Revision History'}
+        </h4>
+        <div className="border border-slate-800 rounded-xl overflow-x-auto">
+          <table className="w-full text-left text-xs text-slate-300">
+            <thead className="bg-slate-800/80 text-slate-400 uppercase text-[10px] font-semibold">
+              <tr>
+                <th className="py-2.5 px-3">Effective From</th>
+                <th className="py-2.5 px-3">Effective To</th>
+                <th className="py-2.5 px-3">Daily Hours</th>
+                <th className="py-2.5 px-3">Shift</th>
+                <th className="py-2.5 px-3">Monthly Allowance</th>
+                <th className="py-2.5 px-3">Reason / Notes</th>
+                <th className="py-2.5 px-3">Recorded By</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-800">
+              {isLoading ? (
+                <tr>
+                  <td colSpan={7} className="py-6 text-center text-slate-400">
+                    Loading work policy revisions...
+                  </td>
+                </tr>
+              ) : orderedRevisions.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="py-6 text-center text-slate-500">
+                    No effective-dated work policy revisions recorded yet. Active baseline policy applies.
+                  </td>
+                </tr>
+              ) : (
+                orderedRevisions.map((rev) => (
+                  <tr key={rev.id} className="hover:bg-slate-800/20">
+                    <td className="py-2.5 px-3 font-mono font-medium text-white whitespace-nowrap">
+                      {rev.effectiveFrom}
+                    </td>
+                    <td className="py-2.5 px-3 font-mono text-slate-400 whitespace-nowrap">
+                      {rev.effectiveTo || (
+                        <span className="font-sans text-emerald-400 font-semibold">
+                          Current / Ongoing
+                        </span>
+                      )}
+                    </td>
+                    <td className="py-2.5 px-3 font-mono tabular-nums text-slate-200 whitespace-nowrap">
+                      {rev.effectiveDailyWorkingHours !== null &&
+                      rev.effectiveDailyWorkingHours !== undefined
+                        ? `${rev.effectiveDailyWorkingHours} hrs/day`
+                        : 'Shift default'}
+                    </td>
+                    <td className="py-2.5 px-3 text-slate-300">
+                      {rev.shiftName
+                        ? `${rev.shiftName}${
+                            rev.shiftStartTime && rev.shiftEndTime
+                              ? ` (${rev.shiftStartTime}–${rev.shiftEndTime})`
+                              : ''
+                          }`
+                        : 'No Shift Assigned'}
+                    </td>
+                    <td className="py-2.5 px-3 font-mono tabular-nums text-indigo-300 whitespace-nowrap">
+                      {rev.effectiveMonthlyLeaveAllowance} days/mo
+                    </td>
+                    <td className="py-2.5 px-3 text-slate-300">
+                      <div>{rev.revisionReason || '—'}</div>
+                      {rev.notes && (
+                        <div className="text-[11px] text-slate-400">{rev.notes}</div>
+                      )}
+                    </td>
+                    <td className="py-2.5 px-3 text-slate-400">
+                      {rev.createdByUserName || 'Admin'}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 interface EmployeesPageProps {
   currentUser: AuthUser;
@@ -64,11 +762,23 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
   const [departments, setDepartments] = useState<DepartmentItem[]>([]);
   const [designations, setDesignations] = useState<DesignationItem[]>([]);
   const [ledgers, setLedgers] = useState<AccountLedgerItem[]>([]);
+  const [shifts, setShifts] = useState<ShiftItem[]>([]);
+  const [loadedCompanyProfile, setLoadedCompanyProfile] = useState<CompanyProfile | null>(null);
   const [biometricOptions, setBiometricOptions] =
     useState<BiometricTerminalEnrollmentOptionsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+
+  const permittedLeaveOptions = useMemo(
+    () =>
+      resolvePermittedLeaveAllowanceOptions(
+        loadedCompanyProfile?.permittedMonthlyLeaveAllowances
+          ? loadedCompanyProfile
+          : companyProfile || loadedCompanyProfile
+      ),
+    [loadedCompanyProfile, companyProfile]
+  );
 
   // Filters
   const [departmentFilter, setDepartmentFilter] = useState('');
@@ -82,9 +792,17 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
 
   // Detail Modal State
   const [selectedEmployee, setSelectedEmployee] = useState<EmployeeItem | null>(null);
-  const [detailTab, setDetailTab] = useState<'PROFILE' | 'SALARY' | 'LEDGER' | 'LOGIN'>('PROFILE');
+  const [detailTab, setDetailTab] = useState<'PROFILE' | 'WORK_POLICY' | 'SALARY' | 'LEDGER' | 'LOGIN'>('PROFILE');
   const [salaries, setSalaries] = useState<SalaryRevisionItem[]>([]);
   const [isLoadingSalaries, setIsLoadingSalaries] = useState(false);
+  const [workPolicies, setWorkPolicies] = useState<EmployeeWorkPolicyRevisionItem[]>([]);
+  const [isLoadingWorkPolicies, setIsLoadingWorkPolicies] = useState(false);
+  const [workPolicyError, setWorkPolicyError] = useState<string | null>(null);
+  const [workPolicySuccess, setWorkPolicySuccess] = useState<{
+    message: string;
+    workPolicyEffectiveFrom: string | null;
+    allowanceEffectiveFrom: string | null;
+  } | null>(null);
 
   // Add/Edit Employee Modal State
   const [isEmployeeModalOpen, setIsEmployeeModalOpen] = useState(false);
@@ -103,6 +821,12 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
   const [formStatus, setFormStatus] = useState<EmployeeStatus>('ACTIVE');
   const [formNotes, setFormNotes] = useState('');
   const [formInitialSalary, setFormInitialSalary] = useState('');
+  const [formShiftId, setFormShiftId] = useState('');
+  const [formDailyWorkingHours, setFormDailyWorkingHours] = useState('');
+  const [formMonthlyLeaveAllowance, setFormMonthlyLeaveAllowance] = useState('');
+  const [formPolicyEffectiveFrom, setFormPolicyEffectiveFrom] = useState('');
+  const [formPolicyRevisionReason, setFormPolicyRevisionReason] = useState('');
+  const [formPolicyRevisionNotes, setFormPolicyRevisionNotes] = useState('');
   const [formMappings, setFormMappings] = useState<EmployeeBiometricMappingInput[]>([]);
   const [terminalSearch, setTerminalSearch] = useState('');
   const [isTerminalDropdownOpen, setIsTerminalDropdownOpen] = useState(false);
@@ -129,6 +853,17 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
   const [newSalaryNotes, setNewSalaryNotes] = useState('');
   const [isAddingSalary, setIsAddingSalary] = useState(false);
 
+  // New Work Policy Revision Form State
+  const [policyRevShiftId, setPolicyRevShiftId] = useState('');
+  const [policyRevDailyHours, setPolicyRevDailyHours] = useState('');
+  const [policyRevLeaveAllowance, setPolicyRevLeaveAllowance] = useState('');
+  const [policyRevEffectiveFrom, setPolicyRevEffectiveFrom] = useState(
+    new Date().toISOString().split('T')[0]
+  );
+  const [policyRevReason, setPolicyRevReason] = useState('');
+  const [policyRevNotes, setPolicyRevNotes] = useState('');
+  const [isAddingWorkPolicy, setIsAddingWorkPolicy] = useState(false);
+
   // Create Login Form State
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
@@ -148,31 +883,49 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
         const self = await api.getEmployeeSelf();
         setSelfEmployee(self);
         setSelectedEmployee(self);
-        // Load own salary history
-        const salList = await api.getEmployeeSalaries(self.id);
-        setSalaries(salList);
-      } else {
-        // Load full administrative employee directory, masters, and active biometric terminal options
-        const [empRes, deptList, desigList, ledgerList, bioOpts] = await Promise.all([
-          api.getEmployees({
-            departmentId: departmentFilter || undefined,
-            designationId: designationFilter || undefined,
-            status: statusFilter === 'ALL' ? undefined : statusFilter,
-            search: search.trim() || undefined,
-            page: currentPage,
-            limit: 20,
+        setWorkPolicyError(null);
+        setIsLoadingWorkPolicies(true);
+        const [salList, policyList] = await Promise.all([
+          api.getEmployeeSalaries(self.id),
+          api.getEmployeeWorkPolicies(self.id).catch((err: unknown) => {
+            setWorkPolicyError(
+              err instanceof ApiError ? err.message : 'Failed to load work policy history.'
+            );
+            return [] as EmployeeWorkPolicyRevisionItem[];
           }),
-          api.getDepartments(),
-          api.getDesignations(),
-          api.getLedgers(),
-          api.getEmployeeBiometricOptions().catch(() => null),
         ]);
+        setSalaries(salList);
+        setWorkPolicies(sortWorkPolicyRevisionsChronologically(policyList));
+        setIsLoadingWorkPolicies(false);
+      } else {
+        // Load full administrative employee directory, masters, shifts, company policy options, and active biometric terminal options
+        const [empRes, deptList, desigList, ledgerList, shiftList, profileData, bioOpts] =
+          await Promise.all([
+            api.getEmployees({
+              departmentId: departmentFilter || undefined,
+              designationId: designationFilter || undefined,
+              status: statusFilter === 'ALL' ? undefined : statusFilter,
+              search: search.trim() || undefined,
+              page: currentPage,
+              limit: 20,
+            }),
+            api.getDepartments(),
+            api.getDesignations(),
+            api.getLedgers(),
+            api.getShifts(false).catch(() => []),
+            api.getCompanyProfile().catch(() => null),
+            api.getEmployeeBiometricOptions().catch(() => null),
+          ]);
 
         setEmployees(empRes.items);
         setTotalEmployees(empRes.total);
         setDepartments(deptList);
         setDesignations(desigList);
         setLedgers(ledgerList);
+        setShifts(shiftList);
+        if (profileData) {
+          setLoadedCompanyProfile(profileData);
+        }
         setBiometricOptions(bioOpts);
       }
     } catch (err: unknown) {
@@ -205,12 +958,42 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     }
   };
 
+  const loadWorkPoliciesForEmployee = async (empId: string) => {
+    setIsLoadingWorkPolicies(true);
+    setWorkPolicyError(null);
+    try {
+      const list = await api.getEmployeeWorkPolicies(empId);
+      setWorkPolicies(sortWorkPolicyRevisionsChronologically(list));
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        setWorkPolicyError(err.message);
+      } else {
+        setWorkPolicyError('Failed to load work policy revisions.');
+      }
+    } finally {
+      setIsLoadingWorkPolicies(false);
+    }
+  };
+
+  const syncPolicyRevisionFormWithEmployee = (emp: EmployeeItem) => {
+    const initial = getInitialWorkPolicyRevisionFormValues(emp);
+    setPolicyRevShiftId(initial.shiftId);
+    setPolicyRevDailyHours(initial.dailyWorkingHours);
+    setPolicyRevLeaveAllowance(initial.monthlyLeaveAllowance);
+    setPolicyRevEffectiveFrom(initial.effectiveFrom);
+    setPolicyRevReason(initial.revisionReason);
+    setPolicyRevNotes(initial.notes);
+  };
+
   const handleOpenDetailModal = (emp: EmployeeItem) => {
     setSelectedEmployee(emp);
     setDetailTab('PROFILE');
     setLoginEmail(emp.email || `${emp.employeeCode.toLowerCase()}@company.local`);
     setLoginPassword('');
+    setWorkPolicySuccess(null);
+    syncPolicyRevisionFormWithEmployee(emp);
     loadSalariesForEmployee(emp.id);
+    loadWorkPoliciesForEmployee(emp.id);
   };
 
   const activeTerminals = useMemo(
@@ -371,6 +1154,22 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
       const primaryBioId = nextMappings[0]?.enrollmentId || null;
 
       if (editingEmployee) {
+        const policyResult = buildEmployeePolicyFieldsForUpdate({
+          employee: editingEmployee,
+          shiftId: formShiftId,
+          dailyWorkingHours: formDailyWorkingHours,
+          monthlyLeaveAllowance: formMonthlyLeaveAllowance,
+          policyEffectiveFrom: formPolicyEffectiveFrom,
+          policyRevisionReason: formPolicyRevisionReason,
+          policyRevisionNotes: formPolicyRevisionNotes,
+          permittedAllowances: permittedLeaveOptions,
+        });
+        if (policyResult.error) {
+          setModalError(policyResult.error);
+          setIsSubmitting(false);
+          return;
+        }
+
         const updatePayload: UpdateEmployeeRequest = {
           employeeCode: formCode.trim(),
           fullName: formName.trim(),
@@ -387,6 +1186,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
           notes: formNotes.trim() || null,
           biometricDeviceId: primaryBioId,
           biometricMappings: nextMappings,
+          ...policyResult.fields,
         };
         const updated = await api.updateEmployee(editingEmployee.id, updatePayload);
         setSuccessMessage(
@@ -394,8 +1194,24 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
         );
         if (selectedEmployee?.id === updated.id) {
           setSelectedEmployee(updated);
+          syncPolicyRevisionFormWithEmployee(updated);
+          void loadWorkPoliciesForEmployee(updated.id);
         }
       } else {
+        const policyResult = buildEmployeePolicyFieldsForCreate({
+          shiftId: formShiftId,
+          dailyWorkingHours: formDailyWorkingHours,
+          monthlyLeaveAllowance: formMonthlyLeaveAllowance,
+          policyEffectiveFrom: formPolicyEffectiveFrom,
+          dateOfJoining: formDoj,
+          permittedAllowances: permittedLeaveOptions,
+        });
+        if (policyResult.error) {
+          setModalError(policyResult.error);
+          setIsSubmitting(false);
+          return;
+        }
+
         const createPayload: CreateEmployeeRequest = {
           employeeCode: formCode.trim(),
           fullName: formName.trim(),
@@ -413,6 +1229,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
           biometricDeviceId: primaryBioId,
           biometricMappings: nextMappings,
           initialSalary: formInitialSalary ? formInitialSalary : undefined,
+          ...policyResult.fields,
         };
         const created = await api.createEmployee(createPayload);
         setSuccessMessage(`Employee '${created.fullName}' (${created.employeeCode}) created successfully.`);
@@ -448,6 +1265,14 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     setFormStatus('ACTIVE');
     setFormNotes('');
     setFormInitialSalary('');
+    setFormShiftId('');
+    setFormDailyWorkingHours('');
+    setFormMonthlyLeaveAllowance(
+      permittedLeaveOptions.length > 0 ? String(permittedLeaveOptions[0]) : '4'
+    );
+    setFormPolicyEffectiveFrom('');
+    setFormPolicyRevisionReason('');
+    setFormPolicyRevisionNotes('');
     setFormMappings([]);
     setTerminalSearch('');
     setIsTerminalDropdownOpen(false);
@@ -475,6 +1300,17 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
     setFormStatus(emp.status);
     setFormNotes(emp.notes || '');
     setFormInitialSalary('');
+    const currentShift = emp.effectiveWorkPolicy?.shiftId ?? emp.shiftId ?? '';
+    const currentAllowance =
+      emp.effectiveWorkPolicy?.monthlyLeaveAllowance ?? emp.monthlyLeaveAllowance ?? null;
+    setFormShiftId(currentShift || '');
+    setFormDailyWorkingHours(resolveExplicitDailyWorkingHoursInput(emp));
+    setFormMonthlyLeaveAllowance(
+      currentAllowance !== null && currentAllowance !== undefined ? String(currentAllowance) : ''
+    );
+    setFormPolicyEffectiveFrom('');
+    setFormPolicyRevisionReason('');
+    setFormPolicyRevisionNotes('');
     setFormMappings(
       (emp.biometricMappings || []).map((m) => ({
         terminalId: m.terminalId,
@@ -581,6 +1417,53 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
       }
     } finally {
       setIsAddingSalary(false);
+    }
+  };
+
+  // Add Work Policy Revision Submit
+  const handleAddWorkPolicyRevision = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!selectedEmployee || showSelfServiceOnly) return;
+
+    setWorkPolicyError(null);
+    setWorkPolicySuccess(null);
+
+    const built = buildWorkPolicyRevisionPayload({
+      shiftId: policyRevShiftId,
+      dailyWorkingHours: policyRevDailyHours,
+      monthlyLeaveAllowance: policyRevLeaveAllowance,
+      effectiveFrom: policyRevEffectiveFrom,
+      revisionReason: policyRevReason,
+      notes: policyRevNotes,
+      permittedAllowances: permittedLeaveOptions,
+      initialDailyWorkingHours: selectedEmployee.dailyWorkingHours ?? null,
+    });
+
+    if (built.error || !built.payload) {
+      setWorkPolicyError(built.error || 'Invalid work policy revision values.');
+      return;
+    }
+
+    setIsAddingWorkPolicy(true);
+    try {
+      const result = await api.createEmployeeWorkPolicyRevision(selectedEmployee.id, built.payload);
+      setSelectedEmployee(result.employee);
+      setWorkPolicies(sortWorkPolicyRevisionsChronologically(result.revisions));
+      syncPolicyRevisionFormWithEmployee(result.employee);
+      setWorkPolicySuccess({
+        message: 'Work policy revision saved successfully.',
+        workPolicyEffectiveFrom: result.workPolicyEffectiveFrom,
+        allowanceEffectiveFrom: result.allowanceEffectiveFrom,
+      });
+      loadData();
+    } catch (err: unknown) {
+      if (err instanceof ApiError) {
+        setWorkPolicyError(err.message);
+      } else {
+        setWorkPolicyError('Failed to create work policy revision.');
+      }
+    } finally {
+      setIsAddingWorkPolicy(false);
     }
   };
 
@@ -820,6 +1703,15 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
               </table>
             </div>
           </div>
+
+          {/* Read-Only Work Policy & Monthly Leave Allowance History (EMPLOYEE self-service) */}
+          <WorkPolicyHistoryPanel
+            employee={selfEmployee}
+            revisions={workPolicies}
+            isLoading={isLoadingWorkPolicies}
+            errorMessage={workPolicyError}
+            canEdit={false}
+          />
         </div>
       )}
 
@@ -915,6 +1807,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                       <th className="py-3 px-4">Code</th>
                       <th className="py-3 px-4">Employee</th>
                       <th className="py-3 px-4">Department & Designation</th>
+                      <th className="py-3 px-4">Work Policy</th>
                       <th className="py-3 px-4">Biometric Mapping</th>
                       <th className="py-3 px-4">Joining Date</th>
                       <th className="py-3 px-4 text-right">Fixed Salary</th>
@@ -928,6 +1821,15 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                     {employees.map((emp) => {
                       const primaryMapping = emp.biometricMappings?.[0];
                       const extraCount = (emp.biometricMappings?.length || 0) - 1;
+                      const effectiveHours =
+                        emp.effectiveWorkPolicy?.dailyWorkingHours ??
+                        emp.dailyWorkingHours ??
+                        emp.configuredDailyWorkingHours ??
+                        null;
+                      const effectiveAllowance =
+                        emp.effectiveWorkPolicy?.monthlyLeaveAllowance ??
+                        emp.monthlyLeaveAllowance ??
+                        4;
                       return (
                       <tr key={emp.id} className="hover:bg-slate-800/40 transition">
                         <td className="py-3 px-4 font-mono tabular-nums font-semibold text-indigo-300">
@@ -945,6 +1847,20 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                           </div>
                           <div className="text-[10px] text-indigo-400">
                             {emp.departmentName || <span className="text-slate-500 italic">No Dept</span>}
+                          </div>
+                        </td>
+                        <td className="py-3 px-4">
+                          <div className="font-mono tabular-nums text-slate-200">
+                            {effectiveHours !== null && effectiveHours !== undefined
+                              ? `${effectiveHours}h/day`
+                              : emp.shiftName
+                              ? 'Shift hrs'
+                              : 'Unset'}
+                            {' · '}
+                            <span className="text-indigo-300">{effectiveAllowance}d leave/mo</span>
+                          </div>
+                          <div className="text-[10px] text-slate-400 truncate max-w-[160px]">
+                            {emp.shiftName || 'No Shift Assigned'}
                           </div>
                         </td>
                         <td className="py-3 px-4">
@@ -1093,7 +2009,7 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
             </div>
 
             {/* Modal Sub-Tabs */}
-            <div className="flex gap-2 border-b border-slate-800 pb-2">
+            <div className="flex flex-wrap gap-2 border-b border-slate-800 pb-2">
               <button
                 onClick={() => setDetailTab('PROFILE')}
                 className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer ${
@@ -1101,6 +2017,15 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                 }`}
               >
                 Profile & Employment
+              </button>
+              <button
+                onClick={() => setDetailTab('WORK_POLICY')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition cursor-pointer flex items-center gap-1.5 ${
+                  detailTab === 'WORK_POLICY' ? 'bg-indigo-600 text-white' : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Clock className="w-3.5 h-3.5" />
+                Work Policy ({workPolicies.length})
               </button>
               <button
                 onClick={() => setDetailTab('SALARY')}
@@ -1153,6 +2078,41 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
 
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   <div className="p-3 bg-slate-800/40 border border-slate-800 rounded-xl space-y-1">
+                    <span className="text-slate-400 text-[10px] uppercase font-semibold">Daily Working Hours</span>
+                    <div className="font-mono font-semibold text-slate-200">
+                      {(selectedEmployee.effectiveWorkPolicy?.dailyWorkingHours ??
+                        selectedEmployee.dailyWorkingHours ??
+                        selectedEmployee.configuredDailyWorkingHours) !== null &&
+                      (selectedEmployee.effectiveWorkPolicy?.dailyWorkingHours ??
+                        selectedEmployee.dailyWorkingHours ??
+                        selectedEmployee.configuredDailyWorkingHours) !== undefined
+                        ? `${
+                            selectedEmployee.effectiveWorkPolicy?.dailyWorkingHours ??
+                            selectedEmployee.dailyWorkingHours ??
+                            selectedEmployee.configuredDailyWorkingHours
+                          } hrs / day`
+                        : 'Shift default'}
+                    </div>
+                  </div>
+                  <div className="p-3 bg-slate-800/40 border border-slate-800 rounded-xl space-y-1">
+                    <span className="text-slate-400 text-[10px] uppercase font-semibold">Assigned Shift</span>
+                    <div className="font-semibold text-slate-200">
+                      {selectedEmployee.shiftName || 'No Shift Assigned'}
+                    </div>
+                  </div>
+                  <div className="p-3 bg-slate-800/40 border border-slate-800 rounded-xl space-y-1">
+                    <span className="text-slate-400 text-[10px] uppercase font-semibold">Monthly Leave Allowance</span>
+                    <div className="font-mono font-semibold text-indigo-300">
+                      {selectedEmployee.effectiveWorkPolicy?.monthlyLeaveAllowance ??
+                        selectedEmployee.monthlyLeaveAllowance ??
+                        4}{' '}
+                      days / month
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  <div className="p-3 bg-slate-800/40 border border-slate-800 rounded-xl space-y-1">
                     <span className="text-slate-400 text-[10px] uppercase font-semibold">Date of Joining</span>
                     <div className="font-semibold text-slate-200">{selectedEmployee.dateOfJoining}</div>
                   </div>
@@ -1198,6 +2158,34 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                   </div>
                 )}
               </div>
+            )}
+
+            {/* Sub-Tab 2: Work Policy & Chronological Revision History */}
+            {detailTab === 'WORK_POLICY' && (
+              <WorkPolicyHistoryPanel
+                employee={selectedEmployee}
+                revisions={workPolicies}
+                isLoading={isLoadingWorkPolicies}
+                errorMessage={workPolicyError}
+                canEdit={!showSelfServiceOnly}
+                shifts={shifts}
+                permittedAllowances={permittedLeaveOptions}
+                shiftId={policyRevShiftId}
+                onShiftIdChange={setPolicyRevShiftId}
+                dailyWorkingHours={policyRevDailyHours}
+                onDailyWorkingHoursChange={setPolicyRevDailyHours}
+                monthlyLeaveAllowance={policyRevLeaveAllowance}
+                onMonthlyLeaveAllowanceChange={setPolicyRevLeaveAllowance}
+                effectiveFrom={policyRevEffectiveFrom}
+                onEffectiveFromChange={setPolicyRevEffectiveFrom}
+                revisionReason={policyRevReason}
+                onRevisionReasonChange={setPolicyRevReason}
+                notes={policyRevNotes}
+                onNotesChange={setPolicyRevNotes}
+                isSubmitting={isAddingWorkPolicy}
+                revisionSuccess={workPolicySuccess}
+                onSubmitRevision={handleAddWorkPolicyRevision}
+              />
             )}
 
             {/* Sub-Tab 2: Salary Structure & Revision History */}
@@ -1673,6 +2661,139 @@ export const EmployeesPage: React.FC<EmployeesPageProps> = ({
                   />
                 </div>
               )}
+
+              {/* Work Schedule & Leave Allowance Policy */}
+              <div className="p-3.5 rounded-xl bg-slate-800/40 border border-slate-800 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 text-slate-200 font-semibold">
+                    <Clock className="w-4 h-4 text-indigo-400" />
+                    <span>Work Hours, Shift &amp; Monthly Leave Allowance</span>
+                  </div>
+                  <span className="text-[11px] text-slate-400">
+                    Shift optional when daily working hours are set
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-slate-400 mb-1">
+                      Daily Working Hours
+                    </label>
+                    <input
+                      type="number"
+                      step="0.25"
+                      min="0.25"
+                      max="24"
+                      aria-label="Employee Daily Working Hours"
+                      placeholder="e.g. 8 or 8.5 (Optional)"
+                      value={formDailyWorkingHours}
+                      onChange={(e) => setFormDailyWorkingHours(e.target.value)}
+                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 font-mono tabular-nums focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-400 mb-1">
+                      Assigned Shift (Optional)
+                    </label>
+                    <select
+                      aria-label="Employee Shift Assignment"
+                      value={formShiftId}
+                      onChange={(e) => setFormShiftId(e.target.value)}
+                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                    >
+                      <option value="">No Shift Assigned</option>
+                      {shifts.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.name} ({s.startTime}–{s.endTime})
+                        </option>
+                      ))}
+                      {formShiftId && !shifts.some((s) => s.id === formShiftId) && (
+                        <option value={formShiftId}>
+                          {editingEmployee?.shiftName || formShiftId}
+                        </option>
+                      )}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-slate-400 mb-1">
+                      Monthly Leave Allowance
+                    </label>
+                    <select
+                      aria-label="Employee Monthly Leave Allowance"
+                      value={formMonthlyLeaveAllowance}
+                      onChange={(e) => setFormMonthlyLeaveAllowance(e.target.value)}
+                      className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                    >
+                      {!editingEmployee && (
+                        <option value="">
+                          Default ({permittedLeaveOptions[0]} days / month)
+                        </option>
+                      )}
+                      {editingEmployee &&
+                        formMonthlyLeaveAllowance &&
+                        !permittedLeaveOptions.includes(Number(formMonthlyLeaveAllowance)) && (
+                          <option value={formMonthlyLeaveAllowance}>
+                            {formMonthlyLeaveAllowance} days / month (Current Legacy Policy)
+                          </option>
+                        )}
+                      {permittedLeaveOptions.map((days) => (
+                        <option key={days} value={String(days)}>
+                          {days} days / month
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                {editingEmployee && (
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3 pt-1">
+                    <div>
+                      <label className="block text-slate-400 mb-1">
+                        Effective Date (Hours / Shift)
+                      </label>
+                      <input
+                        type="date"
+                        aria-label="Policy Effective From"
+                        value={formPolicyEffectiveFrom}
+                        onChange={(e) => setFormPolicyEffectiveFrom(e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-slate-400 mb-1">
+                        Policy Change Reason (Optional)
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="e.g. Schedule revision"
+                        value={formPolicyRevisionReason}
+                        onChange={(e) => setFormPolicyRevisionReason(e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-slate-400 mb-1">
+                        Policy Notes (Optional)
+                      </label>
+                      <input
+                        type="text"
+                        placeholder="Optional remarks"
+                        value={formPolicyRevisionNotes}
+                        onChange={(e) => setFormPolicyRevisionNotes(e.target.value)}
+                        className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div className="p-2.5 rounded-lg bg-indigo-950/30 border border-indigo-800/40 text-[11px] text-indigo-200">
+                  {editingEmployee
+                    ? 'Daily working hours and shift changes apply from the Effective Date selected above (defaulting to today in company timezone if omitted). Monthly leave allowance changes always take effect from the 1st day of the next company-local calendar month.'
+                    : `Permitted monthly leave allowances for this company: ${permittedLeaveOptions.join(', ')} days. Later changes to monthly leave allowance take effect on the 1st day of the next calendar month.`}
+                </div>
+              </div>
 
               {/* Searchable Biometric Terminal & Enrollment Mappings */}
               <div className="p-3.5 rounded-xl bg-slate-800/40 border border-slate-800 space-y-3">

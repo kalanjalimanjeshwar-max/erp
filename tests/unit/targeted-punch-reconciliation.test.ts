@@ -158,6 +158,22 @@ describe('Targeted Biometric Punch Reconciliation (Single-Punch, Enrollment ID &
         }
         continue;
       }
+      if (
+        val &&
+        typeof val === 'object' &&
+        ('gte' in val || 'lte' in val) &&
+        !(val instanceof Date)
+      ) {
+        const punchVal = (punch as any)[key];
+        const punchTime = punchVal instanceof Date ? punchVal.getTime() : new Date(punchVal).getTime();
+        if ((val as any).gte !== undefined && punchTime < new Date((val as any).gte).getTime()) {
+          return false;
+        }
+        if ((val as any).lte !== undefined && punchTime > new Date((val as any).lte).getTime()) {
+          return false;
+        }
+        continue;
+      }
       if ((punch as any)[key] !== val) {
         return false;
       }
@@ -758,10 +774,18 @@ describe('Targeted Biometric Punch Reconciliation (Single-Punch, Enrollment ID &
     expect(punchesStore.find((p) => p.id === 'punch-105-pending')?.syncStatus).toBe('IGNORED');
   });
 
-  it('preserves default batch reconciliation behavior when no targeted filter is supplied', async () => {
-    const result = await PunchReconciliationService.reconcilePendingPunches(
+  it('protects historical PENDING punches when fromPunchTime is omitted and processes explicit fromPunchTime batch runs', async () => {
+    const protectedRes = await PunchReconciliationService.reconcilePendingPunches(
       companyAlphaId,
       { batchSize: 100 },
+      adminActor.userId
+    );
+    expect(protectedRes.totalEvaluated).toBe(0);
+    expect(punchesStore.every((p) => p.syncStatus === 'PENDING')).toBe(true);
+
+    const result = await PunchReconciliationService.reconcilePendingPunches(
+      companyAlphaId,
+      { batchSize: 100, fromPunchTime: '2026-10-20T00:00:00.000Z' },
       adminActor.userId
     );
 

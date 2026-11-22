@@ -101,8 +101,10 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
         '[BLOCKED / NOT RUN] TEST_DATABASE_URL is not configured for PostgreSQL 16 key-rotation integration test.';
       console.warn(
         `\n${blockedReason}\n` +
-        'To run live integration tests against PostgreSQL 16 on Windows/Docker:\n' +
-        '  TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm test\n'
+        'To run live key-rotation integration tests against PostgreSQL 16 on Docker:\n' +
+        '  1. Start container: docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d\n' +
+        '  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy\n' +
+        '  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:key-rotation\n'
       );
       return;
     }

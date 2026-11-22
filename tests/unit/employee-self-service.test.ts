@@ -940,4 +940,446 @@ describe('Employee Self-Service (ESS) & Monthly Leave Aggregation Tests', () => 
         .toBe(payslipCalc.lossOfPayDeduction.toNumber());
     });
   });
+
+  describe('P2-8: Deduplicated Excess Leave Dates & Short-Hours Deduction Eligibility', () => {
+    const shift8h = {
+      id: 'shift-p28-8h',
+      name: 'Standard 8h Shift',
+      code: 'STD-8',
+      startTime: '09:00',
+      endTime: '17:00',
+      isOvernight: false,
+    };
+
+    const setupEmployeeAndLeaveTypes = () => {
+      vi.mocked(prisma.employee.findFirst).mockResolvedValue({
+        id: 'emp-01',
+        companyId,
+      } as any);
+
+      vi.mocked(prisma.employee.findUnique).mockResolvedValue({
+        id: 'emp-01',
+        companyId,
+        fullName: 'Jane Employee',
+        employeeCode: 'EMP-001',
+        shiftId: shift8h.id,
+        shift: shift8h,
+        monthlyLeaveAllowance: 4,
+        // $4,800 / 30 = $160.00/day; $160 / 8h = $20.00/hr
+        salaryRevisions: [{ fixedSalary: '4800.00' }],
+      } as any);
+
+      vi.mocked(prisma.leaveType.findMany).mockResolvedValue([
+        {
+          id: 'lt-annual',
+          companyId,
+          code: 'AL',
+          name: 'Annual Leave',
+          isPaid: true,
+          defaultAllowance: 15,
+          isActive: true,
+        },
+        {
+          id: 'lt-sick',
+          companyId,
+          code: 'SL',
+          name: 'Sick Leave',
+          isPaid: true,
+          defaultAllowance: 10,
+          isActive: true,
+        },
+      ] as any);
+    };
+
+    it('does not overcount overlapping full-day approved leave requests on the same dates into excessLeaveDatesSet', async () => {
+      setupEmployeeAndLeaveTypes();
+
+      // Request 1 & Request 2 both cover Oct 01–02 (2 overlapping full days)
+      // Request 3 covers Oct 03–04 (2 distinct days)
+      // Deduplicated monthly total = 4 unique days (Oct 01..04) == allowance (4) => 0 excess leave days
+      vi.mocked(prisma.leaveRequest.findMany).mockResolvedValue([
+        {
+          id: 'req-p28-fd-1',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-01T00:00:00.000Z'),
+          endDate: new Date('2026-10-02T23:59:59.999Z'),
+          totalDays: 2,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-fd-2',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-sick',
+          startDate: new Date('2026-10-01T00:00:00.000Z'),
+          endDate: new Date('2026-10-02T23:59:59.999Z'),
+          totalDays: 2,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-fd-3',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-03T00:00:00.000Z'),
+          endDate: new Date('2026-10-04T23:59:59.999Z'),
+          totalDays: 2,
+          status: 'APPROVED',
+        },
+      ] as any);
+
+      // Employee has a PRESENT attendance record on Oct 04 with 6h worked (2h short).
+      // Because deduplicated leave is 4 days (not 6), Oct 04 is NOT an excess leave date and
+      // must remain eligible for short-hours deduction.
+      vi.mocked(prisma.attendance.findMany).mockResolvedValue([
+        {
+          id: 'att-p28-oct04',
+          workDate: new Date('2026-10-04T00:00:00.000Z'),
+          checkIn: new Date('2026-10-04T09:00:00.000Z'),
+          checkOut: new Date('2026-10-04T15:00:00.000Z'), // 6h worked vs 8h shift -> 2h short
+          status: 'PRESENT',
+          shift: shift8h,
+        },
+      ] as any);
+
+      const summary = await LeaveService.getMonthlyLeaveSummary(employeeUser, {
+        year: 2026,
+        month: 10,
+      });
+
+      expect(summary.monthApprovedDays).toBe(4);
+      expect(summary.overlappingApprovedDays).toBe(2);
+      expect(summary.monthlyExcessLeaveDays).toBe(0);
+      expect(summary.excessLeaveDeduction).toBe('0.00');
+      expect(summary.deductibleShortHours).toBe(2);
+      expect(summary.shortHoursDeduction).toBe('40.00');
+      expect(summary.totalSalaryDeductions).toBe('40.00');
+    });
+
+    it('deduplicates overlapping half-day approved leaves while preserving half-day counting and excess boundary semantics', async () => {
+      setupEmployeeAndLeaveTypes();
+
+      // Case A: Oct 01 (1.0), Oct 02 has 3 overlapping 0.5-day requests (capped to 1.0, overlap 0.5),
+      // Oct 03 (1.0), Oct 04 (0.5) => deduplicated total = 3.5 <= 4.0 (no excess).
+      vi.mocked(prisma.leaveRequest.findMany).mockResolvedValueOnce([
+        {
+          id: 'req-p28-hd-1',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-01T00:00:00.000Z'),
+          endDate: new Date('2026-10-01T23:59:59.999Z'),
+          totalDays: 1,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-hd-2a',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-02T00:00:00.000Z'),
+          endDate: new Date('2026-10-02T23:59:59.999Z'),
+          totalDays: 0.5,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-hd-2b',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-sick',
+          startDate: new Date('2026-10-02T00:00:00.000Z'),
+          endDate: new Date('2026-10-02T23:59:59.999Z'),
+          totalDays: 0.5,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-hd-2c',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-sick',
+          startDate: new Date('2026-10-02T00:00:00.000Z'),
+          endDate: new Date('2026-10-02T23:59:59.999Z'),
+          totalDays: 0.5,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-hd-3',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-03T00:00:00.000Z'),
+          endDate: new Date('2026-10-03T23:59:59.999Z'),
+          totalDays: 1,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-hd-4',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-04T00:00:00.000Z'),
+          endDate: new Date('2026-10-04T23:59:59.999Z'),
+          totalDays: 0.5,
+          status: 'APPROVED',
+        },
+      ] as any);
+
+      vi.mocked(prisma.attendance.findMany).mockResolvedValueOnce([
+        {
+          id: 'att-p28-hd-oct04',
+          workDate: new Date('2026-10-04T00:00:00.000Z'),
+          checkIn: new Date('2026-10-04T09:00:00.000Z'),
+          checkOut: new Date('2026-10-04T14:00:00.000Z'), // 5h worked -> 3h short
+          status: 'PRESENT',
+          shift: shift8h,
+        },
+      ] as any);
+
+      const withinAllowanceSummary = await LeaveService.getMonthlyLeaveSummary(employeeUser, {
+        year: 2026,
+        month: 10,
+      });
+
+      expect(withinAllowanceSummary.monthApprovedDays).toBe(3.5);
+      expect(withinAllowanceSummary.overlappingApprovedDays).toBe(0.5);
+      expect(withinAllowanceSummary.monthlyExcessLeaveDays).toBe(0);
+      expect(withinAllowanceSummary.excessLeaveDeduction).toBe('0.00');
+      expect(withinAllowanceSummary.deductibleShortHours).toBe(3);
+      expect(withinAllowanceSummary.shortHoursDeduction).toBe('60.00');
+
+      // Case B: Two half-day requests on Oct 04 combine cleanly to 1.0 (total 4.0) and a 0.5-day
+      // request on Oct 05 genuinely crosses the 4.0 allowance -> Oct 05 is excluded from short-hours
+      // deduction to prevent duplicate deduction alongside its 0.5-day excess leave deduction.
+      setupEmployeeAndLeaveTypes();
+      vi.mocked(prisma.leaveRequest.findMany).mockResolvedValueOnce([
+        {
+          id: 'req-p28-hd-b1',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-01T00:00:00.000Z'),
+          endDate: new Date('2026-10-03T23:59:59.999Z'),
+          totalDays: 3,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-hd-b2',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-04T00:00:00.000Z'),
+          endDate: new Date('2026-10-04T23:59:59.999Z'),
+          totalDays: 0.5,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-hd-b3',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-sick',
+          startDate: new Date('2026-10-04T00:00:00.000Z'),
+          endDate: new Date('2026-10-04T23:59:59.999Z'),
+          totalDays: 0.5,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-hd-b4',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-05T00:00:00.000Z'),
+          endDate: new Date('2026-10-05T23:59:59.999Z'),
+          totalDays: 0.5,
+          status: 'APPROVED',
+        },
+      ] as any);
+
+      vi.mocked(prisma.attendance.findMany).mockResolvedValueOnce([
+        {
+          id: 'att-p28-hd-oct05',
+          workDate: new Date('2026-10-05T00:00:00.000Z'),
+          checkIn: new Date('2026-10-05T09:00:00.000Z'),
+          checkOut: new Date('2026-10-05T15:00:00.000Z'), // 6h worked -> skipped because Oct 05 is excess
+          status: 'PRESENT',
+          shift: shift8h,
+        },
+      ] as any);
+
+      const crossingSummary = await LeaveService.getMonthlyLeaveSummary(employeeUser, {
+        year: 2026,
+        month: 10,
+      });
+
+      expect(crossingSummary.monthApprovedDays).toBe(4.5);
+      expect(crossingSummary.overlappingApprovedDays).toBe(0);
+      expect(crossingSummary.monthlyExcessLeaveDays).toBe(0.5);
+      expect(crossingSummary.excessLeaveDeduction).toBe('80.00'); // 0.5 * $160
+      expect(crossingSummary.deductibleShortHours).toBe(0);
+      expect(crossingSummary.shortHoursDeduction).toBe('0.00');
+      expect(crossingSummary.totalSalaryDeductions).toBe('80.00');
+    });
+
+    it('handles multiple approved leave requests on distinct dates deterministically in chronological order', async () => {
+      setupEmployeeAndLeaveTypes();
+
+      // Supplied out of chronological order: Oct 10–11, Oct 01–02, Oct 05–06 (6 distinct days total)
+      // Chronologically: Oct 01, 02, 05, 06 consume the 4-day allowance; Oct 10 & Oct 11 are excess dates.
+      vi.mocked(prisma.leaveRequest.findMany).mockResolvedValue([
+        {
+          id: 'req-p28-dist-3',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-10T00:00:00.000Z'),
+          endDate: new Date('2026-10-11T23:59:59.999Z'),
+          totalDays: 2,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-dist-1',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-01T00:00:00.000Z'),
+          endDate: new Date('2026-10-02T23:59:59.999Z'),
+          totalDays: 2,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-dist-2',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-sick',
+          startDate: new Date('2026-10-05T00:00:00.000Z'),
+          endDate: new Date('2026-10-06T23:59:59.999Z'),
+          totalDays: 2,
+          status: 'APPROVED',
+        },
+      ] as any);
+
+      vi.mocked(prisma.attendance.findMany).mockResolvedValue([
+        {
+          id: 'att-p28-dist-oct06',
+          workDate: new Date('2026-10-06T00:00:00.000Z'), // Within allowance -> eligible (2h short)
+          checkIn: new Date('2026-10-06T09:00:00.000Z'),
+          checkOut: new Date('2026-10-06T15:00:00.000Z'),
+          status: 'PRESENT',
+          shift: shift8h,
+        },
+        {
+          id: 'att-p28-dist-oct10',
+          workDate: new Date('2026-10-10T00:00:00.000Z'), // Excess leave date -> excluded
+          checkIn: new Date('2026-10-10T09:00:00.000Z'),
+          checkOut: new Date('2026-10-10T15:00:00.000Z'),
+          status: 'PRESENT',
+          shift: shift8h,
+        },
+        {
+          id: 'att-p28-dist-oct15',
+          workDate: new Date('2026-10-15T00:00:00.000Z'), // Regular workday -> eligible (1h short)
+          checkIn: new Date('2026-10-15T09:00:00.000Z'),
+          checkOut: new Date('2026-10-15T16:00:00.000Z'),
+          status: 'PRESENT',
+          shift: shift8h,
+        },
+      ] as any);
+
+      const summary = await LeaveService.getMonthlyLeaveSummary(employeeUser, {
+        year: 2026,
+        month: 10,
+      });
+
+      expect(summary.monthApprovedDays).toBe(6);
+      expect(summary.overlappingApprovedDays).toBe(0);
+      expect(summary.monthlyExcessLeaveDays).toBe(2);
+      expect(summary.excessLeaveDeduction).toBe('320.00'); // 2 * $160
+      expect(summary.deductibleShortHours).toBe(3); // 2h (Oct 06) + 1h (Oct 15); Oct 10 excluded
+      expect(summary.shortHoursDeduction).toBe('60.00'); // 3 * $20
+      expect(summary.totalSalaryDeductions).toBe('380.00');
+    });
+
+    it('keeps within-allowance dates eligible and excludes only genuine excess dates for short-hours deduction when overlapping leaves exist', async () => {
+      setupEmployeeAndLeaveTypes();
+
+      // Req 1: Oct 01–03 (3 days)
+      // Req 2: Oct 02–03 (2 overlapping days -> deduplicated occupancy stays 1.0/day)
+      // Req 3: Oct 04–05 (2 days)
+      // Deduplicated: Oct 01 (1), Oct 02 (2), Oct 03 (3), Oct 04 (4 -> within allowance),
+      // Oct 05 (5 > 4 -> ONLY Oct 05 is an excess leave date).
+      vi.mocked(prisma.leaveRequest.findMany).mockResolvedValue([
+        {
+          id: 'req-p28-mix-1',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-01T00:00:00.000Z'),
+          endDate: new Date('2026-10-03T23:59:59.999Z'),
+          totalDays: 3,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-mix-2',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-sick',
+          startDate: new Date('2026-10-02T00:00:00.000Z'),
+          endDate: new Date('2026-10-03T23:59:59.999Z'),
+          totalDays: 2,
+          status: 'APPROVED',
+        },
+        {
+          id: 'req-p28-mix-3',
+          companyId,
+          employeeId: 'emp-01',
+          leaveTypeId: 'lt-annual',
+          startDate: new Date('2026-10-04T00:00:00.000Z'),
+          endDate: new Date('2026-10-05T23:59:59.999Z'),
+          totalDays: 2,
+          status: 'APPROVED',
+        },
+      ] as any);
+
+      vi.mocked(prisma.attendance.findMany).mockResolvedValue([
+        {
+          id: 'att-p28-mix-oct04',
+          workDate: new Date('2026-10-04T00:00:00.000Z'), // 4th deduplicated day -> eligible (2h short)
+          checkIn: new Date('2026-10-04T09:00:00.000Z'),
+          checkOut: new Date('2026-10-04T15:00:00.000Z'),
+          status: 'PRESENT',
+          shift: shift8h,
+        },
+        {
+          id: 'att-p28-mix-oct05',
+          workDate: new Date('2026-10-05T00:00:00.000Z'), // 5th deduplicated day (excess) -> excluded
+          checkIn: new Date('2026-10-05T09:00:00.000Z'),
+          checkOut: new Date('2026-10-05T14:00:00.000Z'), // 5h worked (3h short would be double-deducted if included)
+          status: 'PRESENT',
+          shift: shift8h,
+        },
+        {
+          id: 'att-p28-mix-oct12',
+          workDate: new Date('2026-10-12T00:00:00.000Z'), // Regular workday -> eligible (1h short)
+          checkIn: new Date('2026-10-12T09:00:00.000Z'),
+          checkOut: new Date('2026-10-12T16:00:00.000Z'),
+          status: 'PRESENT',
+          shift: shift8h,
+        },
+      ] as any);
+
+      const summary = await LeaveService.getMonthlyLeaveSummary(employeeUser, {
+        year: 2026,
+        month: 10,
+      });
+
+      expect(summary.monthApprovedDays).toBe(5);
+      expect(summary.overlappingApprovedDays).toBe(2);
+      expect(summary.monthlyExcessLeaveDays).toBe(1);
+      expect(summary.excessLeaveDeduction).toBe('160.00'); // 1 * $160
+      expect(summary.deductibleShortHours).toBe(3); // 2h (Oct 04) + 1h (Oct 12); Oct 05 excluded
+      expect(summary.shortHoursDeduction).toBe('60.00'); // 3 * $20
+      expect(summary.totalSalaryDeductions).toBe('220.00');
+    });
+  });
 });

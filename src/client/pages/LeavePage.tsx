@@ -19,24 +19,287 @@ import {
 import { api, ApiError } from '../services/api.ts';
 import { LoadingSpinner } from '../components/common/LoadingSpinner.tsx';
 import { EmptyState } from '../components/common/EmptyState.tsx';
+import { ConfirmDialog, executeConfirmedAction } from '../components/common/ConfirmDialog.tsx';
 import {
   AuthUser,
+  CompanyProfile,
   LeaveRequestItem,
   LeaveTypeItem,
   LeaveStatus,
   EmployeeItem,
+  MonthlyLeaveSummary,
   CreateLeaveRequestInput,
   CreateLeaveTypeRequest,
   UpdateLeaveTypeRequest,
 } from '../../shared/types.ts';
+import { formatMoney } from '../../shared/currency.ts';
+
+function formatMinutesAsHoursMinutes(totalMinutes: number | null | undefined): string {
+  if (totalMinutes === null || totalMinutes === undefined || !Number.isFinite(totalMinutes)) {
+    return '--';
+  }
+  const safe = Math.max(0, Math.round(totalMinutes));
+  const hrs = Math.floor(safe / 60);
+  const mins = safe % 60;
+  return `${hrs}h ${String(mins).padStart(2, '0')}m`;
+}
+
+export interface LeaveMonthlySummaryInspectorPanelProps {
+  summary: MonthlyLeaveSummary;
+  baseCurrency?: string;
+  roundingPrecision?: number;
+}
+
+export const LeaveMonthlySummaryInspectorPanel: React.FC<LeaveMonthlySummaryInspectorPanelProps> = ({
+  summary,
+  baseCurrency,
+  roundingPrecision,
+}) => {
+  const allowance = summary.monthlyLeaveAllowance ?? 4;
+  const approvedDays = summary.monthApprovedDays ?? summary.approvedDays ?? 0;
+  const remainingLeave = summary.monthRemainingLeave ?? Math.max(0, allowance - approvedDays);
+  const excessLeaveDays = summary.monthlyExcessLeaveDays ?? 0;
+  const shortTimeHours = summary.shortTimeHours ?? summary.deductibleShortHours ?? 0;
+  const extraTimeHours = summary.extraTimeHours ?? 0;
+  const incompleteCount = summary.incompleteAttendanceCount ?? 0;
+  const warnings = summary.warnings ?? [];
+
+  return (
+    <div className="space-y-4">
+      {/* Header & Schedule Overview */}
+      <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-800">
+          <div>
+            <h3 className="text-sm font-bold text-slate-100">
+              {summary.employeeName}{' '}
+              <span className="font-mono text-xs text-slate-400 font-normal">({summary.employeeCode})</span>
+            </h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Monthly Policy, Leave &amp; Working-Hours Summary • {summary.year}-
+              {String(summary.month).padStart(2, '0')}
+            </p>
+          </div>
+          <div className="text-xs text-slate-400 font-mono text-right">
+            <div>
+              {summary.shiftSchedule ? (
+                <span className="text-emerald-400 font-medium">{summary.shiftSchedule}</span>
+              ) : summary.configuredDailyWorkingHours !== null && summary.configuredDailyWorkingHours !== undefined ? (
+                <span className="text-indigo-300 font-medium">
+                  Explicit Daily Target: {summary.configuredDailyWorkingHours} hrs/day (No Shift)
+                </span>
+              ) : (
+                <span className="text-amber-400 font-medium">No Working Schedule Configured</span>
+              )}
+            </div>
+            <div className="text-[11px] text-slate-500 mt-0.5">
+              Daily Rate:{' '}
+              {summary.dailySalaryRate
+                ? formatMoney(summary.dailySalaryRate, baseCurrency, { decimals: roundingPrecision })
+                : '--'}{' '}
+              • Hourly Rate:{' '}
+              {summary.hourlySalaryRate
+                ? formatMoney(summary.hourlySalaryRate, baseCurrency, { decimals: roundingPrecision })
+                : '--'}
+            </div>
+          </div>
+        </div>
+
+        {/* Incomplete Attendance & Policy Warnings */}
+        {(incompleteCount > 0 || warnings.length > 0) && (
+          <div className="space-y-2">
+            {incompleteCount > 0 && (
+              <div className="p-3 bg-amber-950/50 border border-amber-700/70 rounded-lg flex items-start gap-2.5 text-xs text-amber-200">
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <div>
+                  <span className="font-semibold text-amber-100">
+                    Incomplete Attendance Warning ({incompleteCount} record{incompleteCount === 1 ? '' : 's'}):
+                  </span>{' '}
+                  Missing check-out punch(es) detected in this period. Review attendance logs before finalizing payroll deductions.
+                </div>
+              </div>
+            )}
+            {warnings.map((w, idx) => (
+              <div
+                key={idx}
+                className="p-3 bg-amber-950/30 border border-amber-800/70 rounded-lg flex items-start gap-2.5 text-xs text-amber-200"
+              >
+                <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <span>{w}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Monthly Leave Entitlement KPI Grid */}
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div className="bg-slate-950 p-3.5 rounded-lg border border-slate-800/80">
+            <span className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider">
+              Monthly Leave Allowance
+            </span>
+            <div className="text-base font-bold font-mono tabular-nums text-indigo-300 mt-1">
+              {allowance} days
+            </div>
+          </div>
+
+          <div className="bg-slate-950 p-3.5 rounded-lg border border-slate-800/80">
+            <span className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider">
+              Approved Leave Days
+            </span>
+            <div className="text-base font-bold font-mono tabular-nums text-slate-100 mt-1">
+              {approvedDays} days
+            </div>
+          </div>
+
+          <div className="bg-slate-950 p-3.5 rounded-lg border border-slate-800/80">
+            <span className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider">
+              Remaining Leave
+            </span>
+            <div className="text-base font-bold font-mono tabular-nums text-emerald-400 mt-1">
+              {remainingLeave} days
+            </div>
+          </div>
+
+          <div className="bg-slate-950 p-3.5 rounded-lg border border-slate-800/80">
+            <span className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider">
+              Excess Leave Days
+            </span>
+            <div
+              className={`text-base font-bold font-mono tabular-nums mt-1 ${
+                excessLeaveDays > 0 ? 'text-rose-400' : 'text-slate-300'
+              }`}
+            >
+              {excessLeaveDays} days
+            </div>
+          </div>
+        </div>
+
+        {/* Working Hours Reconciliation (Short Time & Extra Time strictly separated) */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
+          <div className="bg-slate-950 p-3.5 rounded-lg border border-slate-800/80">
+            <span className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider">
+              Worked vs Required
+            </span>
+            <div className="text-sm font-bold font-mono tabular-nums text-slate-200 mt-1">
+              {formatMinutesAsHoursMinutes(summary.totalActualWorkedMinutes)} /{' '}
+              {formatMinutesAsHoursMinutes(summary.totalRequiredMinutes)}
+            </div>
+            <div className="text-[10px] text-slate-500 mt-0.5">
+              Configured: {summary.configuredDailyWorkingHours ?? '--'} hrs/day
+            </div>
+          </div>
+
+          <div className="bg-slate-950 p-3.5 rounded-lg border border-rose-900/40">
+            <span className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider">
+              Short Time Hours
+            </span>
+            <div
+              className={`text-base font-bold font-mono tabular-nums mt-1 ${
+                shortTimeHours > 0 ? 'text-rose-400' : 'text-slate-300'
+              }`}
+            >
+              {shortTimeHours} hrs
+            </div>
+            <div className="text-[10px] text-slate-500 mt-0.5">
+              {summary.shortTimeMinutes !== undefined
+                ? `${summary.shortTimeMinutes} min total shortfall`
+                : 'Deductible shortfall'}
+            </div>
+          </div>
+
+          <div className="bg-slate-950 p-3.5 rounded-lg border border-sky-900/40">
+            <span className="text-[10px] text-sky-400 uppercase font-semibold tracking-wider">
+              Extra Time Hours (Informational Only)
+            </span>
+            <div className="text-base font-bold font-mono tabular-nums text-sky-300 mt-1">
+              {extraTimeHours} hrs
+            </div>
+            <div className="text-[10px] text-sky-300/80 mt-0.5">
+              Informational only — never offsets Short Time.
+            </div>
+          </div>
+
+          <div
+            className={`bg-slate-950 p-3.5 rounded-lg border ${
+              incompleteCount > 0 ? 'border-amber-700/70' : 'border-slate-800/80'
+            }`}
+          >
+            <span className="text-[10px] text-slate-500 uppercase font-semibold tracking-wider">
+              Incomplete Attendance
+            </span>
+            <div
+              className={`text-base font-bold font-mono tabular-nums mt-1 ${
+                incompleteCount > 0 ? 'text-amber-400' : 'text-emerald-400'
+              }`}
+            >
+              {incompleteCount} record{incompleteCount === 1 ? '' : 's'}
+            </div>
+            <div className="text-[10px] text-slate-500 mt-0.5">
+              {incompleteCount > 0 ? 'Missing punch-out alert active' : 'All punch records complete'}
+            </div>
+          </div>
+        </div>
+
+        {/* Policy Statement Callout */}
+        <div className="p-3 bg-sky-950/30 border border-sky-800/50 rounded-lg text-[11px] text-sky-200 flex items-start gap-2">
+          <Info className="w-3.5 h-3.5 text-sky-400 shrink-0 mt-0.5" />
+          <span>
+            <strong>Working-Hours Policy:</strong> Extra Time is informational only and never offsets Short Time or generates automatic overtime pay.
+          </span>
+        </div>
+
+        {/* Salary Deductions Breakdown */}
+        <div className="bg-slate-950 p-4 rounded-lg border border-slate-800 space-y-3">
+          <div className="flex items-center justify-between text-xs font-semibold text-slate-300">
+            <span>Monthly Salary Deductions</span>
+            <span className="text-[11px] text-slate-500 font-normal">Authoritative Leave &amp; Hours Computation</span>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="p-3 bg-slate-900/60 rounded border border-slate-800/60 flex justify-between items-center">
+              <div>
+                <div className="text-[11px] text-slate-400">Excess Leave Deduction</div>
+                <div className="text-[10px] text-slate-500">{excessLeaveDays} excess day(s) × Daily Rate</div>
+              </div>
+              <div className="text-sm font-bold font-mono tabular-nums text-rose-400">
+                {formatMoney(summary.excessLeaveDeduction || 0, baseCurrency, { decimals: roundingPrecision })}
+              </div>
+            </div>
+
+            <div className="p-3 bg-slate-900/60 rounded border border-slate-800/60 flex justify-between items-center">
+              <div>
+                <div className="text-[11px] text-slate-400">Short-Hours Deduction</div>
+                <div className="text-[10px] text-slate-500">{shortTimeHours} hrs × Hourly Rate</div>
+              </div>
+              <div className="text-sm font-bold font-mono tabular-nums text-rose-400">
+                {formatMoney(summary.shortHoursDeduction || 0, baseCurrency, { decimals: roundingPrecision })}
+              </div>
+            </div>
+
+            <div className="p-3 bg-slate-900/80 rounded border border-rose-900/40 flex justify-between items-center">
+              <div>
+                <div className="text-[11px] text-slate-200 font-semibold">Total Salary Deductions</div>
+                <div className="text-[10px] text-slate-500">Excess Leave + Short Hours</div>
+              </div>
+              <div className="text-base font-extrabold font-mono tabular-nums text-rose-400">
+                {formatMoney(summary.totalSalaryDeductions || 0, baseCurrency, { decimals: roundingPrecision })}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
 
 interface LeavePageProps {
   currentUser: AuthUser;
+  companyProfile?: CompanyProfile | null;
 }
 
-export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
+export const LeavePage: React.FC<LeavePageProps> = ({ currentUser, companyProfile }) => {
   const isEmployee = currentUser.role === 'EMPLOYEE';
-  const [activeTab, setActiveTab] = useState<'requests' | 'types'>('requests');
+  const baseCurrency = companyProfile?.currency;
+  const roundingPrecision = companyProfile?.roundingPrecision;
+  const [activeTab, setActiveTab] = useState<'requests' | 'summary' | 'types'>('requests');
 
   // Leave Requests State
   const [requests, setRequests] = useState<LeaveRequestItem[]>([]);
@@ -58,8 +321,17 @@ export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
   const [isLoadingTypes, setIsLoadingTypes] = useState<boolean>(false);
   const [typesError, setTypesError] = useState<string | null>(null);
 
-  // Employees lookup for manager filtering
+  // Employees lookup for manager filtering & monthly summary inspector
   const [employees, setEmployees] = useState<EmployeeItem[]>([]);
+
+  // Manager/Admin Monthly Policy & Summary Inspector State
+  const nowDate = new Date();
+  const [inspectorEmployeeId, setInspectorEmployeeId] = useState<string>('');
+  const [inspectorYear, setInspectorYear] = useState<number>(nowDate.getUTCFullYear());
+  const [inspectorMonth, setInspectorMonth] = useState<number>(nowDate.getUTCMonth() + 1);
+  const [inspectorSummary, setInspectorSummary] = useState<MonthlyLeaveSummary | null>(null);
+  const [isLoadingInspector, setIsLoadingInspector] = useState<boolean>(false);
+  const [inspectorError, setInspectorError] = useState<string | null>(null);
 
   // Modals
   const [isSubmitModalOpen, setIsSubmitModalOpen] = useState<boolean>(false);
@@ -91,6 +363,16 @@ export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
   const [typeIsPaid, setTypeIsPaid] = useState<boolean>(true);
   const [typeDefaultAllowance, setTypeDefaultAllowance] = useState<number>(14);
 
+  // Action feedback & confirmation modal state
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<
+    | { kind: 'approve-request'; request: LeaveRequestItem }
+    | { kind: 'deactivate-type'; type: LeaveTypeItem }
+    | null
+  >(null);
+  const [isConfirmSubmitting, setIsConfirmSubmitting] = useState<boolean>(false);
+
   // Load Leave Types
   const loadLeaveTypes = useCallback(async () => {
     setIsLoadingTypes(true);
@@ -111,10 +393,36 @@ export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
     try {
       const res = await api.getEmployees({ limit: 100, status: 'ACTIVE' });
       setEmployees(res.items);
+      if (res.items.length > 0) {
+        setInspectorEmployeeId((prev) => prev || res.items[0].id);
+      }
     } catch {
       // Safe fallback
     }
   }, [isEmployee]);
+
+  // Load Manager/Admin Employee Monthly Summary
+  const loadInspectorSummary = useCallback(async () => {
+    if (isEmployee || !inspectorEmployeeId) {
+      setInspectorSummary(null);
+      return;
+    }
+    setIsLoadingInspector(true);
+    setInspectorError(null);
+    try {
+      const data = await api.getLeaveSummary({
+        employeeId: inspectorEmployeeId,
+        year: inspectorYear,
+        month: inspectorMonth,
+      });
+      setInspectorSummary(data);
+    } catch (err: unknown) {
+      setInspectorSummary(null);
+      setInspectorError((err as Error).message || 'Failed to load employee monthly summary.');
+    } finally {
+      setIsLoadingInspector(false);
+    }
+  }, [isEmployee, inspectorEmployeeId, inspectorYear, inspectorMonth]);
 
   // Load Requests
   const loadRequests = useCallback(async () => {
@@ -147,6 +455,12 @@ export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
     loadLeaveTypes();
     loadEmployees();
   }, [loadLeaveTypes, loadEmployees]);
+
+  useEffect(() => {
+    if (activeTab === 'summary' && !isEmployee && inspectorEmployeeId) {
+      loadInspectorSummary();
+    }
+  }, [activeTab, isEmployee, inspectorEmployeeId, loadInspectorSummary]);
 
   // Calculate day difference between start and end date
   const calculateDays = (start: string, end: string): number => {
@@ -206,16 +520,9 @@ export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
   };
 
   // Manager Approve
-  const handleApprove = async (request: LeaveRequestItem) => {
-    if (!confirm(`Approve leave request for ${request.employeeName} (${request.startDate} to ${request.endDate})?`)) {
-      return;
-    }
-    try {
-      await api.approveLeaveRequest(request.id);
-      loadRequests();
-    } catch (err: unknown) {
-      alert((err as Error).message || 'Failed to approve leave request.');
-    }
+  const handleApprove = (request: LeaveRequestItem) => {
+    setActionError(null);
+    setPendingConfirm({ kind: 'approve-request', request });
   };
 
   // Manager Reject
@@ -306,15 +613,52 @@ export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
     }
   };
 
-  const handleDeactivateType = async (type: LeaveTypeItem) => {
-    if (!confirm(`Are you sure you want to deactivate leave type "${type.name}" (${type.code})? It cannot be selected for future leave applications.`)) {
-      return;
-    }
+  const handleDeactivateType = (type: LeaveTypeItem) => {
+    setActionError(null);
+    setPendingConfirm({ kind: 'deactivate-type', type });
+  };
+
+  const handleConfirmAction = async () => {
+    if (!pendingConfirm) return;
+    setIsConfirmSubmitting(true);
+    setActionError(null);
+
     try {
-      await api.deactivateLeaveType(type.id);
-      loadLeaveTypes();
-    } catch (err: unknown) {
-      alert((err as Error).message || 'Failed to deactivate leave type.');
+      if (pendingConfirm.kind === 'approve-request') {
+        const { request } = pendingConfirm;
+        const outcome = await executeConfirmedAction(
+          true,
+          () => api.approveLeaveRequest(request.id),
+          'Failed to approve leave request.'
+        );
+        if (outcome?.ok) {
+          setActionSuccess(
+            `Approved leave request for ${request.employeeName} (${request.startDate} to ${request.endDate}).`
+          );
+          setPendingConfirm(null);
+          loadRequests();
+        } else if (outcome?.errorMessage) {
+          setActionError(outcome.errorMessage);
+          setPendingConfirm(null);
+        }
+      } else {
+        const { type } = pendingConfirm;
+        const outcome = await executeConfirmedAction(
+          true,
+          () => api.deactivateLeaveType(type.id),
+          'Failed to deactivate leave type.'
+        );
+        if (outcome?.ok) {
+          setActionSuccess(`Leave type "${type.name}" (${type.code}) deactivated.`);
+          setPendingConfirm(null);
+          loadLeaveTypes();
+        } else if (outcome?.errorMessage) {
+          setActionError(outcome.errorMessage);
+          setPendingConfirm(null);
+        }
+      }
+    } finally {
+      setIsConfirmSubmitting(false);
     }
   };
 
@@ -363,6 +707,16 @@ export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
                 Leave Requests
               </button>
               <button
+                onClick={() => setActiveTab('summary')}
+                className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
+                  activeTab === 'summary'
+                    ? 'bg-indigo-600 text-white'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Monthly Policy &amp; Summary
+              </button>
+              <button
                 onClick={() => setActiveTab('types')}
                 className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
                   activeTab === 'types'
@@ -409,6 +763,47 @@ export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
           </p>
         </div>
       </div>
+
+      {/* Action Feedback Banners */}
+      {actionError && (
+        <div
+          role="alert"
+          className="p-4 rounded-xl bg-rose-950/50 border border-rose-800 text-rose-200 text-xs flex items-center justify-between"
+        >
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+            <span>{actionError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActionError(null)}
+            aria-label="Dismiss error notification"
+            className="cursor-pointer text-rose-400 hover:text-white"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {actionSuccess && (
+        <div
+          role="status"
+          className="p-4 rounded-xl bg-emerald-950/50 border border-emerald-800 text-emerald-200 text-xs flex items-center justify-between"
+        >
+          <div className="flex items-center gap-2">
+            <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+            <span>{actionSuccess}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setActionSuccess(null)}
+            aria-label="Dismiss success notification"
+            className="cursor-pointer text-emerald-400 hover:text-white"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Main Tab: Requests */}
       {activeTab === 'requests' && (
@@ -675,6 +1070,117 @@ export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Manager/Admin Monthly Policy, Leave & Working-Hours Summary Inspector */}
+      {activeTab === 'summary' && !isEmployee && (
+        <div className="space-y-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 flex flex-wrap items-end justify-between gap-3">
+            <div className="flex flex-wrap items-end gap-3">
+              <div className="min-w-[220px]">
+                <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                  Employee
+                </label>
+                <select
+                  value={inspectorEmployeeId}
+                  onChange={(e) => setInspectorEmployeeId(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                >
+                  <option value="">Select an employee...</option>
+                  {employees.map((emp) => (
+                    <option key={emp.id} value={emp.id}>
+                      {emp.employeeCode} · {emp.fullName}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                  Month
+                </label>
+                <select
+                  value={inspectorMonth}
+                  onChange={(e) => setInspectorMonth(Number(e.target.value))}
+                  className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                >
+                  {[
+                    { m: 1, label: '01 - January' },
+                    { m: 2, label: '02 - February' },
+                    { m: 3, label: '03 - March' },
+                    { m: 4, label: '04 - April' },
+                    { m: 5, label: '05 - May' },
+                    { m: 6, label: '06 - June' },
+                    { m: 7, label: '07 - July' },
+                    { m: 8, label: '08 - August' },
+                    { m: 9, label: '09 - September' },
+                    { m: 10, label: '10 - October' },
+                    { m: 11, label: '11 - November' },
+                    { m: 12, label: '12 - December' },
+                  ].map((item) => (
+                    <option key={item.m} value={item.m}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                  Year
+                </label>
+                <select
+                  value={inspectorYear}
+                  onChange={(e) => setInspectorYear(Number(e.target.value))}
+                  className="bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 font-mono focus:outline-none focus:border-indigo-500"
+                >
+                  {[2024, 2025, 2026, 2027, 2028].map((yr) => (
+                    <option key={yr} value={yr}>
+                      {yr}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={loadInspectorSummary}
+              disabled={isLoadingInspector || !inspectorEmployeeId}
+              className="px-3 py-1.5 text-xs font-medium text-slate-200 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 rounded-lg transition-colors flex items-center gap-1.5"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${isLoadingInspector ? 'animate-spin' : ''}`} />
+              <span>Refresh Summary</span>
+            </button>
+          </div>
+
+          {inspectorError && (
+            <div className="bg-rose-950/40 border border-rose-900 rounded-xl p-4 text-xs text-rose-300 flex items-center gap-2.5">
+              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+              <span>{inspectorError}</span>
+            </div>
+          )}
+
+          {!inspectorEmployeeId ? (
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-8">
+              <EmptyState
+                icon={<Calendar className="w-6 h-6" />}
+                title="Select an Employee"
+                description="Choose an employee and billing month above to inspect their monthly leave allowance, Short Time, informational Extra Time, deductions, and attendance warnings."
+              />
+            </div>
+          ) : isLoadingInspector ? (
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-12">
+              <LoadingSpinner message="Computing employee monthly policy & hours summary..." />
+            </div>
+          ) : inspectorSummary ? (
+            <LeaveMonthlySummaryInspectorPanel
+              summary={inspectorSummary}
+              baseCurrency={baseCurrency}
+              roundingPrecision={roundingPrecision}
+            />
+          ) : null}
         </div>
       )}
 
@@ -1067,6 +1573,35 @@ export const LeavePage: React.FC<LeavePageProps> = ({ currentUser }) => {
           </div>
         </div>
       )}
+      <ConfirmDialog
+        isOpen={Boolean(pendingConfirm)}
+        title={
+          pendingConfirm?.kind === 'approve-request'
+            ? 'Approve Leave Request'
+            : 'Deactivate Leave Type'
+        }
+        message={
+          pendingConfirm?.kind === 'approve-request'
+            ? `Approve leave request for ${pendingConfirm.request.employeeName} (${pendingConfirm.request.startDate} to ${pendingConfirm.request.endDate})?`
+            : pendingConfirm?.kind === 'deactivate-type'
+            ? `Are you sure you want to deactivate leave type "${pendingConfirm.type.name}" (${pendingConfirm.type.code})? It cannot be selected for future leave applications.`
+            : ''
+        }
+        confirmLabel={
+          pendingConfirm?.kind === 'approve-request' ? 'Approve Request' : 'Deactivate'
+        }
+        confirmBusyLabel={
+          pendingConfirm?.kind === 'approve-request' ? 'Approving...' : 'Deactivating...'
+        }
+        variant={pendingConfirm?.kind === 'approve-request' ? 'primary' : 'danger'}
+        isSubmitting={isConfirmSubmitting}
+        onConfirm={handleConfirmAction}
+        onCancel={() => {
+          if (!isConfirmSubmitting) {
+            setPendingConfirm(null);
+          }
+        }}
+      />
     </div>
   );
 };

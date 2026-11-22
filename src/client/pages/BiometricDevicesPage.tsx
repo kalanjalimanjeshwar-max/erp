@@ -55,7 +55,221 @@ import {
   formatDateTimeInTimezone,
   formatUtcTimestamp,
   getEffectiveTimeZone,
+  localDateTimeToUtcIso,
 } from '../../shared/timezone.ts';
+
+const DATE_ONLY_INPUT_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/;
+const LOCAL_DATETIME_INPUT_REGEX = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/;
+const ISO_DATETIME_TZ_INPUT_REGEX =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-]\d{2}:\d{2})$/;
+
+function isValidCalendarDate(year: number, month: number, day: number): boolean {
+  if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+  const probe = new Date(Date.UTC(year, month - 1, day));
+  return (
+    probe.getUTCFullYear() === year &&
+    probe.getUTCMonth() === month - 1 &&
+    probe.getUTCDate() === day
+  );
+}
+
+/**
+ * Converts an optional administrator-supplied "From Punch Date/Time" input into
+ * an API-compatible cutoff string (`YYYY-MM-DD` or UTC ISO-8601), or `undefined`
+ * when blank so normal company-local today-only sync cutoff is preserved.
+ */
+export function parseLocalHistoricalCutoffInput(
+  input: string,
+  timezone: string
+): string | undefined {
+  const trimmed = input.trim();
+  if (!trimmed) return undefined;
+
+  const dateOnlyMatch = DATE_ONLY_INPUT_REGEX.exec(trimmed);
+  if (dateOnlyMatch) {
+    const [, y, m, d] = dateOnlyMatch;
+    if (!isValidCalendarDate(Number(y), Number(m), Number(d))) {
+      throw new Error(`Invalid From Punch Date '${trimmed}'. Please choose a valid calendar date.`);
+    }
+    return trimmed;
+  }
+
+  const localDtMatch = LOCAL_DATETIME_INPUT_REGEX.exec(trimmed);
+  if (localDtMatch) {
+    const [, y, m, d, hh, mm, ss] = localDtMatch;
+    const hour = Number(hh);
+    const minute = Number(mm);
+    const second = ss !== undefined ? Number(ss) : 0;
+    if (
+      !isValidCalendarDate(Number(y), Number(m), Number(d)) ||
+      hour > 23 ||
+      minute > 59 ||
+      second > 59
+    ) {
+      throw new Error(`Invalid From Punch Date/Time '${trimmed}'.`);
+    }
+    const datePart = `${y}-${m}-${d}`;
+    const timePart = `${hh}:${mm}:${ss ?? '00'}`;
+    return localDateTimeToUtcIso(datePart, timePart, timezone);
+  }
+
+  const isoMatch = ISO_DATETIME_TZ_INPUT_REGEX.exec(trimmed);
+  if (isoMatch) {
+    const [, y, m, d, hh, mm, ss] = isoMatch;
+    const hour = Number(hh);
+    const minute = Number(mm);
+    const second = ss !== undefined ? Number(ss) : 0;
+    if (
+      !isValidCalendarDate(Number(y), Number(m), Number(d)) ||
+      hour > 23 ||
+      minute > 59 ||
+      second > 59 ||
+      Number.isNaN(new Date(trimmed).getTime())
+    ) {
+      throw new Error(`Invalid From Punch Date/Time '${trimmed}'.`);
+    }
+    return trimmed;
+  }
+
+  throw new Error(
+    "Invalid From Punch Date/Time. Leave blank for today-only sync or enter a valid date/time."
+  );
+}
+
+export interface BuildBiometricSyncPayloadInput {
+  batchSize: number;
+  retryErrors: boolean;
+  terminalId?: string;
+  userEnrollmentId?: string;
+  employeeId?: string;
+  punchId?: string;
+  fromPunchDateTime?: string;
+  timezone: string;
+}
+
+export function buildBiometricSyncPayload(
+  params: BuildBiometricSyncPayloadInput
+): PunchReconciliationOptions {
+  const trimmedEnrollmentId = (params.userEnrollmentId || '').trim();
+  const parsedFromPunchTime = parseLocalHistoricalCutoffInput(
+    params.fromPunchDateTime || '',
+    params.timezone
+  );
+
+  return {
+    batchSize: params.punchId ? 1 : Math.max(1, Math.min(500, params.batchSize)),
+    retryErrors: params.retryErrors,
+    ...(params.terminalId ? { terminalId: params.terminalId } : {}),
+    ...(trimmedEnrollmentId ? { userEnrollmentId: trimmedEnrollmentId } : {}),
+    ...(params.employeeId ? { employeeId: params.employeeId } : {}),
+    ...(params.punchId ? { punchId: params.punchId } : {}),
+    ...(parsedFromPunchTime !== undefined ? { fromPunchTime: parsedFromPunchTime } : {}),
+  };
+}
+
+export interface BiometricHistoricalCutoffNoticeProps {
+  timezone: string;
+  compact?: boolean;
+}
+
+export const BiometricHistoricalCutoffNotice: React.FC<BiometricHistoricalCutoffNoticeProps> = ({
+  timezone,
+  compact = false,
+}) => (
+  <div
+    className={`${
+      compact ? 'p-3' : 'p-3.5'
+    } bg-amber-950/30 border border-amber-700/50 rounded-xl flex items-start gap-2.5 text-amber-100 text-xs`}
+  >
+    <Clock className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+    <div className="space-y-1 leading-relaxed">
+      <div className="font-semibold text-amber-200">
+        Normal Sync Today-Only Cutoff ({timezone})
+      </div>
+      <p className="text-[11px] text-amber-200/90">
+        Normal biometric sync processes only punches from the beginning of the current company-local
+        day (00:00 in <span className="font-mono text-amber-100">{timezone}</span>). Historical{' '}
+        <span className="font-mono font-semibold text-amber-100">PENDING</span> punches from prior
+        days are never processed automatically by normal sync.
+      </p>
+      {!compact && (
+        <p className="text-[11px] text-amber-300/80">
+          To intentionally reconcile historical pending punches, open Manual Punch Reconciliation or
+          the Reconciliation Engine tab and explicitly set a{' '}
+          <span className="font-semibold text-amber-100">From Punch Date/Time</span> cutoff.
+        </p>
+      )}
+    </div>
+  </div>
+);
+
+export interface BiometricHistoricalConfirmationBannerProps {
+  fromPunchDateTime: string;
+  resolvedCutoffIso: string;
+  timezone: string;
+  isSubmitting: boolean;
+  onCancel: () => void;
+  onConfirm: () => void;
+}
+
+export const BiometricHistoricalConfirmationBanner: React.FC<
+  BiometricHistoricalConfirmationBannerProps
+> = ({ fromPunchDateTime, resolvedCutoffIso, timezone, isSubmitting, onCancel, onConfirm }) => {
+  const formattedLocalCutoff = DATE_ONLY_INPUT_REGEX.test(resolvedCutoffIso)
+    ? `${resolvedCutoffIso} 00:00 (${timezone})`
+    : `${formatDateTimeInTimezone(resolvedCutoffIso, timezone, { includeSeconds: true })} (${timezone})`;
+
+  return (
+    <div className="p-3.5 bg-amber-950/50 border border-amber-600/70 rounded-xl space-y-2.5 text-xs text-amber-100">
+      <div className="flex items-start gap-2">
+        <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+        <div className="space-y-1">
+          <div className="font-semibold text-amber-200">
+            Confirm Historical Punch Reconciliation
+          </div>
+          <p className="text-[11px] text-amber-100/90 leading-relaxed">
+            You have explicitly specified a historical cutoff (
+            <span className="font-mono font-semibold text-amber-50">{formattedLocalCutoff}</span>
+            {fromPunchDateTime.trim() !== resolvedCutoffIso && (
+              <span className="text-amber-300/90"> · UTC {resolvedCutoffIso}</span>
+            )}
+            ). Historical <span className="font-mono">PENDING</span> punches from this timestamp
+            onward will be evaluated and reconciled against historical shift and work-policy rules.
+            Locked payroll periods and approved leave records remain protected.
+          </p>
+        </div>
+      </div>
+      <div className="flex items-center justify-end gap-2 pt-1">
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={isSubmitting}
+          className="px-3 py-1.5 text-[11px] font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg transition cursor-pointer disabled:opacity-50"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={onConfirm}
+          disabled={isSubmitting}
+          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-[11px] font-semibold text-slate-950 bg-amber-400 hover:bg-amber-300 rounded-lg transition cursor-pointer disabled:opacity-50"
+        >
+          {isSubmitting ? (
+            <>
+              <RefreshCw className="w-3 h-3 animate-spin" />
+              <span>Reconciling Historical Punches...</span>
+            </>
+          ) : (
+            <>
+              <AlertTriangle className="w-3 h-3" />
+              <span>Confirm Historical Reconciliation</span>
+            </>
+          )}
+        </button>
+      </div>
+    </div>
+  );
+};
 
 interface BiometricDevicesPageProps {
   currentUser: AuthUser;
@@ -122,6 +336,8 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   const [syncSelectedEmployeeId, setSyncSelectedEmployeeId] = useState<string>('');
   const [syncSelectedPunchId, setSyncSelectedPunchId] = useState<string>('');
   const [syncRetryErrors, setSyncRetryErrors] = useState<boolean>(false);
+  const [syncFromPunchTime, setSyncFromPunchTime] = useState<string>('');
+  const [isConfirmingHistoricalSync, setIsConfirmingHistoricalSync] = useState<boolean>(false);
   const [syncOutcome, setSyncOutcome] = useState<PunchReconciliationResponse | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [reconcileEmployees, setReconcileEmployees] = useState<EmployeeItem[]>([]);
@@ -339,25 +555,27 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     }
   };
 
-  // Handle Manual Punch Sync (Default Batch or Targeted Filter / Single Punch)
-  const handleTriggerSync = async () => {
+  // Execute Manual Punch Sync (Default Today-Only Batch, Targeted Filter, or Confirmed Historical Cutoff)
+  const executeTriggerSync = async () => {
     setIsTriggeringSync(true);
     setSyncError(null);
     setSyncOutcome(null);
 
     try {
-      const trimmedEnrollmentId = syncEnrollmentId.trim();
-      const payload: PunchReconciliationOptions = {
-        batchSize: syncSelectedPunchId ? 1 : Math.max(1, Math.min(500, syncBatchSize)),
+      const payload = buildBiometricSyncPayload({
+        batchSize: syncBatchSize,
         retryErrors: syncRetryErrors,
-        ...(syncSelectedTerminalId ? { terminalId: syncSelectedTerminalId } : {}),
-        ...(trimmedEnrollmentId ? { userEnrollmentId: trimmedEnrollmentId } : {}),
-        ...(syncSelectedEmployeeId ? { employeeId: syncSelectedEmployeeId } : {}),
-        ...(syncSelectedPunchId ? { punchId: syncSelectedPunchId } : {}),
-      };
+        terminalId: syncSelectedTerminalId || undefined,
+        userEnrollmentId: syncEnrollmentId || undefined,
+        employeeId: syncSelectedEmployeeId || undefined,
+        punchId: syncSelectedPunchId || undefined,
+        fromPunchDateTime: syncFromPunchTime,
+        timezone,
+      });
 
       const result = await api.triggerBiometricSync(payload);
 
+      setIsConfirmingHistoricalSync(false);
       setSyncOutcome(result);
 
       // Refresh telemetry and punch log records
@@ -375,6 +593,28 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     }
   };
 
+  // Handle Manual Punch Sync Click (Requires Explicit Confirmation When Historical Cutoff Is Set)
+  const handleTriggerSync = async () => {
+    setSyncError(null);
+    const trimmedHistoricalCutoff = syncFromPunchTime.trim();
+
+    if (trimmedHistoricalCutoff) {
+      try {
+        parseLocalHistoricalCutoffInput(trimmedHistoricalCutoff, timezone);
+      } catch (err: unknown) {
+        setSyncError((err as Error).message || 'Invalid From Punch Date/Time.');
+        return;
+      }
+
+      if (!isConfirmingHistoricalSync) {
+        setIsConfirmingHistoricalSync(true);
+        return;
+      }
+    }
+
+    await executeTriggerSync();
+  };
+
   const handleOpenTargetedPunchReconcile = (punch: RawPunchLogItem) => {
     setSyncOutcome(null);
     setSyncError(null);
@@ -382,6 +622,8 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     setSyncEnrollmentId('');
     setSyncSelectedEmployeeId('');
     setSyncSelectedPunchId(punch.id);
+    setSyncFromPunchTime('');
+    setIsConfirmingHistoricalSync(false);
     setSyncRetryErrors(punch.syncStatus === 'ERROR');
     setPendingPunchOptions((prev) =>
       prev.some((item) => item.id === punch.id) ? prev : [punch, ...prev]
@@ -394,6 +636,8 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     setSyncEnrollmentId('');
     setSyncSelectedEmployeeId('');
     setSyncSelectedPunchId('');
+    setSyncFromPunchTime('');
+    setIsConfirmingHistoricalSync(false);
   };
 
   // Copy API Key Helper
@@ -563,6 +807,17 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
     punches.find((p) => p.id === syncSelectedPunchId) ||
     null;
 
+  const hasHistoricalCutoff = Boolean(syncFromPunchTime.trim());
+  let resolvedHistoricalCutoffPreview: string | null = null;
+  if (hasHistoricalCutoff) {
+    try {
+      resolvedHistoricalCutoffPreview =
+        parseLocalHistoricalCutoffInput(syncFromPunchTime, timezone) || null;
+    } catch {
+      resolvedHistoricalCutoffPreview = null;
+    }
+  }
+
   return (
     <div className="space-y-6">
       {/* Top Bar Header Contract */}
@@ -613,6 +868,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
             onClick={() => {
               setSyncOutcome(null);
               setSyncError(null);
+              setIsConfirmingHistoricalSync(false);
               setIsSyncModalOpen(true);
             }}
             className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-medium text-indigo-200 bg-indigo-950/80 hover:bg-indigo-900 border border-indigo-700/60 rounded-lg transition cursor-pointer whitespace-nowrap shrink-0"
@@ -725,6 +981,9 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
           <div className="text-[11px] text-slate-400 mt-0.5">Requires enrollment mapping</div>
         </div>
       </div>
+
+      {/* Historical Cutoff Policy Notice */}
+      <BiometricHistoricalCutoffNotice timezone={timezone} />
 
       {/* Segmented Tab Navigation */}
       <div className="flex items-center gap-1 p-1 bg-slate-900/80 border border-slate-800 rounded-xl w-fit">
@@ -1543,6 +1802,8 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                 employee shifts, assign work dates, and record verified attendance logs idempotently.
               </p>
 
+              <BiometricHistoricalCutoffNotice timezone={timezone} compact />
+
               <datalist id="reconcile-enrollment-suggestions">
                 {enrollmentSuggestions.map((eid) => (
                   <option key={eid} value={eid} />
@@ -1564,7 +1825,9 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                 </div>
               ) : (
                 <div className="p-2.5 bg-slate-800/40 border border-slate-700/60 rounded-lg text-[11px] text-slate-400">
-                  Default batch mode: processes up to {syncBatchSize} pending company punches when no targeted filter is selected.
+                  {hasHistoricalCutoff
+                    ? `Historical reconciliation cutoff set: processes up to ${syncBatchSize} pending company punches from the chosen date/time onward after confirmation.`
+                    : `Default today-only batch mode: processes up to ${syncBatchSize} pending company punches from the start of today (${timezone}) when no targeted filter or historical cutoff is selected.`}
                 </div>
               )}
 
@@ -1671,6 +1934,44 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                   </div>
                 </div>
 
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label
+                      htmlFor="sync-tab-from-punch-time"
+                      className="block text-xs font-medium text-slate-300"
+                    >
+                      From Punch Date/Time (Optional — Historical Cutoff)
+                    </label>
+                    {hasHistoricalCutoff && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setSyncFromPunchTime('');
+                          setIsConfirmingHistoricalSync(false);
+                        }}
+                        className="text-[11px] text-amber-300 hover:text-amber-200 cursor-pointer"
+                      >
+                        Clear Cutoff
+                      </button>
+                    )}
+                  </div>
+                  <input
+                    id="sync-tab-from-punch-time"
+                    type="datetime-local"
+                    value={syncFromPunchTime}
+                    onChange={(e) => {
+                      setSyncFromPunchTime(e.target.value);
+                      setIsConfirmingHistoricalSync(false);
+                    }}
+                    className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs font-mono rounded-lg px-3 py-2 focus:outline-none focus:border-amber-500"
+                  />
+                  <span className="text-[11px] text-slate-400 mt-0.5 block">
+                    Leave blank for normal today-only sync (start of current day in{' '}
+                    <span className="font-mono text-slate-300">{timezone}</span>). Set only to
+                    intentionally reconcile historical PENDING punches.
+                  </span>
+                </div>
+
                 <div className="pt-1">
                   <label className="flex items-center gap-2 cursor-pointer">
                     <input
@@ -1691,31 +1992,44 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                   </div>
                 )}
 
-                <div className="pt-2">
-                  <button
-                    onClick={handleTriggerSync}
-                    disabled={isTriggeringSync}
-                    className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition cursor-pointer shadow-sm"
-                  >
-                    {isTriggeringSync ? (
-                      <>
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        <span>Reconciling Punches...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Activity className="w-3.5 h-3.5" />
-                        <span>
-                          {syncSelectedPunchId
-                            ? 'Reconcile Selected Punch'
-                            : isTargetedReconciliation
-                            ? 'Run Targeted Reconciliation'
-                            : 'Run Reconciliation Engine'}
-                        </span>
-                      </>
-                    )}
-                  </button>
-                </div>
+                {isConfirmingHistoricalSync && resolvedHistoricalCutoffPreview ? (
+                  <BiometricHistoricalConfirmationBanner
+                    fromPunchDateTime={syncFromPunchTime}
+                    resolvedCutoffIso={resolvedHistoricalCutoffPreview}
+                    timezone={timezone}
+                    isSubmitting={isTriggeringSync}
+                    onCancel={() => setIsConfirmingHistoricalSync(false)}
+                    onConfirm={executeTriggerSync}
+                  />
+                ) : (
+                  <div className="pt-2">
+                    <button
+                      onClick={handleTriggerSync}
+                      disabled={isTriggeringSync}
+                      className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition cursor-pointer shadow-sm"
+                    >
+                      {isTriggeringSync ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>Reconciling Punches...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Activity className="w-3.5 h-3.5" />
+                          <span>
+                            {syncSelectedPunchId
+                              ? 'Reconcile Selected Punch'
+                              : hasHistoricalCutoff
+                              ? 'Review & Run Historical Reconciliation'
+                              : isTargetedReconciliation
+                              ? 'Run Targeted Reconciliation'
+                              : 'Run Reconciliation Engine'}
+                          </span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1823,6 +2137,16 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                     <span>
                       <strong className="text-slate-100">Overnight Shift Awareness:</strong> Automatically maps punches
                       commencing before midnight to the correct shift start date.
+                    </span>
+                  </div>
+
+                  <div className="flex items-start gap-2">
+                    <Check className="w-3.5 h-3.5 text-emerald-400 shrink-0 mt-0.5" />
+                    <span>
+                      <strong className="text-slate-100">Historical Pending Punch Protection:</strong> Normal
+                      biometric sync processes only punches from the start of the current company-local day
+                      ({timezone}). Historical PENDING punches are never processed automatically unless an
+                      administrator explicitly provides and confirms a From Punch Date/Time cutoff.
                     </span>
                   </div>
 
@@ -2085,14 +2409,17 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
       {/* ==================================================================== */}
       {isSyncModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm">
-          <div className="w-full max-w-lg bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 space-y-4 animate-in fade-in zoom-in-95 duration-150">
+          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto bg-slate-900 border border-slate-800 rounded-2xl shadow-2xl p-6 space-y-4 animate-in fade-in zoom-in-95 duration-150">
             <div className="flex items-center justify-between pb-3 border-b border-slate-800">
               <div className="flex items-center gap-2">
                 <Activity className="w-5 h-5 text-indigo-400" />
                 <h3 className="text-sm font-bold text-slate-100">Manual Punch Reconciliation</h3>
               </div>
               <button
-                onClick={() => setIsSyncModalOpen(false)}
+                onClick={() => {
+                  setIsConfirmingHistoricalSync(false);
+                  setIsSyncModalOpen(false);
+                }}
                 className="text-slate-400 hover:text-slate-200 text-xs cursor-pointer"
               >
                 ✕
@@ -2187,6 +2514,8 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                     Reconcile pending punches with shift schedules. Select targeted filters to isolate one punch, enrollment ID, or employee without affecting other pending logs.
                   </p>
                 </div>
+
+                <BiometricHistoricalCutoffNotice timezone={timezone} compact />
 
                 <datalist id="modal-reconcile-enrollment-suggestions">
                   {enrollmentSuggestions.map((eid) => (
@@ -2299,6 +2628,44 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                   </div>
 
                   <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label
+                        htmlFor="sync-modal-from-punch-time"
+                        className="block text-xs font-medium text-slate-300"
+                      >
+                        From Punch Date/Time (Optional — Historical Cutoff)
+                      </label>
+                      {hasHistoricalCutoff && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSyncFromPunchTime('');
+                            setIsConfirmingHistoricalSync(false);
+                          }}
+                          className="text-[11px] text-amber-300 hover:text-amber-200 cursor-pointer"
+                        >
+                          Clear Cutoff
+                        </button>
+                      )}
+                    </div>
+                    <input
+                      id="sync-modal-from-punch-time"
+                      type="datetime-local"
+                      value={syncFromPunchTime}
+                      onChange={(e) => {
+                        setSyncFromPunchTime(e.target.value);
+                        setIsConfirmingHistoricalSync(false);
+                      }}
+                      className="w-full bg-slate-800 border border-slate-700 text-slate-200 text-xs font-mono rounded-lg px-3 py-2 focus:outline-none focus:border-amber-500"
+                    />
+                    <span className="text-[11px] text-slate-400 mt-0.5 block">
+                      Leave blank for normal today-only sync (start of current day in{' '}
+                      <span className="font-mono text-slate-300">{timezone}</span>). Enter a
+                      date/time only to intentionally reconcile historical PENDING punches.
+                    </span>
+                  </div>
+
+                  <div>
                     <label className="flex items-center gap-2 cursor-pointer">
                       <input
                         type="checkbox"
@@ -2317,38 +2684,54 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                   )}
                 </div>
 
-                <div className="pt-2 flex items-center justify-end gap-2.5">
-                  <button
-                    type="button"
-                    onClick={() => setIsSyncModalOpen(false)}
-                    className="px-3.5 py-2 text-xs font-medium text-slate-400 hover:text-slate-200 bg-slate-800/80 rounded-lg cursor-pointer"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={handleTriggerSync}
-                    disabled={isTriggeringSync}
-                    className="inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition cursor-pointer shadow-sm"
-                  >
-                    {isTriggeringSync ? (
-                      <>
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        <span>Reconciling...</span>
-                      </>
-                    ) : (
-                      <>
-                        <Activity className="w-3.5 h-3.5" />
-                        <span>
-                          {syncSelectedPunchId
-                            ? 'Reconcile Selected Punch'
-                            : isTargetedReconciliation
-                            ? 'Run Targeted Sync'
-                            : 'Run Sync'}
-                        </span>
-                      </>
-                    )}
-                  </button>
-                </div>
+                {isConfirmingHistoricalSync && resolvedHistoricalCutoffPreview ? (
+                  <BiometricHistoricalConfirmationBanner
+                    fromPunchDateTime={syncFromPunchTime}
+                    resolvedCutoffIso={resolvedHistoricalCutoffPreview}
+                    timezone={timezone}
+                    isSubmitting={isTriggeringSync}
+                    onCancel={() => setIsConfirmingHistoricalSync(false)}
+                    onConfirm={executeTriggerSync}
+                  />
+                ) : (
+                  <div className="pt-2 flex items-center justify-end gap-2.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setIsConfirmingHistoricalSync(false);
+                        setIsSyncModalOpen(false);
+                      }}
+                      className="px-3.5 py-2 text-xs font-medium text-slate-400 hover:text-slate-200 bg-slate-800/80 rounded-lg cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={handleTriggerSync}
+                      disabled={isTriggeringSync}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition cursor-pointer shadow-sm"
+                    >
+                      {isTriggeringSync ? (
+                        <>
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                          <span>Reconciling...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Activity className="w-3.5 h-3.5" />
+                          <span>
+                            {syncSelectedPunchId
+                              ? 'Reconcile Selected Punch'
+                              : hasHistoricalCutoff
+                              ? 'Review Historical Sync'
+                              : isTargetedReconciliation
+                              ? 'Run Targeted Sync'
+                              : 'Run Sync'}
+                          </span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </div>

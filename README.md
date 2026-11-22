@@ -173,12 +173,50 @@ npx prisma validate
 # 3. Run TypeScript compilation checks (runs prelint -> prisma generate)
 npm run lint
 
-# 4. Run complete test suite (runs pretest -> prisma generate)
+# 4. Run complete unit/offline test suite (runs pretest -> prisma generate; never connects to 5432 or 5434)
 npm test
 
 # 5. Build production bundle (runs prebuild -> prisma generate)
 npm run build
 ```
+
+### Isolated PostgreSQL 16 Integration Testing (Port 5434)
+
+Real PostgreSQL 16 integration tests run exclusively against the dedicated disposable container defined in `docker-compose.integration-test.yml` (`coreerp-postgres-integration-test`, host port `5434`, database `core_erp_integration_test`, user `erp_integration_user`). This environment is completely separate from local development (`localhost:5432` / `core_erp`) and from staging verification (`localhost:5433` / `core_erp_test` or an external `core_erp_staging` instance documented in `docs/staging-verification-guide.md`).
+
+**Database isolation guard layers**: Three independent layers enforce port-`5434` isolation during integration runs:
+- `tests/setup.ts`: Enables `COREERP_INTEGRATION_TEST_MODE=true`, deletes `DATABASE_URL`, wraps `dotenv.config()`, and validates `TEST_DATABASE_URL` against `localhost`/`127.0.0.1`, port `5434`, and `core_erp_integration_test`.
+- `src/server/db/client.ts`: Refuses conflicting `DATABASE_URL` (split-brain protection) and independently validates `TEST_DATABASE_URL` before creating or binding the integration Prisma client.
+- `src/server/config/env.ts`: Provides an additional independent integration-mode environment validation layer that permits `DATABASE_URL` omission strictly when `NODE_ENV=test` and `COREERP_INTEGRATION_TEST_MODE=true`, rejects any non-empty `DATABASE_URL` in integration mode, and independently validates `TEST_DATABASE_URL` against `localhost`/`127.0.0.1`, port `5434`, and `core_erp_integration_test` — while `tests/setup.ts` and `src/server/db/client.ts` retain their existing responsibilities.
+
+1. **Create a local git-ignored `.env.integration-test` file** on your Docker host:
+   ```env
+   POSTGRES_PASSWORD=<disposable_integration_password>
+   ```
+2. **Start the isolated PostgreSQL 16 integration container**:
+   ```bash
+   docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d
+   ```
+3. **Deploy all 16 version-controlled Prisma migrations** to `core_erp_integration_test` on port `5434` (pass `DATABASE_URL` inline for the explicitly targeted `prisma migrate deploy`/`status` commands only; do not leave it exported when invoking Vitest):
+   ```bash
+   DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy
+   DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate status
+   ```
+4. **Run targeted PostgreSQL 16 integration suites** (ensure `DATABASE_URL` remains unset; do **not** run full `npm test` with integration DB variables, as isolated unit tests reject `COREERP_INTEGRATION_TEST_MODE=true` and port `5434`):
+   ```bash
+   # Dedicated npm scripts:
+   TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency
+   TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:key-rotation
+
+   # Targeted Vitest invocations for all seven PostgreSQL 16 integration suites (with DATABASE_URL unset):
+   COREERP_INTEGRATION_TEST_MODE=true TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx vitest run tests/integration/concurrent-bank-account-default.test.ts
+   COREERP_INTEGRATION_TEST_MODE=true TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx vitest run tests/integration/concurrent-biometric-punch-ingestion.test.ts
+   COREERP_INTEGRATION_TEST_MODE=true TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx vitest run tests/integration/concurrent-punch-reconciliation.test.ts
+   COREERP_INTEGRATION_TEST_MODE=true TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx vitest run tests/integration/key-rotation-reencryption.test.ts
+   COREERP_INTEGRATION_TEST_MODE=true TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx vitest run tests/integration/work-policy-revision-constraints.test.ts
+   COREERP_INTEGRATION_TEST_MODE=true TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx vitest run tests/integration/company-profile-transaction-rollback.test.ts
+   COREERP_INTEGRATION_TEST_MODE=true TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx vitest run tests/integration/attendance-authorization-and-payroll-lock.test.ts
+   ```
 
 ---
 

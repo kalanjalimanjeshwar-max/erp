@@ -58,6 +58,53 @@ function mapChangeRequest(row: {
   };
 }
 
+export const PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY = 'PERMITTED_MONTHLY_LEAVE_ALLOWANCES_V1';
+export const STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS = [4, 5, 6] as const;
+
+export function parsePermittedMonthlyLeaveAllowances(rawValue?: string | null): number[] {
+  if (!rawValue || !rawValue.trim()) {
+    return [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
+  }
+  try {
+    const parsed = JSON.parse(rawValue);
+    if (!Array.isArray(parsed)) {
+      return [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
+    }
+    const valid = Array.from(
+      new Set(
+        parsed
+          .map((v) => Number(v))
+          .filter((n) => Number.isInteger(n) && (STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS as readonly number[]).includes(n))
+      )
+    ).sort((a, b) => a - b);
+    return valid.length > 0 ? valid : [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
+  } catch {
+    return [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
+  }
+}
+
+export function validatePermittedMonthlyLeaveAllowancesInput(raw: unknown): number[] {
+  if (!Array.isArray(raw) || raw.length === 0) {
+    const err = new Error('Permitted monthly leave allowances must be a non-empty array subset of [4, 5, 6] days.');
+    (err as { statusCode?: number }).statusCode = 400;
+    throw err;
+  }
+
+  const normalized: number[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'number' || !Number.isInteger(item) || !(STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS as readonly number[]).includes(item)) {
+      const err = new Error('Each permitted monthly leave allowance must be one of 4, 5, or 6 days.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+    if (!normalized.includes(item)) {
+      normalized.push(item);
+    }
+  }
+
+  return normalized.sort((a, b) => a - b);
+}
+
 export class CompanyService {
   /**
    * Resolves the company's configured base currency code cleanly.
@@ -90,6 +137,7 @@ export class CompanyService {
 
     let salesInvoiceEnabled = false;
     let rawPrintSettings: unknown = null;
+    let permittedMonthlyLeaveAllowances: number[] = [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
     let brandingAssets: CompanyBrandingAssetsState = {
       version: 1,
       logo: null,
@@ -101,15 +149,22 @@ export class CompanyService {
         where: {
           companyId,
           key: {
-            in: ['SALES_INVOICE_ENABLED', DOCUMENT_PRINT_SETTING_KEY, BRANDING_ASSETS_SETTING_KEY],
+            in: [
+              'SALES_INVOICE_ENABLED',
+              DOCUMENT_PRINT_SETTING_KEY,
+              BRANDING_ASSETS_SETTING_KEY,
+              PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
+            ],
           },
         },
       });
       const salesSetting = settings.find((s) => s.key === 'SALES_INVOICE_ENABLED');
       const printSetting = settings.find((s) => s.key === DOCUMENT_PRINT_SETTING_KEY);
       const assetsSetting = settings.find((s) => s.key === BRANDING_ASSETS_SETTING_KEY);
+      const allowanceSetting = settings.find((s) => s.key === PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY);
       salesInvoiceEnabled = salesSetting ? salesSetting.value === 'true' : false;
       rawPrintSettings = printSetting ? printSetting.value : null;
+      permittedMonthlyLeaveAllowances = parsePermittedMonthlyLeaveAllowances(allowanceSetting?.value);
       if (assetsSetting?.value) {
         const parsedAssets = JSON.parse(assetsSetting.value) as Partial<CompanyBrandingAssetsState>;
         brandingAssets = {
@@ -121,6 +176,7 @@ export class CompanyService {
       }
     } catch {
       salesInvoiceEnabled = false;
+      permittedMonthlyLeaveAllowances = [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
     }
 
     let roundingPrecision = getCurrencyMeta(company.currency).defaultDecimals;
@@ -183,7 +239,35 @@ export class CompanyService {
       roundingPrecision,
       defaultDocumentLanguage: company.defaultDocumentLanguage,
       printSettings,
+      permittedMonthlyLeaveAllowances,
     };
+  }
+
+  /**
+   * Resolves the company-permitted monthly leave allowance choices (defaults to [4, 5, 6]).
+   * Avoids touching unmocked Prisma inside offline unit tests.
+   */
+  static async getPermittedMonthlyLeaveAllowances(companyId: string): Promise<number[]> {
+    const findUniqueFn = prisma?.companySetting?.findUnique;
+    const isMocked = typeof (findUniqueFn as { mock?: unknown })?.mock === 'object';
+    const isTestEnv = process.env.VITEST === 'true' && process.env.COREERP_INTEGRATION_TEST_MODE !== 'true';
+    if (typeof findUniqueFn !== 'function' || (isTestEnv && !isMocked)) {
+      return [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
+    }
+
+    try {
+      const setting = await findUniqueFn({
+        where: {
+          companyId_key: {
+            companyId,
+            key: PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
+          },
+        },
+      });
+      return parsePermittedMonthlyLeaveAllowances(setting?.value);
+    } catch {
+      return [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
+    }
   }
 
   /**
@@ -438,6 +522,7 @@ export class CompanyService {
       type?: string;
       companyFields?: Record<string, unknown>;
       salesInvoiceEnabled?: boolean;
+      permittedMonthlyLeaveAllowances?: number[];
       settingKey?: string;
       printSettings?: DocumentPrintSettings;
     };
@@ -485,6 +570,28 @@ export class CompanyService {
           },
           update: {
             value: String(Boolean(payload.salesInvoiceEnabled)),
+          },
+        });
+      }
+
+      if (payload.permittedMonthlyLeaveAllowances !== undefined) {
+        const validatedAllowances = validatePermittedMonthlyLeaveAllowancesInput(
+          payload.permittedMonthlyLeaveAllowances
+        );
+        await tx.companySetting.upsert({
+          where: {
+            companyId_key: {
+              companyId: actor.companyId,
+              key: PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
+            },
+          },
+          create: {
+            companyId: actor.companyId,
+            key: PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
+            value: JSON.stringify(validatedAllowances),
+          },
+          update: {
+            value: JSON.stringify(validatedAllowances),
           },
         });
       }
@@ -652,6 +759,11 @@ export class CompanyService {
       throw err;
     }
 
+    const validatedPermittedAllowances =
+      input.permittedMonthlyLeaveAllowances !== undefined
+        ? validatePermittedMonthlyLeaveAllowancesInput(input.permittedMonthlyLeaveAllowances)
+        : undefined;
+
     if (actor.role !== 'SUPER_ADMIN' && actor.role !== 'ADMIN') {
       const err = new Error('Insufficient permissions to modify company settings.');
       (err as { statusCode?: number }).statusCode = 403;
@@ -661,6 +773,11 @@ export class CompanyService {
     // Check current company state for maker-checker evaluation when actor is ADMIN
     if (actor.role === 'ADMIN') {
       const current = await this.getProfile(actor.companyId);
+      const currentAllowances =
+        current.permittedMonthlyLeaveAllowances || [...STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS];
+      const allowancesChanged =
+        validatedPermittedAllowances !== undefined &&
+        JSON.stringify(currentAllowances) !== JSON.stringify(validatedPermittedAllowances);
       const protectedChanged =
         current.name !== input.name.trim() ||
         (current.legalName || null) !== (input.legalName?.trim() || null) ||
@@ -670,7 +787,8 @@ export class CompanyService {
         (input.salesInvoiceEnabled !== undefined &&
           Boolean(current.salesInvoiceEnabled) !== Boolean(input.salesInvoiceEnabled)) ||
         (input.defaultDocumentLanguage !== undefined &&
-          current.defaultDocumentLanguage !== input.defaultDocumentLanguage);
+          current.defaultDocumentLanguage !== input.defaultDocumentLanguage) ||
+        allowancesChanged;
 
       if (protectedChanged) {
         const changeRequest = await prisma.companySettingsChangeRequest.create({
@@ -698,6 +816,9 @@ export class CompanyService {
               },
               ...(input.salesInvoiceEnabled !== undefined
                 ? { salesInvoiceEnabled: Boolean(input.salesInvoiceEnabled) }
+                : {}),
+              ...(validatedPermittedAllowances !== undefined
+                ? { permittedMonthlyLeaveAllowances: validatedPermittedAllowances }
                 : {}),
             } as object,
           },
@@ -731,25 +852,81 @@ export class CompanyService {
     }
 
     // 2. Persist in PostgreSQL (SUPER_ADMIN or non-protected ADMIN update)
-    const updated = await prisma.company.update({
-      where: { id: actor.companyId },
-      data: {
-        name: input.name.trim(),
-        legalName: input.legalName?.trim() || null,
-        taxId: input.taxId?.trim() || null,
-        timezone: input.timezone.trim(),
-        currency: normalizedCurrency,
-        logoUrl: input.logoUrl?.trim() || null,
-        address: input.address?.trim() || null,
-        phone: input.phone?.trim() || null,
-        email: input.email?.trim().toLowerCase() || null,
-        website: input.website?.trim() || null,
-        appHeaderTitle: input.appHeaderTitle?.trim() || null,
-        ...(input.defaultDocumentLanguage
-          ? { defaultDocumentLanguage: input.defaultDocumentLanguage }
-          : {}),
-      },
-    });
+    const companyUpdateData = {
+      name: input.name.trim(),
+      legalName: input.legalName?.trim() || null,
+      taxId: input.taxId?.trim() || null,
+      timezone: input.timezone.trim(),
+      currency: normalizedCurrency,
+      logoUrl: input.logoUrl?.trim() || null,
+      address: input.address?.trim() || null,
+      phone: input.phone?.trim() || null,
+      email: input.email?.trim().toLowerCase() || null,
+      website: input.website?.trim() || null,
+      appHeaderTitle: input.appHeaderTitle?.trim() || null,
+      ...(input.defaultDocumentLanguage
+        ? { defaultDocumentLanguage: input.defaultDocumentLanguage }
+        : {}),
+    };
+
+    let updated: { code: string; name: string; timezone: string; currency: string };
+
+    if (validatedPermittedAllowances !== undefined || input.salesInvoiceEnabled !== undefined) {
+      // Persist company profile and CompanySetting updates atomically.
+      // Persistence failures roll back the transaction and propagate to the error handler.
+      updated = await prisma.$transaction(async (tx) => {
+        const updatedCompany = await tx.company.update({
+          where: { id: actor.companyId },
+          data: companyUpdateData,
+        });
+
+        if (input.salesInvoiceEnabled !== undefined) {
+          const salesInvoiceEnabled = Boolean(input.salesInvoiceEnabled);
+          await tx.companySetting.upsert({
+            where: {
+              companyId_key: {
+                companyId: actor.companyId,
+                key: 'SALES_INVOICE_ENABLED',
+              },
+            },
+            create: {
+              companyId: actor.companyId,
+              key: 'SALES_INVOICE_ENABLED',
+              value: String(salesInvoiceEnabled),
+            },
+            update: {
+              value: String(salesInvoiceEnabled),
+            },
+          });
+        }
+
+        if (validatedPermittedAllowances !== undefined) {
+          await tx.companySetting.upsert({
+            where: {
+              companyId_key: {
+                companyId: actor.companyId,
+                key: PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
+              },
+            },
+            create: {
+              companyId: actor.companyId,
+              key: PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
+              value: JSON.stringify(validatedPermittedAllowances),
+            },
+            update: {
+              value: JSON.stringify(validatedPermittedAllowances),
+            },
+          });
+        }
+
+        return updatedCompany;
+      });
+    } else {
+      updated = await prisma.company.update({
+        where: { id: actor.companyId },
+        data: companyUpdateData,
+      });
+    }
 
     await AuditService.log({
       companyId: actor.companyId,
@@ -768,31 +945,6 @@ export class CompanyService {
         },
       },
     });
-
-    // 3. Persist optional sales invoice feature setting
-    if (input.salesInvoiceEnabled !== undefined) {
-      const salesInvoiceEnabled = Boolean(input.salesInvoiceEnabled);
-      try {
-        await prisma.companySetting.upsert({
-          where: {
-            companyId_key: {
-              companyId: actor.companyId,
-              key: 'SALES_INVOICE_ENABLED',
-            },
-          },
-          create: {
-            companyId: actor.companyId,
-            key: 'SALES_INVOICE_ENABLED',
-            value: String(salesInvoiceEnabled),
-          },
-          update: {
-            value: String(salesInvoiceEnabled),
-          },
-        });
-      } catch {
-        // Fallback for mocked or offline DB in test environments
-      }
-    }
 
     return this.getProfile(actor.companyId);
   }

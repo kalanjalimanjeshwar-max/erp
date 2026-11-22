@@ -23,6 +23,7 @@ import {
 import { api, ApiError } from '../services/api.ts';
 import { LoadingSpinner } from '../components/common/LoadingSpinner.tsx';
 import { EmptyState } from '../components/common/EmptyState.tsx';
+import { ConfirmDialog, executeConfirmedAction } from '../components/common/ConfirmDialog.tsx';
 import {
   AuthUser,
   PayrollPeriodItem,
@@ -46,6 +47,237 @@ interface PayrollPageProps {
   companyProfile?: CompanyProfile | null;
   onNavigateToJournals?: () => void;
 }
+
+export function computePayslipDeductionSummary(
+  ps: Pick<PayslipItem, 'deductions' | 'lossOfPayDeduction'>
+): {
+  lopDeduction: number;
+  otherDeductions: number;
+  totalDeductions: number;
+} {
+  const totalDeductions = Math.max(0, Number(ps.deductions) || 0);
+  const lopDeduction = Math.max(0, Number(ps.lossOfPayDeduction) || 0);
+  const otherDeductions = Math.max(0, Number((totalDeductions - lopDeduction).toFixed(2)));
+  return {
+    lopDeduction,
+    otherDeductions,
+    totalDeductions,
+  };
+}
+
+export interface PayslipDetailModalContentProps {
+  payslip: PayslipItem;
+  baseCurrency?: string;
+  roundingPrecision?: number;
+  statusTextClass?: string;
+}
+
+export const PayslipDetailModalContent: React.FC<PayslipDetailModalContentProps> = ({
+  payslip,
+  baseCurrency,
+  roundingPrecision,
+  statusTextClass = 'text-indigo-400',
+}) => {
+  const { lopDeduction, otherDeductions, totalDeductions } = computePayslipDeductionSummary(payslip);
+  const breakdown = payslip.reconciliationBreakdown;
+  const currency = breakdown?.currency || baseCurrency;
+  const overtimeVal = Number(payslip.overtimePay) || 0;
+
+  return (
+    <div className="space-y-5">
+      {/* Employee & Period Lockup */}
+      <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 grid grid-cols-2 gap-4 text-xs">
+        <div>
+          <span className="text-slate-500 uppercase tracking-wider text-[10px] block">Employee</span>
+          <span className="font-semibold text-slate-200 text-sm">{payslip.employeeName}</span>
+          <span className="text-slate-400 font-mono block mt-0.5">Code: {payslip.employeeCode}</span>
+        </div>
+        <div>
+          <span className="text-slate-500 uppercase tracking-wider text-[10px] block">Status &amp; Disbursement</span>
+          <span className={`font-semibold text-sm ${statusTextClass}`}>{payslip.status}</span>
+          <span className="text-slate-400 block mt-0.5">
+            {payslip.paymentDate ? `Paid on ${payslip.paymentDate}` : 'Pending settlement'}
+          </span>
+        </div>
+      </div>
+
+      {/* Earnings & Deductions Breakdown */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-6 text-xs">
+        {/* Earnings Column */}
+        <div className="space-y-3">
+          <h4 className="font-semibold text-slate-300 uppercase tracking-wider text-[11px] border-b border-slate-800 pb-1.5">
+            Gross Earnings
+          </h4>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">Basic Salary</span>
+              <span className="font-mono tabular-nums text-slate-200">
+                {formatMoney(payslip.basicSalary, currency, { decimals: roundingPrecision })}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">Allowances</span>
+              <span className="font-mono tabular-nums text-slate-200">
+                {formatMoney(payslip.allowances, currency, { decimals: roundingPrecision })}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <div>
+                <span className="text-slate-400 block">Overtime Pay</span>
+                {overtimeVal === 0 && (
+                  <span className="text-[10px] text-slate-500">0.00 (Extra Time is not paid as OT)</span>
+                )}
+              </div>
+              <span className="font-mono tabular-nums text-slate-200">
+                {formatMoney(payslip.overtimePay, currency, { decimals: roundingPrecision })}
+              </span>
+            </div>
+            <div className="flex items-center justify-between pt-2 border-t border-slate-800 font-semibold">
+              <span className="text-slate-300">Total Gross Pay</span>
+              <span className="font-mono tabular-nums text-indigo-300">
+                {formatMoney(payslip.grossSalary, currency, { decimals: roundingPrecision })}
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* Deductions Column (Strictly non-duplicated) */}
+        <div className="space-y-3">
+          <h4 className="font-semibold text-slate-300 uppercase tracking-wider text-[11px] border-b border-slate-800 pb-1.5">
+            Deductions
+          </h4>
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">Loss of Pay (LOP)</span>
+              <span className="font-mono tabular-nums text-amber-400">
+                {formatMoney(lopDeduction, currency, { decimals: roundingPrecision })}
+              </span>
+            </div>
+            {breakdown && (
+              <div className="pl-3 border-l border-slate-800 space-y-1 text-[11px]">
+                <div className="flex items-center justify-between text-slate-500">
+                  <span>↳ Excess Leave Deduction (incl. in LOP)</span>
+                  <span className="font-mono tabular-nums text-amber-300/90">
+                    {formatMoney(breakdown.excessLeaveDeduction || 0, currency, { decimals: roundingPrecision })}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between text-slate-500">
+                  <span>↳ Short-Hours Deduction (incl. in LOP)</span>
+                  <span className="font-mono tabular-nums text-amber-300/90">
+                    {formatMoney(breakdown.shortHoursDeduction || 0, currency, { decimals: roundingPrecision })}
+                  </span>
+                </div>
+              </div>
+            )}
+            <div className="flex items-center justify-between">
+              <span className="text-slate-400">Other Deductions</span>
+              <span className="font-mono tabular-nums text-rose-400">
+                {formatMoney(otherDeductions, currency, { decimals: roundingPrecision })}
+              </span>
+            </div>
+            <div className="flex items-center justify-between pt-2 border-t border-slate-800 font-semibold">
+              <span className="text-slate-300">Total Deductions</span>
+              <span className="font-mono tabular-nums text-rose-400">
+                {totalDeductions > 0
+                  ? formatMoney(-Math.abs(totalDeductions), currency, { decimals: roundingPrecision })
+                  : formatMoney(0, currency, { decimals: roundingPrecision })}
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Policy & Working-Hours Reconciliation Breakdown */}
+      {breakdown && (
+        <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3 text-xs">
+          <div className="flex items-center justify-between">
+            <h4 className="font-semibold text-slate-300 uppercase tracking-wider text-[11px]">
+              Policy &amp; Attendance Reconciliation
+            </h4>
+            <span className="text-[10px] text-slate-500">Derived from persisted payslip notes</span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+            <div className="p-2.5 bg-slate-900/70 border border-slate-800 rounded-lg">
+              <span className="text-[10px] text-slate-500 uppercase block">Monthly Leave Allowance</span>
+              <span className="font-mono font-semibold text-indigo-300 text-sm">
+                {breakdown.monthlyLeaveAllowance !== null ? `${breakdown.monthlyLeaveAllowance} days` : '--'}
+              </span>
+            </div>
+
+            <div className="p-2.5 bg-slate-900/70 border border-slate-800 rounded-lg">
+              <span className="text-[10px] text-slate-500 uppercase block">Short Time Hours</span>
+              <span
+                className={`font-mono font-semibold text-sm ${
+                  (breakdown.shortTimeHours ?? 0) > 0 ? 'text-rose-400' : 'text-slate-200'
+                }`}
+              >
+                {breakdown.shortTimeHours !== null ? `${breakdown.shortTimeHours} hrs` : '--'}
+              </span>
+            </div>
+
+            <div className="p-2.5 bg-slate-900/70 border border-sky-900/50 rounded-lg">
+              <span className="text-[10px] text-sky-400 uppercase block">Extra Time (Informational Only)</span>
+              <span className="font-mono font-semibold text-sky-300 text-sm">
+                {breakdown.extraTimeHours !== null ? `${breakdown.extraTimeHours} hrs` : '--'}
+              </span>
+              <span className="text-[10px] text-sky-300/75 block mt-0.5">
+                Informational only — never offsets Short Time
+              </span>
+            </div>
+          </div>
+
+          {breakdown.warnings.length > 0 && (
+            <div className="space-y-1.5 pt-1">
+              {breakdown.warnings.map((warning, idx) => (
+                <div
+                  key={idx}
+                  className="p-2.5 bg-amber-950/40 border border-amber-800/70 rounded-lg flex items-start gap-2 text-[11px] text-amber-200"
+                >
+                  <AlertCircle className="w-3.5 h-3.5 text-amber-400 shrink-0 mt-0.5" />
+                  <span>{warning}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Preserved Original Persisted Notes */}
+      {payslip.notes && (
+        <div className="bg-slate-950/80 border border-slate-800 rounded-lg p-3 text-[11px] space-y-1">
+          <div className="text-[10px] uppercase tracking-wider font-semibold text-slate-500">
+            Persisted Reconciliation Notes
+          </div>
+          <p className="text-slate-300 leading-relaxed font-mono break-words">{payslip.notes}</p>
+        </div>
+      )}
+
+      {/* Net Salary Highlight Box */}
+      <div className="bg-emerald-950/30 border border-emerald-800/60 rounded-xl p-4 flex items-center justify-between">
+        <div>
+          <span className="text-emerald-400 font-semibold text-xs uppercase tracking-wider block">
+            Net Take-Home Pay
+          </span>
+          <span className="text-slate-400 text-[11px]">
+            Account Ledger: {payslip.ledgerName || 'General Payroll Payable'}
+          </span>
+        </div>
+        <div className="text-2xl font-bold font-mono tabular-nums text-emerald-300">
+          {formatMoney(payslip.netSalary, currency, { decimals: roundingPrecision })}
+        </div>
+      </div>
+
+      {/* Voucher Reference if Posted */}
+      {payslip.journalVoucherNumber && (
+        <div className="text-xs text-slate-400 flex items-center justify-between bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+          <span>General Journal Voucher:</span>
+          <span className="font-mono font-semibold text-indigo-400">{payslip.journalVoucherNumber}</span>
+        </div>
+      )}
+    </div>
+  );
+};
 
 export const PayrollPage: React.FC<PayrollPageProps> = ({
   currentUser,
@@ -89,9 +321,15 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({
 
   // Processing & Posting Action States
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [isPosting, setIsPosting] = useState<boolean>(false);
   const [isCancelling, setIsCancelling] = useState<boolean>(false);
+  const [pendingConfirm, setPendingConfirm] = useState<
+    | { kind: 'process'; period: PayrollPeriodItem; promptMsg: string; isAccountsApproved: boolean }
+    | { kind: 'cancel'; period: PayrollPeriodItem }
+    | null
+  >(null);
 
   // Accounts Approval Action State
   const [isAccountsApproveModalOpen, setIsAccountsApproveModalOpen] = useState<boolean>(false);
@@ -275,33 +513,26 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({
     }
   };
 
-  // Process / Recalculate Period
-  const handleProcessPeriod = async () => {
+  // Process / Recalculate Period (opens confirmation dialog)
+  const handleProcessPeriod = () => {
     if (!selectedPeriod) return;
     if (currentUser?.isPreview) {
       setActionError('Processing payroll is unavailable in Preview Mode: PostgreSQL is offline in sandbox.');
       return;
     }
     const isAccountsApproved = selectedPeriod.status === 'ACCOUNTS_APPROVED';
+    const periodLabel = selectedPeriod.name || `${selectedPeriod.year}-${selectedPeriod.month}`;
     const promptMsg = isAccountsApproved
-      ? `Recalculate payslips for ${selectedPeriod.name || `${selectedPeriod.year}-${selectedPeriod.month}`}? WARNING: This period is currently ACCOUNTS_APPROVED. Recalculation will invalidate previous Accounts approval and return status to PROCESSED.`
-      : `Calculate and process payslips for ${selectedPeriod.name || `${selectedPeriod.year}-${selectedPeriod.month}`}? This evaluates active employees, salary revisions, and deduplicated unpaid absences.`;
-    if (!confirm(promptMsg)) {
-      return;
-    }
+      ? `Recalculate payslips for ${periodLabel}? WARNING: This period is currently ACCOUNTS_APPROVED. Recalculation will invalidate previous Accounts approval and return status to PROCESSED.`
+      : `Calculate and process payslips for ${periodLabel}? This evaluates active employees, salary revisions, and deduplicated unpaid absences.`;
 
-    setIsProcessing(true);
     setActionError(null);
-    try {
-      const updated = await api.processPayrollPeriod(selectedPeriod.id);
-      setSelectedPeriod(updated);
-      loadPeriods();
-      loadPeriodPayslips(updated.id);
-    } catch (err: unknown) {
-      setActionError((err as Error).message || 'Failed to process payroll period.');
-    } finally {
-      setIsProcessing(false);
-    }
+    setPendingConfirm({
+      kind: 'process',
+      period: selectedPeriod,
+      promptMsg,
+      isAccountsApproved,
+    });
   };
 
   // Open Accounts Approval Modal
@@ -371,28 +602,70 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({
     }
   };
 
-  // Cancel Period
-  const handleCancelPeriod = async () => {
+  // Cancel Period (opens confirmation dialog)
+  const handleCancelPeriod = () => {
     if (!selectedPeriod) return;
     if (currentUser?.isPreview) {
       setActionError('Cancelling payroll periods is unavailable in Preview Mode: PostgreSQL is offline in sandbox.');
       return;
     }
-    if (!confirm(`Cancel payroll period ${selectedPeriod.name}? This will mark it as CANCELLED.`)) {
-      return;
-    }
-
-    setIsCancelling(true);
     setActionError(null);
-    try {
-      const updated = await api.cancelPayrollPeriod(selectedPeriod.id);
-      setSelectedPeriod(updated);
-      loadPeriods();
-      loadPeriodPayslips(updated.id);
-    } catch (err: unknown) {
-      setActionError((err as Error).message || 'Failed to cancel payroll period.');
-    } finally {
-      setIsCancelling(false);
+    setPendingConfirm({ kind: 'cancel', period: selectedPeriod });
+  };
+
+  // Execute confirmed Process / Cancel action
+  const handleConfirmPeriodAction = async () => {
+    if (!pendingConfirm) return;
+    setActionError(null);
+
+    if (pendingConfirm.kind === 'process') {
+      const { period, isAccountsApproved } = pendingConfirm;
+      setIsProcessing(true);
+      try {
+        const outcome = await executeConfirmedAction(
+          true,
+          () => api.processPayrollPeriod(period.id),
+          'Failed to process payroll period.'
+        );
+        if (outcome?.ok && outcome.result) {
+          setSelectedPeriod(outcome.result);
+          setActionSuccess(
+            isAccountsApproved
+              ? `Recalculated payslips for ${period.name || `${period.year}-${period.month}`}. Status returned to PROCESSED.`
+              : `Processed payslips for ${period.name || `${period.year}-${period.month}`}.`
+          );
+          setPendingConfirm(null);
+          loadPeriods();
+          loadPeriodPayslips(outcome.result.id);
+        } else if (outcome?.errorMessage) {
+          setActionError(outcome.errorMessage);
+          setPendingConfirm(null);
+        }
+      } finally {
+        setIsProcessing(false);
+      }
+    } else {
+      const { period } = pendingConfirm;
+      setIsCancelling(true);
+      try {
+        const outcome = await executeConfirmedAction(
+          true,
+          () => api.cancelPayrollPeriod(period.id),
+          'Failed to cancel payroll period.'
+        );
+        if (outcome?.ok && outcome.result) {
+          setSelectedPeriod(outcome.result);
+          setActionSuccess(`Payroll period ${period.name} has been cancelled.`);
+          setPendingConfirm(null);
+          loadPeriods();
+          loadPeriodPayslips(outcome.result.id);
+        } else if (outcome?.errorMessage) {
+          setActionError(outcome.errorMessage);
+          setPendingConfirm(null);
+        }
+      } finally {
+        setIsCancelling(false);
+      }
     }
   };
 
@@ -611,12 +884,41 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({
         <div className="space-y-6">
           {/* Action Error Banner */}
           {actionError && (
-            <div className="bg-rose-950/40 border border-rose-900 rounded-xl p-4 text-xs text-rose-300 flex items-center justify-between">
+            <div
+              role="alert"
+              className="bg-rose-950/40 border border-rose-900 rounded-xl p-4 text-xs text-rose-300 flex items-center justify-between"
+            >
               <div className="flex items-center gap-2.5">
                 <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
                 <span>{actionError}</span>
               </div>
-              <button onClick={() => setActionError(null)} className="text-rose-400 hover:text-rose-200">
+              <button
+                type="button"
+                onClick={() => setActionError(null)}
+                aria-label="Dismiss error notification"
+                className="text-rose-400 hover:text-rose-200"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          {/* Action Success Banner */}
+          {actionSuccess && (
+            <div
+              role="status"
+              className="bg-emerald-950/40 border border-emerald-900 rounded-xl p-4 text-xs text-emerald-200 flex items-center justify-between"
+            >
+              <div className="flex items-center gap-2.5">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>{actionSuccess}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActionSuccess(null)}
+                aria-label="Dismiss success notification"
+                className="text-emerald-400 hover:text-emerald-200"
+              >
                 <X className="w-4 h-4" />
               </button>
             </div>
@@ -1102,59 +1404,94 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({
                           <th className="py-2.5 px-3 font-medium text-right">Allowances</th>
                           <th className="py-2.5 px-3 font-medium text-right">Overtime</th>
                           <th className="py-2.5 px-3 font-medium text-right">Gross Pay</th>
-                          <th className="py-2.5 px-3 font-medium text-right">Loss of Pay</th>
-                          <th className="py-2.5 px-3 font-medium text-right">Deductions</th>
+                          <th className="py-2.5 px-3 font-medium">Policy &amp; Hours</th>
+                          <th className="py-2.5 px-3 font-medium text-right">LOP (Incl.)</th>
+                          <th className="py-2.5 px-3 font-medium text-right">Total Deductions</th>
                           <th className="py-2.5 px-3 font-medium text-right">Net Salary</th>
                           <th className="py-2.5 px-3 font-medium">Payable Ledger</th>
                           <th className="py-2.5 px-3 font-medium text-right">Action</th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-800/60 text-slate-300">
-                        {periodPayslips.map((ps) => (
-                          <tr key={ps.id} className="hover:bg-slate-800/40 transition-colors">
-                            <td className="py-2.5 px-3">
-                              <div className="font-medium text-slate-100">{ps.employeeName}</div>
-                              <div className="text-[11px] text-slate-500 font-mono">{ps.employeeCode}</div>
-                            </td>
-                            <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-300">
-                              {formatMoney(ps.basicSalary, baseCurrency, { decimals: roundingPrecision })}
-                            </td>
-                            <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-400">
-                              {formatMoney(ps.allowances, baseCurrency, { decimals: roundingPrecision })}
-                            </td>
-                            <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-400">
-                              {formatMoney(ps.overtimePay, baseCurrency, { decimals: roundingPrecision })}
-                            </td>
-                            <td className="py-2.5 px-3 text-right font-mono tabular-nums font-semibold text-slate-200">
-                              {formatMoney(ps.grossSalary, baseCurrency, { decimals: roundingPrecision })}
-                            </td>
-                            <td className="py-2.5 px-3 text-right font-mono tabular-nums text-amber-400">
-                              {Number(ps.lossOfPayDeduction) > 0
-                                ? formatMoney(-Math.abs(Number(ps.lossOfPayDeduction)), baseCurrency, { decimals: roundingPrecision })
-                                : formatMoney(0, baseCurrency, { decimals: roundingPrecision })}
-                            </td>
-                            <td className="py-2.5 px-3 text-right font-mono tabular-nums text-rose-400">
-                              {Number(ps.deductions) > 0
-                                ? formatMoney(-Math.abs(Number(ps.deductions)), baseCurrency, { decimals: roundingPrecision })
-                                : formatMoney(0, baseCurrency, { decimals: roundingPrecision })}
-                            </td>
-                            <td className="py-2.5 px-3 text-right font-mono tabular-nums font-bold text-emerald-400">
-                              {formatMoney(ps.netSalary, baseCurrency, { decimals: roundingPrecision })}
-                            </td>
-                            <td className="py-2.5 px-3 text-slate-400 max-w-xs truncate font-mono text-[11px]">
-                              {ps.ledgerName || 'General Payroll Payable'}
-                            </td>
-                            <td className="py-2.5 px-3 text-right">
-                              <button
-                                onClick={() => setViewingPayslip(ps)}
-                                className="p-1 text-slate-400 hover:text-indigo-400 transition-colors rounded hover:bg-slate-800"
-                                title="View Itemized Payslip"
-                              >
-                                <Eye className="w-3.5 h-3.5" />
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
+                        {periodPayslips.map((ps) => {
+                          const bd = ps.reconciliationBreakdown;
+                          const rowCurrency = bd?.currency || baseCurrency;
+                          return (
+                            <tr key={ps.id} className="hover:bg-slate-800/40 transition-colors">
+                              <td className="py-2.5 px-3">
+                                <div className="font-medium text-slate-100">{ps.employeeName}</div>
+                                <div className="text-[11px] text-slate-500 font-mono">{ps.employeeCode}</div>
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-300">
+                                {formatMoney(ps.basicSalary, rowCurrency, { decimals: roundingPrecision })}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-400">
+                                {formatMoney(ps.allowances, rowCurrency, { decimals: roundingPrecision })}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono tabular-nums text-slate-400">
+                                {formatMoney(ps.overtimePay, rowCurrency, { decimals: roundingPrecision })}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono tabular-nums font-semibold text-slate-200">
+                                {formatMoney(ps.grossSalary, rowCurrency, { decimals: roundingPrecision })}
+                              </td>
+                              <td className="py-2.5 px-3 text-[11px] min-w-[200px]">
+                                {bd ? (
+                                  <div className="space-y-0.5">
+                                    <div className="text-slate-300 font-mono">
+                                      Allow: <span className="text-indigo-300">{bd.monthlyLeaveAllowance ?? '--'}d</span> • Short:{' '}
+                                      <span className={(bd.shortTimeHours ?? 0) > 0 ? 'text-rose-400' : 'text-slate-300'}>
+                                        {bd.shortTimeHours ?? 0}h
+                                      </span>
+                                    </div>
+                                    <div className="text-sky-300/90 font-mono text-[10px]">
+                                      Extra: {bd.extraTimeHours ?? 0}h (info only)
+                                    </div>
+                                    <div className="text-slate-500 text-[10px] font-mono">
+                                      ExL: {formatMoney(bd.excessLeaveDeduction || 0, rowCurrency, { decimals: roundingPrecision })} · SH:{' '}
+                                      {formatMoney(bd.shortHoursDeduction || 0, rowCurrency, { decimals: roundingPrecision })}
+                                    </div>
+                                    {bd.warnings.length > 0 && (
+                                      <div
+                                        className="inline-flex items-center gap-1 text-[10px] text-amber-300 bg-amber-950/50 border border-amber-800/60 px-1.5 py-0.5 rounded mt-0.5"
+                                        title={bd.warnings.join(' ')}
+                                      >
+                                        <AlertCircle className="w-3 h-3 text-amber-400 shrink-0" />
+                                        <span>{bd.warnings.length} warning{bd.warnings.length === 1 ? '' : 's'}</span>
+                                      </div>
+                                    )}
+                                  </div>
+                                ) : (
+                                  <span className="text-slate-500">--</span>
+                                )}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono tabular-nums text-amber-400">
+                                {Number(ps.lossOfPayDeduction) > 0
+                                  ? formatMoney(-Math.abs(Number(ps.lossOfPayDeduction)), rowCurrency, { decimals: roundingPrecision })
+                                  : formatMoney(0, rowCurrency, { decimals: roundingPrecision })}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono tabular-nums text-rose-400">
+                                {Number(ps.deductions) > 0
+                                  ? formatMoney(-Math.abs(Number(ps.deductions)), rowCurrency, { decimals: roundingPrecision })
+                                  : formatMoney(0, rowCurrency, { decimals: roundingPrecision })}
+                              </td>
+                              <td className="py-2.5 px-3 text-right font-mono tabular-nums font-bold text-emerald-400">
+                                {formatMoney(ps.netSalary, rowCurrency, { decimals: roundingPrecision })}
+                              </td>
+                              <td className="py-2.5 px-3 text-slate-400 max-w-xs truncate font-mono text-[11px]">
+                                {ps.ledgerName || 'General Payroll Payable'}
+                              </td>
+                              <td className="py-2.5 px-3 text-right">
+                                <button
+                                  onClick={() => setViewingPayslip(ps)}
+                                  className="p-1 text-slate-400 hover:text-indigo-400 transition-colors rounded hover:bg-slate-800"
+                                  title="View Itemized Payslip"
+                                >
+                                  <Eye className="w-3.5 h-3.5" />
+                                </button>
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
@@ -1170,7 +1507,7 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({
       {/* ========================================================================= */}
       {viewingPayslip && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-xl w-full p-6 space-y-6 shadow-2xl">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto p-6 space-y-6 shadow-2xl">
             {/* Header */}
             <div className="flex items-center justify-between border-b border-slate-800 pb-4">
               <div>
@@ -1190,115 +1527,12 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({
               </button>
             </div>
 
-            {/* Employee & Period Lockup */}
-            <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 grid grid-cols-2 gap-4 text-xs">
-              <div>
-                <span className="text-slate-500 uppercase tracking-wider text-[10px] block">Employee</span>
-                <span className="font-semibold text-slate-200 text-sm">{viewingPayslip.employeeName}</span>
-                <span className="text-slate-400 font-mono block mt-0.5">Code: {viewingPayslip.employeeCode}</span>
-              </div>
-              <div>
-                <span className="text-slate-500 uppercase tracking-wider text-[10px] block">Status &amp; Disbursement</span>
-                <span className={`font-semibold text-sm ${getStatusTextClass(viewingPayslip.status)}`}>
-                  {viewingPayslip.status}
-                </span>
-                <span className="text-slate-400 block mt-0.5">
-                  {viewingPayslip.paymentDate ? `Paid on ${viewingPayslip.paymentDate}` : 'Pending settlement'}
-                </span>
-              </div>
-            </div>
-
-            {/* Earnings & Deductions Breakdown */}
-            <div className="grid grid-cols-2 gap-6 text-xs">
-              {/* Earnings Column */}
-              <div className="space-y-3">
-                <h4 className="font-semibold text-slate-300 uppercase tracking-wider text-[11px] border-b border-slate-800 pb-1.5">
-                  Gross Earnings
-                </h4>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Basic Salary</span>
-                    <span className="font-mono tabular-nums text-slate-200">
-                      {formatMoney(viewingPayslip.basicSalary, baseCurrency, { decimals: roundingPrecision })}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Allowances</span>
-                    <span className="font-mono tabular-nums text-slate-200">
-                      {formatMoney(viewingPayslip.allowances, baseCurrency, { decimals: roundingPrecision })}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Overtime Pay</span>
-                    <span className="font-mono tabular-nums text-slate-200">
-                      {formatMoney(viewingPayslip.overtimePay, baseCurrency, { decimals: roundingPrecision })}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between pt-2 border-t border-slate-800 font-semibold">
-                    <span className="text-slate-300">Total Gross Pay</span>
-                    <span className="font-mono tabular-nums text-indigo-300">
-                      {formatMoney(viewingPayslip.grossSalary, baseCurrency, { decimals: roundingPrecision })}
-                    </span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Deductions Column */}
-              <div className="space-y-3">
-                <h4 className="font-semibold text-slate-300 uppercase tracking-wider text-[11px] border-b border-slate-800 pb-1.5">
-                  Deductions
-                </h4>
-                <div className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Loss of Pay (LOP)</span>
-                    <span className="font-mono tabular-nums text-amber-400">
-                      {formatMoney(viewingPayslip.lossOfPayDeduction, baseCurrency, { decimals: roundingPrecision })}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-400">Other Deductions</span>
-                    <span className="font-mono tabular-nums text-rose-400">
-                      {formatMoney(
-                        Number(viewingPayslip.deductions) - Number(viewingPayslip.lossOfPayDeduction),
-                        baseCurrency,
-                        { decimals: roundingPrecision }
-                      )}
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between pt-2 border-t border-slate-800 font-semibold">
-                    <span className="text-slate-300">Total Deductions</span>
-                    <span className="font-mono tabular-nums text-rose-400">
-                      {formatMoney(-Math.abs(Number(viewingPayslip.deductions)), baseCurrency, { decimals: roundingPrecision })}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            {/* Net Salary Highlight Box */}
-            <div className="bg-emerald-950/30 border border-emerald-800/60 rounded-xl p-4 flex items-center justify-between">
-              <div>
-                <span className="text-emerald-400 font-semibold text-xs uppercase tracking-wider block">
-                  Net Take-Home Pay
-                </span>
-                <span className="text-slate-400 text-[11px]">
-                  Account Ledger: {viewingPayslip.ledgerName || 'General Payroll Payable'}
-                </span>
-              </div>
-              <div className="text-2xl font-bold font-mono tabular-nums text-emerald-300">
-                {formatMoney(viewingPayslip.netSalary, baseCurrency, { decimals: roundingPrecision })}
-              </div>
-            </div>
-
-            {/* Voucher Reference if Posted */}
-            {viewingPayslip.journalVoucherNumber && (
-              <div className="text-xs text-slate-400 flex items-center justify-between bg-slate-950 p-2.5 rounded-lg border border-slate-800">
-                <span>General Journal Voucher:</span>
-                <span className="font-mono font-semibold text-indigo-400">
-                  {viewingPayslip.journalVoucherNumber}
-                </span>
-              </div>
-            )}
+            <PayslipDetailModalContent
+              payslip={viewingPayslip}
+              baseCurrency={baseCurrency}
+              roundingPrecision={roundingPrecision}
+              statusTextClass={getStatusTextClass(viewingPayslip.status)}
+            />
 
             {/* Actions */}
             <div className="flex items-center justify-end gap-3 pt-3 border-t border-slate-800">
@@ -1643,6 +1877,47 @@ export const PayrollPage: React.FC<PayrollPageProps> = ({
           </div>
         </div>
       )}
+      <ConfirmDialog
+        isOpen={Boolean(pendingConfirm)}
+        title={
+          pendingConfirm?.kind === 'process'
+            ? pendingConfirm.isAccountsApproved
+              ? 'Recalculate Approved Payroll Period'
+              : 'Process Payroll Period'
+            : 'Cancel Payroll Period'
+        }
+        message={
+          pendingConfirm?.kind === 'process'
+            ? pendingConfirm.promptMsg
+            : pendingConfirm?.kind === 'cancel'
+            ? `Cancel payroll period ${pendingConfirm.period.name}? This will mark it as CANCELLED.`
+            : ''
+        }
+        confirmLabel={
+          pendingConfirm?.kind === 'process'
+            ? pendingConfirm.isAccountsApproved
+              ? 'Recalculate Payslips'
+              : 'Process Payroll'
+            : 'Cancel Period'
+        }
+        confirmBusyLabel={
+          pendingConfirm?.kind === 'process' ? 'Processing...' : 'Cancelling...'
+        }
+        variant={
+          pendingConfirm?.kind === 'cancel'
+            ? 'danger'
+            : pendingConfirm?.kind === 'process' && pendingConfirm.isAccountsApproved
+            ? 'warning'
+            : 'primary'
+        }
+        isSubmitting={isProcessing || isCancelling}
+        onConfirm={handleConfirmPeriodAction}
+        onCancel={() => {
+          if (!isProcessing && !isCancelling) {
+            setPendingConfirm(null);
+          }
+        }}
+      />
     </div>
   );
 };
