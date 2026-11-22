@@ -175,17 +175,25 @@ describe('Environment Validation Unit Tests', () => {
     it('should verify docker-compose.yml enforces explicit SESSION_SECRET and dedicated migration runner', async () => {
       const fs = await import('fs');
       const path = await import('path');
+      const YAML = (await import('yaml')).default;
       const composePath = path.resolve(import.meta.dirname, '../../docker-compose.yml');
       const composeContent = fs.readFileSync(composePath, 'utf-8');
+      const composeDoc = YAML.parse(composeContent);
 
       // Verifies no insecure fallback for SESSION_SECRET and fail-closed syntax properly quoted
       expect(composeContent).not.toContain('SESSION_SECRET:-a_secure_random_production_secret_key_64_characters_min');
       expect(composeContent).toContain('SESSION_SECRET: "${SESSION_SECRET:?');
 
-      // Verifies dedicated one-shot migration service and dependency ordering
+      // Verifies dedicated one-shot migration service uses explicit migration profile
       expect(composeContent).toContain('coreerp-migration');
       expect(composeContent).toContain('command: ["npx", "prisma", "migrate", "deploy"]');
-      expect(composeContent).toContain('condition: service_completed_successfully');
+      expect(composeDoc.services.migration.profiles).toEqual(['migration']);
+
+      // Verifies ordinary app startup depends on healthy postgres only and does not auto-run migration
+      expect(composeDoc.services.app.depends_on).toEqual({
+        postgres: { condition: 'service_healthy' },
+      });
+      expect(composeDoc.services.app.depends_on.migration).toBeUndefined();
     });
 
     it('should verify biometric bridge README documents correct endpoint and stub limitations', async () => {

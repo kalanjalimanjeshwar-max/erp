@@ -136,8 +136,17 @@ describe('Docker Compose YAML Parsing & Fail-Closed Security Validation', () => 
       const devDoc = YAML.parse(fs.readFileSync(devComposePath, 'utf8'));
       const testDoc = YAML.parse(fs.readFileSync(integrationComposePath, 'utf8'));
 
-      // Prod DB port 5432
-      expect(prodDoc.services.postgres.ports).toContain('5432:5432');
+      // Prod DB must not publish host ports and must attach only to the internal DB network
+      expect(prodDoc.services.postgres.ports).toBeUndefined();
+      expect(prodDoc.services.postgres.networks).toEqual(['coreerp-db-internal']);
+      expect(prodDoc.networks['coreerp-db-internal']).toMatchObject({
+        driver: 'bridge',
+        internal: true,
+      });
+      expect(prodDoc.services.migration.networks).toEqual(['coreerp-db-internal']);
+      expect(prodDoc.services.app.networks).toEqual(['coreerp-db-internal', 'coreerp-edge']);
+      expect(prodDoc.services.app.ports).toEqual(['127.0.0.1:${APP_BIND_PORT:-3000}:3000']);
+      expect(prodDoc.networks['coreerp-edge']).toMatchObject({ driver: 'bridge' });
       // Dev DB ports: dev on 5432, unit test on 5433
       expect(devDoc.services.postgres.ports).toContain('5432:5432');
       expect(devDoc.services['postgres-test'].ports).toContain('5433:5432');
