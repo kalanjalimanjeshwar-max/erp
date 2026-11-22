@@ -9,9 +9,13 @@ services:
     container_name: coreerp-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-erp_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-erp_secure_password_123}
-      POSTGRES_DB: ${POSTGRES_DB:-core_erp}
+      # Operator input requirements (not regex-validated by Docker Compose; interpolated directly into DATABASE_URL and healthcheck):
+      # - POSTGRES_USER: URI-safe and shell-safe characters only: ASCII letters, digits, and underscore (pattern: ^[A-Za-z0-9_]+$).
+      # - POSTGRES_PASSWORD: Exactly 64 hexadecimal characters (256-bit random value), URL-safe for direct DATABASE_URL interpolation (generate via: openssl rand -hex 32).
+      # - POSTGRES_DB: URI-safe database-name characters only: ASCII letters, digits, and underscore (pattern: ^[A-Za-z0-9_]+$).
+      POSTGRES_USER: "${POSTGRES_USER:?POSTGRES_USER must be set in your external env file (operator input requirement: URI-safe and shell-safe ASCII letters, digits, and underscore only)}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to exactly 64 hexadecimal characters (256-bit random value), URL-safe for direct DATABASE_URL interpolation (generate via: openssl rand -hex 32)}"
+      POSTGRES_DB: "${POSTGRES_DB:?POSTGRES_DB must be set in your external env file (operator input requirement: URI-safe database-name ASCII letters, digits, and underscore only)}"
       TZ: UTC
       PGTZ: UTC
     ports:
@@ -19,7 +23,7 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-erp_user} -d ${POSTGRES_DB:-core_erp}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:?POSTGRES_USER must be set in your external env file (operator input requirement: URI-safe and shell-safe ASCII letters, digits, and underscore only)} -d ${POSTGRES_DB:?POSTGRES_DB must be set in your external env file (operator input requirement: URI-safe database-name ASCII letters, digits, and underscore only)}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -41,7 +45,9 @@ services:
     restart: "no"
     command: ["npx", "prisma", "migrate", "deploy"]
     environment:
-      DATABASE_URL: "postgresql://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:-erp_secure_password_123}@postgres:5432/${POSTGRES_DB:-core_erp}?schema=public"
+      # Operator input requirements for direct DATABASE_URL interpolation (not regex-validated by Docker Compose):
+      # POSTGRES_USER and POSTGRES_DB must match ^[A-Za-z0-9_]+$; POSTGRES_PASSWORD must be 64 hex chars (generate via: openssl rand -hex 32).
+      DATABASE_URL: "postgresql://${POSTGRES_USER:?POSTGRES_USER must be set in your external env file (operator input requirement: URI-safe and shell-safe ASCII letters, digits, and underscore only)}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to exactly 64 hexadecimal characters (256-bit random value), URL-safe for direct DATABASE_URL interpolation (generate via: openssl rand -hex 32)}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set in your external env file (operator input requirement: URI-safe database-name ASCII letters, digits, and underscore only)}?schema=public"
     depends_on:
       postgres:
         condition: service_healthy
@@ -64,14 +70,16 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
-      DATABASE_URL: "postgresql://${POSTGRES_USER:-erp_user}:${POSTGRES_PASSWORD:-erp_secure_password_123}@postgres:5432/${POSTGRES_DB:-core_erp}?schema=public"
+      # Operator input requirements for direct DATABASE_URL interpolation (not regex-validated by Docker Compose):
+      # POSTGRES_USER and POSTGRES_DB must match ^[A-Za-z0-9_]+$; POSTGRES_PASSWORD must be 64 hex chars (generate via: openssl rand -hex 32).
+      DATABASE_URL: "postgresql://${POSTGRES_USER:?POSTGRES_USER must be set in your external env file (operator input requirement: URI-safe and shell-safe ASCII letters, digits, and underscore only)}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set to exactly 64 hexadecimal characters (256-bit random value), URL-safe for direct DATABASE_URL interpolation (generate via: openssl rand -hex 32)}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set in your external env file (operator input requirement: URI-safe database-name ASCII letters, digits, and underscore only)}?schema=public"
       # Production secret safety: SESSION_SECRET must be explicitly provided in environment.
       # Insecure/default fallback has been removed. Generate via: openssl rand -hex 32
       SESSION_SECRET: "${SESSION_SECRET:?SESSION_SECRET must be explicitly set with a high-entropy string in production (generate via: openssl rand -hex 32)}"
       # Dedicated 256-bit AES-GCM encryption key for corporate bank credentials (Phase 2.3)
-      BANK_ENCRYPTION_KEY: "${BANK_ENCRYPTION_KEY:-}"
-      BANK_ACTIVE_KEY_ID: "${BANK_ACTIVE_KEY_ID:-k1}"
-      BANK_HISTORICAL_KEYS: "${BANK_HISTORICAL_KEYS:-{}}"
+      BANK_ENCRYPTION_KEY: "${BANK_ENCRYPTION_KEY:?BANK_ENCRYPTION_KEY must be set to a 64-character hexadecimal 256-bit key (generate via: openssl rand -hex 32)}"
+      BANK_ACTIVE_KEY_ID: "${BANK_ACTIVE_KEY_ID:?BANK_ACTIVE_KEY_ID must be set (1-32 alphanumeric, dash, or underscore characters, e.g. k1)}"
+      BANK_HISTORICAL_KEYS: "${BANK_HISTORICAL_KEYS:?BANK_HISTORICAL_KEYS must be set to a valid JSON object (use an empty JSON object when no historical keys are active)}"
     volumes:
       - coreerp_storage:/app/storage
     depends_on:
