@@ -72,6 +72,8 @@ services:
       BANK_ENCRYPTION_KEY: "${BANK_ENCRYPTION_KEY:-}"
       BANK_ACTIVE_KEY_ID: "${BANK_ACTIVE_KEY_ID:-k1}"
       BANK_HISTORICAL_KEYS: "${BANK_HISTORICAL_KEYS:-{}}"
+    volumes:
+      - coreerp_storage:/app/storage
     depends_on:
       postgres:
         condition: service_healthy
@@ -87,4 +89,7 @@ networks:
 volumes:
   # Persistent database volume ensures data survives restarts
   postgres_data:
+    driver: local
+  # Persistent application upload storage (branding assets and expense receipts)
+  coreerp_storage:
     driver: local

@@ -54,6 +54,11 @@ COPY --chown=erpuser:nodejs --from=builder /app/server.ts ./
 COPY --chown=erpuser:nodejs --from=builder /app/src/server ./src/server
 COPY --chown=erpuser:nodejs --from=builder /app/src/shared ./src/shared
 
+# Create persistent upload storage directories owned and writable by the non-root runtime user
+RUN mkdir -p /app/storage/branding /app/storage/receipts && \
+    chown -R erpuser:nodejs /app/storage && \
+    chmod -R 750 /app/storage
+
 # Ensure appropriate ownership
 USER erpuser
 

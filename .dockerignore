@@ -1,0 +1,48 @@
+# Version control & workspace metadata
+.git
+.github
+.aistudio
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+
+# Dependencies (installed cleanly inside container via npm ci)
+node_modules
+
+# Environment secrets
+.env
+.env.*
+
+# Local uploaded files & runtime data
+storage/
+postgres_data/
+
+# Build artifacts & TypeScript incremental state
+dist/
+build/
+dist-ssr/
+*.tsbuildinfo
+
+# Tests & coverage
+tests/
+coverage/
+.vitest/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Backups & archives
+backups/
+*.sql.gz
+*.dump
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+*.bak
