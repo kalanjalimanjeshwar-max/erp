@@ -252,6 +252,8 @@ describe('PostgreSQL 16 Integration Test: EmployeeWorkPolicyRevision Overlap Tri
 
     testPrisma1 = configureIntegrationPrismaClient(testDbUrl);
     testPrisma2 = new PrismaClient({ datasources: { db: { url: testDbUrl } } });
+    // Prisma's bundled dotenv loader may repopulate DATABASE_URL during construction; clear it immediately.
+    delete process.env.DATABASE_URL;
     await testPrisma1.$connect();
     await testPrisma2.$connect();
 
