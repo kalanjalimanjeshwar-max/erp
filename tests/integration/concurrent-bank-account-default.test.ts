@@ -182,11 +182,8 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
     // Endpoint is reachable: do NOT catch or downgrade $connect(), auth, missing DB, PG version, identity, or Prisma errors.
     testPrisma1 = configureIntegrationPrismaClient(testDbUrl);
     testPrisma2 = new PrismaClient({ datasources: { db: { url: testDbUrl } } });
-    // Ensure Prisma's internal dotenv loader cannot leave DATABASE_URL populated in integration mode
-    delete process.env.DATABASE_URL;
     await testPrisma1.$connect();
     await testPrisma2.$connect();
-    delete process.env.DATABASE_URL;
     expect(process.env.DATABASE_URL).toBeUndefined();
     expect(process.env.COREERP_INTEGRATION_TEST_MODE).toBe('true');
 

@@ -106,9 +106,7 @@ export function createPrismaClient(databaseUrl?: string): PrismaClient {
     );
   }
 
-  const hadTestDatabaseUrlBeforePrisma = process.env.TEST_DATABASE_URL !== undefined;
-
-  const client = new PrismaClient({
+  return new PrismaClient({
     datasources: {
       db: {
         url,
@@ -117,15 +115,6 @@ export function createPrismaClient(databaseUrl?: string): PrismaClient {
     // Avoid raw stderr logging; handle errors gracefully through application try/catch handlers
     log: [],
   });
-
-  // Guard against Prisma's internal dotenv loader injecting .env variables during test runs
-  if (isIntegrationMode) {
-    delete process.env.DATABASE_URL;
-  } else if (process.env.NODE_ENV === 'test' && !hadTestDatabaseUrlBeforePrisma) {
-    delete process.env.TEST_DATABASE_URL;
-  }
-
-  return client;
 }
 
 /**

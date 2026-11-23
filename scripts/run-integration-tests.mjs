@@ -109,7 +109,11 @@ export function buildIntegrationChildEnv(baseEnv = process.env) {
   );
 
   const childEnv = { ...baseEnv };
-  delete childEnv.DATABASE_URL;
+  for (const key of Object.keys(childEnv)) {
+    if (key.toUpperCase() === 'DATABASE_URL') {
+      delete childEnv[key];
+    }
+  }
   childEnv.NODE_ENV = 'test';
   childEnv.COREERP_INTEGRATION_TEST_MODE = 'true';
   childEnv.TEST_DATABASE_URL = normalizedUrl;

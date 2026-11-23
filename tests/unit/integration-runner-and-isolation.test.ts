@@ -1,6 +1,9 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
+import { createRequire } from 'node:module';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { PrismaClient } from '@prisma/client';
 import {
   normalizeDatabaseUrl as normalizeRunnerUrl,
   redactDatabaseUrl,
@@ -12,12 +15,20 @@ import {
 import {
   APPROVED_STANDARD_TEST_DB_URL,
   configureTestEnvironment,
+  isBlockedRepoEnvPath,
+  installRepoDotenvFsGuard,
+  restoreRepoDotenvFsGuard,
+  withBlockedRepoDotenv,
+  initializePrismaWithoutRepoDotenv,
 } from '../setup.js';
 import { validateIsolatedUnitDbEnv } from '../helpers/unit-prisma-guard.js';
 import {
   createPrismaClient,
   resetPrismaClientForTesting,
 } from '../../src/server/db/client.js';
+
+const cjsRequire = createRequire(import.meta.url);
+const cjsFs = cjsRequire('node:fs') as typeof fs;
 
 describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (DB-Free)', () => {
   const origEnv = { ...process.env };
@@ -128,11 +139,14 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
   });
 
   describe('2. Integration Runner Child Environment & Direct Vitest Execution', () => {
-    it('prepares child env with NODE_ENV=test, COREERP_INTEGRATION_TEST_MODE=true, and removes DATABASE_URL', () => {
+    it('prepares child env with NODE_ENV=test, COREERP_INTEGRATION_TEST_MODE=true, and removes ALL case-insensitive DATABASE_URL variants', () => {
       const baseEnv: NodeJS.ProcessEnv = {
         PATH: process.env.PATH,
         NODE_ENV: 'development',
         DATABASE_URL: 'postgresql://erp_user:dev_secret@localhost:5432/core_erp?schema=public',
+        database_url: 'postgresql://erp_user:dev_secret@localhost:5432/core_erp?schema=public',
+        Database_Url: 'postgresql://erp_user:dev_secret@localhost:5432/core_erp?schema=public',
+        DaTaBaSe_UrL: 'postgresql://erp_user:dev_secret@localhost:5432/core_erp?schema=public',
         TEST_DATABASE_URL: ` "${validLoopbackUrl}" `,
       };
 
@@ -140,11 +154,14 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
 
       expect(childEnv.NODE_ENV).toBe('test');
       expect(childEnv.COREERP_INTEGRATION_TEST_MODE).toBe('true');
-      expect(childEnv.DATABASE_URL).toBeUndefined();
-      expect('DATABASE_URL' in childEnv).toBe(false);
       expect(childEnv.TEST_DATABASE_URL).toBe(validLoopbackUrl);
+
+      for (const key of Object.keys(childEnv)) {
+        expect(key.toUpperCase()).not.toBe('DATABASE_URL');
+      }
       // Base env object must not be mutated
       expect(baseEnv.DATABASE_URL).toContain(':5432/core_erp');
+      expect(baseEnv.Database_Url).toContain(':5432/core_erp');
     });
 
     it('resolves local Vitest CLI JS entrypoint and invokes process.execPath directly without npx.cmd or shell: true', () => {
@@ -170,6 +187,7 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
         {
           env: {
             DATABASE_URL: 'postgresql://erp_user:dev_pass@localhost:5432/core_erp',
+            Database_Url: 'postgresql://erp_user:dev_pass@localhost:5432/core_erp',
             TEST_DATABASE_URL: validLoopbackUrl,
           },
           spawnFn: mockSpawn,
@@ -196,6 +214,7 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
       expect(spawnOpts.env.NODE_ENV).toBe('test');
       expect(spawnOpts.env.COREERP_INTEGRATION_TEST_MODE).toBe('true');
       expect(spawnOpts.env.DATABASE_URL).toBeUndefined();
+      expect(spawnOpts.env.Database_Url).toBeUndefined();
       expect(spawnOpts.env.TEST_DATABASE_URL).toBe(validLoopbackUrl);
     });
 
@@ -209,7 +228,6 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
         },
       };
 
-      // Invalid URL must abort before spawnFn is called
       const invalidCode = runIntegrationTests(['tests/integration'], {
         env: {
           TEST_DATABASE_URL:
@@ -223,7 +241,6 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
       expect(stderrChunks.join('')).toMatch(/Unapproved port "5432"/);
       expect(stderrChunks.join('')).not.toContain('SecretLeakCheck77');
 
-      // Spawn error (e.g., EINVAL / ENOENT) must be reported clearly, never silently
       stderrChunks.length = 0;
       const einvalErr = Object.assign(new Error('spawnSync EINVAL'), { code: 'EINVAL' });
       const errCode = runIntegrationTests([], {
@@ -235,7 +252,6 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
       expect(errCode).toBe(1);
       expect(stderrChunks.join('')).toMatch(/Failed to spawn Vitest.*EINVAL.*spawnSync EINVAL/);
 
-      // Signal termination must be reported clearly
       stderrChunks.length = 0;
       const sigCode = runIntegrationTests([], {
         env: { TEST_DATABASE_URL: validLocalhostUrl },
@@ -246,7 +262,6 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
       expect(sigCode).toBe(1);
       expect(stderrChunks.join('')).toMatch(/terminated by signal SIGTERM/);
 
-      // Non-zero exit status must propagate directly
       stderrChunks.length = 0;
       const failCode = runIntegrationTests([], {
         env: { TEST_DATABASE_URL: validLocalhostUrl },
@@ -296,7 +311,6 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
       expect(simulatedEnv.TEST_DATABASE_URL).toBeUndefined();
       expect(simulatedEnv.DATABASE_URL).toBe(APPROVED_STANDARD_TEST_DB_URL);
 
-      // Verify unit DB guard accepts the resulting normal DB-free environment
       process.env.DATABASE_URL = simulatedEnv.DATABASE_URL;
       delete process.env.TEST_DATABASE_URL;
       delete process.env.COREERP_INTEGRATION_TEST_MODE;
@@ -336,38 +350,274 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
       expect(() => configureTestEnvironment(simulatedEnv, { config: vi.fn() })).toThrow(
         /Conflicting DATABASE_URL detected in integration test mode/
       );
-      // Must not have silently deleted DATABASE_URL before failing
       expect(simulatedEnv.DATABASE_URL).toBe(
         'postgresql://erp_user:dev_pass@localhost:5432/core_erp'
       );
     });
 
-    it('normalizes TEST_DATABASE_URL and guards dotenv.config in explicit integration mode when DATABASE_URL is unset', () => {
+    it('prevents integration-mode dotenv.config from loading repository .env or prisma/.env while allowing non-repo files', () => {
+      const repoRoot = path.resolve('/fake-repo');
       const simulatedEnv: NodeJS.ProcessEnv = {
         NODE_ENV: 'test',
         COREERP_INTEGRATION_TEST_MODE: 'true',
         TEST_DATABASE_URL: ` '${validLocalhostUrl}' `,
       };
-      const fakeDotenv = {
-        config: () => {
-          simulatedEnv.DATABASE_URL = 'postgresql://erp_user:dev@localhost:5432/core_erp';
-          return { parsed: {} };
-        },
-      };
+      const underlyingConfig = vi.fn((_options?: { path?: string | string[] | URL }) => {
+        simulatedEnv.DATABASE_URL = 'postgresql://erp_user:dev@localhost:5432/core_erp';
+        return { parsed: { DATABASE_URL: simulatedEnv.DATABASE_URL } };
+      });
+      const fakeDotenv = { config: underlyingConfig };
 
-      const outcome = configureTestEnvironment(simulatedEnv, fakeDotenv);
+      const outcome = configureTestEnvironment(simulatedEnv, fakeDotenv, repoRoot);
 
       expect(outcome.isIntegrationMode).toBe(true);
       expect(simulatedEnv.TEST_DATABASE_URL).toBe(validLocalhostUrl);
       expect(simulatedEnv.DATABASE_URL).toBeUndefined();
 
-      // Calling wrapped dotenv.config must still leave DATABASE_URL undefined
-      fakeDotenv.config();
+      // Default dotenv.config() (repo .env) and explicit repo .env / prisma/.env must NOT invoke underlying loader
+      expect(fakeDotenv.config()).toEqual({ parsed: {} });
+      expect(fakeDotenv.config({ path: path.join(repoRoot, '.env') })).toEqual({ parsed: {} });
+      expect(fakeDotenv.config({ path: path.join(repoRoot, 'prisma', '.env') })).toEqual({
+        parsed: {},
+      });
+      expect(underlyingConfig).not.toHaveBeenCalled();
       expect(simulatedEnv.DATABASE_URL).toBeUndefined();
+
+      // Explicit non-repo file (e.g. .env.integration-test) is NOT blocked
+      const nonRepoEnv = {
+        config: vi.fn((_options?: { path?: string | string[] | URL }) => ({
+          parsed: { CUSTOM: '1' },
+        })),
+      };
+      configureTestEnvironment(
+        {
+          NODE_ENV: 'test',
+          COREERP_INTEGRATION_TEST_MODE: 'true',
+          TEST_DATABASE_URL: validLocalhostUrl,
+        },
+        nonRepoEnv,
+        repoRoot
+      );
+      expect(
+        nonRepoEnv.config({ path: path.join(repoRoot, '.env.integration-test') })
+      ).toEqual({ parsed: { CUSTOM: '1' } });
     });
   });
 
-  describe('4. Non-Integration Prisma Client Isolation & Dotenv Contamination Prevention', () => {
+  describe('4. Scoped, Reversible Prisma Internal Dotenv Prevention (Zero Permanent Global Override)', () => {
+    it('blocks ONLY repository root .env and prisma/.env on both POSIX and Windows while allowing .env.integration-test, .env.example, and temp .env files', () => {
+      // POSIX paths
+      expect(isBlockedRepoEnvPath('/workspace/coreerp/.env', '/workspace/coreerp', 'linux')).toBe(
+        true
+      );
+      expect(
+        isBlockedRepoEnvPath('/workspace/coreerp/prisma/.env', '/workspace/coreerp', 'linux')
+      ).toBe(true);
+      expect(isBlockedRepoEnvPath('.env', '/workspace/coreerp', 'linux')).toBe(true);
+      expect(isBlockedRepoEnvPath('prisma/.env', '/workspace/coreerp', 'linux')).toBe(true);
+
+      // Must NOT block non-target env files on POSIX
+      expect(
+        isBlockedRepoEnvPath(
+          '/workspace/coreerp/.env.integration-test',
+          '/workspace/coreerp',
+          'linux'
+        )
+      ).toBe(false);
+      expect(
+        isBlockedRepoEnvPath('/workspace/coreerp/.env.example', '/workspace/coreerp', 'linux')
+      ).toBe(false);
+      expect(isBlockedRepoEnvPath('/tmp/test-run/.env', '/workspace/coreerp', 'linux')).toBe(false);
+
+      // Windows mixed-case drive/path matching
+      expect(isBlockedRepoEnvPath('c:\\CoreERP\\.env', 'C:\\CoreERP', 'win32')).toBe(true);
+      expect(
+        isBlockedRepoEnvPath('C:\\coreerp\\prisma\\.env', 'C:\\CoreERP', 'win32')
+      ).toBe(true);
+      expect(
+        isBlockedRepoEnvPath(
+          'C:\\CoreERP\\node_modules\\.prisma\\client\\..\\..\\..\\.env',
+          'C:\\CoreERP',
+          'win32'
+        )
+      ).toBe(true);
+
+      // Must NOT block non-target env files on Windows
+      expect(
+        isBlockedRepoEnvPath('C:\\CoreERP\\.env.integration-test', 'C:\\CoreERP', 'win32')
+      ).toBe(false);
+      expect(
+        isBlockedRepoEnvPath('C:\\CoreERP\\.env.example', 'C:\\CoreERP', 'win32')
+      ).toBe(false);
+      expect(isBlockedRepoEnvPath('C:\\Temp\\unit\\.env', 'C:\\CoreERP', 'win32')).toBe(false);
+    });
+
+    it('wraps fs.existsSync idempotently, scopes strictly to NODE_ENV=test, and restores the exact original function immediately', () => {
+      const originalExistsSync = vi.fn(() => true) as unknown as typeof fs.existsSync;
+      const mockFs = { existsSync: originalExistsSync };
+      const testEnv: NodeJS.ProcessEnv = { NODE_ENV: 'test' };
+      const fakeRoot = path.resolve(os.tmpdir(), 'fake-coreerp-root');
+
+      // Nested installs are reference-counted and idempotent
+      const release1 = installRepoDotenvFsGuard(fakeRoot, mockFs, testEnv);
+      const wrappedRef = mockFs.existsSync;
+      expect(wrappedRef).not.toBe(originalExistsSync);
+
+      const release2 = installRepoDotenvFsGuard(fakeRoot, mockFs, testEnv);
+      expect(mockFs.existsSync).toBe(wrappedRef);
+
+      // Only repo .env and prisma/.env are blocked while NODE_ENV === 'test'
+      expect(mockFs.existsSync(path.join(fakeRoot, '.env'))).toBe(false);
+      expect(mockFs.existsSync(path.join(fakeRoot, 'prisma', '.env'))).toBe(false);
+      expect(mockFs.existsSync(path.join(fakeRoot, '.env.integration-test'))).toBe(true);
+      expect(mockFs.existsSync(path.join(fakeRoot, '.env.example'))).toBe(true);
+      expect(mockFs.existsSync(path.join(os.tmpdir(), 'other-dir', '.env'))).toBe(true);
+
+      // Narrowly scoped to NODE_ENV=test: production runtime is never blocked
+      testEnv.NODE_ENV = 'production';
+      expect(mockFs.existsSync(path.join(fakeRoot, '.env'))).toBe(true);
+      testEnv.NODE_ENV = 'test';
+
+      // Releasing inner scope keeps guard active until outer scope releases
+      release2();
+      expect(mockFs.existsSync).toBe(wrappedRef);
+      release1();
+      expect(mockFs.existsSync).toBe(originalExistsSync);
+
+      // Also restores cleanly if callback throws inside withBlockedRepoDotenv
+      expect(() =>
+        withBlockedRepoDotenv(
+          () => {
+            expect(mockFs.existsSync).not.toBe(originalExistsSync);
+            throw new Error('boom');
+          },
+          { repoRoot: fakeRoot, fsModule: mockFs, env: testEnv }
+        )
+      ).toThrow('boom');
+      expect(mockFs.existsSync).toBe(originalExistsSync);
+
+      // Force restore is safe when already restored
+      restoreRepoDotenvFsGuard(mockFs, true);
+      expect(mockFs.existsSync).toBe(originalExistsSync);
+    });
+
+    it('prevents Prisma top-level warnEnvConflicts from reading repo .env and immediately restores fs.existsSync', () => {
+      const tempRepo = fs.mkdtempSync(path.join(os.tmpdir(), 'coreerp-prisma-dotenv-'));
+      try {
+        const tempRepoEnv = path.join(tempRepo, '.env');
+        const tempPrismaDir = path.join(tempRepo, 'prisma');
+        const tempPrismaEnv = path.join(tempPrismaDir, '.env');
+        const tempIntegrationEnv = path.join(tempRepo, '.env.integration-test');
+        const tempExampleEnv = path.join(tempRepo, '.env.example');
+
+        fs.mkdirSync(tempPrismaDir, { recursive: true });
+        fs.writeFileSync(
+          tempRepoEnv,
+          'DATABASE_URL="postgresql://erp_user:dev_pass@localhost:5432/core_erp?schema=public"\n',
+          'utf-8'
+        );
+        fs.writeFileSync(
+          tempPrismaEnv,
+          'DATABASE_URL="postgresql://erp_user:dev_pass@localhost:5432/core_erp?schema=public"\n',
+          'utf-8'
+        );
+        fs.writeFileSync(tempIntegrationEnv, 'INTEGRATION_MARKER=1\n', 'utf-8');
+        fs.writeFileSync(tempExampleEnv, 'EXAMPLE_MARKER=1\n', 'utf-8');
+
+        delete process.env.DATABASE_URL;
+        process.env.NODE_ENV = 'test';
+        process.env.COREERP_INTEGRATION_TEST_MODE = 'true';
+
+        const originalRealExistsSync = cjsFs.existsSync;
+        const { warnEnvConflicts } = cjsRequire('@prisma/client/runtime/library.js') as {
+          warnEnvConflicts: (paths: {
+            rootEnvPath: string | null;
+            schemaEnvPath: string | null;
+          }) => void;
+        };
+
+        withBlockedRepoDotenv(
+          () => {
+            // Non-target files remain visible even during the temporary guard scope
+            expect(cjsFs.existsSync(tempIntegrationEnv)).toBe(true);
+            expect(cjsFs.existsSync(tempExampleEnv)).toBe(true);
+
+            // Simulate Prisma's top-level import warnEnvConflicts against tempRepo/.env and tempRepo/prisma/.env
+            warnEnvConflicts({
+              rootEnvPath: tempRepoEnv,
+              schemaEnvPath: tempPrismaEnv,
+            });
+          },
+          { repoRoot: tempRepo, fsModule: cjsFs, env: process.env }
+        );
+
+        // DATABASE_URL was NEVER populated from repo .env or prisma/.env
+        expect(process.env.DATABASE_URL).toBeUndefined();
+        // Global fs.existsSync was immediately restored (no permanent override)
+        expect(cjsFs.existsSync).toBe(originalRealExistsSync);
+        expect(cjsFs.existsSync(tempRepoEnv)).toBe(true);
+      } finally {
+        fs.rmSync(tempRepo, { recursive: true, force: true });
+      }
+    });
+
+    it('pre-initializes @prisma/client with guarded PrismaClient constructor, leaves no permanent fs override, and prevents PrismaClient construction from populating DATABASE_URL', () => {
+      const initResult = initializePrismaWithoutRepoDotenv(process.cwd(), cjsFs, process.env);
+      expect(initResult.initialized).toBe(true);
+      expect(initResult.guardActiveAfter).toBe(false);
+
+      // ESM-imported PrismaClient receives the guarded constructor installed by tests/setup.ts
+      expect((PrismaClient as any)[Symbol.for('coreerp.test.prismaCtorGuarded')]).toBe(true);
+
+      const originalRealExistsSync = cjsFs.existsSync;
+      const probedByUnderlyingFs: string[] = [];
+      const spyExistsSync: typeof fs.existsSync = (targetPath: fs.PathLike) => {
+        probedByUnderlyingFs.push(String(targetPath));
+        return originalRealExistsSync.call(cjsFs, targetPath);
+      };
+
+      // Integration mode: constructing BOTH direct new PrismaClient(...) and createPrismaClient()
+      // (without calling $connect()) must block repo .env / prisma/.env probes from reaching the
+      // underlying fs.existsSync, never populate DATABASE_URL, and restore fs.existsSync immediately.
+      process.env.NODE_ENV = 'test';
+      process.env.COREERP_INTEGRATION_TEST_MODE = 'true';
+      delete process.env.DATABASE_URL;
+      process.env.TEST_DATABASE_URL = validLoopbackUrl;
+
+      cjsFs.existsSync = spyExistsSync;
+      try {
+        const directClient = new PrismaClient({
+          datasources: { db: { url: validLoopbackUrl } },
+        });
+        expect(typeof directClient.$connect).toBe('function');
+        expect(typeof directClient.$disconnect).toBe('function');
+        expect((directClient as any)._engineConfig?.overrideDatasources?.db?.url).toBe(
+          validLoopbackUrl
+        );
+        expect(process.env.DATABASE_URL).toBeUndefined();
+        // Immediately restored to the exact pre-constructor reference (no permanent fs override)
+        expect(cjsFs.existsSync).toBe(spyExistsSync);
+
+        const factoryClient = createPrismaClient();
+        const resolvedUrl = (factoryClient as any)._engineConfig?.overrideDatasources?.db?.url;
+        expect(resolvedUrl).toBe(validLoopbackUrl);
+        expect(process.env.DATABASE_URL).toBeUndefined();
+        expect(cjsFs.existsSync).toBe(spyExistsSync);
+
+        // Neither constructor ever allowed repo root `.env` or `prisma/.env` to reach underlying fs.existsSync
+        const leakedBlockedProbes = probedByUnderlyingFs.filter((p) =>
+          isBlockedRepoEnvPath(p, process.cwd())
+        );
+        expect(leakedBlockedProbes).toEqual([]);
+      } finally {
+        cjsFs.existsSync = originalRealExistsSync;
+      }
+
+      expect(cjsFs.existsSync).toBe(originalRealExistsSync);
+    });
+  });
+
+  describe('5. Non-Integration Prisma Client Isolation & Dotenv Contamination Prevention', () => {
     it('never selects TEST_DATABASE_URL in non-integration test mode even when DATABASE_URL is unset', () => {
       delete process.env.COREERP_INTEGRATION_TEST_MODE;
       delete process.env.DATABASE_URL;
@@ -382,18 +632,6 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
       expect(resolvedUrl).not.toContain('core_erp_integration_test');
     });
 
-    it('does not leave DATABASE_URL populated after createPrismaClient() in integration mode', () => {
-      process.env.COREERP_INTEGRATION_TEST_MODE = 'true';
-      delete process.env.DATABASE_URL;
-      process.env.TEST_DATABASE_URL = validLoopbackUrl;
-
-      const client = createPrismaClient();
-      const resolvedUrl = (client as any)._engineConfig?.overrideDatasources?.db?.url;
-
-      expect(resolvedUrl).toBe(validLoopbackUrl);
-      expect(process.env.DATABASE_URL).toBeUndefined();
-    });
-
     it('skips dotenv.config() during test/Vitest runtimes and removes stale port-5433 TEST_DATABASE_URL from generated .env templates', () => {
       const envSource = fs.readFileSync(
         path.resolve(process.cwd(), 'src/server/config/env.ts'),
@@ -404,20 +642,22 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
         'utf-8'
       );
 
-      expect(envSource).toMatch(/process\.env\.NODE_ENV === 'test' \|\| process\.env\.VITEST === 'true'/);
+      expect(envSource).toMatch(
+        /process\.env\.NODE_ENV === 'test' \|\| process\.env\.VITEST === 'true'/
+      );
       expect(envSource).not.toContain('localhost:5433/core_erp_test');
       expect(devSyncSource).not.toContain('localhost:5433/core_erp_test');
     });
   });
 
-  describe('5. Legacy Integration Suites Require Explicit Integration Mode & Safe Skip Behavior', () => {
+  describe('6. Legacy Integration Suites Require Explicit Integration Mode & Safe Skip Behavior', () => {
     const legacySuites = [
       'tests/integration/concurrent-bank-account-default.test.ts',
       'tests/integration/key-rotation-reencryption.test.ts',
     ];
 
     it.each(legacySuites)(
-      '%s gates strictly on COREERP_INTEGRATION_TEST_MODE === true, skips with BLOCKED / NOT RUN, rejects any defined DATABASE_URL, and clears DATABASE_URL after PrismaClient init',
+      '%s gates strictly on COREERP_INTEGRATION_TEST_MODE === true, skips with BLOCKED / NOT RUN, rejects any defined DATABASE_URL, and asserts DATABASE_URL remains undefined without silent post-hoc deletion',
       (relativePath) => {
         const source = fs.readFileSync(path.resolve(process.cwd(), relativePath), 'utf-8');
 
@@ -429,18 +669,20 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
         expect(source).toContain('[BLOCKED / NOT RUN]');
         expect(source).toContain('ctx.skip(blockedReason)');
 
-        // Rejects ANY defined DATABASE_URL in integration mode (not just equality with testDbUrl)
-        expect(source).toMatch(/if \(process\.env\.DATABASE_URL && process\.env\.DATABASE_URL\.trim\(\) !== ''\)/);
+        // Rejects ANY defined DATABASE_URL in integration mode
+        expect(source).toMatch(
+          /if \(process\.env\.DATABASE_URL && process\.env\.DATABASE_URL\.trim\(\) !== ''\)/
+        );
 
         // Preserves strict protocol, localhost/127.0.0.1, port 5434, database name, PG 16, and current_database() guards
-        expect(source).toContain("port !== 5434");
+        expect(source).toContain('port !== 5434');
         expect(source).toContain("dbName !== 'core_erp_integration_test'");
         expect(source).toContain("host !== 'localhost' && host !== '127.0.0.1'");
         expect(source).toContain('/PostgreSQL\\s+16\\b/i');
         expect(source).toContain('SELECT current_database() AS db_name;');
 
-        // Prevents Prisma internal dotenv loader from leaving DATABASE_URL populated
-        expect(source).toContain('delete process.env.DATABASE_URL;');
+        // Asserts DATABASE_URL stays undefined rather than silently deleting it after Prisma init
+        expect(source).not.toContain('delete process.env.DATABASE_URL');
         expect(source).toContain('expect(process.env.DATABASE_URL).toBeUndefined();');
       }
     );

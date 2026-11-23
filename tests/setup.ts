@@ -19,6 +19,27 @@ const APPROVED_STANDARD_TEST_DB_URL =
 const INTEGRATION_TEST_DB_PORT = '5434';
 const INTEGRATION_TEST_DB_NAME = 'core_erp_integration_test';
 
+import fs from 'node:fs';
+import path from 'node:path';
+import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
+import dotenv from 'dotenv';
+import { beforeAll, beforeEach, afterEach, vi } from 'vitest';
+
+const cjsRequire = createRequire(import.meta.url);
+const cjsFs = cjsRequire('node:fs') as typeof fs;
+
+const DOTENV_GUARD_SYMBOL = Symbol.for('coreerp.test.dotenvGuardInstalled');
+const PRISMA_CTOR_GUARD_SYMBOL = Symbol.for('coreerp.test.prismaCtorGuarded');
+
+interface FsExistsGuardState {
+  originalExistsSync: typeof fs.existsSync;
+  depth: number;
+  repoRoot: string;
+}
+
+const fsExistsGuardStates = new WeakMap<object, FsExistsGuardState>();
+
 export {
   APPROVED_TEST_DB_HOSTS,
   STANDARD_TEST_DB_PORT,
@@ -29,8 +50,255 @@ export {
   normalizeDatabaseUrl,
   validateStandardDatabaseUrl,
   validateIntegrationDatabaseUrl,
+  isBlockedRepoEnvPath,
+  installRepoDotenvFsGuard,
+  restoreRepoDotenvFsGuard,
+  withBlockedRepoDotenv,
+  initializePrismaWithoutRepoDotenv,
   configureTestEnvironment,
 };
+
+/**
+ * Returns true ONLY when targetPath resolves to the repository root `.env`
+ * or `prisma/.env`. Never blocks `.env.example`, `.env.integration-test`,
+ * temporary-directory `.env` files, or any other path.
+ */
+function isBlockedRepoEnvPath(
+  targetPath: unknown,
+  repoRoot: string = process.cwd(),
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  let rawPath: string | null = null;
+  if (typeof targetPath === 'string') {
+    rawPath = targetPath;
+  } else if (Buffer.isBuffer(targetPath)) {
+    rawPath = targetPath.toString('utf8');
+  } else if (targetPath instanceof URL && targetPath.protocol === 'file:') {
+    try {
+      rawPath = fileURLToPath(targetPath);
+    } catch {
+      return false;
+    }
+  }
+
+  if (!rawPath || rawPath.trim() === '') {
+    return false;
+  }
+
+  const pathApi = platform === 'win32' ? path.win32 : path.posix;
+  const resolvedRoot = pathApi.resolve(repoRoot);
+  const resolvedCandidate = pathApi.resolve(resolvedRoot, rawPath);
+  const blockedTargets = [
+    pathApi.resolve(resolvedRoot, '.env'),
+    pathApi.resolve(resolvedRoot, 'prisma', '.env'),
+  ];
+
+  if (platform === 'win32') {
+    const lowerCandidate = resolvedCandidate.toLowerCase();
+    return blockedTargets.some((target) => target.toLowerCase() === lowerCandidate);
+  }
+
+  return blockedTargets.includes(resolvedCandidate);
+}
+
+/**
+ * Idempotently and reversibly wraps `fsModule.existsSync` so that ONLY while
+ * `NODE_ENV === 'test'`, probes for `<repo>/.env` and `<repo>/prisma/.env`
+ * return `false`. Reference-counted so nested calls restore cleanly to the
+ * exact original function.
+ */
+function installRepoDotenvFsGuard(
+  repoRoot: string = process.cwd(),
+  fsModule: { existsSync: typeof fs.existsSync } = cjsFs,
+  env: NodeJS.ProcessEnv = process.env
+): () => void {
+  let state = fsExistsGuardStates.get(fsModule);
+  if (state) {
+    state.depth += 1;
+    state.repoRoot = repoRoot;
+    let released = false;
+    return () => {
+      if (!released) {
+        released = true;
+        restoreRepoDotenvFsGuard(fsModule);
+      }
+    };
+  }
+
+  const originalExistsSync = fsModule.existsSync;
+  state = {
+    originalExistsSync,
+    depth: 1,
+    repoRoot,
+  };
+  fsExistsGuardStates.set(fsModule, state);
+
+  const guardedExistsSync: typeof fs.existsSync = (targetPath: fs.PathLike) => {
+    const activeState = fsExistsGuardStates.get(fsModule);
+    if (
+      activeState &&
+      env.NODE_ENV === 'test' &&
+      isBlockedRepoEnvPath(targetPath, activeState.repoRoot)
+    ) {
+      return false;
+    }
+    return originalExistsSync.call(fsModule, targetPath);
+  };
+
+  fsModule.existsSync = guardedExistsSync;
+
+  let released = false;
+  return () => {
+    if (!released) {
+      released = true;
+      restoreRepoDotenvFsGuard(fsModule);
+    }
+  };
+}
+
+/**
+ * Decrements the guard reference count and restores the original `fs.existsSync`
+ * function as soon as no active guard scope remains.
+ */
+function restoreRepoDotenvFsGuard(
+  fsModule: { existsSync: typeof fs.existsSync } = cjsFs,
+  force = false
+): void {
+  const state = fsExistsGuardStates.get(fsModule);
+  if (!state) {
+    return;
+  }
+
+  state.depth = force ? 0 : Math.max(0, state.depth - 1);
+  if (state.depth === 0) {
+    fsModule.existsSync = state.originalExistsSync;
+    fsExistsGuardStates.delete(fsModule);
+  }
+}
+
+/**
+ * Executes `fn` with `<repo>/.env` and `<repo>/prisma/.env` temporarily hidden
+ * from `fs.existsSync`, guaranteeing restoration in `finally`.
+ */
+function withBlockedRepoDotenv<T>(
+  fn: () => T,
+  options?: {
+    repoRoot?: string;
+    fsModule?: { existsSync: typeof fs.existsSync };
+    env?: NodeJS.ProcessEnv;
+  }
+): T {
+  const release = installRepoDotenvFsGuard(
+    options?.repoRoot ?? process.cwd(),
+    options?.fsModule ?? cjsFs,
+    options?.env ?? process.env
+  );
+  try {
+    return fn();
+  } finally {
+    release();
+  }
+}
+
+/**
+ * Wraps a PrismaClient constructor idempotently via Proxy `construct` trap so
+ * each `new PrismaClient(...)` call runs under a scoped, immediately restored
+ * repo `.env` guard while preserving Prisma's exact prototype chain.
+ */
+function wrapPrismaClientConstructor<T extends new (...args: any[]) => any>(
+  OriginalPrismaClient: T,
+  repoRoot: string = process.cwd(),
+  fsModule: { existsSync: typeof fs.existsSync } = cjsFs,
+  env: NodeJS.ProcessEnv = process.env
+): T {
+  if ((OriginalPrismaClient as any)[PRISMA_CTOR_GUARD_SYMBOL]) {
+    return OriginalPrismaClient;
+  }
+
+  const GuardedPrismaClient = new Proxy(OriginalPrismaClient, {
+    construct(target, args, newTarget) {
+      const release = installRepoDotenvFsGuard(repoRoot, fsModule, env);
+      try {
+        const effectiveNewTarget = newTarget === GuardedPrismaClient ? target : newTarget;
+        return Reflect.construct(target, args, effectiveNewTarget);
+      } finally {
+        release();
+      }
+    },
+    get(target, prop) {
+      if (prop === PRISMA_CTOR_GUARD_SYMBOL) {
+        return true;
+      }
+      return Reflect.get(target, prop, target);
+    },
+  });
+
+  return GuardedPrismaClient;
+}
+
+/**
+ * Pre-initializes `@prisma/client` under a temporary, immediately restored
+ * `fs.existsSync` guard so Prisma 6.19.3's module-top-level `warnEnvConflicts`
+ * and subsequent `new PrismaClient(...)` constructor calls can never read
+ * `<repo>/.env` or `<repo>/prisma/.env` into `process.env`, while leaving zero
+ * permanent global filesystem override after setup completes.
+ */
+function initializePrismaWithoutRepoDotenv(
+  repoRoot: string = process.cwd(),
+  fsModule: { existsSync: typeof fs.existsSync } = cjsFs,
+  env: NodeJS.ProcessEnv = process.env
+): { initialized: boolean; guardActiveAfter: boolean } {
+  if (!isPrismaClientInitialized()) {
+    return {
+      initialized: false,
+      guardActiveAfter: fsExistsGuardStates.has(fsModule),
+    };
+  }
+
+  withBlockedRepoDotenv(
+    () => {
+      const generatedEntryPath = path.resolve(repoRoot, 'node_modules/.prisma/client/index.js');
+      if (fs.existsSync(generatedEntryPath)) {
+        const generatedMod = cjsRequire(generatedEntryPath) as Record<string, any>;
+        if (generatedMod && typeof generatedMod.PrismaClient === 'function') {
+          generatedMod.PrismaClient = wrapPrismaClientConstructor(
+            generatedMod.PrismaClient,
+            repoRoot,
+            fsModule,
+            env
+          );
+        }
+      }
+
+      // Load `.prisma/client/default` before `@prisma/client` so re-exports inherit the guarded constructor.
+      const dotPrismaMod = cjsRequire('.prisma/client/default') as Record<string, any>;
+      if (dotPrismaMod && typeof dotPrismaMod.PrismaClient === 'function') {
+        dotPrismaMod.PrismaClient = wrapPrismaClientConstructor(
+          dotPrismaMod.PrismaClient,
+          repoRoot,
+          fsModule,
+          env
+        );
+      }
+
+      const prismaPkgMod = cjsRequire('@prisma/client') as Record<string, any>;
+      if (prismaPkgMod && typeof prismaPkgMod.PrismaClient === 'function') {
+        prismaPkgMod.PrismaClient = wrapPrismaClientConstructor(
+          prismaPkgMod.PrismaClient,
+          repoRoot,
+          fsModule,
+          env
+        );
+      }
+    },
+    { repoRoot, fsModule, env }
+  );
+
+  return {
+    initialized: true,
+    guardActiveAfter: fsExistsGuardStates.has(fsModule),
+  };
+}
 
 /**
  * Trims whitespace and strips matching surrounding single or double quotes.
@@ -150,11 +418,10 @@ function validateIntegrationDatabaseUrl(urlValue: string | undefined): void {
 }
 
 // 2. Validate environment database URLs independently for safety
-import dotenv from 'dotenv';
-
 function configureTestEnvironment(
   env: NodeJS.ProcessEnv = process.env,
-  dotenvModule: { config?: (...args: any[]) => any } = dotenv
+  dotenvModule: { config?: (...args: any[]) => any } = dotenv,
+  repoRoot: string = process.cwd()
 ): { isIntegrationMode: boolean } {
   // Integration mode must ONLY be activated explicitly via COREERP_INTEGRATION_TEST_MODE=true.
   const isIntegrationMode = env.COREERP_INTEGRATION_TEST_MODE === 'true';
@@ -182,14 +449,25 @@ function configureTestEnvironment(
     validateIntegrationDatabaseUrl(normalizedTestDbUrl);
     env.TEST_DATABASE_URL = normalizedTestDbUrl;
 
-    // Wrap dotenv.config so subsequent calls cannot inject DATABASE_URL from .env
-    if (dotenvModule && typeof dotenvModule.config === 'function') {
+    // Prevent dotenv.config from loading the repository .env or prisma/.env in integration mode.
+    if (
+      dotenvModule &&
+      typeof dotenvModule.config === 'function' &&
+      !(dotenvModule.config as any)[DOTENV_GUARD_SYMBOL]
+    ) {
       const origDotenvConfig = dotenvModule.config;
-      dotenvModule.config = (options?: any) => {
-        const res = origDotenvConfig(options);
-        delete env.DATABASE_URL;
-        return res;
+      const guardedDotenvConfig = (options?: { path?: string | string[] | URL }) => {
+        if (!options || options.path == null) {
+          return { parsed: {} };
+        }
+        const candidatePaths = Array.isArray(options.path) ? options.path : [options.path];
+        if (candidatePaths.some((candidate) => isBlockedRepoEnvPath(candidate, repoRoot))) {
+          return { parsed: {} };
+        }
+        return origDotenvConfig(options);
       };
+      (guardedDotenvConfig as any)[DOTENV_GUARD_SYMBOL] = true;
+      dotenvModule.config = guardedDotenvConfig;
     }
     // In integration mode, DATABASE_URL is deliberately not populated with the port 5433 fallback.
   } else {
@@ -216,20 +494,6 @@ function configureTestEnvironment(
   return { isIntegrationMode };
 }
 
-configureTestEnvironment(process.env, dotenv);
-
-// 4. Provide non-secret, test-only SESSION_SECRET satisfying environment schema
-if (!process.env.SESSION_SECRET) {
-  process.env.SESSION_SECRET = 'test_isolated_session_secret_not_for_production_min32chars';
-}
-
-// 5. Default stub for rolePermission in isolated non-connecting test runs
-// Prevents offline database connection failures from blocking permission resolution
-// in tests that do not connect to a live postgres database.
-import fs from 'fs';
-import path from 'path';
-import { beforeAll, beforeEach, afterEach, vi } from 'vitest';
-
 export function isPrismaClientInitialized(): boolean {
   try {
     const prismaClientDir = path.resolve(process.cwd(), 'node_modules/.prisma/client');
@@ -241,6 +505,21 @@ export function isPrismaClientInitialized(): boolean {
     return false;
   }
 }
+
+configureTestEnvironment(process.env, dotenv, process.cwd());
+
+// Pre-initialize Prisma under a temporary, immediately restored repo `.env` guard
+// BEFORE any test file imports `@prisma/client`.
+initializePrismaWithoutRepoDotenv(process.cwd(), cjsFs, process.env);
+
+// 4. Provide non-secret, test-only SESSION_SECRET satisfying environment schema
+if (!process.env.SESSION_SECRET) {
+  process.env.SESSION_SECRET = 'test_isolated_session_secret_not_for_production_min32chars';
+}
+
+// 5. Default stub for rolePermission in isolated non-connecting test runs
+// Prevents offline database connection failures from blocking permission resolution
+// in tests that do not connect to a live postgres database.
 
 async function ensureRolePermissionStub(): Promise<void> {
   if (process.env.COREERP_INTEGRATION_TEST_MODE === 'true') {
