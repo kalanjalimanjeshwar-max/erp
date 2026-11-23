@@ -1,8 +1,39 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { BridgeConfig, TerminalConfig } from './types.js';
+import { BridgeConfig, BridgeSyncMode, TerminalConfig } from './types.js';
 import { LogLevel } from './logger.js';
+
+const ISO_WITH_TZ_REGEX =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
+
+export function parseBridgeSyncMode(raw?: string | null): BridgeSyncMode {
+  if (raw === undefined || raw === null || raw === '') {
+    // Fail-closed safe default: never start normal punch polling unless explicitly configured as FULL
+    return 'USER_SYNC_ONLY';
+  }
+  const normalized = String(raw).trim().toUpperCase();
+  if (normalized === 'USER_SYNC_ONLY' || normalized === 'FULL') {
+    return normalized;
+  }
+  throw new Error(
+    `Invalid bridge syncMode '${raw}'. Supported values are 'USER_SYNC_ONLY' and 'FULL'.`
+  );
+}
+
+export function validateStrictIsoTimestamp(raw: string, fieldName: string): string {
+  const trimmed = raw.trim();
+  if (!ISO_WITH_TZ_REGEX.test(trimmed)) {
+    throw new Error(
+      `Invalid ${fieldName} '${raw}'. Expected full ISO-8601 timestamp with explicit timezone offset (e.g. '2026-11-23T00:00:00+05:30' or '2026-11-22T18:30:00.000Z').`
+    );
+  }
+  const ms = Date.parse(trimmed);
+  if (Number.isNaN(ms)) {
+    throw new Error(`Invalid ${fieldName} '${raw}': timestamp could not be parsed.`);
+  }
+  return new Date(ms).toISOString();
+}
 
 /**
  * Lightweight zero-dependency .env loader (does not overwrite existing process.env values).
@@ -79,12 +110,35 @@ export function loadBridgeConfig(baseDir = process.cwd()): BridgeConfig {
     throw new Error('Missing COREERP_BASE_URL / coreErpBaseUrl configuration.');
   }
 
+  const syncMode = parseBridgeSyncMode(process.env.BRIDGE_SYNC_MODE ?? fileConfig.syncMode);
+
+  const rawMinPunchTime = process.env.BRIDGE_MIN_PUNCH_TIME_ISO ?? fileConfig.minPunchTimeIso;
+  const minPunchTimeIso =
+    rawMinPunchTime !== undefined && String(rawMinPunchTime).trim() !== ''
+      ? validateStrictIsoTimestamp(String(rawMinPunchTime), 'minPunchTimeIso')
+      : undefined;
+
+  const validatedTerminals = terminals.map((term) => {
+    if (term.minPunchTimeIso !== undefined && String(term.minPunchTimeIso).trim() !== '') {
+      return {
+        ...term,
+        minPunchTimeIso: validateStrictIsoTimestamp(
+          String(term.minPunchTimeIso),
+          `terminals['${term.id}'].minPunchTimeIso`
+        ),
+      };
+    }
+    return term;
+  });
+
   return {
     coreErpBaseUrl,
     allowInsecureHttp:
       process.env.BRIDGE_ALLOW_INSECURE_HTTP === 'true' || fileConfig.allowInsecureHttp === true,
     bridgeHost: (process.env.BRIDGE_HOST_NAME || fileConfig.bridgeHost || os.hostname()).trim(),
     bridgeVersion: '1.0.0',
+    syncMode,
+    minPunchTimeIso,
     healthHost: (process.env.BRIDGE_HEALTH_HOST || fileConfig.healthHost || '127.0.0.1').trim(),
     healthPort: Number(process.env.BRIDGE_HEALTH_PORT || fileConfig.healthPort || 4379),
     dataDir,
@@ -107,6 +161,6 @@ export function loadBridgeConfig(baseDir = process.cwd()): BridgeConfig {
       baseDir,
       process.env.BRIDGE_DPAPI_STORE_PATH || fileConfig.dpapiStorePath || path.join(dataDir, 'credentials.dpapi.json')
     ),
-    terminals,
+    terminals: validatedTerminals,
   };
 }

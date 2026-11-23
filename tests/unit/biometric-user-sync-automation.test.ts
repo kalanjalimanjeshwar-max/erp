@@ -656,6 +656,11 @@ describe('CoreERP Problem 2 — Automatic Biometric User Sync, Continuous Bridge
       const checkpointStore = new CheckpointStore(cfg.dataDir);
 
       // Seed existing punch checkpoint state that MUST remain completely untouched
+      checkpointStore.initializeSafeTerminalCheckpoint({
+        terminalKey: 'essl-x2008-main',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-04-01T00:00:00.000Z',
+      });
       const seededPunch = {
         devicePunchId: 'NFZ8252800275:1:2026-04-01 09:00:00:CHECK_IN',
         userEnrollmentId: '1',
@@ -668,6 +673,7 @@ describe('CoreERP Problem 2 — Automatic Biometric User Sync, Continuous Bridge
       const beforeCp = JSON.parse(
         JSON.stringify(checkpointStore.getTerminal('essl-x2008-main', 'NFZ8252800275'))
       );
+      const beforeCpBytes = fs.readFileSync(checkpointStore.getFilePath(), 'utf8');
 
       const adapter = makeMockAdapter();
       const claimJob: BiometricUserSyncJob = {
@@ -728,6 +734,8 @@ describe('CoreERP Problem 2 — Automatic Biometric User Sync, Continuous Bridge
       expect(afterCp.lastSyncedPunchTimeIso).toBe(beforeCp.lastSyncedPunchTimeIso);
       expect(afterCp.recentPunchIds).toEqual(beforeCp.recentPunchIds);
       expect(afterCp.pendingQueue).toEqual(beforeCp.pendingQueue);
+      // Byte-exact immutability of checkpoints.json during user sync
+      expect(fs.readFileSync(checkpointStore.getFilePath(), 'utf8')).toBe(beforeCpBytes);
     });
 
     it('B2. Continuous daemon stays running after completing a user-sync job and shuts down gracefully', async () => {
@@ -784,9 +792,11 @@ describe('CoreERP Problem 2 — Automatic Biometric User Sync, Continuous Bridge
 
       const snapshotDuring = runner.getStatusSnapshot();
       expect(snapshotDuring.running).toBe(true);
+      expect(snapshotDuring.syncMode).toBe('USER_SYNC_ONLY');
       expect(snapshotDuring.pid).toBe(process.pid);
       expect(jobServed).toBe(true);
       expect(coreErpClient.syncUsers).toHaveBeenCalled();
+      expect(adapter.getAttendanceLogs).not.toHaveBeenCalled();
       expect(snapshotDuring.terminals[0].userSyncJobStatus).toBe('SUCCESS');
 
       await runner.stop(2000);
@@ -959,6 +969,11 @@ describe('CoreERP Problem 2 — Automatic Biometric User Sync, Continuous Bridge
       const logger = createQuietLogger(cfg.logDir);
 
       const store1 = new CheckpointStore(cfg.dataDir);
+      store1.initializeSafeTerminalCheckpoint({
+        terminalKey: 'essl-x2008-main',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-04-02T00:00:00.000Z',
+      });
       store1.enqueuePending('essl-x2008-main', 'NFZ8252800275', [
         {
           devicePunchId: 'NFZ8252800275:7:2026-04-02 08:55:00:CHECK_IN',

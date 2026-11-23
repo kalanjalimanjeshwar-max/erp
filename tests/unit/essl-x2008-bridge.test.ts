@@ -23,8 +23,20 @@ import {
   decodeUserTablePayloadDetailed,
   extractZkTcpFrames,
 } from '../../bridges/essl-x2008-bridge/src/protocol/zkteco-tcp.adapter.js';
-import { CheckpointStore } from '../../bridges/essl-x2008-bridge/src/checkpoint-store.js';
-import { BiometricBridgeRunner } from '../../bridges/essl-x2008-bridge/src/bridge-runner.js';
+import {
+  CheckpointSafetyError,
+  CheckpointStore,
+  compareNormalizedPunches,
+} from '../../bridges/essl-x2008-bridge/src/checkpoint-store.js';
+import {
+  BiometricBridgeRunner,
+  computeEffectivePunchCutoff,
+} from '../../bridges/essl-x2008-bridge/src/bridge-runner.js';
+import {
+  loadBridgeConfig,
+  parseBridgeSyncMode,
+  validateStrictIsoTimestamp,
+} from '../../bridges/essl-x2008-bridge/src/config.js';
 import { BridgeLogger } from '../../bridges/essl-x2008-bridge/src/logger.js';
 import { CoreErpApiError, ICoreErpClient } from '../../bridges/essl-x2008-bridge/src/coreerp-client.js';
 import { validateTransportUrl } from '../../bridges/essl-x2008-bridge/src/security/dpapi.js';
@@ -579,12 +591,20 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       });
 
       try {
+        const checkpointStore = new CheckpointStore(dirs.dataDir);
+        checkpointStore.initializeSafeTerminalCheckpoint({
+          terminalKey: 'x2008-1',
+          serialNumber: 'NFZ8252800275',
+          watermarkIso: '2026-11-14T18:30:00.000Z',
+        });
+
         const runner = new BiometricBridgeRunner({
           config: {
             coreErpBaseUrl: 'http://127.0.0.1:3000',
             allowInsecureHttp: false,
             bridgeHost: 'WIN-BRIDGE-01',
             bridgeVersion: '1.0.0',
+            syncMode: 'FULL',
             healthHost: '127.0.0.1',
             healthPort: 4379,
             dataDir: dirs.dataDir,
@@ -609,12 +629,13 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
             ],
           },
           logger: new BridgeLogger({ silentConsole: true }),
-          checkpointStore: new CheckpointStore(dirs.dataDir),
+          checkpointStore,
           coreErpClient: {
             sendHeartbeat: vi.fn(),
             submitPunches: vi.fn(),
             syncUsers: vi.fn(),
           },
+          nowProvider: () => new Date('2026-11-15T06:00:00.000Z'),
         });
 
         await expect(runner.syncTerminalOnce('x2008-1')).rejects.toThrowError(/Hardware serial mismatch/);
@@ -900,6 +921,7 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
         allowInsecureHttp: false,
         bridgeHost: '192.168.1.16',
         bridgeVersion: '1.0.0',
+        syncMode: 'FULL',
         healthHost: '127.0.0.1',
         healthPort: 4379,
         dataDir: dirs.dataDir,
@@ -924,13 +946,22 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
         ],
       });
 
+      const testNow = () => new Date('2026-11-15T14:00:00.000Z');
+      const store1 = new CheckpointStore(dirs.dataDir);
+      store1.initializeSafeTerminalCheckpoint({
+        terminalKey: 'x2008-main',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-11-14T18:30:00.000Z',
+      });
+
       // Run 1: Sync initial punch1
       const runner1 = new BiometricBridgeRunner({
         config: makeConfig(),
         logger: new BridgeLogger({ silentConsole: true }),
-        checkpointStore: new CheckpointStore(dirs.dataDir),
+        checkpointStore: store1,
         coreErpClient: mockCoreErpClient,
         adapterFactory: mockAdapterFactory,
+        nowProvider: testNow,
       });
 
       const res1 = await runner1.syncTerminalOnce('x2008-main');
@@ -952,6 +983,7 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
         checkpointStore: new CheckpointStore(dirs.dataDir),
         coreErpClient: mockCoreErpClient,
         adapterFactory: mockAdapterFactory,
+        nowProvider: testNow,
       });
 
       const resAfterRestart = await runner2.syncTerminalOnce('x2008-main');
@@ -981,12 +1013,20 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       let serverDown = true;
       const uploaded: any[] = [];
 
+      const outageStore = new CheckpointStore(dirs.dataDir);
+      outageStore.initializeSafeTerminalCheckpoint({
+        terminalKey: 'x2008-main',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-11-14T18:30:00.000Z',
+      });
+
       const runner = new BiometricBridgeRunner({
         config: {
           coreErpBaseUrl: 'https://erp.company.local',
           allowInsecureHttp: false,
           bridgeHost: '192.168.1.16',
           bridgeVersion: '1.0.0',
+          syncMode: 'FULL',
           healthHost: '127.0.0.1',
           healthPort: 4379,
           dataDir: dirs.dataDir,
@@ -1011,7 +1051,8 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
           ],
         },
         logger: new BridgeLogger({ silentConsole: true }),
-        checkpointStore: new CheckpointStore(dirs.dataDir),
+        checkpointStore: outageStore,
+        nowProvider: () => new Date('2026-11-15T10:00:00.000Z'),
         coreErpClient: {
           sendHeartbeat: vi.fn(),
           submitPunches: vi.fn().mockImplementation(async (_k, _sn, batch) => {
@@ -1088,12 +1129,25 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
         silentConsole: true,
       });
 
+      const multiStore = new CheckpointStore(dirs.dataDir);
+      multiStore.initializeSafeTerminalCheckpoint({
+        terminalKey: 'term-a',
+        serialNumber: 'SN-A-001',
+        watermarkIso: '2026-11-14T18:30:00.000Z',
+      });
+      multiStore.initializeSafeTerminalCheckpoint({
+        terminalKey: 'term-b',
+        serialNumber: 'SN-B-002',
+        watermarkIso: '2026-11-14T18:30:00.000Z',
+      });
+
       const runner = new BiometricBridgeRunner({
         config: {
           coreErpBaseUrl: 'https://erp.company.local',
           allowInsecureHttp: false,
           bridgeHost: '192.168.1.16',
           bridgeVersion: '1.0.0',
+          syncMode: 'FULL',
           healthHost: '127.0.0.1',
           healthPort: 4379,
           dataDir: dirs.dataDir,
@@ -1127,7 +1181,8 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
           ],
         },
         logger,
-        checkpointStore: new CheckpointStore(dirs.dataDir),
+        checkpointStore: multiStore,
+        nowProvider: () => new Date('2026-11-15T10:00:00.000Z'),
         coreErpClient: {
           sendHeartbeat: vi.fn().mockImplementation(async (apiKey) => {
             if (apiKey === secretA) {
@@ -1477,12 +1532,20 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       const syncedPayloads: any[] = [];
       const submittedPunches: any[] = [];
 
+      const userSyncStore = new CheckpointStore(dirs.dataDir);
+      userSyncStore.initializeSafeTerminalCheckpoint({
+        terminalKey: 'x2008-main',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-11-15T18:30:00.000Z',
+      });
+
       const runner = new BiometricBridgeRunner({
         config: {
           coreErpBaseUrl: 'https://erp.company.local',
           allowInsecureHttp: false,
           bridgeHost: '192.168.1.16',
           bridgeVersion: '1.0.0',
+          syncMode: 'FULL',
           healthHost: '127.0.0.1',
           healthPort: 4379,
           dataDir: dirs.dataDir,
@@ -1507,7 +1570,8 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
           ],
         },
         logger,
-        checkpointStore: new CheckpointStore(dirs.dataDir),
+        checkpointStore: userSyncStore,
+        nowProvider: () => new Date('2026-11-16T06:00:00.000Z'),
         coreErpClient: {
           sendHeartbeat: vi.fn().mockResolvedValue({
             success: true,
@@ -1585,16 +1649,17 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       expect(syncedPayloads[0].deviceUsers[0]).toMatchObject({ enrollmentId: '101', name: 'Karthik Rao' });
       expect(submittedPunches).toHaveLength(0);
 
-      // 2a. API upload failure during syncTerminalUsersOnce queues pendingUserSync and logs warning without secret
+      // 2a. API upload failure during syncTerminalUsersOnce records runtime error without mutating checkpoints.json
+      const cpBytesBeforeUserSyncFail = fs.readFileSync(userSyncStore.getFilePath(), 'utf8');
       syncUsersShouldFail = true;
       await expect(runner.syncTerminalUsersOnce('x2008-main')).rejects.toThrowError(/503 Backend Busy/);
 
       const afterUploadFail = runner.getStatusSnapshot().terminals[0];
       expect(afterUploadFail.lastUserSyncError).toMatch(/503 Backend Busy/);
-      const cpAfterFail = new CheckpointStore(dirs.dataDir).getTerminal('x2008-main', 'NFZ8252800275');
-      expect(cpAfterFail.pendingUserSync?.users).toHaveLength(1);
+      // Strict P0-A isolation: syncTerminalUsersOnce MUST NOT mutate checkpoints.json on disk
+      expect(fs.readFileSync(userSyncStore.getFilePath(), 'utf8')).toBe(cpBytesBeforeUserSyncFail);
 
-      // 2b. When CoreERP recovers, syncTerminalOnce() uploads punches AND clears pendingUserSync + error
+      // 2b. When CoreERP recovers, syncTerminalOnce() uploads punches AND clears pending user sync + error
       syncUsersShouldFail = false;
       const recoveryPollRes = await runner.syncTerminalOnce('x2008-main');
       expect(recoveryPollRes.uploadedCount).toBe(1);
@@ -2248,6 +2313,916 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       } finally {
         await mockEmpty1501Mismatch.close();
       }
+    });
+  });
+
+  describe('7. P0-A Bridge Safety: Fail-Closed Checkpoints, Current-Day Cutoff, Ordering & USER_SYNC_ONLY Mode', () => {
+    function makeP0ABridgeConfig(
+      dirs: { dataDir: string; logDir: string },
+      overrides?: Partial<BridgeConfig>
+    ): BridgeConfig {
+      return {
+        coreErpBaseUrl: 'http://127.0.0.1:3000',
+        allowInsecureHttp: true,
+        bridgeHost: 'WIN-BRIDGE-P0A',
+        bridgeVersion: '1.0.0',
+        syncMode: 'FULL',
+        healthHost: '127.0.0.1',
+        healthPort: 4379,
+        dataDir: dirs.dataDir,
+        logDir: dirs.logDir,
+        logLevel: 'debug',
+        batchSize: 100,
+        pollIntervalMs: 60000,
+        heartbeatIntervalMs: 60000,
+        jobPollIntervalMs: 60000,
+        connectTimeoutMs: 2000,
+        maxBackoffMs: 120000,
+        dpapiStorePath: path.join(dirs.dataDir, 'credentials.dpapi.json'),
+        terminals: [
+          {
+            id: 'essl-x2008-main',
+            name: 'eSSL X2008 Main',
+            serialNumber: 'NFZ8252800275',
+            ipAddress: '192.168.1.201',
+            port: 4370,
+            deviceTimezone: 'Asia/Kolkata',
+            apiKey: 'bio_live_p0a_safety_test_key_0123456789',
+          },
+        ],
+        ...overrides,
+      };
+    }
+
+    function makeMockAdapterWithLogs(
+      logs: DeviceAttendanceRecord[],
+      overrides?: Partial<IBiometricProtocolAdapter>
+    ): IBiometricProtocolAdapter {
+      return {
+        protocolName: 'mock-x2008-p0a',
+        connect: vi.fn().mockResolvedValue(undefined),
+        getDeviceInfo: vi.fn().mockResolvedValue({
+          serialNumber: 'NFZ8252800275',
+          platform: 'ZLM60_TFT',
+          fingerprintAlgorithm: 'VX10.0',
+          firmwareVersion: 'Ver 6.60',
+          deviceName: 'eSSL X2008',
+          oemVendor: 'eSSL',
+        } satisfies DeviceInfo),
+        getAttendanceLogs: vi.fn().mockResolvedValue(logs),
+        getUsers: vi.fn().mockResolvedValue([
+          { uid: 1, enrollmentId: '101', name: 'Asha Rao', cardNo: '1001' },
+        ]),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+        ...overrides,
+      };
+    }
+
+    it('P0A-1: refuses normal punch sync on fresh/missing checkpoint, missing terminal entry, or missing watermark without auto-creating checkpoints.json', async () => {
+      const dirs = makeTempDirs();
+      tempCleanups.push(dirs.cleanup);
+
+      const cpStore = new CheckpointStore(dirs.dataDir);
+      expect(cpStore.getHealth().status).toBe('MISSING');
+      expect(fs.existsSync(cpStore.getFilePath())).toBe(false);
+
+      const adapter = makeMockAdapterWithLogs([]);
+      const submitPunches = vi.fn();
+      const runner = new BiometricBridgeRunner({
+        config: makeP0ABridgeConfig(dirs),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: cpStore,
+        coreErpClient: {
+          sendHeartbeat: vi.fn().mockResolvedValue({
+            success: true,
+            serverTime: '2026-11-23T04:00:00.000Z',
+            terminalId: 'essl-x2008-main',
+            terminalName: 'eSSL X2008 Main',
+            status: 'ONLINE',
+          }),
+          submitPunches,
+          syncUsers: vi.fn(),
+        },
+        adapterFactory: () => adapter,
+        nowProvider: () => new Date('2026-11-23T04:00:00.000Z'),
+      });
+
+      const snap = runner.getStatusSnapshot();
+      expect(snap.terminals[0].punchSyncBlocked).toBe(true);
+      expect(snap.terminals[0].punchSyncBlockReason).toMatch(/missing/i);
+
+      await expect(runner.syncTerminalOnce('essl-x2008-main')).rejects.toMatchObject({
+        name: 'CheckpointSafetyError',
+        code: 'CHECKPOINT_MISSING',
+      });
+
+      // Must fail closed BEFORE contacting hardware or creating checkpoints.json
+      expect(adapter.connect).not.toHaveBeenCalled();
+      expect(adapter.getAttendanceLogs).not.toHaveBeenCalled();
+      expect(submitPunches).not.toHaveBeenCalled();
+      expect(fs.existsSync(cpStore.getFilePath())).toBe(false);
+
+      // Even start() in FULL mode must NOT launch punch polling when checkpoint is missing
+      await runner.start();
+      await new Promise((r) => setTimeout(r, 40));
+      await runner.stop(1000);
+      expect(adapter.getAttendanceLogs).not.toHaveBeenCalled();
+      expect(fs.existsSync(cpStore.getFilePath())).toBe(false);
+
+      // Valid file missing lastSyncedPunchTimeIso watermark must also fail closed (MISSING_WATERMARK)
+      const nullWatermarkFile = {
+        version: 1,
+        updatedAt: '2026-11-23T00:00:00.000Z',
+        terminals: {
+          'essl-x2008-main': {
+            terminalKey: 'essl-x2008-main',
+            serialNumber: 'NFZ8252800275',
+            lastSyncedPunchTimeIso: null,
+            lastSyncedDevicePunchId: null,
+            recentPunchIds: [],
+            pendingQueue: [],
+            lastSuccessfulHeartbeatAt: null,
+            lastSuccessfulSyncAt: null,
+            lastSyncAttemptAt: null,
+            lastProcessedPunchCount: 0,
+            lastError: null,
+          },
+        },
+      };
+      fs.writeFileSync(cpStore.getFilePath(), JSON.stringify(nullWatermarkFile, null, 2), 'utf8');
+      const nullWatermarkStore = new CheckpointStore(dirs.dataDir);
+      expect(() =>
+        nullWatermarkStore.validateTerminalForPunchSync('essl-x2008-main', 'NFZ8252800275')
+      ).toThrowError(CheckpointSafetyError);
+      try {
+        nullWatermarkStore.validateTerminalForPunchSync('essl-x2008-main', 'NFZ8252800275');
+      } catch (err) {
+        expect((err as CheckpointSafetyError).code).toBe('MISSING_WATERMARK');
+      }
+    });
+
+    it('P0A-2: refuses normal punch sync on corrupt JSON, invalid version, or invalid schema without resetting checkpoint or overwriting/deleting .corrupt backups', async () => {
+      const dirs = makeTempDirs();
+      tempCleanups.push(dirs.cleanup);
+      fs.mkdirSync(dirs.dataDir, { recursive: true });
+
+      const cpPath = path.join(dirs.dataDir, 'checkpoints.json');
+      const existingBackupPath = path.join(dirs.dataDir, 'checkpoints.json.corrupt.111111');
+      fs.writeFileSync(existingBackupPath, '{"previous":"backup"}', 'utf8');
+      const corruptContent = '{ "version": 1, "terminals": { BROKEN_JSON';
+      fs.writeFileSync(cpPath, corruptContent, 'utf8');
+
+      const corruptStore = new CheckpointStore(dirs.dataDir);
+      const health = corruptStore.getHealth();
+      expect(health.status).toBe('CORRUPT');
+      expect(health.corruptBackupPath).toBeTruthy();
+      expect(fs.existsSync(health.corruptBackupPath!)).toBe(true);
+      expect(fs.readFileSync(health.corruptBackupPath!, 'utf8')).toBe(corruptContent);
+      // Pre-existing corrupt backup must never be deleted or overwritten
+      expect(fs.readFileSync(existingBackupPath, 'utf8')).toBe('{"previous":"backup"}');
+      // Original corrupt file must NOT be auto-reset to an empty checkpoint
+      expect(fs.readFileSync(cpPath, 'utf8')).toBe(corruptContent);
+
+      const adapter = makeMockAdapterWithLogs([]);
+      const runner = new BiometricBridgeRunner({
+        config: makeP0ABridgeConfig(dirs),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: corruptStore,
+        coreErpClient: {
+          sendHeartbeat: vi.fn(),
+          submitPunches: vi.fn(),
+          syncUsers: vi.fn(),
+        },
+        adapterFactory: () => adapter,
+        nowProvider: () => new Date('2026-11-23T04:00:00.000Z'),
+      });
+
+      await expect(runner.syncTerminalOnce('essl-x2008-main')).rejects.toMatchObject({
+        name: 'CheckpointSafetyError',
+        code: 'CHECKPOINT_CORRUPT',
+      });
+      expect(adapter.connect).not.toHaveBeenCalled();
+      expect(adapter.getAttendanceLogs).not.toHaveBeenCalled();
+
+      // Explicit initialize must also refuse to silently overwrite a corrupt file
+      expect(() =>
+        corruptStore.initializeSafeTerminalCheckpoint({
+          terminalKey: 'essl-x2008-main',
+          serialNumber: 'NFZ8252800275',
+          watermarkIso: '2026-11-22T18:30:00.000Z',
+        })
+      ).toThrowError(CheckpointSafetyError);
+
+      // persist() and updateStatus() must be strict no-ops on corrupt store
+      expect(corruptStore.updateStatus('essl-x2008-main', 'NFZ8252800275', { lastError: 'x' })).toBe(false);
+      corruptStore.persist();
+      expect(fs.readFileSync(cpPath, 'utf8')).toBe(corruptContent);
+
+      // Invalid version check
+      const dirsV = makeTempDirs();
+      tempCleanups.push(dirsV.cleanup);
+      fs.mkdirSync(dirsV.dataDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dirsV.dataDir, 'checkpoints.json'),
+        JSON.stringify({ version: 99, updatedAt: '2026-11-23T00:00:00.000Z', terminals: {} }),
+        'utf8'
+      );
+      const invalidVerStore = new CheckpointStore(dirsV.dataDir);
+      expect(invalidVerStore.getHealth().status).toBe('INVALID_VERSION');
+      expect(() =>
+        invalidVerStore.validateTerminalForPunchSync('essl-x2008-main', 'NFZ8252800275')
+      ).toThrowError(/unsupported version/i);
+
+      // Invalid schema check
+      const dirsS = makeTempDirs();
+      tempCleanups.push(dirsS.cleanup);
+      fs.mkdirSync(dirsS.dataDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(dirsS.dataDir, 'checkpoints.json'),
+        JSON.stringify({ version: 1, updatedAt: '2026-11-23T00:00:00.000Z', terminals: 'not-an-object' }),
+        'utf8'
+      );
+      const invalidSchemaStore = new CheckpointStore(dirsS.dataDir);
+      expect(invalidSchemaStore.getHealth().status).toBe('INVALID_SCHEMA');
+      expect(() =>
+        invalidSchemaStore.validateTerminalForPunchSync('essl-x2008-main', 'NFZ8252800275')
+      ).toThrowError(/invalid 'terminals' map/i);
+    });
+
+    it('P0A-3: fails closed on terminal serial mismatch or changed terminal ID without creating a silent empty watermark', async () => {
+      const dirs = makeTempDirs();
+      tempCleanups.push(dirs.cleanup);
+
+      const store = new CheckpointStore(dirs.dataDir);
+      store.initializeSafeTerminalCheckpoint({
+        terminalKey: 'essl-x2008-main',
+        serialNumber: 'OTHER-SERIAL-99999',
+        watermarkIso: '2026-11-22T18:30:00.000Z',
+      });
+
+      const adapter = makeMockAdapterWithLogs([]);
+      const runnerMismatch = new BiometricBridgeRunner({
+        config: makeP0ABridgeConfig(dirs),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: store,
+        coreErpClient: {
+          sendHeartbeat: vi.fn(),
+          submitPunches: vi.fn(),
+          syncUsers: vi.fn(),
+        },
+        adapterFactory: () => adapter,
+        nowProvider: () => new Date('2026-11-23T04:00:00.000Z'),
+      });
+
+      await expect(runnerMismatch.syncTerminalOnce('essl-x2008-main')).rejects.toMatchObject({
+        name: 'CheckpointSafetyError',
+        code: 'TERMINAL_SERIAL_MISMATCH',
+      });
+      expect(adapter.connect).not.toHaveBeenCalled();
+      expect(adapter.getAttendanceLogs).not.toHaveBeenCalled();
+
+      // Terminal ID changed while serialNumber matches an existing checkpoint entry
+      const dirsId = makeTempDirs();
+      tempCleanups.push(dirsId.cleanup);
+      const storeId = new CheckpointStore(dirsId.dataDir);
+      storeId.initializeSafeTerminalCheckpoint({
+        terminalKey: 'essl-x2008-legacy-key',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-11-22T18:30:00.000Z',
+      });
+
+      const runnerRenamed = new BiometricBridgeRunner({
+        config: makeP0ABridgeConfig(dirsId),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: storeId,
+        coreErpClient: {
+          sendHeartbeat: vi.fn(),
+          submitPunches: vi.fn(),
+          syncUsers: vi.fn(),
+        },
+        adapterFactory: () => adapter,
+        nowProvider: () => new Date('2026-11-23T04:00:00.000Z'),
+      });
+
+      await expect(runnerRenamed.syncTerminalOnce('essl-x2008-main')).rejects.toMatchObject({
+        name: 'CheckpointSafetyError',
+        code: 'TERMINAL_ID_CHANGED',
+      });
+      expect(adapter.getAttendanceLogs).not.toHaveBeenCalled();
+    });
+
+    it('P0A-4: rejects 2,225 historical punches before pendingQueue and upload while uploading only current-day Asia/Kolkata punches', async () => {
+      const dirs = makeTempDirs();
+      tempCleanups.push(dirs.cleanup);
+
+      // Reference clock: 2026-11-23 10:00:00 Asia/Kolkata (= 2026-11-23T04:30:00.000Z)
+      // Current-day cutoff in Asia/Kolkata: 2026-11-23 00:00:00 IST = 2026-11-22T18:30:00.000Z
+      const refNow = () => new Date('2026-11-23T04:30:00.000Z');
+
+      const store = new CheckpointStore(dirs.dataDir);
+      // Even if watermark is older (from previous month), mandatory current-day cutoff MUST still filter all 2,225 historical records!
+      store.initializeSafeTerminalCheckpoint({
+        terminalKey: 'essl-x2008-main',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-10-01T00:00:00.000Z',
+      });
+
+      // Build 2,225 historical punches strictly before 2026-11-23 00:00:00 IST (including 2026-11-22 23:59:59 IST)
+      const historicalLogs: DeviceAttendanceRecord[] = Array.from({ length: 2225 }, (_, i) => {
+        if (i === 2224) {
+          // Exact 1 second before Asia/Kolkata midnight boundary -> MUST be rejected
+          return {
+            uid: 1,
+            userEnrollmentId: '101',
+            localDateTime: { year: 2026, month: 11, day: 22, hour: 23, minute: 59, second: 59 },
+            verifyCode: 1,
+            verifyType: 'FINGERPRINT',
+            inOutCode: 0,
+            inOutMode: 'CHECK_IN',
+            workCode: 0,
+            recordSequence: i,
+          };
+        }
+        const dayOffset = Math.floor(i / 100); // 0..22 days earlier
+        const day = Math.max(1, 22 - (dayOffset % 21));
+        const hour = 8 + (i % 10);
+        const minute = i % 60;
+        const second = i % 59;
+        return {
+          uid: (i % 13) + 1,
+          userEnrollmentId: String(100 + (i % 13) + 1),
+          localDateTime: { year: 2026, month: 11, day, hour, minute, second },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: i % 2,
+          inOutMode: i % 2 === 0 ? 'CHECK_IN' : 'CHECK_OUT',
+          workCode: 0,
+          recordSequence: i,
+        };
+      });
+
+      // Two valid current-day punches (including exact Asia/Kolkata midnight 00:00:00 IST)
+      const todayLogs: DeviceAttendanceRecord[] = [
+        {
+          uid: 1,
+          userEnrollmentId: '101',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 0, minute: 0, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 2225,
+        },
+        {
+          uid: 2,
+          userEnrollmentId: '102',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 9, minute: 15, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 2226,
+        },
+      ];
+
+      const submittedBatches: any[] = [];
+      const enqueueSpy = vi.spyOn(store, 'enqueuePending');
+
+      const runner = new BiometricBridgeRunner({
+        config: makeP0ABridgeConfig(dirs),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: store,
+        coreErpClient: {
+          sendHeartbeat: vi.fn(),
+          submitPunches: vi.fn().mockImplementation(async (_k, _sn, batch) => {
+            submittedBatches.push(batch);
+            return {
+              success: true,
+              totalReceived: batch.length,
+              inserted: batch.length,
+              duplicates: 0,
+              unmappedEmployees: 0,
+              terminalId: 'essl-x2008-main',
+              terminalName: 'eSSL X2008 Main',
+            };
+          }),
+          syncUsers: vi.fn().mockResolvedValue({
+            success: true,
+            terminalId: 'essl-x2008-main',
+            terminalName: 'eSSL X2008 Main',
+            discoveredCount: 1,
+            syncedCount: 1,
+            syncedAt: '2026-11-23T04:30:00.000Z',
+          }),
+        },
+        adapterFactory: () => makeMockAdapterWithLogs([...historicalLogs, ...todayLogs]),
+        nowProvider: refNow,
+      });
+
+      const res = await runner.syncTerminalOnce('essl-x2008-main');
+      expect(res.pulledCount).toBe(2227);
+      expect(res.filteredHistoricalCount).toBe(2225);
+      expect(res.newlyQueuedCount).toBe(2);
+      expect(res.uploadedCount).toBe(2);
+      expect(res.effectiveCutoffIso).toBe('2026-11-22T18:30:00.000Z');
+
+      // Ensure NONE of the 2,225 historical records ever entered pendingQueue or submitPunches
+      expect(enqueueSpy).toHaveBeenCalledTimes(1);
+      expect(enqueueSpy.mock.calls[0][2]).toHaveLength(2);
+      expect(submittedBatches).toHaveLength(1);
+      expect(submittedBatches[0]).toHaveLength(2);
+      expect(submittedBatches[0][0].punchTime).toBe('2026-11-22T18:30:00.000Z');
+      expect(submittedBatches[0][1].punchTime).toBe('2026-11-23T03:45:00.000Z');
+
+      // Defensive pre-upload gate: stale pendingQueue entry older than cutoff is pruned and never uploaded
+      store.enqueuePending('essl-x2008-main', 'NFZ8252800275', [
+        {
+          devicePunchId: 'NFZ8252800275:999:2026-11-20T09:00:00:CHECK_IN',
+          userEnrollmentId: '999',
+          punchTime: '2026-11-20T03:30:00.000Z',
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+        },
+      ]);
+      const resPrune = await runner.syncTerminalOnce('essl-x2008-main');
+      expect(resPrune.uploadedCount).toBe(0);
+      expect(resPrune.remainingQueueCount).toBe(0);
+      expect(submittedBatches).toHaveLength(1);
+    });
+
+    it('P0A-5: converts Asia/Kolkata midnight cutoff accurately to UTC and prevents explicit minPunchTimeIso from weakening current-day cutoff', () => {
+      // Case A: Morning IST (2026-11-23 07:45 IST = 2026-11-23T02:15:00.000Z)
+      const morning = computeEffectivePunchCutoff('Asia/Kolkata', {
+        now: new Date('2026-11-23T02:15:00.000Z'),
+      });
+      expect(morning.currentLocalDate).toBe('2026-11-23');
+      expect(morning.currentDayStartIso).toBe('2026-11-22T18:30:00.000Z');
+      expect(morning.effectiveCutoffIso).toBe('2026-11-22T18:30:00.000Z');
+
+      // Case B: Just after IST midnight while UTC is still previous day (2026-11-23 00:30 IST = 2026-11-22T19:00:00.000Z)
+      const postMidnightIst = computeEffectivePunchCutoff('Asia/Kolkata', {
+        now: new Date('2026-11-22T19:00:00.000Z'),
+      });
+      expect(postMidnightIst.currentLocalDate).toBe('2026-11-23');
+      expect(postMidnightIst.effectiveCutoffIso).toBe('2026-11-22T18:30:00.000Z');
+
+      // Case C: Explicit earlier minPunchTimeIso MUST NOT weaken mandatory current-day cutoff
+      const attemptedWeaken = computeEffectivePunchCutoff('Asia/Kolkata', {
+        now: new Date('2026-11-23T02:15:00.000Z'),
+        bridgeMinPunchTimeIso: '2026-11-01T00:00:00+05:30',
+        terminalMinPunchTimeIso: '2026-11-20T00:00:00+05:30',
+      });
+      expect(attemptedWeaken.effectiveCutoffIso).toBe('2026-11-22T18:30:00.000Z');
+
+      // Case D: Explicit later minPunchTimeIso CAN tighten the cutoff
+      const tightened = computeEffectivePunchCutoff('Asia/Kolkata', {
+        now: new Date('2026-11-23T04:00:00.000Z'),
+        terminalMinPunchTimeIso: '2026-11-23T08:00:00+05:30',
+      });
+      expect(tightened.effectiveCutoffIso).toBe('2026-11-23T02:30:00.000Z');
+
+      // Case E: Config helpers default syncMode to USER_SYNC_ONLY and fail closed on invalid values
+      expect(parseBridgeSyncMode(undefined)).toBe('USER_SYNC_ONLY');
+      expect(parseBridgeSyncMode('')).toBe('USER_SYNC_ONLY');
+      expect(parseBridgeSyncMode('USER_SYNC_ONLY')).toBe('USER_SYNC_ONLY');
+      expect(parseBridgeSyncMode('FULL')).toBe('FULL');
+      expect(() => parseBridgeSyncMode('ALL_PUNCHES')).toThrowError(/Invalid bridge syncMode/i);
+      expect(() => validateStrictIsoTimestamp('2026-11-23T00:00:00', 'minPunchTimeIso')).toThrowError(
+        /explicit timezone offset/i
+      );
+
+      // Verify loadBridgeConfig defaults omitted syncMode to USER_SYNC_ONLY
+      const cfgDir = makeTempDirs();
+      tempCleanups.push(cfgDir.cleanup);
+      fs.writeFileSync(
+        path.join(cfgDir.root, 'bridge.config.json'),
+        JSON.stringify({
+          coreErpBaseUrl: 'http://127.0.0.1:3000',
+          allowInsecureHttp: true,
+          terminals: [
+            {
+              id: 'essl-x2008-main',
+              name: 'X2008',
+              serialNumber: 'NFZ8252800275',
+              ipAddress: '192.168.1.201',
+              port: 4370,
+              deviceTimezone: 'Asia/Kolkata',
+            },
+          ],
+        }),
+        'utf8'
+      );
+      const savedSyncEnv = process.env.BRIDGE_SYNC_MODE;
+      const savedCfgPath = process.env.BRIDGE_CONFIG_PATH;
+      delete process.env.BRIDGE_SYNC_MODE;
+      delete process.env.BRIDGE_CONFIG_PATH;
+      try {
+        const loadedCfg = loadBridgeConfig(cfgDir.root);
+        expect(loadedCfg.syncMode).toBe('USER_SYNC_ONLY');
+      } finally {
+        if (savedSyncEnv !== undefined) process.env.BRIDGE_SYNC_MODE = savedSyncEnv;
+        if (savedCfgPath !== undefined) process.env.BRIDGE_CONFIG_PATH = savedCfgPath;
+      }
+    });
+
+    it('P0A-6: sorts out-of-order device logs ascending with deterministic tie-breaking and surfaces late-arriving pre-watermark records explicitly', async () => {
+      const dirs = makeTempDirs();
+      tempCleanups.push(dirs.cleanup);
+
+      const store = new CheckpointStore(dirs.dataDir);
+      store.initializeSafeTerminalCheckpoint({
+        terminalKey: 'essl-x2008-main',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-11-22T18:30:00.000Z',
+      });
+
+      const logger = new BridgeLogger({
+        level: 'debug',
+        logDir: dirs.logDir,
+        fileName: 'p0a-ordering.log',
+        silentConsole: true,
+      });
+
+      // Intentionally scrambled order including same-timestamp tie-breaker records
+      const scrambledLogs: DeviceAttendanceRecord[] = [
+        {
+          uid: 1,
+          userEnrollmentId: '101',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 18, minute: 0, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 4,
+        },
+        {
+          uid: 2,
+          userEnrollmentId: '102',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 9, minute: 0, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 2,
+        },
+        {
+          uid: 1,
+          userEnrollmentId: '101',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 9, minute: 0, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 1,
+        },
+        {
+          uid: 1,
+          userEnrollmentId: '101',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 13, minute: 0, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 3,
+        },
+      ];
+
+      let currentLogs = [...scrambledLogs];
+      const submittedBatches: any[][] = [];
+
+      const runner = new BiometricBridgeRunner({
+        config: makeP0ABridgeConfig(dirs, { batchSize: 2 }),
+        logger,
+        checkpointStore: store,
+        coreErpClient: {
+          sendHeartbeat: vi.fn(),
+          submitPunches: vi.fn().mockImplementation(async (_k, _sn, batch) => {
+            submittedBatches.push(batch);
+            return {
+              success: true,
+              totalReceived: batch.length,
+              inserted: batch.length,
+              duplicates: 0,
+              unmappedEmployees: 0,
+              terminalId: 'essl-x2008-main',
+              terminalName: 'eSSL X2008 Main',
+            };
+          }),
+          syncUsers: vi.fn().mockResolvedValue({
+            success: true,
+            terminalId: 'essl-x2008-main',
+            terminalName: 'eSSL X2008 Main',
+            discoveredCount: 1,
+            syncedCount: 1,
+            syncedAt: '2026-11-23T13:00:00.000Z',
+          }),
+        },
+        adapterFactory: () =>
+          makeMockAdapterWithLogs([], {
+            getAttendanceLogs: vi.fn().mockImplementation(async () => [...currentLogs]),
+          }),
+        nowProvider: () => new Date('2026-11-23T13:00:00.000Z'),
+      });
+
+      const res = await runner.syncTerminalOnce('essl-x2008-main');
+      expect(res.uploadedCount).toBe(4);
+      expect(submittedBatches).toHaveLength(2);
+      // Batch 1 must contain the two 09:00 IST records sorted deterministically (101 before 102)
+      expect(submittedBatches[0].map((e) => `${e.userEnrollmentId}@${e.punchTime}`)).toEqual([
+        '101@2026-11-23T03:30:00.000Z',
+        '102@2026-11-23T03:30:00.000Z',
+      ]);
+      // Batch 2 must contain 13:00 IST then 18:00 IST
+      expect(submittedBatches[1].map((e) => `${e.userEnrollmentId}@${e.punchTime}`)).toEqual([
+        '101@2026-11-23T07:30:00.000Z',
+        '101@2026-11-23T12:30:00.000Z',
+      ]);
+
+      // Verify comparator symmetry & determinism
+      expect(compareNormalizedPunches(submittedBatches[0][0], submittedBatches[0][1])).toBeLessThan(0);
+
+      // Late-arriving unseen in-day punch strictly older than watermark - 5min must NOT be silently discarded:
+      // watermark restriction is preserved AND structured warning + count are emitted
+      currentLogs = [
+        ...scrambledLogs,
+        {
+          uid: 3,
+          userEnrollmentId: '103',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 10, minute: 0, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 99,
+        },
+      ];
+
+      const resLate = await runner.syncTerminalOnce('essl-x2008-main');
+      expect(resLate.newlyQueuedCount).toBe(0);
+      expect(resLate.skippedBeforeWatermarkCount).toBe(1);
+      expect(runner.getStatusSnapshot().terminals[0].lastSkippedBeforeWatermarkCount).toBe(1);
+      const logContent = fs.readFileSync(path.join(dirs.logDir, 'p0a-ordering.log'), 'utf8');
+      expect(logContent).toContain('terminal_late_records_before_watermark');
+    });
+
+    it('P0A-7 & P0A-8: advances checkpoint ONLY after CoreERP acknowledges persistence and preserves pendingQueue on failure/unacknowledged response', async () => {
+      const dirs = makeTempDirs();
+      tempCleanups.push(dirs.cleanup);
+
+      const initialWatermark = '2026-11-22T18:30:00.000Z';
+      const store = new CheckpointStore(dirs.dataDir);
+      store.initializeSafeTerminalCheckpoint({
+        terminalKey: 'essl-x2008-main',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: initialWatermark,
+      });
+
+      const logs: DeviceAttendanceRecord[] = [
+        {
+          uid: 1,
+          userEnrollmentId: '101',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 9, minute: 0, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 1,
+        },
+        {
+          uid: 1,
+          userEnrollmentId: '101',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 12, minute: 0, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 2,
+        },
+        {
+          uid: 1,
+          userEnrollmentId: '101',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 17, minute: 0, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 3,
+        },
+      ];
+
+      let batchCallNum = 0;
+      let watermarkObservedMidUpload: string | null = null;
+      let pendingLenObservedMidUpload = -1;
+      let mode: 'FAIL_SECOND_BATCH' | 'UNACK_FALSE' | 'SUCCEED' = 'FAIL_SECOND_BATCH';
+
+      const runner = new BiometricBridgeRunner({
+        config: makeP0ABridgeConfig(dirs, { batchSize: 2 }),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: store,
+        coreErpClient: {
+          sendHeartbeat: vi.fn(),
+          submitPunches: vi.fn().mockImplementation(async (_k, _sn, batch) => {
+            batchCallNum += 1;
+            if (batchCallNum === 1) {
+              // Inspect disk BEFORE returning ack: watermark must NOT have advanced yet
+              const midDisk = new CheckpointStore(dirs.dataDir).getTerminal(
+                'essl-x2008-main',
+                'NFZ8252800275'
+              );
+              watermarkObservedMidUpload = midDisk.lastSyncedPunchTimeIso;
+              pendingLenObservedMidUpload = midDisk.pendingQueue.length;
+              return {
+                success: true,
+                totalReceived: batch.length,
+                inserted: batch.length,
+                duplicates: 0,
+                unmappedEmployees: 0,
+                terminalId: 'essl-x2008-main',
+                terminalName: 'eSSL X2008 Main',
+              };
+            }
+            if (mode === 'FAIL_SECOND_BATCH') {
+              throw new CoreErpApiError('503 DB write failed', 503, 'HTTP_503');
+            }
+            if (mode === 'UNACK_FALSE') {
+              return {
+                success: false,
+                totalReceived: batch.length,
+                inserted: 0,
+                duplicates: 0,
+                unmappedEmployees: 0,
+                terminalId: 'essl-x2008-main',
+                terminalName: 'eSSL X2008 Main',
+              };
+            }
+            return {
+              success: true,
+              totalReceived: batch.length,
+              inserted: batch.length,
+              duplicates: 0,
+              unmappedEmployees: 0,
+              terminalId: 'essl-x2008-main',
+              terminalName: 'eSSL X2008 Main',
+            };
+          }),
+          syncUsers: vi.fn().mockResolvedValue({
+            success: true,
+            terminalId: 'essl-x2008-main',
+            terminalName: 'eSSL X2008 Main',
+            discoveredCount: 1,
+            syncedCount: 1,
+            syncedAt: '2026-11-23T12:00:00.000Z',
+          }),
+        },
+        adapterFactory: () => makeMockAdapterWithLogs(logs),
+        nowProvider: () => new Date('2026-11-23T12:00:00.000Z'),
+      });
+
+      // Attempt 1: Batch 1 acked, Batch 2 throws 503 -> watermark stops at Batch 1 (12:00 IST = 06:30Z), Batch 2 stays queued
+      await expect(runner.syncTerminalOnce('essl-x2008-main')).rejects.toThrowError(/503 DB write failed/);
+      expect(watermarkObservedMidUpload).toBe(initialWatermark);
+      expect(pendingLenObservedMidUpload).toBe(3);
+
+      const cpAfterFail = new CheckpointStore(dirs.dataDir).getTerminal('essl-x2008-main', 'NFZ8252800275');
+      expect(cpAfterFail.lastSyncedPunchTimeIso).toBe('2026-11-23T06:30:00.000Z');
+      expect(cpAfterFail.pendingQueue).toHaveLength(1);
+      expect(cpAfterFail.pendingQueue[0].punchTime).toBe('2026-11-23T11:30:00.000Z');
+
+      // Attempt 2: CoreERP returns success: false -> checkpoint STILL must not advance
+      mode = 'UNACK_FALSE';
+      await expect(runner.syncTerminalOnce('essl-x2008-main')).rejects.toThrowError(
+        /did not acknowledge punch batch persistence/i
+      );
+      const cpAfterUnack = new CheckpointStore(dirs.dataDir).getTerminal('essl-x2008-main', 'NFZ8252800275');
+      expect(cpAfterUnack.lastSyncedPunchTimeIso).toBe('2026-11-23T06:30:00.000Z');
+      expect(cpAfterUnack.pendingQueue).toHaveLength(1);
+
+      // Attempt 3: CoreERP acknowledges Batch 2 -> watermark advances to 17:00 IST (11:30Z) and queue drains cleanly
+      mode = 'SUCCEED';
+      const recovered = await runner.syncTerminalOnce('essl-x2008-main');
+      expect(recovered.uploadedCount).toBe(1);
+      expect(recovered.remainingQueueCount).toBe(0);
+      const cpAfterSuccess = new CheckpointStore(dirs.dataDir).getTerminal('essl-x2008-main', 'NFZ8252800275');
+      expect(cpAfterSuccess.lastSyncedPunchTimeIso).toBe('2026-11-23T11:30:00.000Z');
+      expect(cpAfterSuccess.pendingQueue).toHaveLength(0);
+    });
+
+    it('P0A-9: USER_SYNC_ONLY mode (and omitted syncMode default) never calls getAttendanceLogs() or mutates punch checkpoints even when daemon runs or server requests sync', async () => {
+      const dirs = makeTempDirs();
+      tempCleanups.push(dirs.cleanup);
+
+      // Seed an existing valid checkpoint on disk and capture exact file bytes
+      const store = new CheckpointStore(dirs.dataDir);
+      store.initializeSafeTerminalCheckpoint({
+        terminalKey: 'essl-x2008-main',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-11-22T18:30:00.000Z',
+      });
+      const checkpointBytesBefore = fs.readFileSync(store.getFilePath(), 'utf8');
+
+      const adapter = makeMockAdapterWithLogs([
+        {
+          uid: 1,
+          userEnrollmentId: '101',
+          localDateTime: { year: 2026, month: 11, day: 23, hour: 9, minute: 0, second: 0 },
+          verifyCode: 1,
+          verifyType: 'FINGERPRINT',
+          inOutCode: 0,
+          inOutMode: 'CHECK_IN',
+          workCode: 0,
+          recordSequence: 1,
+        },
+      ]);
+
+      const submitPunches = vi.fn();
+      const syncUsers = vi.fn().mockResolvedValue({
+        success: true,
+        terminalId: 'essl-x2008-main',
+        terminalName: 'eSSL X2008 Main',
+        discoveredCount: 1,
+        syncedCount: 1,
+        syncedAt: '2026-11-23T04:00:00.000Z',
+      });
+      const claimUserSyncJob = vi
+        .fn()
+        .mockResolvedValueOnce({
+          success: true,
+          claimed: true,
+          terminalId: 'essl-x2008-main',
+          job: {
+            jobId: 'job-user-only-1',
+            status: 'RUNNING',
+            requestedAt: '2026-11-23T04:00:00.000Z',
+            timeoutAt: '2026-11-23T04:05:00.000Z',
+            attempts: 1,
+            maxAttempts: 3,
+          },
+        })
+        .mockResolvedValue({
+          success: true,
+          claimed: false,
+          terminalId: 'essl-x2008-main',
+          job: null,
+        });
+
+      const cfgWithoutSyncMode = makeP0ABridgeConfig(dirs, {
+        syncMode: undefined, // Must default fail-closed to USER_SYNC_ONLY
+        jobPollIntervalMs: 30,
+      });
+
+      const runner = new BiometricBridgeRunner({
+        config: cfgWithoutSyncMode,
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: store,
+        coreErpClient: {
+          sendHeartbeat: vi.fn().mockResolvedValue({
+            success: true,
+            serverTime: '2026-11-23T04:00:00.000Z',
+            terminalId: 'essl-x2008-main',
+            terminalName: 'eSSL X2008 Main',
+            status: 'ONLINE',
+            syncRequested: true, // Even if server requests punch sync, USER_SYNC_ONLY MUST ignore it!
+          }),
+          submitPunches,
+          syncUsers,
+          claimUserSyncJob,
+        },
+        adapterFactory: () => adapter,
+        nowProvider: () => new Date('2026-11-23T04:00:00.000Z'),
+      });
+
+      expect(runner.getSyncMode()).toBe('USER_SYNC_ONLY');
+      expect(runner.getStatusSnapshot().syncMode).toBe('USER_SYNC_ONLY');
+      expect(runner.getStatusSnapshot().terminals[0].punchSyncBlocked).toBe(true);
+
+      // Direct syncTerminalOnce() MUST fail closed with SYNC_MODE_BLOCKED
+      await expect(runner.syncTerminalOnce('essl-x2008-main')).rejects.toMatchObject({
+        name: 'CheckpointSafetyError',
+        code: 'SYNC_MODE_BLOCKED',
+      });
+
+      // Start daemon: services UI User Sync job + heartbeat (with syncRequested: true), NEVER polls punches
+      await runner.start();
+      await new Promise((r) => setTimeout(r, 120));
+      await runner.stop(1000);
+
+      expect(syncUsers).toHaveBeenCalledTimes(1);
+      expect(adapter.getUsers).toHaveBeenCalledTimes(1);
+      expect(adapter.getAttendanceLogs).not.toHaveBeenCalled();
+      expect(submitPunches).not.toHaveBeenCalled();
+
+      // Exact byte-for-byte immutability of checkpoints.json in USER_SYNC_ONLY mode
+      expect(fs.readFileSync(store.getFilePath(), 'utf8')).toBe(checkpointBytesBefore);
     });
   });
 });

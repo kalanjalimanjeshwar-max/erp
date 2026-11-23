@@ -1,15 +1,18 @@
 import {
   BridgeConfig,
   BridgeStatusSnapshot,
+  BridgeSyncMode,
   DeviceAttendanceRecord,
   DeviceEnrolledUser,
   DeviceInfo,
   IBiometricProtocolAdapter,
   NormalizedPunchEvent,
+  PendingUserSyncSnapshot,
   TerminalConfig,
   TerminalRuntimeStatus,
 } from './types.js';
-import { CheckpointStore } from './checkpoint-store.js';
+import { CheckpointSafetyError, CheckpointStore } from './checkpoint-store.js';
+import { parseBridgeSyncMode, validateStrictIsoTimestamp } from './config.js';
 import { CoreErpApiError, ICoreErpClient } from './coreerp-client.js';
 import { BridgeLogger, redactSensitiveText } from './logger.js';
 import { ZKTecoTcpAdapter } from './protocol/zkteco-tcp.adapter.js';
@@ -17,6 +20,121 @@ import { resolveTerminalApiKey, validateTransportUrl } from './security/dpapi.js
 import { deviceLocalDateTimeToUtcIso, formatLocalWallClock, isValidIanaTimezone } from './timezone.js';
 
 export type AdapterFactory = (terminal: TerminalConfig) => IBiometricProtocolAdapter;
+
+export interface EffectivePunchCutoffResult {
+  deviceTimezone: string;
+  currentLocalDate: string;
+  currentDayStartIso: string;
+  explicitMinPunchTimeIso: string | null;
+  effectiveCutoffIso: string;
+}
+
+/**
+ * Computes the mandatory start-of-current-day cutoff in the terminal's configured IANA deviceTimezone
+ * (e.g., Asia/Kolkata -> UTC), optionally tightened—NEVER weakened—by explicit minPunchTimeIso settings.
+ */
+export function computeEffectivePunchCutoff(
+  deviceTimezone: string,
+  options?: {
+    now?: Date;
+    bridgeMinPunchTimeIso?: string;
+    terminalMinPunchTimeIso?: string;
+  }
+): EffectivePunchCutoffResult {
+  if (!isValidIanaTimezone(deviceTimezone)) {
+    throw new CheckpointSafetyError(
+      'INVALID_CUTOFF',
+      `Cannot compute current-day punch cutoff: invalid deviceTimezone '${String(deviceTimezone)}'.`,
+      { filePath: '' }
+    );
+  }
+
+  const tz = deviceTimezone.trim();
+  const now = options?.now ?? new Date();
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) {
+    throw new CheckpointSafetyError(
+      'INVALID_CUTOFF',
+      'Cannot compute current-day punch cutoff: invalid reference clock timestamp.',
+      { filePath: '' }
+    );
+  }
+
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(now);
+
+  const map: Record<string, string> = {};
+  for (const part of parts) {
+    if (part.type !== 'literal') map[part.type] = part.value;
+  }
+
+  const year = Number(map.year);
+  const month = Number(map.month);
+  const day = Number(map.day);
+  if (!Number.isInteger(year) || !Number.isInteger(month) || !Number.isInteger(day)) {
+    throw new CheckpointSafetyError(
+      'INVALID_CUTOFF',
+      `Failed to resolve current local calendar date in timezone '${tz}'.`,
+      { filePath: '' }
+    );
+  }
+
+  const currentDayStartIso = deviceLocalDateTimeToUtcIso(
+    { year, month, day, hour: 0, minute: 0, second: 0 },
+    tz
+  );
+  const currentDayStartMs = Date.parse(currentDayStartIso);
+  if (Number.isNaN(currentDayStartMs)) {
+    throw new CheckpointSafetyError(
+      'INVALID_CUTOFF',
+      `Failed to convert start-of-day in timezone '${tz}' to UTC ISO.`,
+      { filePath: '' }
+    );
+  }
+
+  let explicitMinMs: number | null = null;
+  let explicitMinPunchTimeIso: string | null = null;
+
+  const explicitCandidates: Array<{ raw?: string; label: string }> = [
+    { raw: options?.bridgeMinPunchTimeIso, label: 'minPunchTimeIso' },
+    { raw: options?.terminalMinPunchTimeIso, label: 'terminal.minPunchTimeIso' },
+  ];
+
+  for (const candidate of explicitCandidates) {
+    if (candidate.raw === undefined || String(candidate.raw).trim() === '') continue;
+    let normalizedIso: string;
+    try {
+      normalizedIso = validateStrictIsoTimestamp(String(candidate.raw), candidate.label);
+    } catch (err: unknown) {
+      throw new CheckpointSafetyError(
+        'INVALID_CUTOFF',
+        (err as Error)?.message || `Invalid ${candidate.label}`,
+        { filePath: '' }
+      );
+    }
+    const candidateMs = Date.parse(normalizedIso);
+    if (explicitMinMs === null || candidateMs > explicitMinMs) {
+      explicitMinMs = candidateMs;
+      explicitMinPunchTimeIso = normalizedIso;
+    }
+  }
+
+  // Mandatory current-day cutoff can NEVER be weakened by an earlier explicit minPunchTimeIso.
+  const effectiveMs =
+    explicitMinMs !== null ? Math.max(currentDayStartMs, explicitMinMs) : currentDayStartMs;
+
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return {
+    deviceTimezone: tz,
+    currentLocalDate: `${year}-${pad(month)}-${pad(day)}`,
+    currentDayStartIso,
+    explicitMinPunchTimeIso,
+    effectiveCutoffIso: new Date(effectiveMs).toISOString(),
+  };
+}
 
 export interface DiagnosticReport {
   terminalId: string;
@@ -49,14 +167,17 @@ interface TerminalController {
   deferredPunchSyncPending: boolean;
   activeTasks: Set<Promise<unknown>>;
   deviceUsers?: DeviceEnrolledUser[];
+  pendingUserSync: PendingUserSyncSnapshot | null;
 }
 
 export class BiometricBridgeRunner {
   private readonly config: BridgeConfig;
+  private readonly syncMode: BridgeSyncMode;
   private readonly logger: BridgeLogger;
   private readonly checkpointStore: CheckpointStore;
   private readonly coreErpClient: ICoreErpClient;
   private readonly adapterFactory: AdapterFactory;
+  private readonly nowProvider: () => Date;
   private readonly controllers = new Map<string, TerminalController>();
   private readonly startedAt = new Date();
   private running = false;
@@ -69,11 +190,14 @@ export class BiometricBridgeRunner {
     checkpointStore: CheckpointStore;
     coreErpClient: ICoreErpClient;
     adapterFactory?: AdapterFactory;
+    nowProvider?: () => Date;
   }) {
     this.config = options.config;
+    this.syncMode = parseBridgeSyncMode(this.config.syncMode);
     this.logger = options.logger;
     this.checkpointStore = options.checkpointStore;
     this.coreErpClient = options.coreErpClient;
+    this.nowProvider = options.nowProvider || (() => new Date());
     this.adapterFactory =
       options.adapterFactory ||
       ((term) =>
@@ -100,10 +224,48 @@ export class BiometricBridgeRunner {
 
     validateTransportUrl(this.config.coreErpBaseUrl, this.config.allowInsecureHttp);
 
+    if (this.config.minPunchTimeIso !== undefined && String(this.config.minPunchTimeIso).trim() !== '') {
+      validateStrictIsoTimestamp(String(this.config.minPunchTimeIso), 'minPunchTimeIso');
+    }
+
     for (const term of this.config.terminals) {
       if (term.enabled === false) continue;
       this.validateTerminalConfig(term);
-      const cp = this.checkpointStore.getTerminal(term.id, term.serialNumber);
+
+      // Non-mutating read-only lookup: constructor must NEVER create or reset checkpoints.json
+      const cp = this.checkpointStore.peekTerminal(term.id);
+
+      let initialCutoffIso: string | null = null;
+      let punchSyncBlocked = this.syncMode === 'USER_SYNC_ONLY';
+      let punchSyncBlockReason: string | null =
+        this.syncMode === 'USER_SYNC_ONLY'
+          ? 'Bridge syncMode is USER_SYNC_ONLY; punch polling is disabled.'
+          : null;
+      let initialError: string | null = cp?.lastError ?? null;
+
+      try {
+        initialCutoffIso = this.computeTerminalCutoff(term).effectiveCutoffIso;
+      } catch (cutoffErr: unknown) {
+        punchSyncBlocked = true;
+        punchSyncBlockReason = redactSensitiveText(
+          (cutoffErr as Error)?.message || 'Invalid effective punch cutoff configuration.'
+        );
+        if (this.syncMode === 'FULL') {
+          initialError = punchSyncBlockReason;
+        }
+      }
+
+      if (this.syncMode === 'FULL' && !punchSyncBlocked) {
+        try {
+          this.checkpointStore.validateTerminalForPunchSync(term.id, term.serialNumber);
+        } catch (safetyErr: unknown) {
+          punchSyncBlocked = true;
+          punchSyncBlockReason = redactSensitiveText(
+            (safetyErr as Error)?.message || 'Checkpoint failed safety validation.'
+          );
+          initialError = punchSyncBlockReason;
+        }
+      }
 
       this.controllers.set(term.id, {
         config: term,
@@ -114,6 +276,12 @@ export class BiometricBridgeRunner {
           ipAddress: term.ipAddress,
           port: term.port,
           deviceTimezone: term.deviceTimezone,
+          syncMode: this.syncMode,
+          punchSyncBlocked,
+          punchSyncBlockReason,
+          effectiveCutoffIso: initialCutoffIso,
+          lastFilteredHistoricalCount: 0,
+          lastSkippedBeforeWatermarkCount: 0,
           bridgeConnected: false,
           deviceReachable: false,
           lastDeviceContactAt: null,
@@ -121,18 +289,18 @@ export class BiometricBridgeRunner {
           consecutiveFailures: 0,
           heartbeatConsecutiveFailures: 0,
           nextRetryAt: null,
-          pendingQueueSize: cp.pendingQueue.length,
-          lastSuccessfulHeartbeatAt: cp.lastSuccessfulHeartbeatAt,
-          lastSuccessfulSyncAt: cp.lastSuccessfulSyncAt,
-          lastSyncAttemptAt: cp.lastSyncAttemptAt,
-          lastProcessedPunchCount: cp.lastProcessedPunchCount,
-          lastError: cp.lastError,
-          deviceInfo: cp.deviceInfo || null,
-          lastSuccessfulUserSyncAt: cp.lastSuccessfulUserSyncAt ?? null,
-          lastUserSyncAttemptAt: cp.lastUserSyncAttemptAt ?? null,
-          lastUserSyncError: cp.lastUserSyncError ?? null,
-          discoveredUserCount: cp.discoveredUserCount ?? null,
-          syncedUserCount: cp.syncedUserCount ?? null,
+          pendingQueueSize: cp?.pendingQueue.length ?? 0,
+          lastSuccessfulHeartbeatAt: cp?.lastSuccessfulHeartbeatAt ?? null,
+          lastSuccessfulSyncAt: cp?.lastSuccessfulSyncAt ?? null,
+          lastSyncAttemptAt: cp?.lastSyncAttemptAt ?? null,
+          lastProcessedPunchCount: cp?.lastProcessedPunchCount ?? 0,
+          lastError: initialError,
+          deviceInfo: cp?.deviceInfo || null,
+          lastSuccessfulUserSyncAt: cp?.lastSuccessfulUserSyncAt ?? null,
+          lastUserSyncAttemptAt: cp?.lastUserSyncAttemptAt ?? null,
+          lastUserSyncError: cp?.lastUserSyncError ?? null,
+          discoveredUserCount: cp?.discoveredUserCount ?? null,
+          syncedUserCount: cp?.syncedUserCount ?? null,
           userSyncJobStatus: 'IDLE',
           activeUserSyncJobId: null,
         },
@@ -146,9 +314,14 @@ export class BiometricBridgeRunner {
         deferredUserSyncPending: false,
         deferredPunchSyncPending: false,
         activeTasks: new Set<Promise<unknown>>(),
-        deviceUsers: cp.pendingUserSync?.users,
+        deviceUsers: cp?.pendingUserSync?.users,
+        pendingUserSync: cp?.pendingUserSync ?? null,
       });
     }
+  }
+
+  getSyncMode(): BridgeSyncMode {
+    return this.syncMode;
   }
 
   validateTerminalConfig(term: TerminalConfig): void {
@@ -164,6 +337,73 @@ export class BiometricBridgeRunner {
     }
     if (!isValidIanaTimezone(term.deviceTimezone)) {
       throw new Error(`Terminal '${term.id}' has invalid deviceTimezone '${term.deviceTimezone}'.`);
+    }
+    if (term.minPunchTimeIso !== undefined && String(term.minPunchTimeIso).trim() !== '') {
+      validateStrictIsoTimestamp(
+        String(term.minPunchTimeIso),
+        `terminals['${term.id}'].minPunchTimeIso`
+      );
+    }
+  }
+
+  private computeTerminalCutoff(term: TerminalConfig): EffectivePunchCutoffResult {
+    return computeEffectivePunchCutoff(term.deviceTimezone, {
+      now: this.nowProvider(),
+      bridgeMinPunchTimeIso: this.config.minPunchTimeIso,
+      terminalMinPunchTimeIso: term.minPunchTimeIso,
+    });
+  }
+
+  private assertPunchSyncReady(ctrl: TerminalController): EffectivePunchCutoffResult {
+    const term = ctrl.config;
+
+    if (this.syncMode === 'USER_SYNC_ONLY') {
+      const reason =
+        `Refusing normal punch sync for terminal '${term.id}': bridge syncMode is 'USER_SYNC_ONLY'.`;
+      ctrl.runtime.punchSyncBlocked = true;
+      ctrl.runtime.punchSyncBlockReason = reason;
+      throw new CheckpointSafetyError('SYNC_MODE_BLOCKED', reason, {
+        terminalKey: term.id,
+        filePath: this.checkpointStore.getFilePath(),
+      });
+    }
+
+    try {
+      this.checkpointStore.validateTerminalForPunchSync(term.id, term.serialNumber);
+      const cutoff = this.computeTerminalCutoff(term);
+      ctrl.runtime.punchSyncBlocked = false;
+      ctrl.runtime.punchSyncBlockReason = null;
+      ctrl.runtime.effectiveCutoffIso = cutoff.effectiveCutoffIso;
+      return cutoff;
+    } catch (err: unknown) {
+      const safeMsg = redactSensitiveText(
+        (err as Error)?.message || 'Checkpoint or cutoff validation failed.'
+      );
+      ctrl.runtime.punchSyncBlocked = true;
+      ctrl.runtime.punchSyncBlockReason = safeMsg;
+      ctrl.runtime.lastError = safeMsg;
+
+      const safetyCode = err instanceof CheckpointSafetyError ? err.code : 'INVALID_CUTOFF';
+      const corruptBackupPath =
+        err instanceof CheckpointSafetyError ? err.corruptBackupPath : null;
+
+      this.logger.error('terminal_punch_sync_blocked_fail_closed', {
+        terminalId: term.id,
+        serialNumber: term.serialNumber,
+        syncMode: this.syncMode,
+        code: safetyCode,
+        checkpointFile: this.checkpointStore.getFilePath(),
+        corruptBackupPath,
+        error: safeMsg,
+      });
+
+      if (err instanceof CheckpointSafetyError) {
+        throw err;
+      }
+      throw new CheckpointSafetyError('INVALID_CUTOFF', safeMsg, {
+        terminalKey: term.id,
+        filePath: this.checkpointStore.getFilePath(),
+      });
     }
   }
 
@@ -183,6 +423,7 @@ export class BiometricBridgeRunner {
     this.logger.info('bridge_starting', {
       bridgeHost: this.config.bridgeHost,
       bridgeVersion: this.config.bridgeVersion,
+      syncMode: this.syncMode,
       pid: process.pid,
       terminalCount: this.controllers.size,
       coreErpBaseUrl: this.config.coreErpBaseUrl,
@@ -191,11 +432,32 @@ export class BiometricBridgeRunner {
     });
 
     for (const ctrl of this.controllers.values()) {
-      // Launch independent poll, heartbeat, and fast user-sync job discovery loops
-      void this.trackTask(ctrl, this.runTerminalPollCycle(ctrl.config.id));
+      if (this.syncMode === 'USER_SYNC_ONLY') {
+        ctrl.runtime.punchSyncBlocked = true;
+        ctrl.runtime.punchSyncBlockReason =
+          'Bridge syncMode is USER_SYNC_ONLY; punch polling is disabled.';
+        this.logger.info('bridge_punch_sync_disabled_user_sync_only', {
+          terminalId: ctrl.config.id,
+          serialNumber: ctrl.config.serialNumber,
+          syncMode: this.syncMode,
+        });
+      } else {
+        // Fail-closed startup gate: never start punch polling unless checkpoint & cutoff pass validation
+        try {
+          this.assertPunchSyncReady(ctrl);
+          void this.trackTask(ctrl, this.runTerminalPollCycle(ctrl.config.id));
+        } catch {
+          // Critical error already logged and runtime marked punchSyncBlocked=true
+        }
+      }
+
+      // Heartbeat and user-sync job discovery loops remain operational for UI User Sync jobs
       void this.trackTask(ctrl, this.runTerminalHeartbeatLoop(ctrl.config.id));
       if (typeof this.coreErpClient.claimUserSyncJob === 'function') {
-        this.scheduleNextJobPoll(ctrl, ctrl.config.jobPollIntervalMs ?? this.config.jobPollIntervalMs ?? 5000);
+        this.scheduleNextJobPoll(
+          ctrl,
+          ctrl.config.jobPollIntervalMs ?? this.config.jobPollIntervalMs ?? 5000
+        );
       }
     }
 
@@ -274,8 +536,14 @@ export class BiometricBridgeRunner {
       ]);
     }
 
-    this.checkpointStore.persist();
-    this.logger.info('bridge_stopped', { terminalCount: this.controllers.size });
+    // Never touch checkpoints.json in USER_SYNC_ONLY mode or when checkpoint file is invalid/missing
+    if (this.syncMode === 'FULL' && this.checkpointStore.getHealth().status === 'VALID') {
+      this.checkpointStore.persist();
+    }
+    this.logger.info('bridge_stopped', {
+      syncMode: this.syncMode,
+      terminalCount: this.controllers.size,
+    });
   }
 
   getStatusSnapshot(): BridgeStatusSnapshot {
@@ -283,6 +551,7 @@ export class BiometricBridgeRunner {
       bridgeVersion: this.config.bridgeVersion,
       bridgeHost: this.config.bridgeHost,
       coreErpBaseUrl: this.config.coreErpBaseUrl,
+      syncMode: this.syncMode,
       pid: process.pid,
       startedAt: this.startedAt.toISOString(),
       uptimeSeconds: Math.floor((Date.now() - this.startedAt.getTime()) / 1000),
@@ -311,25 +580,47 @@ export class BiometricBridgeRunner {
   }
 
   /**
-   * Normalizes raw hardware records using device IANA timezone and deterministic punch IDs.
+   * Normalizes raw hardware records using device IANA timezone and deterministic punch IDs,
+   * sorted strictly ascending by punchTime with deterministic tie-breakers preserving unique device identity.
    */
   normalizeDeviceRecords(term: TerminalConfig, records: DeviceAttendanceRecord[]): NormalizedPunchEvent[] {
-    return records.map((rec) => {
+    const decorated = records.map((rec) => {
       const localStamp = formatLocalWallClock(rec.localDateTime);
       const utcIso = deviceLocalDateTimeToUtcIso(rec.localDateTime, term.deviceTimezone);
       const devicePunchId = `${term.serialNumber}:${rec.userEnrollmentId}:${localStamp}:${rec.inOutMode}`;
       return {
-        devicePunchId,
-        userEnrollmentId: rec.userEnrollmentId,
-        punchTime: utcIso,
-        verifyType: rec.verifyType,
-        inOutMode: rec.inOutMode,
+        event: {
+          devicePunchId,
+          userEnrollmentId: rec.userEnrollmentId,
+          punchTime: utcIso,
+          verifyType: rec.verifyType,
+          inOutMode: rec.inOutMode,
+        } satisfies NormalizedPunchEvent,
+        punchTimeMs: Date.parse(utcIso),
+        recordSequence: rec.recordSequence,
+        uid: rec.uid,
+        inOutCode: rec.inOutCode,
+        verifyCode: rec.verifyCode,
       };
     });
+
+    decorated.sort((a, b) => {
+      if (a.punchTimeMs !== b.punchTimeMs) return a.punchTimeMs - b.punchTimeMs;
+      if (a.recordSequence !== b.recordSequence) return a.recordSequence - b.recordSequence;
+      if (a.uid !== b.uid) return a.uid - b.uid;
+      if (a.event.devicePunchId !== b.event.devicePunchId) {
+        return a.event.devicePunchId < b.event.devicePunchId ? -1 : 1;
+      }
+      if (a.inOutCode !== b.inOutCode) return a.inOutCode - b.inOutCode;
+      return a.verifyCode - b.verifyCode;
+    });
+
+    return decorated.map((item) => item.event);
   }
 
   /**
-   * Executes one full poll + checkpoint + batched upload cycle for a single terminal.
+   * Executes one full poll + cutoff/checkpoint filter + ordered batched upload cycle for a single terminal.
+   * Fails closed BEFORE connecting to hardware if syncMode is USER_SYNC_ONLY or checkpoint/cutoff is invalid.
    */
   async syncTerminalOnce(terminalId: string): Promise<{
     pulledCount: number;
@@ -337,14 +628,21 @@ export class BiometricBridgeRunner {
     uploadedCount: number;
     duplicateCount: number;
     remainingQueueCount: number;
+    filteredHistoricalCount: number;
+    skippedBeforeWatermarkCount: number;
+    effectiveCutoffIso: string;
   }> {
     const ctrl = this.controllers.get(terminalId);
     if (!ctrl) {
       throw new Error(`Unknown terminal ID '${terminalId}'.`);
     }
 
+    // Fail-closed pre-flight gate: validate syncMode, checkpoint integrity, serial identity, watermark, and cutoff
+    // BEFORE contacting hardware or mutating any checkpoint metadata.
+    const cutoff = this.assertPunchSyncReady(ctrl);
+
     const term = ctrl.config;
-    const attemptIso = new Date().toISOString();
+    const attemptIso = this.nowProvider().toISOString();
     ctrl.runtime.lastSyncAttemptAt = attemptIso;
     this.checkpointStore.updateStatus(term.id, term.serialNumber, { lastSyncAttemptAt: attemptIso });
 
@@ -354,7 +652,7 @@ export class BiometricBridgeRunner {
     let queriedUsers: DeviceEnrolledUser[] | null = null;
     let userQueryAttemptIso: string | null = null;
 
-    // 1. Poll physical biometric device over TCP (read-only)
+    // 1. Poll physical biometric device over TCP (strictly read-only; never clears device logs)
     try {
       await adapter.connect({
         host: term.ipAddress,
@@ -382,7 +680,7 @@ export class BiometricBridgeRunner {
       pulledRecords = await adapter.getAttendanceLogs();
 
       if (typeof adapter.getUsers === 'function') {
-        userQueryAttemptIso = new Date().toISOString();
+        userQueryAttemptIso = this.nowProvider().toISOString();
         ctrl.runtime.lastUserSyncAttemptAt = userQueryAttemptIso;
         try {
           const users = await adapter.getUsers();
@@ -414,7 +712,7 @@ export class BiometricBridgeRunner {
       }
 
       ctrl.runtime.deviceReachable = true;
-      ctrl.runtime.lastDeviceContactAt = new Date().toISOString();
+      ctrl.runtime.lastDeviceContactAt = this.nowProvider().toISOString();
       this.checkpointStore.updateStatus(term.id, term.serialNumber, { deviceInfo });
     } catch (err: unknown) {
       ctrl.runtime.deviceReachable = false;
@@ -427,14 +725,65 @@ export class BiometricBridgeRunner {
       }
     }
 
-    // 2. Convert timestamps & filter against persistent local checkpoint
+    // 2. Convert timestamps, sort ascending deterministically, and apply mandatory current-day cutoff + watermark
     const normalized = this.normalizeDeviceRecords(term, pulledRecords);
-    const freshEvents = this.checkpointStore.filterNewEvents(term.id, term.serialNumber, normalized);
-    if (freshEvents.length > 0) {
-      this.checkpointStore.enqueuePending(term.id, term.serialNumber, freshEvents);
+    const filterResult = this.checkpointStore.filterEligibleEvents(
+      term.id,
+      term.serialNumber,
+      normalized,
+      { effectiveCutoffIso: cutoff.effectiveCutoffIso }
+    );
+
+    let totalFilteredHistorical = filterResult.filteredHistoricalCount;
+    ctrl.runtime.effectiveCutoffIso = cutoff.effectiveCutoffIso;
+    ctrl.runtime.lastFilteredHistoricalCount = totalFilteredHistorical;
+    ctrl.runtime.lastSkippedBeforeWatermarkCount = filterResult.skippedBeforeWatermarkCount;
+
+    if (filterResult.filteredHistoricalCount > 0) {
+      this.logger.info('terminal_historical_punches_filtered', {
+        terminalId: term.id,
+        serialNumber: term.serialNumber,
+        deviceTimezone: cutoff.deviceTimezone,
+        currentLocalDate: cutoff.currentLocalDate,
+        effectiveCutoffIso: cutoff.effectiveCutoffIso,
+        filteredHistoricalCount: filterResult.filteredHistoricalCount,
+        eligibleCount: filterResult.eligible.length,
+      });
     }
 
-    // 3. Flush persistent pendingQueue in bounded batches to CoreERP
+    if (filterResult.skippedBeforeWatermarkCount > 0) {
+      this.logger.warn('terminal_late_records_before_watermark', {
+        terminalId: term.id,
+        serialNumber: term.serialNumber,
+        effectiveCutoffIso: cutoff.effectiveCutoffIso,
+        skippedBeforeWatermarkCount: filterResult.skippedBeforeWatermarkCount,
+        samples: filterResult.lateBeforeWatermarkSamples,
+      });
+    }
+
+    if (filterResult.eligible.length > 0) {
+      this.checkpointStore.enqueuePending(term.id, term.serialNumber, filterResult.eligible);
+    }
+
+    // Defensive pre-upload cutoff gate: never upload stale pendingQueue entries older than effectiveCutoffIso
+    const pruned = this.checkpointStore.prunePendingQueueBeforeCutoff(
+      term.id,
+      term.serialNumber,
+      cutoff.effectiveCutoffIso
+    );
+    if (pruned.removedCount > 0) {
+      totalFilteredHistorical += pruned.removedCount;
+      ctrl.runtime.lastFilteredHistoricalCount = totalFilteredHistorical;
+      this.logger.warn('terminal_stale_pending_queue_pruned', {
+        terminalId: term.id,
+        serialNumber: term.serialNumber,
+        effectiveCutoffIso: cutoff.effectiveCutoffIso,
+        prunedCount: pruned.removedCount,
+        samples: pruned.removedSamples,
+      });
+    }
+
+    // 3. Flush persistent pendingQueue strictly in ascending order, advancing checkpoint ONLY after CoreERP ack
     const apiKey = this.resolveKey(term);
     const batchLimit = Math.min(250, Math.max(1, this.config.batchSize || 100));
     let uploadedCount = 0;
@@ -451,6 +800,12 @@ export class BiometricBridgeRunner {
         bridgeVersion: this.config.bridgeVersion,
       });
 
+      if (!res || res.success !== true) {
+        throw new Error(
+          `CoreERP did not acknowledge punch batch persistence for terminal '${term.id}'; preserving pendingQueue and checkpoint watermark.`
+        );
+      }
+
       this.checkpointStore.markBatchAcknowledged(term.id, term.serialNumber, batch);
       uploadedCount += res.inserted;
       duplicateCount += res.duplicates;
@@ -459,14 +814,14 @@ export class BiometricBridgeRunner {
     const updatedCp = this.checkpointStore.getTerminal(term.id, term.serialNumber);
     ctrl.runtime.pendingQueueSize = updatedCp.pendingQueue.length;
     ctrl.runtime.lastSuccessfulSyncAt = updatedCp.lastSuccessfulSyncAt || attemptIso;
-    ctrl.runtime.lastProcessedPunchCount = freshEvents.length;
+    ctrl.runtime.lastProcessedPunchCount = filterResult.eligible.length;
     ctrl.runtime.lastError = null;
     ctrl.runtime.authError = false;
     ctrl.runtime.bridgeConnected = true;
     ctrl.runtime.consecutiveFailures = 0;
     ctrl.runtime.nextRetryAt = null;
 
-    if (freshEvents.length === 0) {
+    if (filterResult.eligible.length === 0) {
       this.checkpointStore.updateStatus(term.id, term.serialNumber, {
         lastSuccessfulSyncAt: ctrl.runtime.lastSuccessfulSyncAt,
         lastProcessedPunchCount: 0,
@@ -479,21 +834,26 @@ export class BiometricBridgeRunner {
     const snapshotToUpload =
       queriedUsers !== null
         ? { users: queriedUsers, discoveredAt: userQueryAttemptIso || attemptIso }
-        : updatedCp.pendingUserSync || null;
+        : ctrl.pendingUserSync || updatedCp.pendingUserSync || null;
 
     if (snapshotToUpload) {
       try {
-        await this.uploadTerminalUsers(ctrl, snapshotToUpload.users, snapshotToUpload.discoveredAt);
+        await this.uploadTerminalUsers(ctrl, snapshotToUpload.users, snapshotToUpload.discoveredAt, {
+          persistCheckpointStatus: true,
+        });
       } catch {
-        // Error already logged and persisted on pendingUserSync for retry on next cycle
+        // Error already logged and stored for retry on next cycle
       }
     }
 
     this.logger.info('terminal_sync_completed', {
       terminalId: term.id,
       serialNumber: term.serialNumber,
+      effectiveCutoffIso: cutoff.effectiveCutoffIso,
       pulledCount: pulledRecords.length,
-      newlyQueuedCount: freshEvents.length,
+      filteredHistoricalCount: totalFilteredHistorical,
+      skippedBeforeWatermarkCount: filterResult.skippedBeforeWatermarkCount,
+      newlyQueuedCount: filterResult.eligible.length,
       uploadedCount,
       duplicateCount,
       remainingQueueCount: updatedCp.pendingQueue.length,
@@ -501,16 +861,20 @@ export class BiometricBridgeRunner {
 
     return {
       pulledCount: pulledRecords.length,
-      newlyQueuedCount: freshEvents.length,
+      newlyQueuedCount: filterResult.eligible.length,
       uploadedCount,
       duplicateCount,
       remainingQueueCount: updatedCp.pendingQueue.length,
+      filteredHistoricalCount: totalFilteredHistorical,
+      skippedBeforeWatermarkCount: filterResult.skippedBeforeWatermarkCount,
+      effectiveCutoffIso: cutoff.effectiveCutoffIso,
     };
   }
 
   /**
-   * Executes a dedicated hardware user discovery + upload cycle for a single terminal
-   * WITHOUT pulling attendance punches, modifying punch checkpoints, or triggering punch reconciliation.
+   * Executes a dedicated hardware user discovery + upload cycle for a single terminal.
+   * STRICTLY NEVER calls getAttendanceLogs(), NEVER alters or writes checkpoints.json,
+   * and NEVER enqueues punch records.
    */
   async syncTerminalUsersOnce(
     terminalId: string,
@@ -530,11 +894,8 @@ export class BiometricBridgeRunner {
     }
 
     const term = ctrl.config;
-    const attemptIso = new Date().toISOString();
+    const attemptIso = this.nowProvider().toISOString();
     ctrl.runtime.lastUserSyncAttemptAt = attemptIso;
-    this.checkpointStore.updateStatus(term.id, term.serialNumber, {
-      lastUserSyncAttemptAt: attemptIso,
-    });
 
     const adapter = this.adapterFactory(term);
     let users: DeviceEnrolledUser[] = [];
@@ -577,20 +938,12 @@ export class BiometricBridgeRunner {
       users = rawUsers;
       ctrl.deviceUsers = users;
       ctrl.runtime.deviceReachable = true;
-      ctrl.runtime.lastDeviceContactAt = new Date().toISOString();
+      ctrl.runtime.lastDeviceContactAt = this.nowProvider().toISOString();
       ctrl.runtime.discoveredUserCount = users.length;
-      this.checkpointStore.updateStatus(term.id, term.serialNumber, {
-        deviceInfo,
-        discoveredUserCount: users.length,
-      });
     } catch (err: unknown) {
       const safeErr = redactSensitiveText((err as Error)?.message || 'Hardware user query failed');
       ctrl.runtime.deviceReachable = false;
       ctrl.runtime.lastUserSyncError = safeErr;
-      this.checkpointStore.updateStatus(term.id, term.serialNumber, {
-        lastUserSyncAttemptAt: attemptIso,
-        lastUserSyncError: safeErr,
-      });
       this.logger.warn('terminal_user_query_failed', {
         terminalId: term.id,
         serialNumber: term.serialNumber,
@@ -608,9 +961,11 @@ export class BiometricBridgeRunner {
       }
     }
 
+    // Strict P0-A isolation: user-only sync must NEVER alter checkpoints.json
     const res = await this.uploadTerminalUsers(ctrl, users, attemptIso, {
       jobId: options?.jobId,
       bridgeDaemonRunning: options?.bridgeDaemonRunning,
+      persistCheckpointStatus: false,
     });
     return {
       discoveredCount: res.discoveredCount,
@@ -627,10 +982,13 @@ export class BiometricBridgeRunner {
     options?: {
       jobId?: string;
       bridgeDaemonRunning?: boolean;
+      persistCheckpointStatus?: boolean;
     }
   ) {
     const term = ctrl.config;
     const apiKey = this.resolveKey(term);
+    const shouldPersistCheckpoint =
+      options?.persistCheckpointStatus === true && this.syncMode === 'FULL';
 
     try {
       const res = await this.coreErpClient.syncUsers(apiKey, term.serialNumber, {
@@ -651,14 +1009,17 @@ export class BiometricBridgeRunner {
       ctrl.runtime.discoveredUserCount = res.discoveredCount;
       ctrl.runtime.syncedUserCount = res.syncedCount;
       ctrl.runtime.lastUserSyncError = null;
+      ctrl.pendingUserSync = null;
 
-      this.checkpointStore.updateStatus(term.id, term.serialNumber, {
-        lastSuccessfulUserSyncAt: res.syncedAt,
-        discoveredUserCount: res.discoveredCount,
-        syncedUserCount: res.syncedCount,
-        lastUserSyncError: null,
-        pendingUserSync: null,
-      });
+      if (shouldPersistCheckpoint) {
+        this.checkpointStore.updateStatus(term.id, term.serialNumber, {
+          lastSuccessfulUserSyncAt: res.syncedAt,
+          discoveredUserCount: res.discoveredCount,
+          syncedUserCount: res.syncedCount,
+          lastUserSyncError: null,
+          pendingUserSync: null,
+        });
+      }
 
       this.logger.info('terminal_user_sync_completed', {
         terminalId: term.id,
@@ -673,16 +1034,19 @@ export class BiometricBridgeRunner {
       const safeErr = redactSensitiveText((err as Error)?.message || 'Failed to upload hardware users to CoreERP');
       ctrl.runtime.lastUserSyncError = safeErr;
       ctrl.runtime.discoveredUserCount = users.length;
+      ctrl.pendingUserSync = { users, discoveredAt };
       if (err instanceof CoreErpApiError && err.isAuthError) {
         ctrl.runtime.authError = true;
         ctrl.runtime.bridgeConnected = false;
       }
 
-      this.checkpointStore.updateStatus(term.id, term.serialNumber, {
-        discoveredUserCount: users.length,
-        lastUserSyncError: safeErr,
-        pendingUserSync: { users, discoveredAt },
-      });
+      if (shouldPersistCheckpoint) {
+        this.checkpointStore.updateStatus(term.id, term.serialNumber, {
+          discoveredUserCount: users.length,
+          lastUserSyncError: safeErr,
+          pendingUserSync: { users, discoveredAt },
+        });
+      }
 
       this.logger.warn('terminal_user_upload_failed', {
         terminalId: term.id,
@@ -699,7 +1063,7 @@ export class BiometricBridgeRunner {
 
   /**
    * Sends a single authenticated heartbeat for a terminal and triggers immediate poll/user-sync if requested.
-   * Reports accurate separated bridge process health vs physical device reachability.
+   * In USER_SYNC_ONLY mode (or when punch sync is blocked), server punch-sync requests are safely ignored.
    */
   async sendTerminalHeartbeat(terminalId: string): Promise<boolean> {
     const ctrl = this.controllers.get(terminalId);
@@ -733,14 +1097,18 @@ export class BiometricBridgeRunner {
         syncedUserCount: ctrl.runtime.syncedUserCount,
       });
 
-      const nowIso = new Date().toISOString();
+      const nowIso = this.nowProvider().toISOString();
       ctrl.runtime.bridgeConnected = true;
       ctrl.runtime.authError = false;
       ctrl.runtime.heartbeatConsecutiveFailures = 0;
       ctrl.runtime.lastSuccessfulHeartbeatAt = nowIso;
-      this.checkpointStore.updateStatus(term.id, term.serialNumber, {
-        lastSuccessfulHeartbeatAt: nowIso,
-      });
+
+      // Never mutate checkpoints.json during USER_SYNC_ONLY mode or while punch sync is blocked
+      if (this.syncMode === 'FULL' && !ctrl.runtime.punchSyncBlocked) {
+        this.checkpointStore.updateStatus(term.id, term.serialNumber, {
+          lastSuccessfulHeartbeatAt: nowIso,
+        });
+      }
 
       if (this.running) {
         // Prioritize user-sync jobs cleanly without dropping them if a punch poll is currently in flight
@@ -761,14 +1129,23 @@ export class BiometricBridgeRunner {
         }
 
         if (hbRes.syncRequested) {
-          this.logger.info('bridge_sync_requested_by_server', {
-            terminalId: term.id,
-            serialNumber: term.serialNumber,
-          });
-          if (!ctrl.inFlightSync && !ctrl.inFlightUserSync) {
-            void this.trackTask(ctrl, this.runTerminalPollCycle(term.id));
+          if (this.syncMode === 'USER_SYNC_ONLY' || ctrl.runtime.punchSyncBlocked) {
+            this.logger.warn('bridge_punch_sync_request_ignored', {
+              terminalId: term.id,
+              serialNumber: term.serialNumber,
+              syncMode: this.syncMode,
+              reason: ctrl.runtime.punchSyncBlockReason,
+            });
           } else {
-            ctrl.deferredPunchSyncPending = true;
+            this.logger.info('bridge_sync_requested_by_server', {
+              terminalId: term.id,
+              serialNumber: term.serialNumber,
+            });
+            if (!ctrl.inFlightSync && !ctrl.inFlightUserSync) {
+              void this.trackTask(ctrl, this.runTerminalPollCycle(term.id));
+            } else {
+              ctrl.deferredPunchSyncPending = true;
+            }
           }
         }
       }
@@ -797,6 +1174,7 @@ export class BiometricBridgeRunner {
 
   /**
    * Diagnostic connection test against physical hardware + CoreERP heartbeat authentication.
+   * Respects USER_SYNC_ONLY mode by skipping getAttendanceLogs() when punch polling is disabled.
    */
   async testAllConnections(): Promise<DiagnosticReport[]> {
     const reports: DiagnosticReport[] = [];
@@ -827,8 +1205,10 @@ export class BiometricBridgeRunner {
           Boolean(deviceInfo.serialNumber) &&
           deviceInfo.serialNumber!.trim() === term.serialNumber.trim();
 
-        const logs = await adapter.getAttendanceLogs();
-        attendanceRecordCount = logs.length;
+        if (this.syncMode === 'FULL') {
+          const logs = await adapter.getAttendanceLogs();
+          attendanceRecordCount = logs.length;
+        }
 
         if (typeof adapter.getUsers === 'function') {
           try {
@@ -1096,9 +1476,16 @@ export class BiometricBridgeRunner {
         void this.trackTask(ctrl, this.sendTerminalHeartbeat(ctrl.config.id));
       }
 
-      if (this.running && ctrl.deferredPunchSyncPending) {
+      if (
+        this.running &&
+        ctrl.deferredPunchSyncPending &&
+        this.syncMode === 'FULL' &&
+        !ctrl.runtime.punchSyncBlocked
+      ) {
         ctrl.deferredPunchSyncPending = false;
         void this.trackTask(ctrl, this.runTerminalPollCycle(ctrl.config.id));
+      } else {
+        ctrl.deferredPunchSyncPending = false;
       }
     }
   }
@@ -1107,6 +1494,11 @@ export class BiometricBridgeRunner {
     const ctrl = this.controllers.get(terminalId);
     if (!ctrl || ctrl.inFlightSync || ctrl.inFlightUserSync) return;
 
+    if (this.syncMode === 'USER_SYNC_ONLY') {
+      ctrl.runtime.punchSyncBlocked = true;
+      return;
+    }
+
     if (ctrl.pollTimer) {
       clearTimeout(ctrl.pollTimer);
       ctrl.pollTimer = null;
@@ -1114,6 +1506,7 @@ export class BiometricBridgeRunner {
 
     ctrl.inFlightSync = true;
     const baseInterval = ctrl.config.pollIntervalMs ?? this.config.pollIntervalMs;
+    let blockedFailClosed = false;
 
     try {
       await this.syncTerminalOnce(terminalId);
@@ -1122,22 +1515,29 @@ export class BiometricBridgeRunner {
       ctrl.runtime.consecutiveFailures += 1;
       ctrl.runtime.lastError = msg;
 
-      if (err instanceof CoreErpApiError && err.isAuthError) {
-        ctrl.runtime.authError = true;
-        ctrl.runtime.bridgeConnected = false;
+      if (err instanceof CheckpointSafetyError) {
+        blockedFailClosed = true;
+        ctrl.runtime.punchSyncBlocked = true;
+        ctrl.runtime.punchSyncBlockReason = msg;
+        ctrl.runtime.nextRetryAt = null;
+      } else {
+        if (err instanceof CoreErpApiError && err.isAuthError) {
+          ctrl.runtime.authError = true;
+          ctrl.runtime.bridgeConnected = false;
+        }
+
+        this.checkpointStore.updateStatus(ctrl.config.id, ctrl.config.serialNumber, {
+          lastError: msg,
+        });
+
+        this.logger.error('terminal_sync_failed', {
+          terminalId: ctrl.config.id,
+          serialNumber: ctrl.config.serialNumber,
+          consecutiveFailures: ctrl.runtime.consecutiveFailures,
+          authError: ctrl.runtime.authError,
+          error: msg,
+        });
       }
-
-      this.checkpointStore.updateStatus(ctrl.config.id, ctrl.config.serialNumber, {
-        lastError: msg,
-      });
-
-      this.logger.error('terminal_sync_failed', {
-        terminalId: ctrl.config.id,
-        serialNumber: ctrl.config.serialNumber,
-        consecutiveFailures: ctrl.runtime.consecutiveFailures,
-        authError: ctrl.runtime.authError,
-        error: msg,
-      });
     } finally {
       ctrl.inFlightSync = false;
 
@@ -1146,7 +1546,7 @@ export class BiometricBridgeRunner {
         void this.trackTask(ctrl, this.runTerminalUserSync(terminalId));
       }
 
-      if (this.running) {
+      if (this.running && !blockedFailClosed && !ctrl.runtime.punchSyncBlocked) {
         const delayMs = ctrl.runtime.authError
           ? this.config.maxBackoffMs
           : this.computeBackoffDelayMs(ctrl.runtime.consecutiveFailures, baseInterval);

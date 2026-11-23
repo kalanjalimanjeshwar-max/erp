@@ -1,5 +1,25 @@
 export type BiometricVerifyType = 'FINGERPRINT' | 'CARD' | 'PASSWORD' | 'FACE';
 export type PunchInOutMode = 'CHECK_IN' | 'CHECK_OUT' | 'BREAK_OUT' | 'BREAK_IN';
+export type BridgeSyncMode = 'USER_SYNC_ONLY' | 'FULL';
+export type CheckpointHealthState =
+  | 'VALID'
+  | 'MISSING'
+  | 'CORRUPT'
+  | 'INVALID_VERSION'
+  | 'INVALID_SCHEMA';
+
+export type CheckpointSafetyErrorCode =
+  | 'CHECKPOINT_MISSING'
+  | 'CHECKPOINT_CORRUPT'
+  | 'CHECKPOINT_INVALID_VERSION'
+  | 'CHECKPOINT_INVALID_SCHEMA'
+  | 'TERMINAL_ENTRY_MISSING'
+  | 'TERMINAL_ID_CHANGED'
+  | 'TERMINAL_SERIAL_MISMATCH'
+  | 'MISSING_WATERMARK'
+  | 'INVALID_TERMINAL_ENTRY'
+  | 'INVALID_CUTOFF'
+  | 'SYNC_MODE_BLOCKED';
 
 export interface TerminalConfig {
   id: string;
@@ -9,6 +29,7 @@ export interface TerminalConfig {
   port: number;
   commKey?: number;
   deviceTimezone: string;
+  minPunchTimeIso?: string;
   apiKey?: string;
   apiKeyEnv?: string;
   dpapiCredentialName?: string;
@@ -26,6 +47,8 @@ export interface BridgeConfig {
   allowInsecureHttp: boolean;
   bridgeHost: string;
   bridgeVersion: string;
+  syncMode?: BridgeSyncMode;
+  minPunchTimeIso?: string;
   healthPort: number;
   healthHost: string;
   dataDir: string;
@@ -172,6 +195,12 @@ export interface TerminalRuntimeStatus {
   ipAddress: string;
   port: number;
   deviceTimezone: string;
+  syncMode: BridgeSyncMode;
+  punchSyncBlocked: boolean;
+  punchSyncBlockReason: string | null;
+  effectiveCutoffIso: string | null;
+  lastFilteredHistoricalCount: number;
+  lastSkippedBeforeWatermarkCount: number;
   bridgeConnected: boolean;
   deviceReachable: boolean;
   lastDeviceContactAt: string | null;
@@ -199,6 +228,7 @@ export interface BridgeStatusSnapshot {
   bridgeVersion: string;
   bridgeHost: string;
   coreErpBaseUrl: string;
+  syncMode: BridgeSyncMode;
   pid: number;
   startedAt: string;
   uptimeSeconds: number;
