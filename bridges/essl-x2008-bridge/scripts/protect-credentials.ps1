@@ -1,7 +1,7 @@
 param(
   [string]$CredentialName = "coreerp-essl-x2008-main",
   [ValidateSet("CurrentUser", "LocalMachine")]
-  [string]$Scope = "LocalMachine"
+  [string]$Scope = "CurrentUser"
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,7 +9,7 @@ $BridgeRoot = Split-Path -Parent $PSScriptRoot
 
 Write-Host "CoreERP Windows DPAPI Credential Setup" -ForegroundColor Cyan
 Write-Host "Credential Key : $CredentialName"
-Write-Host "DPAPI Scope    : $Scope (use LocalMachine for Windows Services running as LocalSystem)"
+Write-Host "DPAPI Scope    : $Scope (CurrentUser is recommended for Task Scheduler user-logon auto-start; use LocalMachine only for LocalSystem Windows Services)"
 Write-Host ""
 
 $secureKey = Read-Host -Prompt "Paste the one-time CoreERP Device API Key (bio_live_...)" -AsSecureString

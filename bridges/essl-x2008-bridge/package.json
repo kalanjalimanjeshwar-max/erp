@@ -13,6 +13,7 @@
     "start": "node dist/index.js",
     "test-connection": "node dist/index.js --test-connection",
     "sync-once": "node dist/index.js --sync-once",
+    "sync-users-once": "node dist/index.js --sync-users-once",
     "status": "node dist/index.js --status",
     "diagnose": "node dist/index.js --diagnose"
   }

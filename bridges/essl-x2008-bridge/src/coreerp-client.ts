@@ -9,6 +9,9 @@ export interface HeartbeatPayload {
   bridgeConnected: boolean;
   bridgeHost: string;
   bridgeVersion: string;
+  bridgePid?: number;
+  deviceReachable?: boolean;
+  lastDeviceContactAt?: string | null;
   lastConnectionError?: string | null;
   lastProcessedPunchCount?: number;
   lastSyncAttemptAt?: string;
@@ -26,19 +29,70 @@ export interface HeartbeatPayload {
   }>;
 }
 
+export interface PendingUserSyncJobInfo {
+  jobId: string;
+  requestedAt: string;
+  attempts: number;
+  maxAttempts: number;
+  timeoutAt: string;
+}
+
 export interface HeartbeatResult {
   success: boolean;
   serverTime: string;
   terminalId: string;
   terminalName: string;
   status: string;
+  bridgeStatus?: 'ONLINE' | 'OFFLINE';
+  deviceConnectionStatus?: 'CONNECTED' | 'DISCONNECTED' | 'DEACTIVATED';
   syncRequested?: boolean;
   syncRequestedAt?: string | null;
   userSyncRequested?: boolean;
   userSyncRequestedAt?: string | null;
+  pendingUserSyncJob?: PendingUserSyncJobInfo | null;
+}
+
+export interface UserSyncJobDescriptor {
+  jobId: string;
+  status: 'QUEUED' | 'RUNNING' | 'SUCCESS' | 'FAILED';
+  requestedAt: string;
+  claimedAt?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  timeoutAt: string;
+  attempts: number;
+  maxAttempts: number;
+  discoveredCount?: number | null;
+  syncedCount?: number | null;
+  error?: string | null;
+  bridgeHost?: string | null;
+}
+
+export interface ClaimUserSyncJobResult {
+  success: boolean;
+  claimed: boolean;
+  terminalId: string;
+  job: UserSyncJobDescriptor | null;
+}
+
+export interface ReportUserSyncJobFailurePayload {
+  jobId?: string;
+  bridgeHost?: string;
+  bridgeVersion?: string;
+  error: string;
+  retryable?: boolean;
+  deviceReachable?: boolean;
+}
+
+export interface ReportUserSyncJobFailureResult {
+  success: boolean;
+  terminalId: string;
+  job: UserSyncJobDescriptor | null;
 }
 
 export interface UserSyncPayload {
+  jobId?: string;
+  bridgeDaemonRunning?: boolean;
   deviceUsers: Array<{
     uid?: number;
     enrollmentId: string;
@@ -58,6 +112,7 @@ export interface UserSyncResult {
   discoveredCount: number;
   syncedCount: number;
   syncedAt: string;
+  job?: UserSyncJobDescriptor | null;
 }
 
 export interface BatchSubmitResult {
@@ -99,6 +154,16 @@ export interface ICoreErpClient {
     serialNumber: string,
     payload: UserSyncPayload
   ): Promise<UserSyncResult>;
+  claimUserSyncJob?(
+    apiKey: string,
+    serialNumber: string,
+    meta?: { bridgeHost?: string; bridgeVersion?: string }
+  ): Promise<ClaimUserSyncJobResult>;
+  reportUserSyncJobFailure?(
+    apiKey: string,
+    serialNumber: string,
+    payload: ReportUserSyncJobFailurePayload
+  ): Promise<ReportUserSyncJobFailureResult>;
 }
 
 export class CoreErpHttpClient implements ICoreErpClient {
@@ -128,12 +193,42 @@ export class CoreErpHttpClient implements ICoreErpClient {
     });
   }
 
+  async claimUserSyncJob(
+    apiKey: string,
+    serialNumber: string,
+    meta?: { bridgeHost?: string; bridgeVersion?: string }
+  ): Promise<ClaimUserSyncJobResult> {
+    return this.postJson<ClaimUserSyncJobResult>('/api/biometric/users/jobs/claim', apiKey, serialNumber, {
+      deviceSerialNumber: serialNumber,
+      bridgeHost: meta?.bridgeHost,
+      bridgeVersion: meta?.bridgeVersion,
+    });
+  }
+
+  async reportUserSyncJobFailure(
+    apiKey: string,
+    serialNumber: string,
+    payload: ReportUserSyncJobFailurePayload
+  ): Promise<ReportUserSyncJobFailureResult> {
+    return this.postJson<ReportUserSyncJobFailureResult>('/api/biometric/users/jobs/fail', apiKey, serialNumber, {
+      jobId: payload.jobId,
+      deviceSerialNumber: serialNumber,
+      bridgeHost: payload.bridgeHost,
+      bridgeVersion: payload.bridgeVersion,
+      error: redactSensitiveText(payload.error),
+      retryable: payload.retryable,
+      deviceReachable: payload.deviceReachable,
+    });
+  }
+
   async syncUsers(
     apiKey: string,
     serialNumber: string,
     payload: UserSyncPayload
   ): Promise<UserSyncResult> {
     return this.postJson<UserSyncResult>('/api/biometric/users', apiKey, serialNumber, {
+      jobId: payload.jobId,
+      bridgeDaemonRunning: payload.bridgeDaemonRunning,
       deviceUsers: payload.deviceUsers,
       deviceSerialNumber: serialNumber,
       discoveredCount: payload.discoveredCount ?? payload.deviceUsers.length,

@@ -14,6 +14,8 @@ export interface TerminalConfig {
   dpapiCredentialName?: string;
   pollIntervalMs?: number;
   heartbeatIntervalMs?: number;
+  jobPollIntervalMs?: number;
+  userSyncTimeoutMs?: number;
   connectTimeoutMs?: number;
   skipSerialValidation?: boolean;
   enabled?: boolean;
@@ -32,6 +34,8 @@ export interface BridgeConfig {
   batchSize: number;
   pollIntervalMs: number;
   heartbeatIntervalMs: number;
+  jobPollIntervalMs?: number;
+  userSyncTimeoutMs?: number;
   connectTimeoutMs: number;
   maxBackoffMs: number;
   dpapiStorePath: string;
@@ -86,6 +90,8 @@ export type UserSyncOutcome =
   | 'UNSUPPORTED_COMMAND'
   | 'COMMUNICATION_FAILURE'
   | 'MALFORMED_RESPONSE';
+
+export type BridgeUserSyncJobState = 'IDLE' | 'QUEUED' | 'RUNNING' | 'SUCCESS' | 'FAILED';
 
 export interface ProtocolDiagnosticEvent {
   operation: 'get_free_sizes' | 'get_users' | 'read_with_buffer' | 'read_chunk' | 'decode_users' | 'send_command';
@@ -168,8 +174,10 @@ export interface TerminalRuntimeStatus {
   deviceTimezone: string;
   bridgeConnected: boolean;
   deviceReachable: boolean;
+  lastDeviceContactAt: string | null;
   authError: boolean;
   consecutiveFailures: number;
+  heartbeatConsecutiveFailures: number;
   nextRetryAt: string | null;
   pendingQueueSize: number;
   lastSuccessfulHeartbeatAt: string | null;
@@ -183,12 +191,15 @@ export interface TerminalRuntimeStatus {
   lastUserSyncError: string | null;
   discoveredUserCount: number | null;
   syncedUserCount: number | null;
+  userSyncJobStatus: BridgeUserSyncJobState;
+  activeUserSyncJobId: string | null;
 }
 
 export interface BridgeStatusSnapshot {
   bridgeVersion: string;
   bridgeHost: string;
   coreErpBaseUrl: string;
+  pid: number;
   startedAt: string;
   uptimeSeconds: number;
   running: boolean;

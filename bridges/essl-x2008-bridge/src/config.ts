@@ -93,7 +93,13 @@ export function loadBridgeConfig(baseDir = process.cwd()): BridgeConfig {
     batchSize: Number(process.env.BRIDGE_BATCH_SIZE || fileConfig.batchSize || 200),
     pollIntervalMs: Number(process.env.BRIDGE_POLL_INTERVAL_MS || fileConfig.pollIntervalMs || 15000),
     heartbeatIntervalMs: Number(
-      process.env.BRIDGE_HEARTBEAT_INTERVAL_MS || fileConfig.heartbeatIntervalMs || 60000
+      process.env.BRIDGE_HEARTBEAT_INTERVAL_MS || fileConfig.heartbeatIntervalMs || 30000
+    ),
+    jobPollIntervalMs: Number(
+      process.env.BRIDGE_JOB_POLL_INTERVAL_MS || fileConfig.jobPollIntervalMs || 5000
+    ),
+    userSyncTimeoutMs: Number(
+      process.env.BRIDGE_USER_SYNC_TIMEOUT_MS || fileConfig.userSyncTimeoutMs || 45000
     ),
     connectTimeoutMs: Number(process.env.BRIDGE_CONNECT_TIMEOUT_MS || fileConfig.connectTimeoutMs || 5000),
     maxBackoffMs: Number(process.env.BRIDGE_MAX_BACKOFF_MS || fileConfig.maxBackoffMs || 300000),

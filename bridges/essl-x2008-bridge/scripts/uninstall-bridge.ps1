@@ -5,6 +5,8 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+$BridgeRoot = (Resolve-Path (Split-Path -Parent $PSScriptRoot)).Path
+$LockFilePath = Join-Path $BridgeRoot "data\bridge.lock.json"
 
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
   Write-Host "Stopping and removing Windows Service '$ServiceName'..." -ForegroundColor Yellow
@@ -18,8 +20,24 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
 
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
   Write-Host "Stopping and removing Scheduled Task '$TaskName'..." -ForegroundColor Yellow
-  Stop-ScheduledTask -TaskName $TaskName
+  Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
 }
 
-Write-Host "CoreERP Biometric Bridge uninstalled. Checkpoints and logs remain in ./data and ./logs for auditability." -ForegroundColor Green
+if (Test-Path $LockFilePath) {
+  try {
+    $lockData = Get-Content -Path $LockFilePath -Raw | ConvertFrom-Json
+    if ($lockData.pid) {
+      $proc = Get-Process -Id $lockData.pid -ErrorAction SilentlyContinue
+      if ($proc) {
+        Write-Host "Stopping running bridge daemon (PID $($lockData.pid))..." -ForegroundColor Yellow
+        Stop-Process -Id $lockData.pid -Force -ErrorAction SilentlyContinue
+      }
+    }
+    Remove-Item -Path $LockFilePath -Force -ErrorAction SilentlyContinue
+  } catch {
+    # Ignore malformed lockfile
+  }
+}
+
+Write-Host "CoreERP Biometric Bridge auto-start uninstalled. Checkpoints (./data/checkpoints.json), DPAPI credentials (./data/credentials.dpapi.json), and logs (./logs) were preserved." -ForegroundColor Green

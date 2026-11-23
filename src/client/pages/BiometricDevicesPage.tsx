@@ -356,6 +356,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   const [syncingTerminalId, setSyncingTerminalId] = useState<string | null>(null);
   const [selectedUserSyncTerminalId, setSelectedUserSyncTerminalId] = useState<string>('');
   const [syncingUsersTerminalId, setSyncingUsersTerminalId] = useState<string | null>(null);
+  const [pollingUserSyncTerminalId, setPollingUserSyncTerminalId] = useState<string | null>(null);
   const [selectedTerminalDeviceUsers, setSelectedTerminalDeviceUsers] = useState<DeviceEnrolledUserItem[]>([]);
   const [isLoadingDeviceUsers, setIsLoadingDeviceUsers] = useState<boolean>(false);
   const [showBridgeGuide, setShowBridgeGuide] = useState<boolean>(false);
@@ -491,6 +492,67 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
       loadSelectedTerminalDeviceUsers(selectedUserSyncTerminalId);
     }
   }, [selectedUserSyncTerminalId, loadSelectedTerminalDeviceUsers]);
+
+  // Automatic polling while any terminal has an active QUEUED/RUNNING user-sync job
+  useEffect(() => {
+    const activeTerminal =
+      terminals.find(
+        (t) =>
+          t.id === pollingUserSyncTerminalId &&
+          (t.userSyncStatus === 'QUEUED' || t.userSyncStatus === 'RUNNING')
+      ) ||
+      terminals.find((t) => t.userSyncStatus === 'QUEUED' || t.userSyncStatus === 'RUNNING') ||
+      null;
+
+    if (!activeTerminal) {
+      if (pollingUserSyncTerminalId !== null) {
+        setPollingUserSyncTerminalId(null);
+      }
+      return;
+    }
+
+    let cancelled = false;
+    const pollTargetId = activeTerminal.id;
+
+    const timer = window.setInterval(async () => {
+      if (cancelled) return;
+      try {
+        const statusRes = await api.getBiometricUserSyncStatus(pollTargetId);
+        if (cancelled) return;
+
+        setTerminals((prev) =>
+          prev.map((t) => (t.id === pollTargetId ? statusRes.terminal : t))
+        );
+        if (pollTargetId === selectedUserSyncTerminalId) {
+          setSelectedTerminalDeviceUsers(statusRes.deviceUsers || []);
+        }
+
+        if (statusRes.userSyncStatus === 'SUCCESS') {
+          setPollingUserSyncTerminalId(null);
+          const count = statusRes.job?.syncedCount ?? statusRes.deviceUsers.length;
+          setActionErrorMessage(null);
+          setActionSuccessMessage(
+            `${statusRes.terminal.name}: Hardware user sync completed successfully (${count} enrolled user${count === 1 ? '' : 's'} synchronized).`
+          );
+        } else if (statusRes.userSyncStatus === 'FAILED') {
+          setPollingUserSyncTerminalId(null);
+          setActionSuccessMessage(null);
+          setActionErrorMessage(
+            `${statusRes.terminal.name}: Hardware user sync failed — ${
+              statusRes.job?.error || statusRes.terminal.lastUserSyncError || 'Check bridge connectivity.'
+            }`
+          );
+        }
+      } catch {
+        // Transient poll error; keep polling until next interval
+      }
+    }, 3000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [terminals, pollingUserSyncTerminalId, selectedUserSyncTerminalId]);
 
   useEffect(() => {
     if (activeTab === 'punches') {
@@ -752,6 +814,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
       const res = await api.syncBiometricTerminalUsers(terminal.id);
       setTerminals((prev) => prev.map((t) => (t.id === terminal.id ? res.terminal : t)));
       setSelectedTerminalDeviceUsers(res.deviceUsers || []);
+      setPollingUserSyncTerminalId(terminal.id);
       setActionSuccessMessage(`${terminal.name}: ${res.message}`);
     } catch (err: unknown) {
       const apiErr = err as ApiError;
@@ -1072,10 +1135,10 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                 </div>
 
                 <div className="space-y-1.5">
-                  <div className="font-semibold text-slate-100">3. Verify &amp; Install Service</div>
+                  <div className="font-semibold text-slate-100">3. Verify &amp; Enable Windows Auto-Start</div>
                   <p className="text-slate-400 leading-relaxed">
-                    Run <code className="font-mono text-indigo-300">npm run test-connection</code> to verify TCP 4370 handshake + serial match, then install persistently with{' '}
-                    <code className="font-mono text-slate-300">scripts/install-nssm-service.ps1</code>. Local diagnostics run on <code className="font-mono text-slate-300">127.0.0.1:4379/health</code>.
+                    Run <code className="font-mono text-indigo-300">npm run test-connection</code> to verify TCP 4370 handshake + serial match, then register continuous user-logon auto-start (preserving DPAPI <code className="font-mono text-slate-300">CurrentUser</code>) with{' '}
+                    <code className="font-mono text-slate-300">scripts/install-task-scheduler.ps1</code>. Local diagnostics run on <code className="font-mono text-slate-300">127.0.0.1:4379/health</code>.
                   </p>
                 </div>
               </div>
@@ -1116,7 +1179,9 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                     disabled={
                       !selectedUserSyncTerminal ||
                       !selectedUserSyncTerminal.isActive ||
-                      syncingUsersTerminalId === selectedUserSyncTerminal?.id
+                      syncingUsersTerminalId === selectedUserSyncTerminal?.id ||
+                      selectedUserSyncTerminal.userSyncStatus === 'QUEUED' ||
+                      selectedUserSyncTerminal.userSyncStatus === 'RUNNING'
                     }
                     onClick={() =>
                       selectedUserSyncTerminal && handleSyncDeviceUsers(selectedUserSyncTerminal)
@@ -1125,12 +1190,20 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                   >
                     <RefreshCw
                       className={`w-3.5 h-3.5 ${
-                        syncingUsersTerminalId === selectedUserSyncTerminal?.id ? 'animate-spin' : ''
+                        syncingUsersTerminalId === selectedUserSyncTerminal?.id ||
+                        selectedUserSyncTerminal?.userSyncStatus === 'QUEUED' ||
+                        selectedUserSyncTerminal?.userSyncStatus === 'RUNNING'
+                          ? 'animate-spin'
+                          : ''
                       }`}
                     />
                     <span>
                       {syncingUsersTerminalId === selectedUserSyncTerminal?.id
                         ? 'Queueing User Sync...'
+                        : selectedUserSyncTerminal?.userSyncStatus === 'RUNNING'
+                        ? 'Syncing Users...'
+                        : selectedUserSyncTerminal?.userSyncStatus === 'QUEUED'
+                        ? 'User Sync Queued...'
                         : 'Sync Device Users'}
                     </span>
                   </button>
@@ -1139,7 +1212,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
 
               {selectedUserSyncTerminal && (
                 <div className="space-y-3">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 text-xs">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-3 text-xs">
                     <div className="p-2.5 rounded-lg bg-slate-950/50 border border-slate-800/80">
                       <div className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">
                         Selected terminal
@@ -1149,6 +1222,30 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                       </div>
                       <div className="text-[11px] font-mono text-slate-400 truncate">
                         {selectedUserSyncTerminal.terminalModel} · {selectedUserSyncTerminal.deviceSerialNumber}
+                      </div>
+                    </div>
+
+                    <div className="p-2.5 rounded-lg bg-slate-950/50 border border-slate-800/80">
+                      <div className="text-[11px] font-medium text-slate-400 uppercase tracking-wider">
+                        User Sync Job
+                      </div>
+                      <div
+                        className={`font-mono font-semibold mt-1 ${
+                          selectedUserSyncTerminal.userSyncStatus === 'SUCCESS'
+                            ? 'text-emerald-400'
+                            : selectedUserSyncTerminal.userSyncStatus === 'RUNNING' ||
+                              selectedUserSyncTerminal.userSyncStatus === 'QUEUED'
+                            ? 'text-indigo-300'
+                            : selectedUserSyncTerminal.userSyncStatus === 'FAILED'
+                            ? 'text-rose-400'
+                            : 'text-slate-300'
+                        }`}
+                      >
+                        {selectedUserSyncTerminal.userSyncStatus || 'IDLE'}
+                      </div>
+                      <div className="text-[11px] font-mono text-slate-400 mt-0.5">
+                        Bridge: {selectedUserSyncTerminal.bridgeStatus || (selectedUserSyncTerminal.bridgeConnected ? 'ONLINE' : 'OFFLINE')} · Device:{' '}
+                        {selectedUserSyncTerminal.deviceConnectionStatus || (selectedUserSyncTerminal.status === 'ONLINE' ? 'CONNECTED' : 'DISCONNECTED')}
                       </div>
                     </div>
 
@@ -1170,9 +1267,12 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                             })
                           : 'Never'}
                       </div>
-                      {selectedUserSyncTerminal.userSyncRequestedAt && (
+                      {(selectedUserSyncTerminal.userSyncStatus === 'QUEUED' ||
+                        selectedUserSyncTerminal.userSyncStatus === 'RUNNING') && (
                         <div className="text-[11px] text-indigo-300 mt-0.5 font-mono">
-                          Sync queued for bridge
+                          {selectedUserSyncTerminal.userSyncStatus === 'RUNNING'
+                            ? 'Bridge reading hardware users...'
+                            : 'Waiting for bridge pickup...'}
                         </div>
                       )}
                     </div>
@@ -1305,10 +1405,20 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                   </thead>
                   <tbody className="divide-y divide-slate-800/60 text-xs">
                     {terminals.map((terminal) => {
-                      const isOnline = terminal.status === 'ONLINE';
-                      const isOffline = terminal.status === 'OFFLINE';
-                      const isDeactivated = terminal.status === 'DEACTIVATED';
-                      const isBridgeOnline = terminal.bridgeConnected === true;
+                      const isDeactivated = terminal.status === 'DEACTIVATED' || !terminal.isActive;
+                      const bridgeStatus = terminal.bridgeStatus || (terminal.bridgeConnected ? 'ONLINE' : 'OFFLINE');
+                      const isBridgeOnline = bridgeStatus === 'ONLINE';
+                      const deviceConnectionStatus =
+                        terminal.deviceConnectionStatus ||
+                        (isDeactivated
+                          ? 'DEACTIVATED'
+                          : terminal.status === 'ONLINE'
+                          ? 'CONNECTED'
+                          : 'DISCONNECTED');
+                      const isDeviceConnected = deviceConnectionStatus === 'CONNECTED';
+                      const userSyncStatus = terminal.userSyncStatus || 'IDLE';
+                      const isUserSyncActive =
+                        userSyncStatus === 'QUEUED' || userSyncStatus === 'RUNNING';
                       const isTesting = testingTerminalId === terminal.id;
                       const isSyncing = syncingTerminalId === terminal.id;
 
@@ -1351,38 +1461,55 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                           <td className="py-3.5 px-4">
                             <div className="space-y-1.5">
                               <div
-                                className={`inline-flex items-center gap-1.5 font-mono text-[11px] font-semibold ${
-                                  isOnline
-                                    ? 'text-emerald-400'
-                                    : isOffline
-                                    ? 'text-amber-400'
-                                    : isDeactivated
-                                    ? 'text-slate-400'
-                                    : 'text-rose-400'
-                                }`}
-                              >
-                                {isOnline && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
-                                {isOffline && <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />}
-                                {isDeactivated && <XCircle className="w-3.5 h-3.5 text-slate-400 shrink-0" />}
-                                {!isOnline && !isOffline && !isDeactivated && (
-                                  <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                                )}
-                                <span>Device: {terminal.status}</span>
-                              </div>
-
-                              <div
-                                className={`flex items-center gap-1.5 font-mono text-[11px] ${
-                                  isBridgeOnline ? 'text-indigo-300' : 'text-slate-400'
+                                className={`flex items-center gap-1.5 font-mono text-[11px] font-semibold ${
+                                  isBridgeOnline ? 'text-emerald-400' : 'text-amber-400'
                                 }`}
                               >
                                 {isBridgeOnline ? (
-                                  <Wifi className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                                  <Wifi className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
                                 ) : (
-                                  <WifiOff className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                                  <WifiOff className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                                 )}
                                 <span>
-                                  Bridge: {isBridgeOnline ? `Connected (${terminal.bridgeHost || 'LAN'})` : 'Disconnected'}
+                                  Bridge: {bridgeStatus}
+                                  {isBridgeOnline && terminal.bridgeHost ? ` (${terminal.bridgeHost})` : ''}
                                 </span>
+                              </div>
+
+                              <div
+                                className={`inline-flex items-center gap-1.5 font-mono text-[11px] font-semibold ${
+                                  isDeviceConnected
+                                    ? 'text-emerald-300'
+                                    : isDeactivated
+                                    ? 'text-slate-400'
+                                    : terminal.status === 'ERROR'
+                                    ? 'text-rose-400'
+                                    : 'text-amber-300'
+                                }`}
+                              >
+                                {isDeviceConnected && <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
+                                {!isDeviceConnected && !isDeactivated && terminal.status !== 'ERROR' && (
+                                  <Clock className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                                )}
+                                {isDeactivated && <XCircle className="w-3.5 h-3.5 text-slate-400 shrink-0" />}
+                                {!isDeviceConnected && !isDeactivated && terminal.status === 'ERROR' && (
+                                  <AlertTriangle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                                )}
+                                <span>Device: {deviceConnectionStatus}</span>
+                              </div>
+
+                              <div
+                                className={`text-[11px] font-mono ${
+                                  userSyncStatus === 'SUCCESS'
+                                    ? 'text-emerald-300'
+                                    : isUserSyncActive
+                                    ? 'text-indigo-300'
+                                    : userSyncStatus === 'FAILED'
+                                    ? 'text-rose-300'
+                                    : 'text-slate-400'
+                                }`}
+                              >
+                                User Sync: {userSyncStatus}
                               </div>
 
                               {terminal.lastTestConnectionStatus && (
@@ -1423,11 +1550,20 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                             title={terminal.lastSyncAt ? `UTC: ${formatUtcTimestamp(terminal.lastSyncAt)}` : undefined}
                           >
                             <div>
+                              Punch Sync:{' '}
                               {terminal.lastSyncAt
                                 ? formatDateTimeInTimezone(terminal.lastSyncAt, timezone, { includeZoneAbbr: true })
                                 : 'Never'}
                             </div>
                             <div className="text-[11px] text-slate-400 mt-1">
+                              User Sync:{' '}
+                              {terminal.lastUserSyncAt
+                                ? formatDateTimeInTimezone(terminal.lastUserSyncAt, timezone, {
+                                    includeZoneAbbr: true,
+                                  })
+                                : 'Never'}
+                            </div>
+                            <div className="text-[11px] text-slate-400 mt-0.5">
                               Last batch: {terminal.lastProcessedPunchCount ?? 0} punches
                             </div>
                             {terminal.syncRequestedAt && (
@@ -1450,12 +1586,26 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                                   </button>
                                   <button
                                     onClick={() => handleSyncDeviceUsers(terminal)}
-                                    disabled={syncingUsersTerminalId === terminal.id}
+                                    disabled={syncingUsersTerminalId === terminal.id || isUserSyncActive}
                                     title="Queue hardware user synchronization only (does not reconcile attendance)"
                                     className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-indigo-200 hover:text-white bg-indigo-950/60 hover:bg-indigo-900/80 border border-indigo-800/60 rounded-md transition cursor-pointer whitespace-nowrap shrink-0 disabled:opacity-50"
                                   >
-                                    <Users className={`w-3 h-3 text-indigo-400 ${syncingUsersTerminalId === terminal.id ? 'animate-pulse' : ''}`} />
-                                    <span>{syncingUsersTerminalId === terminal.id ? 'Queueing...' : 'Sync Users'}</span>
+                                    <Users
+                                      className={`w-3 h-3 text-indigo-400 ${
+                                        syncingUsersTerminalId === terminal.id || isUserSyncActive
+                                          ? 'animate-pulse'
+                                          : ''
+                                      }`}
+                                    />
+                                    <span>
+                                      {syncingUsersTerminalId === terminal.id
+                                        ? 'Queueing...'
+                                        : userSyncStatus === 'RUNNING'
+                                        ? 'Syncing...'
+                                        : userSyncStatus === 'QUEUED'
+                                        ? 'Queued...'
+                                        : 'Sync Users'}
+                                    </span>
                                   </button>
                                   <button
                                     onClick={() => handleSyncTerminal(terminal)}

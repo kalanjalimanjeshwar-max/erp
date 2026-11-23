@@ -3,17 +3,27 @@ import net from 'net';
 import { prisma } from '../db/client.js';
 import {
   AuthUser,
+  BiometricBridgeProcessStatus,
+  BiometricDeviceConnectionStatus,
   BiometricTerminalItem,
   BiometricConnectionTestStatus,
+  BiometricUserSyncJob,
+  BiometricUserSyncJobStatus,
+  ClaimUserSyncJobRequest,
+  ClaimUserSyncJobResponse,
   CreateBiometricTerminalRequest,
   CreateBiometricTerminalResponse,
   BatchPunchSubmissionRequest,
   BatchPunchSubmissionResponse,
   DeviceEnrolledUserItem,
+  PendingUserSyncJobSummary,
+  ReportUserSyncJobFailureRequest,
+  ReportUserSyncJobFailureResponse,
   SyncDeviceUsersRequest,
   SyncDeviceUsersResponse,
   TerminalHeartbeatRequest,
   TerminalHeartbeatResponse,
+  TerminalUserSyncStatusResponse,
   TestBiometricConnectionResponse,
   TriggerTerminalSyncResponse,
   TriggerTerminalUserSyncResponse,
@@ -34,11 +44,17 @@ const VALID_IN_OUT_MODES: PunchInOutMode[] = ['CHECK_IN', 'CHECK_OUT', 'BREAK_OU
 const MAX_BATCH_PUNCHES = 500;
 const BRIDGE_TELEMETRY_SETTING_KEY = 'BIOMETRIC_BRIDGE_TELEMETRY_V1';
 const HEARTBEAT_FRESHNESS_WINDOW_MS = 5 * 60 * 1000;
+const USER_SYNC_QUEUE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes to be claimed/completed before timeout
+const USER_SYNC_EXECUTION_LEASE_MS = 60 * 1000; // 60 seconds active execution lease once claimed
+const USER_SYNC_DEFAULT_MAX_ATTEMPTS = 3;
 
 export interface TerminalBridgeTelemetry {
   bridgeConnected?: boolean;
   bridgeHost?: string | null;
   bridgeVersion?: string | null;
+  bridgePid?: number | null;
+  deviceReachable?: boolean;
+  lastDeviceContactAt?: string | null;
   lastBridgeHeartbeatAt?: string | null;
   lastSyncAttemptAt?: string | null;
   lastConnectionError?: string | null;
@@ -55,9 +71,35 @@ export interface TerminalBridgeTelemetry {
   discoveredUserCount?: number | null;
   syncedUserCount?: number | null;
   userSyncRequestedAt?: string | null;
+  userSyncJob?: BiometricUserSyncJob | null;
 }
 
+const telemetryCompanyLocks = new Map<string, Promise<void>>();
+
 export class BiometricService {
+  /**
+   * Serializes read-modify-write mutations to CompanySetting telemetry JSON per company
+   * so concurrent heartbeats, UI sync requests, and job claims never clobber each other.
+   */
+  private static async withTelemetryLock<T>(companyId: string, fn: () => Promise<T>): Promise<T> {
+    const prev = telemetryCompanyLocks.get(companyId) || Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const nextChain = prev.then(() => gate, () => gate);
+    telemetryCompanyLocks.set(companyId, nextChain);
+
+    await prev.catch(() => undefined);
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (telemetryCompanyLocks.get(companyId) === nextChain) {
+        telemetryCompanyLocks.delete(companyId);
+      }
+    }
+  }
   /**
    * Non-destructively reads per-terminal bridge telemetry stored in CompanySetting
    */
@@ -90,49 +132,189 @@ export class BiometricService {
     terminalId: string,
     patch: Partial<TerminalBridgeTelemetry>
   ): Promise<TerminalBridgeTelemetry> {
-    const existingMap = await this.readBridgeTelemetryMap(companyId);
-    const prev = existingMap[terminalId] || {};
-    const nextEntry: TerminalBridgeTelemetry = {
-      ...prev,
-      ...patch,
-    };
+    return this.withTelemetryLock(companyId, async () => {
+      const existingMap = await this.readBridgeTelemetryMap(companyId);
+      const prev = existingMap[terminalId] || {};
+      const nextEntry: TerminalBridgeTelemetry = {
+        ...prev,
+        ...patch,
+      };
 
-    if (typeof nextEntry.lastConnectionError === 'string') {
-      nextEntry.lastConnectionError = redactSensitiveText(nextEntry.lastConnectionError).slice(0, 500);
-    }
-    if (typeof nextEntry.lastTestConnectionMessage === 'string') {
-      nextEntry.lastTestConnectionMessage = redactSensitiveText(nextEntry.lastTestConnectionMessage).slice(0, 500);
-    }
-    if (typeof nextEntry.lastUserSyncError === 'string') {
-      nextEntry.lastUserSyncError = redactSensitiveText(nextEntry.lastUserSyncError).slice(0, 500);
-    }
+      if (typeof nextEntry.lastConnectionError === 'string') {
+        nextEntry.lastConnectionError = redactSensitiveText(nextEntry.lastConnectionError).slice(0, 500);
+      }
+      if (typeof nextEntry.lastTestConnectionMessage === 'string') {
+        nextEntry.lastTestConnectionMessage = redactSensitiveText(nextEntry.lastTestConnectionMessage).slice(0, 500);
+      }
+      if (typeof nextEntry.lastUserSyncError === 'string') {
+        nextEntry.lastUserSyncError = redactSensitiveText(nextEntry.lastUserSyncError).slice(0, 500);
+      }
+      if (nextEntry.userSyncJob && typeof nextEntry.userSyncJob.error === 'string') {
+        nextEntry.userSyncJob = {
+          ...nextEntry.userSyncJob,
+          error: redactSensitiveText(nextEntry.userSyncJob.error).slice(0, 500),
+        };
+      }
 
-    existingMap[terminalId] = nextEntry;
+      existingMap[terminalId] = nextEntry;
 
-    try {
-      if (typeof prisma.companySetting?.upsert === 'function') {
-        await prisma.companySetting.upsert({
-          where: {
-            companyId_key: {
+      try {
+        if (typeof prisma.companySetting?.upsert === 'function') {
+          await prisma.companySetting.upsert({
+            where: {
+              companyId_key: {
+                companyId,
+                key: BRIDGE_TELEMETRY_SETTING_KEY,
+              },
+            },
+            update: {
+              value: JSON.stringify(existingMap),
+            },
+            create: {
               companyId,
               key: BRIDGE_TELEMETRY_SETTING_KEY,
+              value: JSON.stringify(existingMap),
             },
-          },
-          update: {
-            value: JSON.stringify(existingMap),
-          },
-          create: {
-            companyId,
-            key: BRIDGE_TELEMETRY_SETTING_KEY,
-            value: JSON.stringify(existingMap),
-          },
-        });
+          });
+        }
+      } catch {
+        // Non-fatal: mocked tests or transient telemetry write failure must not abort punch ingestion
       }
-    } catch {
-      // Non-fatal: mocked tests or transient telemetry write failure must not abort punch ingestion
+
+      return nextEntry;
+    });
+  }
+
+  /**
+   * Atomically mutates telemetry for a single terminal using a transform callback.
+   */
+  private static async mutateTerminalTelemetry<T>(
+    companyId: string,
+    terminalId: string,
+    mutator: (prev: TerminalBridgeTelemetry) => { next: TerminalBridgeTelemetry; result: T; persist?: boolean }
+  ): Promise<{ telemetry: TerminalBridgeTelemetry; result: T }> {
+    return this.withTelemetryLock(companyId, async () => {
+      const existingMap = await this.readBridgeTelemetryMap(companyId);
+      const prev = existingMap[terminalId] || {};
+      const { next, result, persist = true } = mutator(prev);
+
+      if (typeof next.lastConnectionError === 'string') {
+        next.lastConnectionError = redactSensitiveText(next.lastConnectionError).slice(0, 500);
+      }
+      if (typeof next.lastUserSyncError === 'string') {
+        next.lastUserSyncError = redactSensitiveText(next.lastUserSyncError).slice(0, 500);
+      }
+      if (next.userSyncJob && typeof next.userSyncJob.error === 'string') {
+        next.userSyncJob = {
+          ...next.userSyncJob,
+          error: redactSensitiveText(next.userSyncJob.error).slice(0, 500),
+        };
+      }
+
+      if (persist) {
+        existingMap[terminalId] = next;
+        try {
+          if (typeof prisma.companySetting?.upsert === 'function') {
+            await prisma.companySetting.upsert({
+              where: {
+                companyId_key: {
+                  companyId,
+                  key: BRIDGE_TELEMETRY_SETTING_KEY,
+                },
+              },
+              update: {
+                value: JSON.stringify(existingMap),
+              },
+              create: {
+                companyId,
+                key: BRIDGE_TELEMETRY_SETTING_KEY,
+                value: JSON.stringify(existingMap),
+              },
+            });
+          }
+        } catch {
+          // Non-fatal in mocked unit tests
+        }
+      }
+
+      return { telemetry: next, result };
+    });
+  }
+
+  /**
+   * Evaluates a persisted user-sync job against its deadline without losing history.
+   * Expired QUEUED/RUNNING jobs transition to FAILED with a clear diagnostic message
+   * when no bridge claimed/completed them in time.
+   */
+  static evaluateUserSyncJob(
+    job: BiometricUserSyncJob | null | undefined,
+    nowMs: number = Date.now()
+  ): BiometricUserSyncJob | null {
+    if (!job) return null;
+    if (job.status === 'QUEUED' || job.status === 'RUNNING') {
+      const timeoutMs = new Date(job.timeoutAt).getTime();
+      if (!Number.isNaN(timeoutMs) && nowMs > timeoutMs) {
+        if (job.status === 'RUNNING' && job.attempts < job.maxAttempts) {
+          return {
+            ...job,
+            status: 'FAILED',
+            completedAt: new Date(nowMs).toISOString(),
+            error:
+              job.error ||
+              'User sync job timed out while waiting for the Windows LAN Bridge to finish reading the device.',
+          };
+        }
+        return {
+          ...job,
+          status: 'FAILED',
+          completedAt: new Date(nowMs).toISOString(),
+          error:
+            job.error ||
+            (job.status === 'QUEUED'
+              ? 'User sync job timed out before the Windows LAN Bridge claimed it. Verify the bridge daemon is running and sending heartbeats.'
+              : 'User sync job timed out while reading enrolled users from the biometric device.'),
+        };
+      }
+    }
+    return job;
+  }
+
+  /**
+   * Determines whether a terminal has a claimable user-sync job.
+   */
+  private static getClaimableJobSummary(
+    telemetry: TerminalBridgeTelemetry,
+    nowMs: number = Date.now()
+  ): PendingUserSyncJobSummary | null {
+    const job = telemetry.userSyncJob;
+    if (!job) return null;
+    const timeoutMs = new Date(job.timeoutAt).getTime();
+
+    if (job.status === 'QUEUED') {
+      if (!Number.isNaN(timeoutMs) && nowMs > timeoutMs) {
+        return null;
+      }
+      return {
+        jobId: job.jobId,
+        requestedAt: job.requestedAt,
+        attempts: job.attempts,
+        maxAttempts: job.maxAttempts,
+        timeoutAt: job.timeoutAt,
+      };
     }
 
-    return nextEntry;
+    // Re-claimable if an earlier bridge execution lease expired and retry budget remains
+    if (job.status === 'RUNNING' && !Number.isNaN(timeoutMs) && nowMs > timeoutMs && job.attempts < job.maxAttempts) {
+      return {
+        jobId: job.jobId,
+        requestedAt: job.requestedAt,
+        attempts: job.attempts,
+        maxAttempts: job.maxAttempts,
+        timeoutAt: job.timeoutAt,
+      };
+    }
+
+    return null;
   }
 
   /**
@@ -217,10 +399,58 @@ export class BiometricService {
   }
 
   /**
+   * Derives explicit Bridge Process status (ONLINE / OFFLINE) based strictly on fresh authenticated heartbeat.
+   */
+  static deriveBridgeStatus(
+    terminal: { isActive: boolean; status: string; lastHeartbeatAt: Date | null },
+    telemetry?: TerminalBridgeTelemetry
+  ): BiometricBridgeProcessStatus {
+    return this.isBridgeFresh(terminal, telemetry) ? 'ONLINE' : 'OFFLINE';
+  }
+
+  /**
+   * Derives explicit Physical Device connection status (CONNECTED / DISCONNECTED / DEACTIVATED).
+   * Never reports CONNECTED solely because the terminal is registered or because the bridge process is alive.
+   */
+  static deriveDeviceConnectionStatus(
+    terminal: { isActive: boolean; status: string; lastHeartbeatAt: Date | null },
+    telemetry?: TerminalBridgeTelemetry
+  ): BiometricDeviceConnectionStatus {
+    if (!terminal.isActive || terminal.status === 'DEACTIVATED') {
+      return 'DEACTIVATED';
+    }
+    const bridgeOnline = this.isBridgeFresh(terminal, telemetry);
+    if (!bridgeOnline) {
+      return 'DISCONNECTED';
+    }
+    if (telemetry?.deviceReachable === false) {
+      return 'DISCONNECTED';
+    }
+    if (telemetry?.lastConnectionError) {
+      return 'DISCONNECTED';
+    }
+    if (telemetry?.deviceReachable === true) {
+      if (telemetry.lastDeviceContactAt) {
+        const contactMs = new Date(telemetry.lastDeviceContactAt).getTime();
+        if (!Number.isNaN(contactMs) && Date.now() - contactMs > HEARTBEAT_FRESHNESS_WINDOW_MS) {
+          return 'DISCONNECTED';
+        }
+      }
+      return 'CONNECTED';
+    }
+    // Legacy heartbeats without explicit deviceReachable field fall back to effective terminal status
+    return this.getEffectiveStatus(terminal) === 'ONLINE' ? 'CONNECTED' : 'DISCONNECTED';
+  }
+
+  /**
    * Maps a Prisma biometric terminal record + bridge telemetry to a client-safe BiometricTerminalItem
    */
   static mapToTerminalItem(t: any, telemetry?: TerminalBridgeTelemetry): BiometricTerminalItem {
     const bridgeConnected = this.isBridgeFresh(t, telemetry);
+    const bridgeStatus: BiometricBridgeProcessStatus = bridgeConnected ? 'ONLINE' : 'OFFLINE';
+    const deviceConnectionStatus = this.deriveDeviceConnectionStatus(t, telemetry);
+    const evaluatedJob = this.evaluateUserSyncJob(telemetry?.userSyncJob);
+    const userSyncStatus: BiometricUserSyncJobStatus = evaluatedJob ? evaluatedJob.status : 'IDLE';
 
     return {
       id: t.id,
@@ -246,6 +476,12 @@ export class BiometricService {
       notes: t.notes,
       createdAt: t.createdAt instanceof Date ? t.createdAt.toISOString() : new Date(t.createdAt).toISOString(),
       updatedAt: t.updatedAt instanceof Date ? t.updatedAt.toISOString() : new Date(t.updatedAt).toISOString(),
+      bridgeStatus,
+      deviceConnectionStatus,
+      deviceReachable: deviceConnectionStatus === 'CONNECTED',
+      lastDeviceContactAt: telemetry?.lastDeviceContactAt ?? null,
+      userSyncStatus,
+      userSyncJob: evaluatedJob,
       bridgeConnected,
       bridgeHost: telemetry?.bridgeHost ?? null,
       bridgeVersion: telemetry?.bridgeVersion ?? null,
@@ -261,7 +497,9 @@ export class BiometricService {
       fingerprintAlgorithm: telemetry?.fingerprintAlgorithm ?? null,
       lastUserSyncAt: telemetry?.lastUserSyncAt ?? null,
       lastUserSyncAttemptAt: telemetry?.lastUserSyncAttemptAt ?? null,
-      lastUserSyncError: telemetry?.lastUserSyncError ?? null,
+      lastUserSyncError: evaluatedJob?.status === 'FAILED' && evaluatedJob.error
+        ? evaluatedJob.error
+        : telemetry?.lastUserSyncError ?? null,
       discoveredUserCount: telemetry?.discoveredUserCount ?? null,
       syncedUserCount: telemetry?.syncedUserCount ?? null,
       userSyncRequestedAt: telemetry?.userSyncRequestedAt ?? null,
@@ -402,7 +640,10 @@ export class BiometricService {
     const now = new Date();
     const hasConnectionError =
       typeof payload.lastConnectionError === 'string' && payload.lastConnectionError.trim().length > 0;
-    const isDeviceOnline = payload.bridgeConnected !== false && !hasConnectionError;
+    const bridgeAlive = payload.bridgeConnected !== false;
+    // Physical device is only considered online when bridge is alive, has no connection error,
+    // and did NOT explicitly report deviceReachable === false.
+    const isDeviceOnline = bridgeAlive && !hasConnectionError && payload.deviceReachable !== false;
     const derivedStatus: BiometricTerminalStatus = hasConnectionError
       ? 'ERROR'
       : isDeviceOnline
@@ -436,11 +677,22 @@ export class BiometricService {
     });
 
     const telemetryPatch: Partial<TerminalBridgeTelemetry> = {
-      bridgeConnected: payload.bridgeConnected !== false,
+      bridgeConnected: bridgeAlive,
       lastBridgeHeartbeatAt: now.toISOString(),
       lastConnectionError: hasConnectionError ? redactSensitiveText(payload.lastConnectionError!.trim()) : null,
     };
 
+    if (typeof payload.deviceReachable === 'boolean') {
+      telemetryPatch.deviceReachable = payload.deviceReachable;
+    } else if (hasConnectionError) {
+      telemetryPatch.deviceReachable = false;
+    }
+    if (payload.lastDeviceContactAt !== undefined) {
+      telemetryPatch.lastDeviceContactAt = payload.lastDeviceContactAt;
+    }
+    if (typeof payload.bridgePid === 'number' && Number.isInteger(payload.bridgePid) && payload.bridgePid > 0) {
+      telemetryPatch.bridgePid = payload.bridgePid;
+    }
     if (payload.bridgeHost) telemetryPatch.bridgeHost = payload.bridgeHost.trim().slice(0, 128);
     if (payload.bridgeVersion) telemetryPatch.bridgeVersion = payload.bridgeVersion.trim().slice(0, 64);
     if (payload.platform) telemetryPatch.platform = payload.platform.trim().slice(0, 64);
@@ -486,7 +738,7 @@ export class BiometricService {
 
     const updatedTelemetry = await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, telemetryPatch);
 
-    // Check if an admin requested an out-of-band bridge sync after the last sync attempt
+    // Check if an admin requested an out-of-band bridge punch sync after the last sync attempt
     let syncRequested = false;
     if (updatedTelemetry.syncRequestedAt) {
       const reqMs = new Date(updatedTelemetry.syncRequestedAt).getTime();
@@ -496,8 +748,9 @@ export class BiometricService {
       syncRequested = !Number.isNaN(reqMs) && reqMs > attemptMs;
     }
 
-    let userSyncRequested = false;
-    if (updatedTelemetry.userSyncRequestedAt) {
+    const pendingUserSyncJob = this.getClaimableJobSummary(updatedTelemetry, now.getTime());
+    let userSyncRequested = pendingUserSyncJob !== null;
+    if (!userSyncRequested && !updatedTelemetry.userSyncJob && updatedTelemetry.userSyncRequestedAt) {
       const reqMs = new Date(updatedTelemetry.userSyncRequestedAt).getTime();
       const attemptMs = updatedTelemetry.lastUserSyncAttemptAt
         ? new Date(updatedTelemetry.lastUserSyncAttemptAt).getTime()
@@ -505,22 +758,339 @@ export class BiometricService {
       userSyncRequested = !Number.isNaN(reqMs) && reqMs > attemptMs;
     }
 
+    const bridgeStatus: BiometricBridgeProcessStatus = bridgeAlive ? 'ONLINE' : 'OFFLINE';
+    const deviceConnectionStatus: BiometricDeviceConnectionStatus = isDeviceOnline
+      ? 'CONNECTED'
+      : 'DISCONNECTED';
+
     return {
       success: true,
       serverTime: now.toISOString(),
       terminalId: terminal.id,
       terminalName: terminal.name,
       status: derivedStatus,
+      bridgeStatus,
+      deviceConnectionStatus,
       syncRequested,
       syncRequestedAt: syncRequested ? updatedTelemetry.syncRequestedAt || null : null,
       userSyncRequested,
-      userSyncRequestedAt: userSyncRequested ? updatedTelemetry.userSyncRequestedAt || null : null,
+      userSyncRequestedAt: userSyncRequested
+        ? pendingUserSyncJob?.requestedAt || updatedTelemetry.userSyncRequestedAt || null
+        : null,
+      pendingUserSyncJob,
+    };
+  }
+
+  /**
+   * Atomically claims a pending or retryable user-sync job for an authenticated terminal (POST /api/biometric/users/jobs/claim).
+   * Enforces serial verification, single-claim lease semantics, and strict tenant/terminal isolation.
+   */
+  static async claimPendingUserSyncJob(
+    terminal: any,
+    payload: ClaimUserSyncJobRequest = {},
+    correlationId?: string
+  ): Promise<ClaimUserSyncJobResponse> {
+    if (
+      payload.deviceSerialNumber &&
+      payload.deviceSerialNumber.trim() &&
+      terminal.deviceSerialNumber &&
+      payload.deviceSerialNumber.trim() !== terminal.deviceSerialNumber
+    ) {
+      const mismatchMsg = `Serial number mismatch during user-sync job claim: expected '${terminal.deviceSerialNumber}', received '${payload.deviceSerialNumber.trim()}'.`;
+      const err = new Error(mismatchMsg);
+      (err as { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
+    const now = new Date();
+    const nowMs = now.getTime();
+    const nowIso = now.toISOString();
+
+    const { result } = await this.mutateTerminalTelemetry<{ claimed: boolean; job: BiometricUserSyncJob | null }>(
+      terminal.companyId,
+      terminal.id,
+      (prev) => {
+        const existingJob = prev.userSyncJob;
+        if (!existingJob) {
+          // Support legacy timestamp-only requests by materializing a tracked job
+          if (prev.userSyncRequestedAt) {
+            const reqMs = new Date(prev.userSyncRequestedAt).getTime();
+            const attemptMs = prev.lastUserSyncAttemptAt ? new Date(prev.lastUserSyncAttemptAt).getTime() : 0;
+            if (!Number.isNaN(reqMs) && reqMs > attemptMs) {
+              const materialized: BiometricUserSyncJob = {
+                jobId: crypto.randomUUID(),
+                status: 'RUNNING',
+                requestedAt: prev.userSyncRequestedAt,
+                claimedAt: nowIso,
+                startedAt: nowIso,
+                completedAt: null,
+                timeoutAt: new Date(nowMs + USER_SYNC_EXECUTION_LEASE_MS).toISOString(),
+                attempts: 1,
+                maxAttempts: USER_SYNC_DEFAULT_MAX_ATTEMPTS,
+                error: null,
+                bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || prev.bridgeHost || null,
+              };
+              return {
+                next: {
+                  ...prev,
+                  bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || prev.bridgeHost,
+                  bridgeVersion: payload.bridgeVersion?.trim().slice(0, 64) || prev.bridgeVersion,
+                  lastUserSyncAttemptAt: nowIso,
+                  userSyncJob: materialized,
+                },
+                result: { claimed: true, job: materialized },
+              };
+            }
+          }
+          return { next: prev, result: { claimed: false, job: null }, persist: false };
+        }
+
+        const timeoutMs = new Date(existingJob.timeoutAt).getTime();
+        const isExpired = !Number.isNaN(timeoutMs) && nowMs > timeoutMs;
+
+        if (existingJob.status === 'QUEUED') {
+          if (isExpired) {
+            const timedOutJob: BiometricUserSyncJob = {
+              ...existingJob,
+              status: 'FAILED',
+              completedAt: nowIso,
+              error: 'User sync job timed out before the Windows LAN Bridge claimed it.',
+            };
+            return {
+              next: {
+                ...prev,
+                userSyncRequestedAt: null,
+                lastUserSyncError: timedOutJob.error,
+                userSyncJob: timedOutJob,
+              },
+              result: { claimed: false, job: null },
+            };
+          }
+
+          const claimedJob: BiometricUserSyncJob = {
+            ...existingJob,
+            status: 'RUNNING',
+            claimedAt: nowIso,
+            startedAt: nowIso,
+            completedAt: null,
+            timeoutAt: new Date(nowMs + USER_SYNC_EXECUTION_LEASE_MS).toISOString(),
+            attempts: existingJob.attempts + 1,
+            error: null,
+            bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || prev.bridgeHost || null,
+          };
+
+          return {
+            next: {
+              ...prev,
+              bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || prev.bridgeHost,
+              bridgeVersion: payload.bridgeVersion?.trim().slice(0, 64) || prev.bridgeVersion,
+              lastUserSyncAttemptAt: nowIso,
+              lastUserSyncError: null,
+              userSyncJob: claimedJob,
+            },
+            result: { claimed: true, job: claimedJob },
+          };
+        }
+
+        // Allow lease takeover only if a RUNNING job expired and still has retry attempts
+        if (existingJob.status === 'RUNNING' && isExpired) {
+          if (existingJob.attempts < existingJob.maxAttempts) {
+            const retriedJob: BiometricUserSyncJob = {
+              ...existingJob,
+              status: 'RUNNING',
+              claimedAt: nowIso,
+              startedAt: nowIso,
+              completedAt: null,
+              timeoutAt: new Date(nowMs + USER_SYNC_EXECUTION_LEASE_MS).toISOString(),
+              attempts: existingJob.attempts + 1,
+              error: null,
+              bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || prev.bridgeHost || null,
+            };
+            return {
+              next: {
+                ...prev,
+                lastUserSyncAttemptAt: nowIso,
+                userSyncJob: retriedJob,
+              },
+              result: { claimed: true, job: retriedJob },
+            };
+          }
+
+          const timedOutJob: BiometricUserSyncJob = {
+            ...existingJob,
+            status: 'FAILED',
+            completedAt: nowIso,
+            error: 'User sync job exceeded maximum retry attempts after execution timeout.',
+          };
+          return {
+            next: {
+              ...prev,
+              userSyncRequestedAt: null,
+              lastUserSyncError: timedOutJob.error,
+              userSyncJob: timedOutJob,
+            },
+            result: { claimed: false, job: null },
+          };
+        }
+
+        // Already RUNNING (not expired) or terminal (SUCCESS/FAILED)
+        return { next: prev, result: { claimed: false, job: null }, persist: false };
+      }
+    );
+
+    if (result.claimed && result.job) {
+      await AuditService.log({
+        companyId: terminal.companyId,
+        userId: terminal.registeredByUserId,
+        action: 'BIOMETRIC_DEVICE_USER_SYNC_STARTED',
+        entity: 'BiometricTerminal',
+        entityId: terminal.id,
+        correlationId,
+        details: {
+          jobId: result.job.jobId,
+          attempt: result.job.attempts,
+          maxAttempts: result.job.maxAttempts,
+          deviceSerialNumber: terminal.deviceSerialNumber,
+          bridgeHost: result.job.bridgeHost,
+        },
+      });
+    }
+
+    return {
+      success: true,
+      claimed: result.claimed,
+      terminalId: terminal.id,
+      job: result.job,
+    };
+  }
+
+  /**
+   * Records a user-sync job failure reported by an authenticated bridge (POST /api/biometric/users/jobs/fail).
+   * Supports bounded retry (returning to QUEUED when retryable and attempts < maxAttempts) or terminal FAILED state.
+   */
+  static async reportUserSyncJobFailure(
+    terminal: any,
+    payload: ReportUserSyncJobFailureRequest,
+    correlationId?: string
+  ): Promise<ReportUserSyncJobFailureResponse> {
+    if (!payload || typeof payload.error !== 'string' || !payload.error.trim()) {
+      const err = new Error('Failure report must include a non-empty "error" message.');
+      (err as { statusCode?: number }).statusCode = 400;
+      throw err;
+    }
+
+    if (
+      payload.deviceSerialNumber &&
+      payload.deviceSerialNumber.trim() &&
+      terminal.deviceSerialNumber &&
+      payload.deviceSerialNumber.trim() !== terminal.deviceSerialNumber
+    ) {
+      const mismatchMsg = `Serial number mismatch during user-sync failure report: expected '${terminal.deviceSerialNumber}', received '${payload.deviceSerialNumber.trim()}'.`;
+      const err = new Error(mismatchMsg);
+      (err as { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
+    const sanitizedError = redactSensitiveText(payload.error.trim()).slice(0, 500);
+    const now = new Date();
+    const nowIso = now.toISOString();
+
+    const { result: updatedJob } = await this.mutateTerminalTelemetry<BiometricUserSyncJob | null>(
+      terminal.companyId,
+      terminal.id,
+      (prev) => {
+        const existingJob = prev.userSyncJob;
+        if (payload.jobId && existingJob && existingJob.jobId !== payload.jobId) {
+          // Ignore stale failure reports for an older superseded job
+          return { next: prev, result: existingJob, persist: false };
+        }
+
+        const shouldRequeue =
+          payload.retryable === true &&
+          existingJob !== null &&
+          existingJob !== undefined &&
+          existingJob.attempts < existingJob.maxAttempts;
+
+        const nextJob: BiometricUserSyncJob = existingJob
+          ? {
+              ...existingJob,
+              status: shouldRequeue ? 'QUEUED' : 'FAILED',
+              completedAt: shouldRequeue ? null : nowIso,
+              timeoutAt: shouldRequeue
+                ? new Date(now.getTime() + USER_SYNC_QUEUE_TIMEOUT_MS).toISOString()
+                : existingJob.timeoutAt,
+              error: sanitizedError,
+              bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || existingJob.bridgeHost || null,
+            }
+          : {
+              jobId: payload.jobId || crypto.randomUUID(),
+              status: 'FAILED',
+              requestedAt: prev.userSyncRequestedAt || nowIso,
+              claimedAt: nowIso,
+              startedAt: nowIso,
+              completedAt: nowIso,
+              timeoutAt: nowIso,
+              attempts: 1,
+              maxAttempts: USER_SYNC_DEFAULT_MAX_ATTEMPTS,
+              error: sanitizedError,
+              bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || prev.bridgeHost || null,
+            };
+
+        return {
+          next: {
+            ...prev,
+            bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || prev.bridgeHost,
+            bridgeVersion: payload.bridgeVersion?.trim().slice(0, 64) || prev.bridgeVersion,
+            deviceReachable:
+              typeof payload.deviceReachable === 'boolean' ? payload.deviceReachable : prev.deviceReachable,
+            lastConnectionError:
+              payload.deviceReachable === false ? sanitizedError : prev.lastConnectionError,
+            lastUserSyncAttemptAt: nowIso,
+            lastUserSyncError: sanitizedError,
+            userSyncRequestedAt: shouldRequeue ? prev.userSyncRequestedAt || nowIso : null,
+            userSyncJob: nextJob,
+          },
+          result: nextJob,
+        };
+      }
+    );
+
+    if (payload.deviceReachable === false && typeof prisma.biometricTerminal?.update === 'function') {
+      await prisma.biometricTerminal.update({
+        where: { id: terminal.id },
+        data: { status: 'ERROR' },
+      });
+    }
+
+    await AuditService.log({
+      companyId: terminal.companyId,
+      userId: terminal.registeredByUserId,
+      action: 'BIOMETRIC_DEVICE_USER_SYNC_FAILED',
+      entity: 'BiometricTerminal',
+      entityId: terminal.id,
+      correlationId,
+      details: {
+        jobId: updatedJob?.jobId || payload.jobId || null,
+        status: updatedJob?.status || 'FAILED',
+        attempts: updatedJob?.attempts || 1,
+        maxAttempts: updatedJob?.maxAttempts || USER_SYNC_DEFAULT_MAX_ATTEMPTS,
+        deviceSerialNumber: terminal.deviceSerialNumber,
+        deviceReachable: payload.deviceReachable ?? null,
+        error: sanitizedError,
+      },
+    });
+
+    return {
+      success: true,
+      terminalId: terminal.id,
+      job: updatedJob,
     };
   }
 
   /**
    * Dedicated authenticated hardware user synchronization ingestion endpoint (POST /api/biometric/users).
-   * Persists verified hardware users idempotently, enforces serial & company ownership, and updates telemetry.
+   * Persists verified hardware users idempotently, enforces serial & company ownership, and updates job + telemetry.
+   * NEVER triggers punch ingestion or PunchReconciliationService.
    */
   static async syncDeviceUsers(
     terminal: any,
@@ -563,7 +1133,12 @@ export class BiometricService {
     );
 
     const now = new Date();
-    if (typeof prisma.biometricTerminal?.update === 'function') {
+    const nowIso = now.toISOString();
+    // Only mark continuous bridge daemon heartbeat fresh if this upload came from a running daemon
+    // (one-shot CLI --sync-users-once sends bridgeDaemonRunning: false so it does not mask an offline daemon).
+    const isContinuousDaemon = payload.bridgeDaemonRunning !== false;
+
+    if (isContinuousDaemon && typeof prisma.biometricTerminal?.update === 'function') {
       await prisma.biometricTerminal.update({
         where: { id: terminal.id },
         data: {
@@ -573,18 +1148,61 @@ export class BiometricService {
       });
     }
 
-    await this.upsertTerminalTelemetry(terminal.companyId, terminal.id, {
-      bridgeConnected: true,
-      bridgeHost: payload.bridgeHost?.trim() || undefined,
-      bridgeVersion: payload.bridgeVersion?.trim() || undefined,
-      lastBridgeHeartbeatAt: now.toISOString(),
-      lastUserSyncAt: snap.syncedAt,
-      lastUserSyncAttemptAt: attemptIso,
-      lastUserSyncError: null,
-      discoveredUserCount: discoveredCount,
-      syncedUserCount: snap.syncedCount,
-      userSyncRequestedAt: null,
-    });
+    const { result: completedJob } = await this.mutateTerminalTelemetry<BiometricUserSyncJob>(
+      terminal.companyId,
+      terminal.id,
+      (prev) => {
+        const existingJob = prev.userSyncJob;
+        const jobMatches = !payload.jobId || !existingJob || existingJob.jobId === payload.jobId;
+        const completed: BiometricUserSyncJob =
+          existingJob && jobMatches
+            ? {
+                ...existingJob,
+                status: 'SUCCESS',
+                completedAt: snap.syncedAt,
+                discoveredCount,
+                syncedCount: snap.syncedCount,
+                error: null,
+                bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || existingJob.bridgeHost || null,
+              }
+            : {
+                jobId: payload.jobId || crypto.randomUUID(),
+                status: 'SUCCESS',
+                requestedAt: prev.userSyncRequestedAt || attemptIso,
+                claimedAt: attemptIso,
+                startedAt: attemptIso,
+                completedAt: snap.syncedAt,
+                timeoutAt: snap.syncedAt,
+                attempts: 1,
+                maxAttempts: USER_SYNC_DEFAULT_MAX_ATTEMPTS,
+                discoveredCount,
+                syncedCount: snap.syncedCount,
+                error: null,
+                bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || prev.bridgeHost || null,
+              };
+
+        return {
+          next: {
+            ...prev,
+            bridgeConnected: isContinuousDaemon ? true : prev.bridgeConnected ?? false,
+            bridgeHost: payload.bridgeHost?.trim().slice(0, 128) || prev.bridgeHost,
+            bridgeVersion: payload.bridgeVersion?.trim().slice(0, 64) || prev.bridgeVersion,
+            lastBridgeHeartbeatAt: isContinuousDaemon ? nowIso : prev.lastBridgeHeartbeatAt ?? null,
+            deviceReachable: true,
+            lastDeviceContactAt: nowIso,
+            lastConnectionError: null,
+            lastUserSyncAt: snap.syncedAt,
+            lastUserSyncAttemptAt: attemptIso,
+            lastUserSyncError: null,
+            discoveredUserCount: discoveredCount,
+            syncedUserCount: snap.syncedCount,
+            userSyncRequestedAt: null,
+            userSyncJob: completed,
+          },
+          result: completed,
+        };
+      }
+    );
 
     await AuditService.log({
       companyId: terminal.companyId,
@@ -594,9 +1212,11 @@ export class BiometricService {
       entityId: terminal.id,
       correlationId,
       details: {
+        jobId: completedJob.jobId,
         deviceSerialNumber: terminal.deviceSerialNumber,
         discoveredCount,
         syncedCount: snap.syncedCount,
+        bridgeDaemonRunning: isContinuousDaemon,
       },
     });
 
@@ -607,6 +1227,7 @@ export class BiometricService {
       discoveredCount,
       syncedCount: snap.syncedCount,
       syncedAt: snap.syncedAt,
+      job: completedJob,
     };
   }
 
@@ -995,42 +1616,137 @@ export class BiometricService {
       throw err;
     }
 
-    const userSyncRequestedAt = new Date().toISOString();
-    const [updatedTel, deviceUsersMap] = await Promise.all([
-      this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
-        userSyncRequestedAt,
-      }),
+    const now = new Date();
+    const nowMs = now.getTime();
+    const userSyncRequestedAt = now.toISOString();
+
+    const [{ telemetry: updatedTel, result: jobOutcome }, deviceUsersMap] = await Promise.all([
+      this.mutateTerminalTelemetry<{ job: BiometricUserSyncJob; deduplicated: boolean }>(
+        actor.companyId,
+        terminal.id,
+        (prev) => {
+          const evaluatedExisting = this.evaluateUserSyncJob(prev.userSyncJob, nowMs);
+          if (
+            evaluatedExisting &&
+            (evaluatedExisting.status === 'QUEUED' || evaluatedExisting.status === 'RUNNING')
+          ) {
+            // Idempotent duplicate prevention: return the active job instead of creating a duplicate
+            return {
+              next: prev,
+              result: { job: evaluatedExisting, deduplicated: true },
+              persist: false,
+            };
+          }
+
+          const newJob: BiometricUserSyncJob = {
+            jobId: crypto.randomUUID(),
+            status: 'QUEUED',
+            requestedAt: userSyncRequestedAt,
+            requestedByUserId: actor.userId || actor.id,
+            claimedAt: null,
+            startedAt: null,
+            completedAt: null,
+            timeoutAt: new Date(nowMs + USER_SYNC_QUEUE_TIMEOUT_MS).toISOString(),
+            attempts: 0,
+            maxAttempts: USER_SYNC_DEFAULT_MAX_ATTEMPTS,
+            discoveredCount: null,
+            syncedCount: null,
+            error: null,
+            bridgeHost: prev.bridgeHost || null,
+          };
+
+          return {
+            next: {
+              ...prev,
+              userSyncRequestedAt,
+              lastUserSyncError: null,
+              userSyncJob: newJob,
+            },
+            result: { job: newJob, deduplicated: false },
+          };
+        }
+      ),
       BiometricMappingService.readDeviceUsersMap(actor.companyId),
     ]);
 
     const deviceUsers: DeviceEnrolledUserItem[] = deviceUsersMap[terminal.id] || [];
     const bridgeFresh = this.isBridgeFresh(terminal, updatedTel);
+    const { job, deduplicated } = jobOutcome;
 
-    await AuditService.log({
-      companyId: actor.companyId,
-      userId: actor.userId || actor.id,
-      action: 'BIOMETRIC_DEVICE_USER_SYNC_QUEUED',
-      entity: 'BiometricTerminal',
-      entityId: terminal.id,
-      correlationId,
-      details: {
-        deviceSerialNumber: terminal.deviceSerialNumber,
-        name: terminal.name,
-        userSyncRequestedAt,
-      },
-    });
+    if (!deduplicated) {
+      await AuditService.log({
+        companyId: actor.companyId,
+        userId: actor.userId || actor.id,
+        action: 'BIOMETRIC_DEVICE_USER_SYNC_QUEUED',
+        entity: 'BiometricTerminal',
+        entityId: terminal.id,
+        correlationId,
+        details: {
+          jobId: job.jobId,
+          deviceSerialNumber: terminal.deviceSerialNumber,
+          name: terminal.name,
+          userSyncRequestedAt: job.requestedAt,
+        },
+      });
+    }
 
-    const message = bridgeFresh
-      ? `Queued hardware user sync for "${terminal.name}". The LAN Bridge will read enrolled users on its next heartbeat without running punch reconciliation.`
-      : `Queued hardware user sync for "${terminal.name}". Enrolled users will be read when the Windows LAN Bridge reconnects or completes its next cycle.`;
+    const message = deduplicated
+      ? `A hardware user sync job (${job.status}) is already active for "${terminal.name}". Waiting for the Windows LAN Bridge to complete it.`
+      : bridgeFresh
+      ? `Queued hardware user sync job for "${terminal.name}". The Windows LAN Bridge will automatically read enrolled users within seconds without running punch reconciliation.`
+      : `Queued hardware user sync job for "${terminal.name}". The Windows LAN Bridge is currently offline — start or restore the bridge daemon to process this job automatically.`;
 
     return {
       success: true,
       bridgeUserSyncQueued: true,
-      userSyncRequestedAt,
+      deduplicated,
+      userSyncRequestedAt: job.requestedAt,
       message,
+      job,
       terminal: this.mapToTerminalItem(terminal, updatedTel),
       deviceUsers,
+    };
+  }
+
+  /**
+   * Returns real-time user-sync job status, bridge status, physical device status, and synced users for a terminal.
+   */
+  static async getTerminalUserSyncStatus(
+    companyId: string,
+    terminalId: string
+  ): Promise<TerminalUserSyncStatusResponse> {
+    const terminal = await prisma.biometricTerminal.findFirst({
+      where: {
+        id: terminalId,
+        companyId,
+      },
+      include: {
+        registeredByUser: {
+          select: { fullName: true },
+        },
+      },
+    });
+
+    if (!terminal) {
+      const err = new Error('Biometric terminal not found.');
+      (err as { statusCode?: number }).statusCode = 404;
+      throw err;
+    }
+
+    const [telemetryMap, deviceUsersMap] = await Promise.all([
+      this.readBridgeTelemetryMap(companyId),
+      BiometricMappingService.readDeviceUsersMap(companyId),
+    ]);
+
+    const mapped = this.mapToTerminalItem(terminal, telemetryMap[terminal.id]);
+    return {
+      terminalId: terminal.id,
+      bridgeStatus: mapped.bridgeStatus || 'OFFLINE',
+      deviceConnectionStatus: mapped.deviceConnectionStatus || 'DISCONNECTED',
+      userSyncStatus: mapped.userSyncStatus || 'IDLE',
+      job: mapped.userSyncJob || null,
+      terminal: mapped,
+      deviceUsers: deviceUsersMap[terminal.id] || [],
     };
   }
 

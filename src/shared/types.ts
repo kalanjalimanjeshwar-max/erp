@@ -1718,6 +1718,29 @@ export type BiometricConnectionTestStatus =
   | 'INVALID_CONFIG'
   | 'DEACTIVATED';
 
+export type BiometricUserSyncJobStatus = 'IDLE' | 'QUEUED' | 'RUNNING' | 'SUCCESS' | 'FAILED';
+
+export type BiometricBridgeProcessStatus = 'ONLINE' | 'OFFLINE';
+
+export type BiometricDeviceConnectionStatus = 'CONNECTED' | 'DISCONNECTED' | 'DEACTIVATED';
+
+export interface BiometricUserSyncJob {
+  jobId: string;
+  status: Exclude<BiometricUserSyncJobStatus, 'IDLE'>;
+  requestedAt: string;
+  requestedByUserId?: string | null;
+  claimedAt?: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  timeoutAt: string;
+  attempts: number;
+  maxAttempts: number;
+  discoveredCount?: number | null;
+  syncedCount?: number | null;
+  error?: string | null;
+  bridgeHost?: string | null;
+}
+
 export interface BiometricTerminalItem {
   id: string;
   companyId: string;
@@ -1738,6 +1761,13 @@ export interface BiometricTerminalItem {
   notes: string | null;
   createdAt: string;
   updatedAt: string;
+  // Separated Bridge Process vs Physical Device vs User Sync statuses
+  bridgeStatus?: BiometricBridgeProcessStatus;
+  deviceConnectionStatus?: BiometricDeviceConnectionStatus;
+  deviceReachable?: boolean;
+  lastDeviceContactAt?: string | null;
+  userSyncStatus?: BiometricUserSyncJobStatus;
+  userSyncJob?: BiometricUserSyncJob | null;
   // Bridge telemetry (persisted non-destructively via CompanySetting)
   bridgeConnected?: boolean;
   bridgeHost?: string | null;
@@ -1819,6 +1849,9 @@ export interface TerminalHeartbeatRequest {
   bridgeConnected?: boolean;
   bridgeHost?: string;
   bridgeVersion?: string;
+  bridgePid?: number;
+  deviceReachable?: boolean;
+  lastDeviceContactAt?: string | null;
   deviceSerialNumber?: string;
   platform?: string;
   fingerprintAlgorithm?: string;
@@ -1839,19 +1872,61 @@ export interface TerminalHeartbeatRequest {
   }>;
 }
 
+export interface PendingUserSyncJobSummary {
+  jobId: string;
+  requestedAt: string;
+  attempts: number;
+  maxAttempts: number;
+  timeoutAt: string;
+}
+
 export interface TerminalHeartbeatResponse {
   success: boolean;
   serverTime: string;
   terminalId: string;
   terminalName: string;
   status: BiometricTerminalStatus;
+  bridgeStatus?: BiometricBridgeProcessStatus;
+  deviceConnectionStatus?: BiometricDeviceConnectionStatus;
   syncRequested?: boolean;
   syncRequestedAt?: string | null;
   userSyncRequested?: boolean;
   userSyncRequestedAt?: string | null;
+  pendingUserSyncJob?: PendingUserSyncJobSummary | null;
+}
+
+export interface ClaimUserSyncJobRequest {
+  deviceSerialNumber?: string;
+  bridgeHost?: string;
+  bridgeVersion?: string;
+}
+
+export interface ClaimUserSyncJobResponse {
+  success: boolean;
+  claimed: boolean;
+  terminalId: string;
+  job: BiometricUserSyncJob | null;
+}
+
+export interface ReportUserSyncJobFailureRequest {
+  jobId?: string;
+  deviceSerialNumber?: string;
+  bridgeHost?: string;
+  bridgeVersion?: string;
+  error: string;
+  retryable?: boolean;
+  deviceReachable?: boolean;
+}
+
+export interface ReportUserSyncJobFailureResponse {
+  success: boolean;
+  terminalId: string;
+  job: BiometricUserSyncJob | null;
 }
 
 export interface SyncDeviceUsersRequest {
+  jobId?: string;
+  bridgeDaemonRunning?: boolean;
   deviceUsers: Array<{
     uid?: number;
     enrollmentId: string;
@@ -1872,6 +1947,7 @@ export interface SyncDeviceUsersResponse {
   discoveredCount: number;
   syncedCount: number;
   syncedAt: string;
+  job?: BiometricUserSyncJob | null;
 }
 
 export interface TestBiometricConnectionResponse {
@@ -1895,8 +1971,20 @@ export interface TriggerTerminalSyncResponse {
 export interface TriggerTerminalUserSyncResponse {
   success: boolean;
   bridgeUserSyncQueued: boolean;
+  deduplicated?: boolean;
   userSyncRequestedAt: string;
   message: string;
+  job: BiometricUserSyncJob;
+  terminal: BiometricTerminalItem;
+  deviceUsers: DeviceEnrolledUserItem[];
+}
+
+export interface TerminalUserSyncStatusResponse {
+  terminalId: string;
+  bridgeStatus: BiometricBridgeProcessStatus;
+  deviceConnectionStatus: BiometricDeviceConnectionStatus;
+  userSyncStatus: BiometricUserSyncJobStatus;
+  job: BiometricUserSyncJob | null;
   terminal: BiometricTerminalItem;
   deviceUsers: DeviceEnrolledUserItem[];
 }

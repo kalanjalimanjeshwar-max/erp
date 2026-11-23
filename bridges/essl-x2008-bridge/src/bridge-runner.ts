@@ -40,9 +40,14 @@ interface TerminalController {
   runtime: TerminalRuntimeStatus;
   pollTimer: NodeJS.Timeout | null;
   heartbeatTimer: NodeJS.Timeout | null;
+  jobPollTimer: NodeJS.Timeout | null;
   inFlightSync: boolean;
   inFlightUserSync: boolean;
   inFlightHeartbeat: boolean;
+  inFlightJobPoll: boolean;
+  deferredUserSyncPending: boolean;
+  deferredPunchSyncPending: boolean;
+  activeTasks: Set<Promise<unknown>>;
   deviceUsers?: DeviceEnrolledUser[];
 }
 
@@ -55,6 +60,8 @@ export class BiometricBridgeRunner {
   private readonly controllers = new Map<string, TerminalController>();
   private readonly startedAt = new Date();
   private running = false;
+  private wakeCheckTimer: NodeJS.Timeout | null = null;
+  private lastWakeTickMs = Date.now();
 
   constructor(options: {
     config: BridgeConfig;
@@ -109,8 +116,10 @@ export class BiometricBridgeRunner {
           deviceTimezone: term.deviceTimezone,
           bridgeConnected: false,
           deviceReachable: false,
+          lastDeviceContactAt: null,
           authError: false,
           consecutiveFailures: 0,
+          heartbeatConsecutiveFailures: 0,
           nextRetryAt: null,
           pendingQueueSize: cp.pendingQueue.length,
           lastSuccessfulHeartbeatAt: cp.lastSuccessfulHeartbeatAt,
@@ -124,12 +133,19 @@ export class BiometricBridgeRunner {
           lastUserSyncError: cp.lastUserSyncError ?? null,
           discoveredUserCount: cp.discoveredUserCount ?? null,
           syncedUserCount: cp.syncedUserCount ?? null,
+          userSyncJobStatus: 'IDLE',
+          activeUserSyncJobId: null,
         },
         pollTimer: null,
         heartbeatTimer: null,
+        jobPollTimer: null,
         inFlightSync: false,
         inFlightUserSync: false,
         inFlightHeartbeat: false,
+        inFlightJobPoll: false,
+        deferredUserSyncPending: false,
+        deferredPunchSyncPending: false,
+        activeTasks: new Set<Promise<unknown>>(),
         deviceUsers: cp.pendingUserSync?.users,
       });
     }
@@ -151,42 +167,113 @@ export class BiometricBridgeRunner {
     }
   }
 
+  private trackTask(ctrl: TerminalController, task: Promise<unknown>): Promise<unknown> {
+    ctrl.activeTasks.add(task);
+    void task.finally(() => {
+      ctrl.activeTasks.delete(task);
+    });
+    return task;
+  }
+
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
+    this.lastWakeTickMs = Date.now();
+
     this.logger.info('bridge_starting', {
       bridgeHost: this.config.bridgeHost,
       bridgeVersion: this.config.bridgeVersion,
+      pid: process.pid,
       terminalCount: this.controllers.size,
       coreErpBaseUrl: this.config.coreErpBaseUrl,
+      heartbeatIntervalMs: this.config.heartbeatIntervalMs,
+      jobPollIntervalMs: this.config.jobPollIntervalMs ?? 5000,
     });
 
     for (const ctrl of this.controllers.values()) {
-      // Run initial heartbeat + poll immediately, then schedule independent loops
-      void this.runTerminalPollCycle(ctrl.config.id);
-      void this.runTerminalHeartbeat(ctrl.config.id);
+      // Launch independent poll, heartbeat, and fast user-sync job discovery loops
+      void this.trackTask(ctrl, this.runTerminalPollCycle(ctrl.config.id));
+      void this.trackTask(ctrl, this.runTerminalHeartbeatLoop(ctrl.config.id));
+      if (typeof this.coreErpClient.claimUserSyncJob === 'function') {
+        this.scheduleNextJobPoll(ctrl, ctrl.config.jobPollIntervalMs ?? this.config.jobPollIntervalMs ?? 5000);
+      }
+    }
 
-      const hbInterval = ctrl.config.heartbeatIntervalMs ?? this.config.heartbeatIntervalMs;
-      ctrl.heartbeatTimer = setInterval(() => {
-        if (this.running) {
-          void this.runTerminalHeartbeat(ctrl.config.id);
-        }
-      }, hbInterval);
+    // Sleep/wake wall-clock drift detector: recovers immediately after Windows sleep/hibernation
+    const wakeCheckIntervalMs = 10000;
+    this.wakeCheckTimer = setInterval(() => {
+      const nowMs = Date.now();
+      const elapsed = nowMs - this.lastWakeTickMs;
+      this.lastWakeTickMs = nowMs;
+      if (this.running && elapsed > wakeCheckIntervalMs + 15000) {
+        this.logger.warn('bridge_sleep_wake_detected', {
+          elapsedMs: elapsed,
+          terminalCount: this.controllers.size,
+        });
+        this.triggerImmediateRecoveryAll();
+      }
+    }, wakeCheckIntervalMs);
+    if (typeof this.wakeCheckTimer.unref === 'function') {
+      this.wakeCheckTimer.unref();
     }
   }
 
-  async stop(): Promise<void> {
+  /**
+   * Triggers immediate heartbeat + job check recovery across all terminals (e.g., after sleep/wake)
+   * without touching or resetting any checkpoint data.
+   */
+  triggerImmediateRecoveryAll(): void {
+    if (!this.running) return;
+    for (const ctrl of this.controllers.values()) {
+      ctrl.runtime.heartbeatConsecutiveFailures = 0;
+      ctrl.runtime.consecutiveFailures = 0;
+      if (ctrl.heartbeatTimer) {
+        clearTimeout(ctrl.heartbeatTimer);
+        ctrl.heartbeatTimer = null;
+      }
+      void this.trackTask(ctrl, this.runTerminalHeartbeatLoop(ctrl.config.id));
+      if (typeof this.coreErpClient.claimUserSyncJob === 'function') {
+        void this.trackTask(ctrl, this.pollPendingUserSyncJob(ctrl.config.id));
+      }
+    }
+  }
+
+  async stop(graceTimeoutMs = 5000): Promise<void> {
     this.running = false;
+    if (this.wakeCheckTimer) {
+      clearInterval(this.wakeCheckTimer);
+      this.wakeCheckTimer = null;
+    }
+
+    const pendingTasks: Promise<unknown>[] = [];
     for (const ctrl of this.controllers.values()) {
       if (ctrl.pollTimer) {
         clearTimeout(ctrl.pollTimer);
         ctrl.pollTimer = null;
       }
       if (ctrl.heartbeatTimer) {
-        clearInterval(ctrl.heartbeatTimer);
+        clearTimeout(ctrl.heartbeatTimer);
         ctrl.heartbeatTimer = null;
       }
+      if (ctrl.jobPollTimer) {
+        clearTimeout(ctrl.jobPollTimer);
+        ctrl.jobPollTimer = null;
+      }
+      for (const task of ctrl.activeTasks) {
+        pendingTasks.push(task);
+      }
     }
+
+    if (pendingTasks.length > 0 && graceTimeoutMs > 0) {
+      await Promise.race([
+        Promise.allSettled(pendingTasks),
+        new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, graceTimeoutMs);
+          if (typeof timer.unref === 'function') timer.unref();
+        }),
+      ]);
+    }
+
     this.checkpointStore.persist();
     this.logger.info('bridge_stopped', { terminalCount: this.controllers.size });
   }
@@ -196,6 +283,7 @@ export class BiometricBridgeRunner {
       bridgeVersion: this.config.bridgeVersion,
       bridgeHost: this.config.bridgeHost,
       coreErpBaseUrl: this.config.coreErpBaseUrl,
+      pid: process.pid,
       startedAt: this.startedAt.toISOString(),
       uptimeSeconds: Math.floor((Date.now() - this.startedAt.getTime()) / 1000),
       running: this.running,
@@ -326,6 +414,7 @@ export class BiometricBridgeRunner {
       }
 
       ctrl.runtime.deviceReachable = true;
+      ctrl.runtime.lastDeviceContactAt = new Date().toISOString();
       this.checkpointStore.updateStatus(term.id, term.serialNumber, { deviceInfo });
     } catch (err: unknown) {
       ctrl.runtime.deviceReachable = false;
@@ -421,9 +510,15 @@ export class BiometricBridgeRunner {
 
   /**
    * Executes a dedicated hardware user discovery + upload cycle for a single terminal
-   * WITHOUT pulling attendance punches or triggering punch reconciliation.
+   * WITHOUT pulling attendance punches, modifying punch checkpoints, or triggering punch reconciliation.
    */
-  async syncTerminalUsersOnce(terminalId: string): Promise<{
+  async syncTerminalUsersOnce(
+    terminalId: string,
+    options?: {
+      jobId?: string;
+      bridgeDaemonRunning?: boolean;
+    }
+  ): Promise<{
     discoveredCount: number;
     syncedCount: number;
     syncedAt: string;
@@ -482,6 +577,7 @@ export class BiometricBridgeRunner {
       users = rawUsers;
       ctrl.deviceUsers = users;
       ctrl.runtime.deviceReachable = true;
+      ctrl.runtime.lastDeviceContactAt = new Date().toISOString();
       ctrl.runtime.discoveredUserCount = users.length;
       this.checkpointStore.updateStatus(term.id, term.serialNumber, {
         deviceInfo,
@@ -498,9 +594,12 @@ export class BiometricBridgeRunner {
       this.logger.warn('terminal_user_query_failed', {
         terminalId: term.id,
         serialNumber: term.serialNumber,
+        jobId: options?.jobId,
         error: safeErr,
       });
-      throw new Error(safeErr);
+      const wrapped = new Error(safeErr) as Error & { isDeviceFailure?: boolean };
+      wrapped.isDeviceFailure = true;
+      throw wrapped;
     } finally {
       try {
         await adapter.disconnect();
@@ -509,7 +608,10 @@ export class BiometricBridgeRunner {
       }
     }
 
-    const res = await this.uploadTerminalUsers(ctrl, users, attemptIso);
+    const res = await this.uploadTerminalUsers(ctrl, users, attemptIso, {
+      jobId: options?.jobId,
+      bridgeDaemonRunning: options?.bridgeDaemonRunning,
+    });
     return {
       discoveredCount: res.discoveredCount,
       syncedCount: res.syncedCount,
@@ -521,13 +623,19 @@ export class BiometricBridgeRunner {
   private async uploadTerminalUsers(
     ctrl: TerminalController,
     users: DeviceEnrolledUser[],
-    discoveredAt: string
+    discoveredAt: string,
+    options?: {
+      jobId?: string;
+      bridgeDaemonRunning?: boolean;
+    }
   ) {
     const term = ctrl.config;
     const apiKey = this.resolveKey(term);
 
     try {
       const res = await this.coreErpClient.syncUsers(apiKey, term.serialNumber, {
+        jobId: options?.jobId,
+        bridgeDaemonRunning: options?.bridgeDaemonRunning,
         deviceUsers: users,
         discoveredCount: users.length,
         discoveredAt,
@@ -535,7 +643,9 @@ export class BiometricBridgeRunner {
         bridgeVersion: this.config.bridgeVersion,
       });
 
-      ctrl.runtime.bridgeConnected = true;
+      if (options?.bridgeDaemonRunning !== false) {
+        ctrl.runtime.bridgeConnected = true;
+      }
       ctrl.runtime.authError = false;
       ctrl.runtime.lastSuccessfulUserSyncAt = res.syncedAt;
       ctrl.runtime.discoveredUserCount = res.discoveredCount;
@@ -553,6 +663,7 @@ export class BiometricBridgeRunner {
       this.logger.info('terminal_user_sync_completed', {
         terminalId: term.id,
         serialNumber: term.serialNumber,
+        jobId: options?.jobId,
         discoveredUserCount: res.discoveredCount,
         syncedUserCount: res.syncedCount,
       });
@@ -576,6 +687,7 @@ export class BiometricBridgeRunner {
       this.logger.warn('terminal_user_upload_failed', {
         terminalId: term.id,
         serialNumber: term.serialNumber,
+        jobId: options?.jobId,
         discoveredUserCount: users.length,
         statusCode: err instanceof CoreErpApiError ? err.statusCode : undefined,
         error: safeErr,
@@ -587,6 +699,7 @@ export class BiometricBridgeRunner {
 
   /**
    * Sends a single authenticated heartbeat for a terminal and triggers immediate poll/user-sync if requested.
+   * Reports accurate separated bridge process health vs physical device reachability.
    */
   async sendTerminalHeartbeat(terminalId: string): Promise<boolean> {
     const ctrl = this.controllers.get(terminalId);
@@ -606,6 +719,9 @@ export class BiometricBridgeRunner {
         bridgeConnected: true,
         bridgeHost: this.config.bridgeHost,
         bridgeVersion: this.config.bridgeVersion,
+        bridgePid: process.pid,
+        deviceReachable: ctrl.runtime.deviceReachable,
+        lastDeviceContactAt: ctrl.runtime.lastDeviceContactAt,
         lastConnectionError: ctrl.runtime.lastError,
         lastProcessedPunchCount: ctrl.runtime.lastProcessedPunchCount,
         lastSyncAttemptAt: ctrl.runtime.lastSyncAttemptAt || undefined,
@@ -620,29 +736,48 @@ export class BiometricBridgeRunner {
       const nowIso = new Date().toISOString();
       ctrl.runtime.bridgeConnected = true;
       ctrl.runtime.authError = false;
+      ctrl.runtime.heartbeatConsecutiveFailures = 0;
       ctrl.runtime.lastSuccessfulHeartbeatAt = nowIso;
       this.checkpointStore.updateStatus(term.id, term.serialNumber, {
         lastSuccessfulHeartbeatAt: nowIso,
       });
 
-      if (hbRes.syncRequested && this.running && !ctrl.inFlightSync && !ctrl.inFlightUserSync) {
-        this.logger.info('bridge_sync_requested_by_server', {
-          terminalId: term.id,
-          serialNumber: term.serialNumber,
-        });
-        void this.runTerminalPollCycle(term.id);
-      } else if (hbRes.userSyncRequested && this.running && !ctrl.inFlightSync && !ctrl.inFlightUserSync) {
-        this.logger.info('bridge_user_sync_requested_by_server', {
-          terminalId: term.id,
-          serialNumber: term.serialNumber,
-        });
-        void this.runTerminalUserSync(term.id);
+      if (this.running) {
+        // Prioritize user-sync jobs cleanly without dropping them if a punch poll is currently in flight
+        if (hbRes.userSyncRequested || hbRes.pendingUserSyncJob) {
+          this.logger.info('bridge_user_sync_requested_by_server', {
+            terminalId: term.id,
+            serialNumber: term.serialNumber,
+            jobId: hbRes.pendingUserSyncJob?.jobId,
+          });
+          if (!ctrl.inFlightSync && !ctrl.inFlightUserSync) {
+            void this.trackTask(
+              ctrl,
+              this.runTerminalUserSync(term.id, { knownJobId: hbRes.pendingUserSyncJob?.jobId })
+            );
+          } else {
+            ctrl.deferredUserSyncPending = true;
+          }
+        }
+
+        if (hbRes.syncRequested) {
+          this.logger.info('bridge_sync_requested_by_server', {
+            terminalId: term.id,
+            serialNumber: term.serialNumber,
+          });
+          if (!ctrl.inFlightSync && !ctrl.inFlightUserSync) {
+            void this.trackTask(ctrl, this.runTerminalPollCycle(term.id));
+          } else {
+            ctrl.deferredPunchSyncPending = true;
+          }
+        }
       }
 
       return true;
     } catch (err: unknown) {
       const msg = redactSensitiveText((err as Error)?.message || 'Heartbeat failed');
       ctrl.runtime.bridgeConnected = false;
+      ctrl.runtime.heartbeatConsecutiveFailures += 1;
       if (err instanceof CoreErpApiError && err.isAuthError) {
         ctrl.runtime.authError = true;
         ctrl.runtime.lastError = msg;
@@ -650,6 +785,7 @@ export class BiometricBridgeRunner {
       this.logger.warn('terminal_heartbeat_failed', {
         terminalId: term.id,
         serialNumber: term.serialNumber,
+        heartbeatConsecutiveFailures: ctrl.runtime.heartbeatConsecutiveFailures,
         error: msg,
         statusCode: err instanceof CoreErpApiError ? err.statusCode : undefined,
       });
@@ -740,21 +876,230 @@ export class BiometricBridgeRunner {
     return reports;
   }
 
-  private async runTerminalHeartbeat(terminalId: string): Promise<void> {
+  /**
+   * Self-scheduling heartbeat loop with bounded exponential backoff on CoreERP outages.
+   * Never stops permanently on transient network/API errors; recovers automatically when CoreERP returns.
+   */
+  private async runTerminalHeartbeatLoop(terminalId: string): Promise<void> {
+    const ctrl = this.controllers.get(terminalId);
+    if (!ctrl || !this.running) return;
+
+    if (ctrl.heartbeatTimer) {
+      clearTimeout(ctrl.heartbeatTimer);
+      ctrl.heartbeatTimer = null;
+    }
+
     await this.sendTerminalHeartbeat(terminalId);
+
+    if (!this.running) return;
+    const baseInterval = ctrl.config.heartbeatIntervalMs ?? this.config.heartbeatIntervalMs;
+    const delayMs = ctrl.runtime.authError
+      ? this.config.maxBackoffMs
+      : ctrl.runtime.heartbeatConsecutiveFailures > 0
+      ? this.computeBackoffDelayMs(ctrl.runtime.heartbeatConsecutiveFailures, Math.min(baseInterval, 10000))
+      : baseInterval;
+
+    ctrl.heartbeatTimer = setTimeout(() => {
+      if (this.running) {
+        void this.trackTask(ctrl, this.runTerminalHeartbeatLoop(terminalId));
+      }
+    }, delayMs);
   }
 
-  private async runTerminalUserSync(terminalId: string): Promise<void> {
+  private scheduleNextJobPoll(ctrl: TerminalController, delayMs: number): void {
+    if (!this.running) return;
+    if (ctrl.jobPollTimer) {
+      clearTimeout(ctrl.jobPollTimer);
+      ctrl.jobPollTimer = null;
+    }
+    ctrl.jobPollTimer = setTimeout(() => {
+      if (this.running) {
+        void this.trackTask(ctrl, this.pollPendingUserSyncJob(ctrl.config.id));
+      }
+    }, delayMs);
+  }
+
+  /**
+   * Fast per-terminal job discovery loop (default 5s):
+   * Claims and executes pending UI-triggered User Sync jobs without waiting for full heartbeat intervals
+   * and without ever running punch sync or punch reconciliation.
+   */
+  async pollPendingUserSyncJob(terminalId: string): Promise<boolean> {
     const ctrl = this.controllers.get(terminalId);
-    if (!ctrl || ctrl.inFlightUserSync || ctrl.inFlightSync) return;
+    if (!ctrl) return false;
+    if (typeof this.coreErpClient.claimUserSyncJob !== 'function') return false;
+    if (ctrl.inFlightJobPoll || ctrl.inFlightUserSync || ctrl.inFlightSync) {
+      if (this.running) {
+        const baseJobPoll = ctrl.config.jobPollIntervalMs ?? this.config.jobPollIntervalMs ?? 5000;
+        this.scheduleNextJobPoll(ctrl, baseJobPoll);
+      }
+      return false;
+    }
+
+    ctrl.inFlightJobPoll = true;
+    let claimed = false;
+    const baseJobPoll = ctrl.config.jobPollIntervalMs ?? this.config.jobPollIntervalMs ?? 5000;
+
+    try {
+      const apiKey = this.resolveKey(ctrl.config);
+      const claimRes = await this.coreErpClient.claimUserSyncJob(apiKey, ctrl.config.serialNumber, {
+        bridgeHost: this.config.bridgeHost,
+        bridgeVersion: this.config.bridgeVersion,
+      });
+
+      if (claimRes.claimed && claimRes.job) {
+        claimed = true;
+        await this.executeClaimedUserSyncJob(ctrl, claimRes.job.jobId);
+      }
+    } catch (err: unknown) {
+      const msg = redactSensitiveText((err as Error)?.message || 'User sync job poll failed');
+      if (err instanceof CoreErpApiError && err.isAuthError) {
+        ctrl.runtime.authError = true;
+        ctrl.runtime.bridgeConnected = false;
+      }
+      this.logger.debug('terminal_user_sync_job_poll_error', {
+        terminalId: ctrl.config.id,
+        serialNumber: ctrl.config.serialNumber,
+        error: msg,
+      });
+    } finally {
+      ctrl.inFlightJobPoll = false;
+      if (this.running) {
+        const nextDelay = ctrl.runtime.authError
+          ? this.config.maxBackoffMs
+          : ctrl.runtime.heartbeatConsecutiveFailures > 0
+          ? this.computeBackoffDelayMs(ctrl.runtime.heartbeatConsecutiveFailures, baseJobPoll)
+          : baseJobPoll;
+        this.scheduleNextJobPoll(ctrl, nextDelay);
+      }
+    }
+
+    return claimed;
+  }
+
+  /**
+   * Executes a claimed or server-signaled User Sync job strictly via syncTerminalUsersOnce().
+   * NEVER calls syncTerminalOnce(), getAttendanceLogs(), or submitPunches().
+   */
+  private async runTerminalUserSync(
+    terminalId: string,
+    options?: { knownJobId?: string }
+  ): Promise<void> {
+    const ctrl = this.controllers.get(terminalId);
+    if (!ctrl || ctrl.inFlightUserSync || ctrl.inFlightSync) {
+      if (ctrl) ctrl.deferredUserSyncPending = true;
+      return;
+    }
+
+    let jobId = options?.knownJobId;
+    if (typeof this.coreErpClient.claimUserSyncJob === 'function') {
+      try {
+        const apiKey = this.resolveKey(ctrl.config);
+        const claimRes = await this.coreErpClient.claimUserSyncJob(apiKey, ctrl.config.serialNumber, {
+          bridgeHost: this.config.bridgeHost,
+          bridgeVersion: this.config.bridgeVersion,
+        });
+        if (!claimRes.claimed || !claimRes.job) {
+          // Another worker/poll already claimed or completed this job
+          return;
+        }
+        jobId = claimRes.job.jobId;
+      } catch (err: unknown) {
+        this.logger.warn('terminal_user_sync_claim_failed', {
+          terminalId: ctrl.config.id,
+          serialNumber: ctrl.config.serialNumber,
+          error: redactSensitiveText((err as Error)?.message || 'Claim failed'),
+        });
+        return;
+      }
+    }
+
+    await this.executeClaimedUserSyncJob(ctrl, jobId);
+  }
+
+  private async executeClaimedUserSyncJob(ctrl: TerminalController, jobId?: string): Promise<void> {
+    if (ctrl.inFlightUserSync || ctrl.inFlightSync) {
+      ctrl.deferredUserSyncPending = true;
+      return;
+    }
 
     ctrl.inFlightUserSync = true;
+    ctrl.deferredUserSyncPending = false;
+    ctrl.runtime.userSyncJobStatus = 'RUNNING';
+    ctrl.runtime.activeUserSyncJobId = jobId || null;
+
+    const timeoutMs = ctrl.config.userSyncTimeoutMs ?? this.config.userSyncTimeoutMs ?? 45000;
+    let timeoutHandle: NodeJS.Timeout | null = null;
+
     try {
-      await this.syncTerminalUsersOnce(terminalId);
-    } catch {
-      // Errors already logged and recorded in ctrl.runtime.lastUserSyncError
+      const syncPromise = this.syncTerminalUsersOnce(ctrl.config.id, {
+        jobId,
+        bridgeDaemonRunning: true,
+      });
+
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          const timeoutErr = new Error(
+            `Hardware user sync timed out after ${timeoutMs}ms while communicating with ${ctrl.config.ipAddress}:${ctrl.config.port}.`
+          ) as Error & { isDeviceFailure?: boolean };
+          timeoutErr.isDeviceFailure = true;
+          reject(timeoutErr);
+        }, timeoutMs);
+        if (typeof timeoutHandle.unref === 'function') {
+          timeoutHandle.unref();
+        }
+      });
+
+      await Promise.race([syncPromise, timeoutPromise]);
+      ctrl.runtime.userSyncJobStatus = 'SUCCESS';
+      ctrl.runtime.activeUserSyncJobId = null;
+    } catch (err: unknown) {
+      const safeErr = redactSensitiveText((err as Error)?.message || 'Hardware user sync failed');
+      const isDeviceFailure = Boolean((err as { isDeviceFailure?: boolean })?.isDeviceFailure);
+      const isSerialMismatch = /serial mismatch/i.test(safeErr);
+      const isAuthErr = err instanceof CoreErpApiError && err.isAuthError;
+      const retryable = !isSerialMismatch && !isAuthErr;
+
+      ctrl.runtime.userSyncJobStatus = 'FAILED';
+      ctrl.runtime.activeUserSyncJobId = null;
+      ctrl.runtime.lastUserSyncError = safeErr;
+
+      if (typeof this.coreErpClient.reportUserSyncJobFailure === 'function') {
+        try {
+          const apiKey = this.resolveKey(ctrl.config);
+          await this.coreErpClient.reportUserSyncJobFailure(apiKey, ctrl.config.serialNumber, {
+            jobId,
+            bridgeHost: this.config.bridgeHost,
+            bridgeVersion: this.config.bridgeVersion,
+            error: safeErr,
+            retryable,
+            deviceReachable: isDeviceFailure ? false : ctrl.runtime.deviceReachable,
+          });
+        } catch (reportErr: unknown) {
+          this.logger.warn('terminal_user_sync_failure_report_failed', {
+            terminalId: ctrl.config.id,
+            serialNumber: ctrl.config.serialNumber,
+            jobId,
+            error: redactSensitiveText((reportErr as Error)?.message || 'Failed to report failure'),
+          });
+        }
+      }
     } finally {
+      if (timeoutHandle) {
+        clearTimeout(timeoutHandle);
+        timeoutHandle = null;
+      }
       ctrl.inFlightUserSync = false;
+
+      // Refresh CoreERP heartbeat immediately so UI sees fresh device & job state
+      if (this.running) {
+        void this.trackTask(ctrl, this.sendTerminalHeartbeat(ctrl.config.id));
+      }
+
+      if (this.running && ctrl.deferredPunchSyncPending) {
+        ctrl.deferredPunchSyncPending = false;
+        void this.trackTask(ctrl, this.runTerminalPollCycle(ctrl.config.id));
+      }
     }
   }
 
@@ -796,6 +1141,11 @@ export class BiometricBridgeRunner {
     } finally {
       ctrl.inFlightSync = false;
 
+      if (this.running && ctrl.deferredUserSyncPending) {
+        ctrl.deferredUserSyncPending = false;
+        void this.trackTask(ctrl, this.runTerminalUserSync(terminalId));
+      }
+
       if (this.running) {
         const delayMs = ctrl.runtime.authError
           ? this.config.maxBackoffMs
@@ -803,7 +1153,7 @@ export class BiometricBridgeRunner {
         ctrl.runtime.nextRetryAt = new Date(Date.now() + delayMs).toISOString();
         ctrl.pollTimer = setTimeout(() => {
           if (this.running) {
-            void this.runTerminalPollCycle(terminalId);
+            void this.trackTask(ctrl, this.runTerminalPollCycle(terminalId));
           }
         }, delayMs);
       }

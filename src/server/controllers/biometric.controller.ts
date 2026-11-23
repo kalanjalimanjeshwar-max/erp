@@ -376,6 +376,27 @@ export class BiometricController {
   }
 
   /**
+   * GET /api/biometric/devices/:id/user-sync-status
+   * Returns current user-sync job lifecycle state, bridge process status, physical device status, and synced users (requires BIOMETRIC:VIEW)
+   */
+  static async getUserSyncStatus(req: Request, res: Response): Promise<void> {
+    try {
+      const actor = req.user as AuthUser;
+      const { id } = req.params;
+      const status = await BiometricService.getTerminalUserSyncStatus(actor.companyId, id);
+      res.json(status);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: status === 404 ? 'TERMINAL_NOT_FOUND' : 'BIOMETRIC_USER_SYNC_STATUS_FAILED',
+          message: (err as Error).message || 'Failed to load hardware user sync status.',
+        },
+      });
+    }
+  }
+
+  /**
    * GET /api/biometric/devices/:id/users
    * Lists persisted hardware users synced from this terminal (requires BIOMETRIC:VIEW)
    */
@@ -410,6 +431,54 @@ export class BiometricController {
       res.status(status).json({
         error: {
           code: 'BIOMETRIC_HEARTBEAT_FAILED',
+          message: (err as Error).message,
+        },
+      });
+    }
+  }
+
+  /**
+   * POST /api/biometric/users/jobs/claim
+   * Atomically claims a pending user-sync job for an authenticated terminal (authenticated via device API key)
+   */
+  static async claimUserSyncJob(req: AuthenticatedDeviceRequest, res: Response): Promise<void> {
+    try {
+      const terminal = req.terminal;
+      const result = await BiometricService.claimPendingUserSyncJob(
+        terminal,
+        req.body || {},
+        req.correlationId
+      );
+      res.json(result);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: 'BIOMETRIC_USER_SYNC_CLAIM_FAILED',
+          message: (err as Error).message,
+        },
+      });
+    }
+  }
+
+  /**
+   * POST /api/biometric/users/jobs/fail
+   * Reports a user-sync job execution failure from an authenticated bridge (authenticated via device API key)
+   */
+  static async failUserSyncJob(req: AuthenticatedDeviceRequest, res: Response): Promise<void> {
+    try {
+      const terminal = req.terminal;
+      const result = await BiometricService.reportUserSyncJobFailure(
+        terminal,
+        req.body || {},
+        req.correlationId
+      );
+      res.json(result);
+    } catch (err: unknown) {
+      const status = (err as { statusCode?: number }).statusCode || 500;
+      res.status(status).json({
+        error: {
+          code: 'BIOMETRIC_USER_SYNC_FAIL_REPORT_FAILED',
           message: (err as Error).message,
         },
       });

@@ -1,127 +1,149 @@
 # CoreERP eSSL X2008 Biometric LAN Bridge
 
-Permanent Windows-compatible LAN Bridge service that polls **eSSL X2008** (Platform `ZLM60_TFT`, Fingerprint Algorithm `VX10.0`) standalone biometric terminals over LAN TCP port `4370` and pushes idempotent attendance punches and heartbeats to CoreERP.
+Permanent Windows-compatible LAN Bridge daemon that runs continuously in the background to:
+1. Maintain authenticated keepalive heartbeats with CoreERP (`POST /api/biometric/heartbeat`).
+2. Automatically discover, claim, and execute UI-triggered **User Sync** jobs (`POST /api/biometric/users/jobs/claim`, `POST /api/biometric/users`, `POST /api/biometric/users/jobs/fail`) strictly isolated from punch sync.
+3. Poll **eSSL X2008** (`ZLM60_TFT` / `VX10.0`) standalone biometric terminals over LAN TCP port `4370` (strictly read-only) and push idempotent attendance punches to CoreERP (`POST /api/biometric/punches`).
 
 ---
 
-## 1. Hardware & Protocol Verification Notes
+## 1. Hardware & Safety Guarantees
 
-- **Target Hardware**: eSSL X2008 (`ZLM60_TFT` OEM ZKTeco platform, `VX10.0` fingerprint algorithm, e.g. Serial `NFZ8252800275`).
-- **Transport**: ZKTeco Standalone Pull TCP Protocol on port `4370` (`START_TAG = 0x5050827D`).
-- **Implementation**: Zero-dependency pure Node.js `net.Socket` protocol driver (`ZKTecoTcpAdapter`) isolated behind `IBiometricProtocolAdapter`.
-  - **Licensing**: Implemented cleanly in-repo with Node.js 22 standard library (`net`, `crypto`, `http`, `fs`) — no GPL/AGPL libraries, no unmaintained `node-zklib` / `zkteco-js` runtime dependencies, and no 32-bit `zkemkeeper.dll` COM registration dependency.
-  - **Official SDK Alternative**: Because protocol parsing is isolated behind `IBiometricProtocolAdapter`, if an older/custom OEM firmware locks TCP 4370 behind proprietary encryption, a Windows COM (`zkemkeeper.dll`) or ADMS push adapter can implement the same interface without altering `BiometricBridgeRunner` or CoreERP backend contracts.
-- **Safety Guarantee**: The bridge is **strictly read-only** against the biometric terminal. It NEVER issues `CMD_CLEAR_ATTLOG` or modifies terminal user/attendance storage.
-- **Timezone Accuracy**: ZKTeco devices store timestamps in local wall-clock time without a timezone offset. The bridge converts device timestamps using `deviceTimezone` (default `Asia/Kolkata`) into exact UTC ISO-8601 before uploading to CoreERP.
+- **Target Hardware**: eSSL X2008 (`ZLM60_TFT` OEM ZKTeco platform, `VX10.0` fingerprint algorithm, e.g. Serial `NFZ8252800275`, LAN IP `192.168.1.201:4370`).
+- **Read-Only Against Hardware**: The bridge NEVER clears attendance logs (`CMD_CLEAR_ATTLOG`), never modifies device settings, and never mutates enrolled users on the device.
+- **Strict User-Sync Isolation**: UI-triggered User Sync jobs execute `syncTerminalUsersOnce()` only (connect -> validate serial -> read enrolled users -> upload user list -> update job status). User Sync NEVER reads attendance logs, uploads punches, triggers punch reconciliation, or modifies punch checkpoints.
+- **Checkpoint Preservation**: `data/checkpoints.json` is written atomically and is NEVER deleted or reset on crash, restart, network outage, or uninstall.
+- **DPAPI `CurrentUser` Preservation**: Windows Task Scheduler auto-start runs under your authorized Windows user account (`LogonType Interactive`), NOT `SYSTEM`, so existing Windows DPAPI `CurrentUser` credentials in `data/credentials.dpapi.json` continue to decrypt without migration.
 
 ---
 
 ## 2. Architecture
 
 ```
-[eSSL X2008: 192.168.1.201:4370]
-       ▲  TCP 4370 (ZKTeco Pull Protocol, Read-Only)
-       │
-[Windows Bridge PC: 192.168.1.16]
-  ├─ ZKTecoTcpAdapter (IBiometricProtocolAdapter)
-  ├─ CheckpointStore (data/checkpoints.json, atomic write + pendingQueue)
-  ├─ Windows DPAPI Store (data/credentials.dpapi.json)
-  ├─ Local Health Endpoint (http://127.0.0.1:4379/health & /status)
-  └─ CoreErpHttpClient
-       │  HTTPS (X-Device-Api-Key + X-Device-Serial)
+[CoreERP UI: "Sync Users from Device"]
+       │  POST /api/biometric/devices/:id/sync-users -> Creates QUEUED Job
        ▼
-[CoreERP Server]
-  ├─ POST /api/biometric/heartbeat
-  └─ POST /api/biometric/punches
+[CoreERP REST API: http://127.0.0.1:3000 or HTTPS]
+       ▲  Authenticated Device API Key (X-Device-Api-Key + X-Device-Serial)
+       │  ├─ POST /api/biometric/heartbeat         (every 30s, reports Bridge ONLINE & Device CONNECTED/DISCONNECTED)
+       │  ├─ POST /api/biometric/users/jobs/claim  (every 5s, fast UI job discovery)
+       │  ├─ POST /api/biometric/users             (uploads enrolled users, marks job SUCCESS)
+       │  ├─ POST /api/biometric/users/jobs/fail   (reports failure/retry state immediately)
+       │  └─ POST /api/biometric/punches           (periodic punch pull only; never invoked by User Sync)
+[Windows Bridge Host]
+  ├─ Windows Task Scheduler (AtLogOn, authorized user account, MultipleInstances=IgnoreNew)
+  ├─ scripts/run-bridge-supervised.ps1 (Named Mutex + crash-loop exponential backoff)
+  ├─ node dist/index.js (BridgeInstanceLock data/bridge.lock.json + sleep/wake detector)
+  ├─ ZKTecoTcpAdapter (TCP 4370 read-only)
+  ├─ CheckpointStore (data/checkpoints.json)
+  ├─ DPAPI Credential Store (data/credentials.dpapi.json, Scope=CurrentUser)
+  └─ Local Health Server (http://127.0.0.1:4379/health & /status)
+       │  LAN TCP 4370
+       ▼
+[eSSL X2008: 192.168.1.201:4370]
 ```
 
 ---
 
-## 3. Windows Deployment (PC `192.168.1.16`)
-
-### Prerequisites
-- Windows 10 / 11 or Windows Server 2019+
-- **Node.js 22 LTS** installed (`node -v`)
-- Network reachability from `192.168.1.16` to `192.168.1.201` TCP port `4370` (subnet `255.255.255.0`)
-
-Verify LAN connectivity in PowerShell:
-```powershell
-Test-NetConnection -ComputerName 192.168.1.201 -Port 4370
-```
+## 3. Build & Configure on Windows
 
 ### Step 1: Build & Configure
-Copy `bridges/essl-x2008-bridge` to `C:\CoreERP\essl-x2008-bridge`, then:
 ```powershell
-cd C:\CoreERP\essl-x2008-bridge
+cd <PathToRepo>\bridges\essl-x2008-bridge
 npm run build
 Copy-Item bridge.config.example.json bridge.config.json
 Copy-Item .env.example .env
 ```
-Edit `bridge.config.json` with:
-- `coreErpBaseUrl`: Your CoreERP HTTPS URL (e.g. `https://erp.company.com`)
-- `serialNumber`: Exact serial printed on the terminal (`NFZ8252800275`)
-- `ipAddress`: `192.168.1.201`
-- `port`: `4370`
-- `commKey`: `0` (default unless configured on the X2008 menu -> Comm. -> Comm Key)
-- `deviceTimezone`: `Asia/Kolkata`
+Edit `bridge.config.json` with your exact `coreErpBaseUrl` (e.g., `http://127.0.0.1:3000` for local Windows development or `https://erp.company.com` in production), `serialNumber` (`NFZ8252800275`), `ipAddress` (`192.168.1.201`), `port` (`4370`), `deviceTimezone` (`Asia/Kolkata`), and `dpapiCredentialName`.
 
-### Step 2: Store Device API Key Securely via Windows DPAPI
-Register the terminal in CoreERP (**Biometric Devices -> Register Terminal**) and copy the one-time `bio_live_...` API key. Store it encrypted with Windows DPAPI (no plaintext key on disk):
+### Step 2: Store Device API Key via Windows DPAPI (`CurrentUser`)
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\protect-credentials.ps1 -CredentialName "coreerp-essl-x2008-main" -Scope LocalMachine
+powershell -ExecutionPolicy Bypass -File .\scripts\protect-credentials.ps1 -CredentialName "coreerp-essl-x2008-main" -Scope CurrentUser
 ```
-*(Use `-Scope CurrentUser` if running interactively instead of a `LocalSystem` Windows Service.)*
+*(No plaintext API key is stored on disk or passed in Task Scheduler or CLI arguments.)*
 
-### Step 3: Run Connection Diagnostics
+### Step 3: Verify Connectivity (Optional Diagnostic)
 ```powershell
 npm run test-connection
 ```
-This connects to `192.168.1.201:4370`, reads `~SerialNumber`, `~Platform`, `~ZKFPVersion`, verifies serial match against `NFZ8252800275`, reads attendance log count (without deleting logs), and verifies authenticated `POST /api/biometric/heartbeat`.
+*(One-time manual user-only sync remains available as `npm run sync-users-once`, but normal operation should use the continuous daemon below.)*
 
-### Step 4: Run One-Shot Sync Check
-```powershell
-npm run sync-once
-```
+---
 
-### Step 5: Install as a Permanent Background Service
+## 4. Windows Auto-Start Installation (Task Scheduler — Recommended)
 
-#### Option A: NSSM (Recommended)
+Runs under your current Windows user identity (`$env:USERDOMAIN\$env:USERNAME`, `LogonType=Interactive`) so **DPAPI `CurrentUser` credentials remain intact**.
+
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-nssm-service.ps1
-```
-#### Option B: Windows Task Scheduler
-```powershell
+# Register Scheduled Task and start immediately
 powershell -ExecutionPolicy Bypass -File .\scripts\install-task-scheduler.ps1
+
+# Or register without starting immediately
+powershell -ExecutionPolicy Bypass -File .\scripts\install-task-scheduler.ps1 -NoStart
 ```
 
----
-
-## 4. Operations, Restart & Uninstall
-
-- **Local Status & Health**:
-  - `http://127.0.0.1:4379/health` (`200 OK` or `503 degraded`)
-  - `http://127.0.0.1:4379/status` (per-terminal queue size, last heartbeat/sync, redacted errors)
-  - CLI: `npm run status`
-- **Safe Restart**:
-  ```powershell
-  Restart-Service CoreERPBiometricBridge
-  ```
-  All unsynced batches in `data/checkpoints.json` are preserved atomically and uploaded automatically upon restart.
-- **Logs**: Structured JSON logs with automatic secret redaction are written to `logs/bridge.log` (5 MB auto-rotation).
-- **Uninstall**:
-  ```powershell
-  powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-bridge.ps1
-  ```
+What `install-task-scheduler.ps1` configures:
+- **Identity**: Current authorized Windows user (refuses `SYSTEM` to protect DPAPI `CurrentUser`).
+- **Trigger**: At user logon (`AtLogOn`), plus immediate start unless `-NoStart` is passed.
+- **Working Directory & Paths**: Absolute paths for `powershell.exe`, `run-bridge-supervised.ps1`, `node.exe`, and working directory.
+- **Duplicate Prevention**: Three layers — Task Scheduler `-MultipleInstances IgnoreNew`, supervisor named Windows Mutex, and Node PID lockfile (`data\bridge.lock.json`).
+- **Crash-Loop Recovery**: `run-bridge-supervised.ps1` restarts unexpected crashes with bounded exponential backoff (`10s -> 20s -> 40s -> 80s -> 160s -> max 300s`), resetting after 120s of healthy runtime; Task Scheduler also restarts the supervisor up to 5 times with a 2-minute interval.
+- **Zero Secrets in Args**: No API keys, tokens, or comm keys appear in Task Scheduler arguments or plaintext logs.
 
 ---
 
-## 5. Troubleshooting
+## 5. Manual Start, Stop, Verification & Uninstall
+
+### Manual Start (Foreground or Background)
+```powershell
+# Foreground (Ctrl+C shuts down cleanly)
+powershell -ExecutionPolicy Bypass -File .\scripts\start-bridge.ps1
+
+# Background hidden process + health verification
+powershell -ExecutionPolicy Bypass -File .\scripts\start-bridge.ps1 -Background
+```
+
+### Manual Stop
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\stop-bridge.ps1
+```
+
+### Startup & Runtime Verification
+```powershell
+# 1. Verify Scheduled Task registration & state
+Get-ScheduledTask -TaskName CoreERPBiometricBridge | Select-Object TaskName, State
+Get-ScheduledTaskInfo -TaskName CoreERPBiometricBridge
+
+# 2. Verify local bridge health & per-terminal status
+Invoke-RestMethod http://127.0.0.1:4379/health
+Invoke-RestMethod http://127.0.0.1:4379/status
+
+# 3. Inspect structured redacted logs
+Get-Content .\logs\bridge.log -Tail 30
+Get-Content .\logs\supervisor.log -Tail 20
+```
+
+### Safe Uninstall
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\uninstall-bridge.ps1
+```
+Safely stops and removes the Scheduled Task (and legacy NSSM service if installed) while **preserving `data\checkpoints.json`, `data\credentials.dpapi.json`, and `logs\`**.
+
+---
+
+## 6. Crash, Network & Sleep/Wake Self-Recovery
+
+- **Device Network Outage (`192.168.1.201:4370`)**: Bridge stays alive, marks `deviceReachable: false` (`Device: DISCONNECTED`, `Bridge: ONLINE`), retries with bounded exponential backoff, and automatically restores `Device: CONNECTED` once TCP `4370` responds.
+- **CoreERP API Outage (`127.0.0.1:3000`)**: Heartbeat and job-poll loops back off exponentially without exiting, retain queued punches locally in `data\checkpoints.json`, and resume heartbeats and job execution automatically when CoreERP restarts.
+- **Windows Sleep / Hibernation Wake**: Bridge detects wall-clock jumps (`> 25s`), resets failure backoff, and immediately sends a fresh heartbeat and checks for pending user-sync jobs without modifying checkpoints.
+
+---
+
+## 7. Troubleshooting
 
 | Symptom | Cause | Resolution |
 |---|---|---|
-| `TCP connection timed out` to `192.168.1.201:4370` | Firewall or VLAN blocking port 4370, or terminal powered off | Run `Test-NetConnection 192.168.1.201 -Port 4370` and verify X2008 Ethernet settings (`192.168.1.201 / 255.255.255.0`). |
-| `Hardware serial mismatch` | Configured `serialNumber` differs from device `~SerialNumber` | Update `bridge.config.json` and CoreERP terminal registration to match the exact device serial (`NFZ8252800275`). |
-| `CMD_AUTH failed` | Non-zero Comm Key configured on the X2008 terminal | Set `commKey` in `bridge.config.json` to match `Menu -> Comm. -> Comm Key` on the device. |
-| `HTTP 401 INVALID_DEVICE_CREDENTIALS` | Wrong/revoked API key or rotated key in CoreERP | Rotate key in CoreERP UI and re-run `scripts\protect-credentials.ps1`. |
-| `Insecure CoreERP URL rejected` | `http://` used for non-localhost CoreERP server | Switch `coreErpBaseUrl` to `https://` (recommended). For isolated LAN HTTP dev only, set `BRIDGE_ALLOW_INSECURE_HTTP=true`. |
-| Punches appear shifted by 5h 30m | Wrong `deviceTimezone` configured | Verify `"deviceTimezone": "Asia/Kolkata"` in `bridge.config.json`. |
+| CoreERP shows `Bridge: OFFLINE` | Continuous bridge daemon is not running or CoreERP API unreachable | Run `Invoke-RestMethod http://127.0.0.1:4379/health` or `Start-ScheduledTask -TaskName CoreERPBiometricBridge`. |
+| CoreERP shows `Bridge: ONLINE` and `Device: DISCONNECTED` | Bridge is running, but physical eSSL X2008 (`192.168.1.201:4370`) is unreachable or serial mismatched | Run `Test-NetConnection 192.168.1.201 -Port 4370` and check `logs\bridge.log`. |
+| `DPAPI decryption failed` | Task running under a different Windows user or `SYSTEM` | Re-register with `scripts\install-task-scheduler.ps1` under the same Windows account that ran `protect-credentials.ps1`. |
+| `HTTP 401 INVALID_DEVICE_CREDENTIALS` | Key rotated or revoked in CoreERP | Rotate key in CoreERP UI and re-run `scripts\protect-credentials.ps1 -Scope CurrentUser`. |

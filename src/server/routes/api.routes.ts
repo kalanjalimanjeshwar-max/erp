@@ -241,8 +241,11 @@ apiRouter.post('/biometric/devices/:id/rotate-key', requireAuth, requirePermissi
 apiRouter.post('/biometric/devices/:id/test-connection', requireAuth, requirePermission('BIOMETRIC', 'VIEW'), BiometricController.testConnection);
 apiRouter.post('/biometric/devices/:id/sync', requireAuth, requirePermission('BIOMETRIC', 'EDIT'), BiometricController.syncTerminal);
 apiRouter.post('/biometric/devices/:id/sync-users', requireAuth, requirePermission('BIOMETRIC', 'EDIT'), BiometricController.syncTerminalUsers);
+apiRouter.get('/biometric/devices/:id/user-sync-status', requireAuth, requirePermission('BIOMETRIC', 'VIEW'), BiometricController.getUserSyncStatus);
 apiRouter.get('/biometric/devices/:id/users', requireAuth, requirePermission('BIOMETRIC', 'VIEW'), BiometricController.listDeviceUsers);
 apiRouter.post('/biometric/heartbeat', requireDeviceAuth, BiometricController.heartbeat);
+apiRouter.post('/biometric/users/jobs/claim', requireDeviceAuth, BiometricController.claimUserSyncJob);
+apiRouter.post('/biometric/users/jobs/fail', requireDeviceAuth, BiometricController.failUserSyncJob);
 apiRouter.post('/biometric/users', requireDeviceAuth, BiometricController.ingestUsers);
 apiRouter.post('/biometric/punches', requireDeviceAuth, BiometricController.ingestPunches);
 

@@ -36,8 +36,11 @@ export class BridgeHealthServer {
           JSON.stringify({
             status: statusCode === 200 ? 'ok' : 'degraded',
             running: snapshot.running,
+            pid: snapshot.pid,
             uptimeSeconds: snapshot.uptimeSeconds,
             terminalCount: snapshot.terminals.length,
+            bridgeConnectedCount: snapshot.terminals.filter((t) => t.bridgeConnected).length,
+            deviceConnectedCount: snapshot.terminals.filter((t) => t.deviceReachable).length,
             onlineCount: snapshot.terminals.filter((t) => t.bridgeConnected && t.deviceReachable).length,
           })
         );
