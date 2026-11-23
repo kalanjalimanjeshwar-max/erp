@@ -24,8 +24,9 @@
     "db:sync:dev-credentials": "tsx scripts/sync-dev-credentials.ts",
     "maintenance:backfill-bank-accounts": "tsx scripts/backfill-bank-accounts.ts",
     "maintenance:key-inventory": "tsx scripts/backfill-bank-accounts.ts --inventory",
-    "test:integration:concurrency": "node -e \"process.env.COREERP_INTEGRATION_TEST_MODE='true'; delete process.env.DATABASE_URL; const { spawnSync } = require('child_process'); const cmd = process.platform === 'win32' ? 'npx.cmd' : 'npx'; const res = spawnSync(cmd, ['vitest', 'run', 'tests/integration/concurrent-bank-account-default.test.ts'], { stdio: 'inherit', env: process.env }); process.exit(res.status ?? 1);\"",
-    "test:integration:key-rotation": "node -e \"process.env.COREERP_INTEGRATION_TEST_MODE='true'; delete process.env.DATABASE_URL; const { spawnSync } = require('child_process'); const cmd = process.platform === 'win32' ? 'npx.cmd' : 'npx'; const res = spawnSync(cmd, ['vitest', 'run', 'tests/integration/key-rotation-reencryption.test.ts'], { stdio: 'inherit', env: process.env }); process.exit(res.status ?? 1);\""
+    "test:integration": "node scripts/run-integration-tests.mjs tests/integration",
+    "test:integration:concurrency": "node scripts/run-integration-tests.mjs tests/integration/concurrent-bank-account-default.test.ts",
+    "test:integration:key-rotation": "node scripts/run-integration-tests.mjs tests/integration/key-rotation-reencryption.test.ts"
   },
   "dependencies": {
     "@fontsource/noto-sans-kannada": "^5.3.0",

@@ -3,10 +3,9 @@ import path from 'path';
 import { z } from 'zod';
 import dotenv from 'dotenv';
 
-const isIntegrationTestRuntime =
+const isTestRuntime =
   typeof process !== 'undefined' &&
-  process.env.NODE_ENV === 'test' &&
-  process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
+  (process.env.NODE_ENV === 'test' || process.env.VITEST === 'true');
 
 // In development, ensure default development .env file exists if missing
 if (
@@ -26,7 +25,6 @@ if (
         'POSTGRES_PASSWORD=erp_password_dev',
         'POSTGRES_DB=core_erp',
         'DATABASE_URL="postgresql://erp_user:erp_password_dev@localhost:5432/core_erp?schema=public"',
-        'TEST_DATABASE_URL="postgresql://erp_test_user:dev_test_password@localhost:5433/core_erp_test?schema=public"',
         'STAGING_DATABASE_URL="postgresql://erp_test_user:dev_test_password@localhost:5433/core_erp_staging?schema=public"',
         'SESSION_SECRET="dev_insecure_fallback_session_secret_32_chars_long"',
         'BIOMETRIC_BRIDGE_TOKEN="dev_biometric_bridge_secret_token_123456"',
@@ -39,8 +37,8 @@ if (
   }
 }
 
-// Load environment variables from .env if present (skipped in isolated integration-test mode)
-if (!isIntegrationTestRuntime) {
+// Load environment variables from .env if present (skipped in test/Vitest runtimes)
+if (!isTestRuntime) {
   dotenv.config();
 }
 

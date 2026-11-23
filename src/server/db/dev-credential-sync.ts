@@ -203,7 +203,6 @@ export function syncEnvFileDatabaseUrl(
       `POSTGRES_PASSWORD="${newPassword}"`,
       `POSTGRES_DB="${CANONICAL_DEV_DB}"`,
       `DATABASE_URL="postgresql://${CANONICAL_DEV_USER}:${newPassword}@localhost:${CANONICAL_DEV_PORT}/${CANONICAL_DEV_DB}?schema=public"`,
-      'TEST_DATABASE_URL="postgresql://erp_test_user:dev_test_password@localhost:5433/core_erp_test?schema=public"',
       'STAGING_DATABASE_URL="postgresql://erp_test_user:dev_test_password@localhost:5433/core_erp_staging?schema=public"',
       'SESSION_SECRET="dev_insecure_fallback_session_secret_32_chars_long"',
       'BIOMETRIC_BRIDGE_TOKEN="dev_biometric_bridge_secret_token_123456"',

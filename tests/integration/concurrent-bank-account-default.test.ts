@@ -25,7 +25,8 @@ import net from 'net';
  */
 
 describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switching', () => {
-  const testDbUrl = process.env.TEST_DATABASE_URL;
+  const testDbUrl = process.env.TEST_DATABASE_URL?.trim().replace(/^["']|["']$/g, '');
+  const isIntegrationMode = process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
   let blockedReason: string | null = null;
   let isDbConnected = false;
   let testPrisma1: PrismaClient | null = null;
@@ -87,10 +88,11 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
   };
 
   beforeAll(async () => {
-    // 1. Require an explicitly provided TEST_DATABASE_URL
-    if (!testDbUrl || testDbUrl.trim() === '') {
+    // 1. Require explicit integration mode AND a configured TEST_DATABASE_URL
+    if (!isIntegrationMode || !testDbUrl) {
       blockedReason =
-        '[BLOCKED / NOT RUN] TEST_DATABASE_URL is not configured for PostgreSQL 16 concurrency integration test.';
+        '[BLOCKED / NOT RUN] PostgreSQL 16 concurrency integration test requires explicit ' +
+        'COREERP_INTEGRATION_TEST_MODE=true and TEST_DATABASE_URL targeting localhost:5434/core_erp_integration_test.';
       console.warn(
         `\n${blockedReason}` +
         '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
@@ -101,10 +103,10 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
       return;
     }
 
-    // 2. Reject collision with standard test or primary DATABASE_URL
-    if (process.env.DATABASE_URL && testDbUrl === process.env.DATABASE_URL) {
+    // 2. Reject ANY defined DATABASE_URL in integration mode to prevent split-brain routing
+    if (process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== '') {
       throw new Error(
-        '[SECURITY FATAL] Integration test refused: TEST_DATABASE_URL matches primary DATABASE_URL. Test execution requires an isolated dedicated database.'
+        '[SECURITY FATAL] Integration test refused: Conflicting DATABASE_URL detected in integration test mode. DATABASE_URL must remain unset.'
       );
     }
 
@@ -180,8 +182,13 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
     // Endpoint is reachable: do NOT catch or downgrade $connect(), auth, missing DB, PG version, identity, or Prisma errors.
     testPrisma1 = configureIntegrationPrismaClient(testDbUrl);
     testPrisma2 = new PrismaClient({ datasources: { db: { url: testDbUrl } } });
+    // Ensure Prisma's internal dotenv loader cannot leave DATABASE_URL populated in integration mode
+    delete process.env.DATABASE_URL;
     await testPrisma1.$connect();
     await testPrisma2.$connect();
+    delete process.env.DATABASE_URL;
+    expect(process.env.DATABASE_URL).toBeUndefined();
+    expect(process.env.COREERP_INTEGRATION_TEST_MODE).toBe('true');
 
     // Verify secondary integration client database identity immediately after connect
     const dbRows2 = await testPrisma2.$queryRawUnsafe<Array<{ db_name: string }>>(

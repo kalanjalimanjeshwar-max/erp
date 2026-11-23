@@ -86,8 +86,7 @@ export function createPrismaClient(databaseUrl?: string): PrismaClient {
       databaseUrl ||
       process.env.DATABASE_URL ||
       (process.env.NODE_ENV === 'test'
-        ? process.env.TEST_DATABASE_URL ||
-          'postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public'
+        ? 'postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public'
         : undefined);
   }
 
@@ -107,7 +106,9 @@ export function createPrismaClient(databaseUrl?: string): PrismaClient {
     );
   }
 
-  return new PrismaClient({
+  const hadTestDatabaseUrlBeforePrisma = process.env.TEST_DATABASE_URL !== undefined;
+
+  const client = new PrismaClient({
     datasources: {
       db: {
         url,
@@ -116,6 +117,15 @@ export function createPrismaClient(databaseUrl?: string): PrismaClient {
     // Avoid raw stderr logging; handle errors gracefully through application try/catch handlers
     log: [],
   });
+
+  // Guard against Prisma's internal dotenv loader injecting .env variables during test runs
+  if (isIntegrationMode) {
+    delete process.env.DATABASE_URL;
+  } else if (process.env.NODE_ENV === 'test' && !hadTestDatabaseUrlBeforePrisma) {
+    delete process.env.TEST_DATABASE_URL;
+  }
+
+  return client;
 }
 
 /**

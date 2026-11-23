@@ -28,7 +28,8 @@ import net from 'net';
  */
 
 describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run', () => {
-  const testDbUrl = process.env.TEST_DATABASE_URL;
+  const testDbUrl = process.env.TEST_DATABASE_URL?.trim().replace(/^["']|["']$/g, '');
+  const isIntegrationMode = process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
   let blockedReason: string | null = null;
   let isDbConnected = false;
   let testPrisma: PrismaClient | null = null;
@@ -96,9 +97,10 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
   };
 
   beforeAll(async () => {
-    if (!testDbUrl || testDbUrl.trim() === '') {
+    if (!isIntegrationMode || !testDbUrl) {
       blockedReason =
-        '[BLOCKED / NOT RUN] TEST_DATABASE_URL is not configured for PostgreSQL 16 key-rotation integration test.';
+        '[BLOCKED / NOT RUN] PostgreSQL 16 key-rotation integration test requires explicit ' +
+        'COREERP_INTEGRATION_TEST_MODE=true and TEST_DATABASE_URL targeting localhost:5434/core_erp_integration_test.';
       console.warn(
         `\n${blockedReason}\n` +
         'To run live key-rotation integration tests against PostgreSQL 16 on Docker:\n' +
@@ -109,9 +111,9 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       return;
     }
 
-    if (process.env.DATABASE_URL && testDbUrl === process.env.DATABASE_URL) {
+    if (process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== '') {
       throw new Error(
-        '[SECURITY FATAL] Integration test refused: TEST_DATABASE_URL matches primary DATABASE_URL.'
+        '[SECURITY FATAL] Integration test refused: Conflicting DATABASE_URL detected in integration test mode. DATABASE_URL must remain unset.'
       );
     }
 
@@ -152,7 +154,12 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
 
     // Endpoint is reachable: do NOT catch or downgrade $connect(), auth, missing DB, PG version, identity, or Prisma errors.
     testPrisma = configureIntegrationPrismaClient(testDbUrl);
+    // Ensure Prisma's internal dotenv loader cannot leave DATABASE_URL populated in integration mode
+    delete process.env.DATABASE_URL;
     await testPrisma.$connect();
+    delete process.env.DATABASE_URL;
+    expect(process.env.DATABASE_URL).toBeUndefined();
+    expect(process.env.COREERP_INTEGRATION_TEST_MODE).toBe('true');
 
     const versionResult = await testPrisma.$queryRawUnsafe<Array<{ version: string }>>('SELECT version();');
     const versionString = versionResult[0]?.version || '';
