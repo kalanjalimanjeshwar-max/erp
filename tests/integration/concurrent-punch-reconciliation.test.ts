@@ -531,8 +531,8 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     expect(resOut.results[0]?.status).toBe('PROCESSED');
 
     // Depending on which transaction acquires pg_advisory_xact_lock first,
-    // either (CHECK_IN opens -> CHECK_OUT pairs chronologically) or
-    // (CHECK_OUT opens incomplete -> CHECK_IN pairs chronologically).
+    // either (09:00 opens -> 18:00 pairs as OUT) or
+    // (18:00 opens as 1st punch -> 09:00 re-sequences chronologically so 09:00=IN and 18:00=OUT).
     const messagePair = [resIn.results[0]?.message, resOut.results[0]?.message];
     const validOrders = [
       [
@@ -541,7 +541,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
       ],
       [
         'Check-in paired chronologically (1 pair).',
-        'Incomplete check-out recorded as PROCESSED pending matching check-in.',
+        'Check-in recorded as open punch pending check-out.',
       ],
     ];
     expect(

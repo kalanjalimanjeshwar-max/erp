@@ -241,6 +241,13 @@ describe('Step 2 Stage 3: Multi-Pair Chronological Punch Reconciliation Tests', 
       return row as any;
     }) as any);
 
+    vi.spyOn((prisma as any).attendancePunchEvent, 'update').mockImplementation((async (args: any) => {
+      const row = events.find((e) => e.id === args.where.id);
+      if (!row) throw new Error('Punch event not found');
+      Object.assign(row, args.data);
+      return row as any;
+    }) as any);
+
     vi.spyOn((prisma as any).attendanceInterval, 'deleteMany').mockImplementation((async (args: any) => {
       const w = args?.where || {};
       const before = intervals.length;
@@ -428,13 +435,15 @@ describe('Step 2 Stage 3: Multi-Pair Chronological Punch Reconciliation Tests', 
       const orphanRes = await PunchReconciliationService.reconcilePunch('p-orphan-earlier-out');
 
       expect(orphanRes.status).toBe('PROCESSED');
-      expect(orphanRes.message).toContain('Incomplete check-out recorded as PROCESSED');
+      expect(orphanRes.message).toContain('paired chronologically (1 pair) with open trailing check-in');
       expect(rawPunches.find((p) => p.id === 'p-orphan-earlier-out')?.syncStatus).toBe('PROCESSED');
+      // 3 punches sorted chronologically (12:00, 13:00, 17:30) -> 12:00->13:00 (60m) + 17:30 open IN
       expect(attendances[0].hasIncompletePunch).toBe(true);
       expect(attendances[0].punchPairsCount).toBe(1);
-      expect(attendances[0].actualWorkedMinutes).toBe(270); // 13:00->17:30 still intact
+      expect(attendances[0].actualWorkedMinutes).toBe(60);
 
-      // Now delayed earlier CHECK_IN (09:00) arrives -> re-pairs 09:00->12:00 AND 13:00->17:30 cleanly
+      // Now delayed earlier punch (09:00) arrives -> deterministically re-sequences ALL 4 events:
+      // 09:00 (IN) -> 12:00 (OUT) [180m] AND 13:00 (IN) -> 17:30 (OUT) [270m]
       const repairRes = await PunchReconciliationService.reconcilePunch('p-delayed-earlier-in');
       expect(repairRes.status).toBe('PROCESSED');
       expect(repairRes.message).toContain('2 pairs');
@@ -442,9 +451,22 @@ describe('Step 2 Stage 3: Multi-Pair Chronological Punch Reconciliation Tests', 
       expect(attendances[0].punchPairsCount).toBe(2);
       expect(attendances[0].actualWorkedMinutes).toBe(180 + 270); // 450m
       expect(attendances[0].checkIn?.toISOString()).toBe('2026-11-11T09:00:00.000Z');
+      expect(attendances[0].checkOut?.toISOString()).toBe('2026-11-11T17:30:00.000Z');
       expect(intervals).toHaveLength(2);
       expect(intervals[0].isComplete).toBe(true);
       expect(intervals[1].isComplete).toBe(true);
+
+      // Verify normalized AttendancePunchEvent modes alternate cleanly while RawPunchLog modes remain preserved
+      const sortedEvents = events
+        .slice()
+        .sort((a, b) => a.punchTime.getTime() - b.punchTime.getTime());
+      expect(sortedEvents.map((e) => e.inOutMode)).toEqual([
+        'CHECK_IN',
+        'CHECK_OUT',
+        'CHECK_IN',
+        'CHECK_OUT',
+      ]);
+      expect(rawPunches.find((p) => p.id === 'p-orphan-earlier-out')?.inOutMode).toBe('CHECK_OUT');
     });
 
     it('debounces rapid duplicate taps against ALL workday events of the same mode and seeds legacy Attendance rows', async () => {

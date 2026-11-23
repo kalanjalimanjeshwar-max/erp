@@ -380,7 +380,7 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
       );
     });
 
-    it('should record missing check-in gracefully when CHECK_OUT arrives alone', async () => {
+    it('should treat the first punch of the day as CHECK_IN chronologically even if raw device mode is CHECK_OUT', async () => {
       const punchOutAlone = {
         id: 'punch-out-alone',
         companyId: companyAlphaId,
@@ -404,16 +404,17 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
       expect(createSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           data: expect.objectContaining({
-            checkIn: null,
-            checkOut: punchOutAlone.punchTime,
-            status: 'PRESENT',
-            notes: expect.stringContaining('without matching check-in'),
+            checkIn: punchOutAlone.punchTime,
+            checkOut: null,
+            hasIncompletePunch: true,
+            punchPairsCount: 0,
+            source: 'BIOMETRIC',
           }),
         })
       );
     });
 
-    it('should handle an earlier or orphan CHECK_OUT as PROCESSED incomplete pending matching earlier CHECK_IN', async () => {
+    it('should re-order out-of-order earlier punch chronologically as CHECK_IN and shift existing punch to CHECK_OUT', async () => {
       const existingAttendance = {
         id: 'att-uuid-1',
         companyId: companyAlphaId,
@@ -423,7 +424,7 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         checkOut: null,
       };
 
-      // Out-of-order / earlier checkout timestamp 07:00 before 09:00 checkin
+      // Out-of-order earlier punch timestamp 07:00 arrives after 09:00
       const earlierOutPunch = {
         id: 'punch-earlier-out',
         companyId: companyAlphaId,
@@ -444,12 +445,16 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
       const result = await PunchReconciliationService.reconcilePunch('punch-earlier-out');
 
       expect(result.status).toBe('PROCESSED');
-      expect(result.message).toContain('Incomplete check-out recorded as PROCESSED');
+      expect(result.message).toContain('paired chronologically');
       expect(updateAttSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { id: 'att-uuid-1' },
           data: expect.objectContaining({
-            hasIncompletePunch: true,
+            checkIn: earlierOutPunch.punchTime,
+            checkOut: existingAttendance.checkIn,
+            actualWorkedMinutes: 120,
+            hasIncompletePunch: false,
+            punchPairsCount: 1,
           }),
         })
       );
