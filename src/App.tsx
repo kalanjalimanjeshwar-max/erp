@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { ErrorBoundary } from './client/components/common/ErrorBoundary.tsx';
 import { AppLayout } from './client/components/layout/AppLayout.tsx';
 import { LoginPage } from './client/pages/LoginPage.tsx';
@@ -33,6 +33,14 @@ import { DatabaseDisconnectedNotice } from './client/components/common/DatabaseD
 import { LoadingSpinner } from './client/components/common/LoadingSpinner.tsx';
 import { api, ApiError } from './client/services/api.ts';
 import {
+  formatHashForTab,
+  isOperationalTab,
+  parseTabFromHash,
+  resolveInitialSessionState,
+  resolvePostLoginState,
+  resolvePostLogoutState,
+} from './client/utils/authSessionState.ts';
+import {
   SetupStatusResponse,
   DatabaseReadiness,
   AuthUser,
@@ -42,7 +50,10 @@ import {
 } from './shared/types.ts';
 
 export default function App() {
-  const [currentTab, setCurrentTab] = useState<string>('dashboard');
+  const initialHashTab =
+    typeof window !== 'undefined' ? parseTabFromHash(window.location.hash) : null;
+  const [currentTab, setCurrentTabState] = useState<string>(initialHashTab || 'dashboard');
+  const requestedTabRef = useRef<string | null>(initialHashTab);
   const [statementLedgerId, setStatementLedgerId] = useState<string | null>(null);
   const [selectedInvoiceId, setSelectedInvoiceId] = useState<string | null>(null);
   const [receiptTargetInvoice, setReceiptTargetInvoice] = useState<InvoiceItem | null>(null);
@@ -55,60 +66,23 @@ export default function App() {
   const [isRetryingConnection, setIsRetryingConnection] = useState<boolean>(false);
   const [sessionExpiredMessage, setSessionExpiredMessage] = useState<string | null>(null);
 
-  // Initial session restoration and system bootstrap probe
-  const initializeApp = useCallback(async () => {
-    setIsInitializing(true);
-    try {
-      const [readinessRes, setupRes, authRes] = await Promise.allSettled([
-        api.getReadiness(),
-        api.getSetupStatus(),
-        api.getMe(),
-      ]);
-
-      if (readinessRes.status === 'fulfilled') {
-        setDbReadiness(readinessRes.value.checks.postgres);
-      } else {
-        setDbReadiness({
-          status: 'disconnected',
-          database: 'PostgreSQL',
-          error: 'Backend API or database probe did not return a valid response.',
-        });
-      }
-
-      let hasAuthenticatedUser = false;
-      if (authRes.status === 'fulfilled') {
-        setCurrentUser(authRes.value.user);
-        setCompanyProfile(authRes.value.company);
-        setSessionExpiredMessage(null);
-        hasAuthenticatedUser = true;
-      } else {
-        setCurrentUser(null);
-      }
-
-      if (setupRes.status === 'fulfilled') {
-        setSetupStatus(setupRes.value);
-        if (setupRes.value.databaseConnected && setupRes.value.isSetupRequired) {
-          setCurrentTab((prev) => (prev === 'login' ? 'login' : 'setup'));
-        } else if (setupRes.value.databaseConnected && !setupRes.value.isSetupRequired && !hasAuthenticatedUser) {
-          setCurrentTab('login');
+  const setCurrentTab = useCallback((next: string | ((prev: string) => string)) => {
+    setCurrentTabState((prev) => {
+      const resolved = typeof next === 'function' ? next(prev) : next;
+      if (isOperationalTab(resolved)) {
+        requestedTabRef.current = resolved;
+        if (typeof window !== 'undefined') {
+          const nextHash = formatHashForTab(resolved);
+          if (window.location.hash !== nextHash) {
+            window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}${nextHash}`);
+          }
         }
       }
-    } finally {
-      setIsInitializing(false);
-    }
+      return resolved;
+    });
   }, []);
 
-  useEffect(() => {
-    initializeApp();
-  }, [initializeApp]);
-
-  const handleRetryConnection = async () => {
-    setIsRetryingConnection(true);
-    await initializeApp();
-    setIsRetryingConnection(false);
-  };
-
-  const refreshDiagnostics = async () => {
+  const refreshDiagnostics = useCallback(async () => {
     setIsHealthLoading(true);
     try {
       const [readinessRes, setupRes] = await Promise.allSettled([
@@ -124,24 +98,99 @@ export default function App() {
     } finally {
       setIsHealthLoading(false);
     }
+  }, []);
+
+  // Initial session restoration and system bootstrap probe
+  const initializeApp = useCallback(async () => {
+    setIsInitializing(true);
+    try {
+      const [readinessRes, setupRes, authRes] = await Promise.allSettled([
+        api.getReadiness(),
+        api.getSetupStatus(),
+        api.getMe(),
+      ]);
+
+      const readiness =
+        readinessRes.status === 'fulfilled' ? readinessRes.value.checks.postgres : null;
+      const setup = setupRes.status === 'fulfilled' ? setupRes.value : null;
+      if (setup) {
+        setSetupStatus(setup);
+      }
+
+      const authProbe =
+        authRes.status === 'fulfilled'
+          ? { ok: true as const, user: authRes.value.user, company: authRes.value.company }
+          : {
+              ok: false as const,
+              errorCode: authRes.reason instanceof ApiError ? authRes.reason.code : undefined,
+              errorMessage: authRes.reason instanceof ApiError ? authRes.reason.message : undefined,
+            };
+
+      const requestedTab =
+        (typeof window !== 'undefined' ? parseTabFromHash(window.location.hash) : null) ||
+        requestedTabRef.current;
+
+      const resolved = resolveInitialSessionState({
+        auth: authProbe,
+        readiness,
+        setupStatus: setup,
+        requestedTab,
+      });
+
+      setDbReadiness(resolved.dbReadiness);
+      setCurrentUser(resolved.currentUser);
+      setCompanyProfile(resolved.companyProfile);
+      setSessionExpiredMessage(resolved.sessionExpiredMessage);
+      setCurrentTab(resolved.activeTab);
+    } finally {
+      setIsInitializing(false);
+    }
+  }, [setCurrentTab]);
+
+  useEffect(() => {
+    initializeApp();
+  }, [initializeApp]);
+
+  const handleRetryConnection = async () => {
+    setIsRetryingConnection(true);
+    await initializeApp();
+    setIsRetryingConnection(false);
   };
 
   const handleLoginSuccess = (data: LoginResponse) => {
-    setCurrentUser(data.user);
-    setCompanyProfile(data.company);
-    setSessionExpiredMessage(null);
-    setCurrentTab('dashboard');
+    const resolved = resolvePostLoginState({
+      data,
+      currentReadiness: dbReadiness,
+      requestedTab: requestedTabRef.current,
+    });
+    setCurrentUser(resolved.currentUser);
+    setCompanyProfile(resolved.companyProfile);
+    setDbReadiness(resolved.dbReadiness);
+    setSessionExpiredMessage(resolved.sessionExpiredMessage);
+    setCurrentTab(resolved.activeTab);
+
+    if (!data.user.isPreview) {
+      void refreshDiagnostics();
+    }
   };
 
   const handleLogout = async () => {
     try {
-      await api.logout();
+      if (!currentUser?.isPreview) {
+        await api.logout();
+      }
     } catch {
-      // Safe exit
+      // Safe exit — always clear local state even if session already expired
     } finally {
-      setCurrentUser(null);
-      setSessionExpiredMessage(null);
-      setCurrentTab('login');
+      const cleared = resolvePostLogoutState();
+      requestedTabRef.current = null;
+      if (typeof window !== 'undefined' && window.location.hash) {
+        window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`);
+      }
+      setCurrentUser(cleared.currentUser);
+      setCompanyProfile(cleared.companyProfile);
+      setSessionExpiredMessage(cleared.sessionExpiredMessage);
+      setCurrentTabState(cleared.activeTab);
     }
   };
 

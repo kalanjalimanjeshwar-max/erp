@@ -258,12 +258,13 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   let response: Response;
   try {
     response = await fetch(path, {
+      ...options,
       credentials: 'include', // Include HttpOnly session cookie
       headers: {
         'Content-Type': 'application/json',
+        'X-Requested-With': 'CoreERP',
         ...options?.headers,
       },
-      ...options,
     });
   } catch (err: unknown) {
     throw new ApiError(
@@ -297,12 +298,13 @@ async function requestBlob(
   let response: Response;
   try {
     response = await fetch(path, {
+      ...options,
       credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
+        'X-Requested-With': 'CoreERP',
         ...options?.headers,
       },
-      ...options,
     });
   } catch (err: unknown) {
     throw new ApiError(

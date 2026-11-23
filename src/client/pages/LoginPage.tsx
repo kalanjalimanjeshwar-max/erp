@@ -25,9 +25,12 @@ export const LoginPage: React.FC<LoginPageProps> = ({
 }) => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [companyCode, setCompanyCode] = useState('');
+  const [showCompanyCodeField, setShowCompanyCodeField] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const isDbConnected = readiness?.status === 'connected';
 
   const handleQuickPreviewLogin = async () => {
     setEmail('preview_admin');
@@ -83,78 +86,83 @@ export const LoginPage: React.FC<LoginPageProps> = ({
       return;
     }
 
-    // Check if user is logging in with temporary preview credentials or in-memory demo user
-    const isPreviewCredentials =
-      trimmedIdentifier === 'preview_admin' && password === 'PreviewOnly_2026!';
-    const matchedPreviewUser = previewStore.findPreviewUser(trimmedIdentifier);
+    // Only allow sandbox preview login when PostgreSQL is offline.
+    // Never intercept real database logins or bypass password checks for preview_admin.
+    if (!isDbConnected) {
+      const isExactPreviewAdminCredentials =
+        trimmedIdentifier === 'preview_admin' && password === 'PreviewOnly_2026!';
+      const candidatePreviewUser = previewStore.findPreviewUser(trimmedIdentifier);
+      const isNonRootPreviewDemoUser =
+        Boolean(candidatePreviewUser) &&
+        candidatePreviewUser?.id !== 'preview-session-id' &&
+        candidatePreviewUser?.email !== 'preview_admin@preview.local';
 
-    if (isPreviewCredentials || matchedPreviewUser) {
-      setIsSubmitting(true);
-      try {
-        if (isPreviewCredentials) {
-          try {
-            const previewRes = await api.previewLogin({ id: trimmedIdentifier, password });
-            onLoginSuccess({
-              user: previewRes.user,
-              company: previewRes.company,
-            });
-            return;
-          } catch (err: unknown) {
-            if (err instanceof ApiError && err.code === 'PREVIEW_MODE_DISABLED') {
-              setErrorMessage(err.message);
+      if (isExactPreviewAdminCredentials || isNonRootPreviewDemoUser) {
+        setIsSubmitting(true);
+        try {
+          if (isExactPreviewAdminCredentials) {
+            try {
+              const previewRes = await api.previewLogin({ id: trimmedIdentifier, password });
+              onLoginSuccess({
+                user: previewRes.user,
+                company: previewRes.company,
+              });
               return;
+            } catch (err: unknown) {
+              if (err instanceof ApiError && err.code === 'PREVIEW_MODE_DISABLED') {
+                setErrorMessage(err.message);
+                return;
+              }
             }
           }
+
+          const previewUserObj = isNonRootPreviewDemoUser && candidatePreviewUser
+            ? previewStore.createMockAuthUser(candidatePreviewUser)
+            : {
+                id: 'preview-session-id',
+                userId: 'preview-session-id',
+                companyId: 'preview-company-id',
+                email: 'preview_admin@preview.local',
+                fullName: 'Temporary Preview Account — Not a Real Super Admin',
+                role: 'SUPER_ADMIN' as const,
+                isActive: true,
+                tokenVersion: 1,
+                isPreview: true,
+              };
+
+          onLoginSuccess({
+            user: previewUserObj,
+            company: {
+              id: 'preview-company-id',
+              code: 'PREVIEW',
+              name: 'CoreERP Preview Sandbox',
+              legalName: 'CoreERP Temporary Preview Entity (Read-Only)',
+              currency: 'USD',
+              timezone: 'UTC',
+            },
+          });
+          return;
+        } finally {
+          setIsSubmitting(false);
         }
-
-        const previewUserObj = matchedPreviewUser
-          ? previewStore.createMockAuthUser(matchedPreviewUser)
-          : {
-              id: 'preview-session-id',
-              userId: 'preview-session-id',
-              companyId: 'preview-company-id',
-              email: 'preview_admin@preview.local',
-              fullName: 'Temporary Preview Account — Not a Real Super Admin',
-              role: 'SUPER_ADMIN' as const,
-              isActive: true,
-              tokenVersion: 1,
-              isPreview: true,
-            };
-
-        onLoginSuccess({
-          user: previewUserObj,
-          company: {
-            id: 'preview-company-id',
-            code: 'PREVIEW',
-            name: 'CoreERP Preview Sandbox',
-            legalName: 'CoreERP Temporary Preview Entity (Read-Only)',
-            currency: 'USD',
-            timezone: 'UTC',
-          },
-        });
-        return;
-      } finally {
-        setIsSubmitting(false);
       }
     }
 
-    // Real database sign-in check
-    if (readiness && readiness.status !== 'connected') {
-      setErrorMessage(
-        'Database service is currently unavailable. Real account sign-in requires an active PostgreSQL instance. Use the Temporary Preview Account below to explore the dashboard UI.'
-      );
-      return;
-    }
-
+    // Always submit real credentials to the backend authentication endpoint so stale readiness
+    // state cannot block login when PostgreSQL is online, and real DB outages return HTTP 503.
     setIsSubmitting(true);
     try {
       const response = await api.login({
         email: trimmedIdentifier,
         password,
+        ...(companyCode.trim() ? { companyCode: companyCode.trim() } : {}),
       });
       onLoginSuccess(response);
     } catch (err: unknown) {
       if (err instanceof ApiError) {
+        if (err.code === 'COMPANY_CODE_REQUIRED') {
+          setShowCompanyCodeField(true);
+        }
         setErrorMessage(err.message);
       } else {
         setErrorMessage('Authentication service unavailable. Please check backend connection.');
@@ -236,7 +244,8 @@ export const LoginPage: React.FC<LoginPageProps> = ({
           </div>
         )}
 
-        {/* Temporary Preview Account Card (UI Testing Only) */}
+        {/* Temporary Preview Account Card (Shown Only When PostgreSQL Is Offline) */}
+        {!isDbConnected && (
         <div className="bg-gradient-to-r from-amber-950/80 via-slate-900 to-slate-900 border border-amber-700/70 rounded-2xl p-5 shadow-xl space-y-3.5">
           <div className="flex items-start gap-3">
             <div className="p-2.5 bg-amber-900/40 text-amber-400 rounded-xl border border-amber-800/60 shrink-0 mt-0.5">
@@ -252,7 +261,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                 </span>
               </div>
               <p className="text-[11px] text-slate-300 leading-relaxed">
-                Explore the CoreERP Dashboard and administrative navigation in Google AI Studio Preview
+                Explore the CoreERP Dashboard and administrative navigation in Preview Mode
                 while PostgreSQL is unavailable. Data-changing actions are blocked.
               </p>
               <div className="pt-1 grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px] font-mono">
@@ -276,15 +285,10 @@ export const LoginPage: React.FC<LoginPageProps> = ({
                   <span>Explore Dashboard in Preview Mode</span>
                 </button>
               </div>
-
-              <div className="pt-1.5 border-t border-amber-900/40">
-                <p className="text-[10px] text-amber-300/80 leading-relaxed font-mono">
-                  Mock Sign-in Mechanism: In Preview Mode, use the demo credentials above. Any temporary in-memory staff accounts created in User Management can also be tested by entering their email/username with any password or "PreviewOnly_2026!". (Preview Only — Lost on Refresh).
-                </p>
-              </div>
             </div>
           </div>
         </div>
+        )}
 
         {/* Login Card */}
         <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl space-y-5">
@@ -373,6 +377,27 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               </div>
             </div>
 
+            {showCompanyCodeField && (
+              <div>
+                <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                  Company Code
+                </label>
+                <div className="relative">
+                  <div className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-slate-400">
+                    <Building2 className="w-4 h-4" />
+                  </div>
+                  <input
+                    type="text"
+                    autoComplete="organization"
+                    value={companyCode}
+                    onChange={(e) => setCompanyCode(e.target.value.toUpperCase())}
+                    placeholder="e.g. ACME_01"
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-3 py-2 text-xs text-slate-100 placeholder-slate-400 focus:outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition font-mono"
+                  />
+                </div>
+              </div>
+            )}
+
             <button
               type="submit"
               disabled={isSubmitting}
@@ -391,7 +416,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
               )}
             </button>
 
-            {onNavigateToDashboard && (
+            {!isDbConnected && onNavigateToDashboard && (
               <div className="pt-2 text-center">
                 <button
                   type="button"

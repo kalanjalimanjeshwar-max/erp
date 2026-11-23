@@ -292,6 +292,7 @@ export interface DocumentPrintSettingsUpdateResponse {
 export interface LoginRequest {
   email: string;
   password: string;
+  companyCode?: string;
 }
 
 export interface LoginResponse {

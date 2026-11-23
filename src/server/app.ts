@@ -7,6 +7,9 @@ import { errorHandler } from './middleware/error.middleware.js';
 export function createApp(): Express {
   const app = express();
 
+  // Respect X-Forwarded-Proto and X-Forwarded-For behind HTTPS reverse proxies
+  app.set('trust proxy', 1);
+
   // Standard middleware
   app.use(
     cors({

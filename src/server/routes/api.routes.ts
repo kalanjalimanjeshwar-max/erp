@@ -42,7 +42,7 @@ apiRouter.delete('/setup/branding/assets/:id', SetupController.deleteStagedBrand
 
 // 3. Authentication Endpoints
 apiRouter.post('/auth/login', AuthController.login);
-apiRouter.post('/auth/logout', requireAuth, AuthController.logout);
+apiRouter.post('/auth/logout', AuthController.logout);
 apiRouter.get('/auth/me', requireAuth, AuthController.getMe);
 apiRouter.post('/auth/preview-login', PreviewAuthController.login);
 apiRouter.get('/auth/preview-status', PreviewAuthController.getStatus);

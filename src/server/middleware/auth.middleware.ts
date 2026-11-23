@@ -14,6 +14,35 @@ declare global {
   }
 }
 
+const STATE_CHANGING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
+export function isCookieCsrfRequestAllowed(req: Request): boolean {
+  if (!STATE_CHANGING_METHODS.has(req.method.toUpperCase())) {
+    return true;
+  }
+
+  const originHeader = req.headers.origin;
+  if (typeof originHeader === 'string' && originHeader.trim().length > 0) {
+    const forwardedHost = req.headers['x-forwarded-host'];
+    const rawExpectedHost =
+      (typeof forwardedHost === 'string' ? forwardedHost.split(',')[0]?.trim() : undefined) ||
+      req.headers.host;
+
+    if (!rawExpectedHost) {
+      return false;
+    }
+
+    try {
+      const parsedOrigin = new URL(originHeader);
+      return parsedOrigin.host.toLowerCase() === rawExpectedHost.toLowerCase();
+    } catch {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 /**
  * Extracts and verifies session token from HTTP-only cookie or Bearer authorization header
  */
@@ -28,10 +57,13 @@ export async function requireAuth(
   req.correlationId = (req.headers['x-correlation-id'] as string) || `req-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
 
   // 1. Check HttpOnly cookie first, then fallback to Authorization header
-  let rawToken: string | undefined = req.cookies?.[SESSION_COOKIE_NAME];
+  const cookieToken: string | undefined = req.cookies?.[SESSION_COOKIE_NAME];
+  let rawToken: string | undefined = cookieToken;
+  let authenticatedViaCookie = Boolean(cookieToken);
 
   if (!rawToken && req.headers.authorization?.startsWith('Bearer ')) {
-    rawToken = req.headers.authorization.substring(7);
+    rawToken = req.headers.authorization.substring(7).trim();
+    authenticatedViaCookie = false;
   }
 
   if (!rawToken) {
@@ -39,6 +71,17 @@ export async function requireAuth(
       error: {
         code: 'UNAUTHENTICATED',
         message: 'Authentication session required to access this endpoint.',
+        timestamp,
+      },
+    });
+    return;
+  }
+
+  if (authenticatedViaCookie && !isCookieCsrfRequestAllowed(req)) {
+    res.status(403).json({
+      error: {
+        code: 'CSRF_ORIGIN_MISMATCH',
+        message: 'Cross-origin request rejected. Please refresh the page and try again.',
         timestamp,
       },
     });
@@ -58,8 +101,14 @@ export async function requireAuth(
     return;
   }
 
-  // Validate active account and tokenVersion
-  const freshUser = await AuthService.validateSessionUser(sessionPayload);
+  // Validate active account, tenant binding, and tokenVersion
+  let freshUser: AuthUser | null = null;
+  try {
+    freshUser = await AuthService.validateSessionUser(sessionPayload);
+  } catch (err) {
+    next(err);
+    return;
+  }
 
   if (!freshUser) {
     res.status(401).json({
