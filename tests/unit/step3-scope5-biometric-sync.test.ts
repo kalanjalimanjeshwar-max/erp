@@ -93,7 +93,7 @@ describe('Step 3 Scope 5 — Biometric Sync Controller Validation & Tenant Isola
     });
 
     it('normalizes YYYY-MM-DD fromPunchTime using company timezone (Asia/Kolkata +05:30)', async () => {
-      vi.spyOn(WorkPolicyService, 'resolveCompanyTimezone').mockResolvedValue('Asia/Kolkata');
+      vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'Asia/Kolkata' } as any);
       const reconcileSpy = vi
         .spyOn(PunchReconciliationService, 'reconcilePendingPunches')
         .mockResolvedValue(mockSyncOutcome as any);
@@ -112,7 +112,7 @@ describe('Step 3 Scope 5 — Biometric Sync Controller Validation & Tenant Isola
     });
 
     it('normalizes YYYY-MM-DD fromPunchTime using negative-offset company timezone (America/New_York EDT -04:00)', async () => {
-      vi.spyOn(WorkPolicyService, 'resolveCompanyTimezone').mockResolvedValue('America/New_York');
+      vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'America/New_York' } as any);
       const reconcileSpy = vi
         .spyOn(PunchReconciliationService, 'reconcilePendingPunches')
         .mockResolvedValue(mockSyncOutcome as any);
@@ -297,8 +297,10 @@ describe('Step 3 Scope 5 — Biometric Sync Controller Validation & Tenant Isola
           retryErrors: true,
           keepUnmappedPending: true,
           fromPunchTime: new Date('2026-05-01T00:00:00.000Z'),
+          toPunchTime: undefined,
+          allowHistorical: undefined,
         },
-        'user-admin-1',
+        expect.objectContaining({ userId: 'user-admin-1', role: 'ADMIN' }),
         'corr-scope5-test'
       );
     });
@@ -327,7 +329,7 @@ describe('Step 3 Scope 5 — Biometric Sync Controller Validation & Tenant Isola
     });
 
     it('normalizes YYYY-MM-DD fromPunchTime in company timezone and preserves ISO-8601 datetime', async () => {
-      vi.spyOn(WorkPolicyService, 'resolveCompanyTimezone').mockResolvedValue('Asia/Kolkata');
+      vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'Asia/Kolkata' } as any);
       const terminalSyncSpy = vi
         .spyOn(BiometricService, 'triggerTerminalSync')
         .mockResolvedValue({ success: true, message: 'Queued' } as any);
@@ -456,14 +458,14 @@ describe('Step 3 Scope 5 — Biometric Sync Controller Validation & Tenant Isola
 
         expect(res.statusCode).toBe(200);
         expect(reconcileSpy).toHaveBeenCalledTimes(1);
-        const [companyId, options, actorUserId, correlationId] = reconcileSpy.mock.calls[0];
+        const [companyId, options, forwardedActor, correlationId] = reconcileSpy.mock.calls[0];
         expect(companyId).toBe('comp-alpha');
         expect(options?.terminalId).toBe('term-alpha-1');
         expect(options?.batchSize).toBe(50);
         expect(options?.retryErrors).toBe(false);
         expect(options?.keepUnmappedPending).toBe(true);
         expect(options?.fromPunchTime).toBeInstanceOf(Date);
-        expect(actorUserId).toBe('user-admin-1');
+        expect(forwardedActor).toEqual(expect.objectContaining({ userId: 'user-admin-1', role: 'ADMIN' }));
         expect(correlationId).toBe('corr-scope5-test');
       });
 

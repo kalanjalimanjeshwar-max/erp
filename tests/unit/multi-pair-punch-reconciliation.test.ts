@@ -1,5 +1,6 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { prisma } from '../../src/server/db/client.js';
+import { AuthService } from '../../src/server/services/auth.service.js';
 import {
   PunchReconciliationService,
   pairAttendanceEventsChronologically,
@@ -364,6 +365,9 @@ describe('Step 2 Stage 3: Multi-Pair Chronological Punch Reconciliation Tests', 
         }
       );
 
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-10T20:00:00.000Z'));
+
       for (const id of ['p1', 'p2', 'p3', 'p4']) {
         const r = await PunchReconciliationService.reconcilePunch(id);
         expect(r.status).toBe('PROCESSED');
@@ -429,6 +433,9 @@ describe('Step 2 Stage 3: Multi-Pair Chronological Punch Reconciliation Tests', 
           matchedEmployeeId: employeeId,
         }
       );
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-11T19:00:00.000Z'));
 
       await PunchReconciliationService.reconcilePunch('p-late-in');
       await PunchReconciliationService.reconcilePunch('p-late-out');
@@ -514,6 +521,9 @@ describe('Step 2 Stage 3: Multi-Pair Chronological Punch Reconciliation Tests', 
         }
       );
 
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-12T15:00:00.000Z'));
+
       const dupRes = await PunchReconciliationService.reconcilePunch('p-dup-morning');
       expect(dupRes.status).toBe('IGNORED');
       expect(dupRes.message).toContain('debounced');
@@ -525,6 +535,10 @@ describe('Step 2 Stage 3: Multi-Pair Chronological Punch Reconciliation Tests', 
       expect(attendances[0].hasIncompletePunch).toBe(true);
       expect(attendances[0].punchPairsCount).toBe(1);
       expect(attendances[0].actualWorkedMinutes).toBe(180);
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
     });
 
     it('blocks reconciliation during ACCOUNTS_APPROVED payroll lock and respects fromPunchTime cutoff', async () => {
@@ -562,10 +576,36 @@ describe('Step 2 Stage 3: Multi-Pair Chronological Punch Reconciliation Tests', 
         }
       );
 
-      // Reconcile only from Nov 18 onward -> p-historical remains untouched PENDING!
-      const res = await PunchReconciliationService.reconcilePendingPunches(companyId, {
-        fromPunchTime: '2026-11-18T00:00:00.000Z',
-      });
+      vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
+      vi.spyOn(prisma.user, 'findUnique').mockResolvedValue({
+        id: 'super-admin-1',
+        companyId,
+        email: 'super@multipair.test',
+        fullName: 'Super Admin',
+        role: 'SUPER_ADMIN',
+        isActive: true,
+        lastLoginAt: null,
+        tokenVersion: 1,
+      } as any);
+      const authenticatedSuperAdmin = (await AuthService.validateSessionUser({
+        userId: 'super-admin-1',
+        companyId,
+        email: 'super@multipair.test',
+        role: 'SUPER_ADMIN',
+        tokenVersion: 1,
+        exp: Math.floor(Date.now() / 1000) + 3600,
+      }))!;
+
+      // Reconcile only from Nov 18..19 via authorized SUPER_ADMIN historical mode -> p-historical (Nov 05) remains untouched PENDING!
+      const res = await PunchReconciliationService.reconcilePendingPunches(
+        companyId,
+        {
+          allowHistorical: true,
+          fromPunchTime: '2026-11-18T00:00:00.000Z',
+          toPunchTime: '2026-11-19T23:59:59.000Z',
+        },
+        authenticatedSuperAdmin
+      );
 
       expect(res.totalEvaluated).toBe(1);
       expect(res.errors).toBe(1);

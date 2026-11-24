@@ -15,17 +15,202 @@ import { BiometricMappingService } from './biometric-mapping.service.js';
 import {
   WorkPolicyService,
   canUsePrismaDelegate,
-  getStartOfLocalDayUtc,
   ShiftDurationShape,
 } from './work-policy.service.js';
 import {
   addCalendarDaysToDateStr,
   localDateTimeToUtcIso,
 } from '../../shared/timezone.js';
+import {
+  computeCurrentDayUpperBoundUtc,
+  computeCurrentLocalDayStartUtc,
+  createBiometricSafetyError,
+  evaluateReconciliationWindow,
+  EvaluatedReconciliationWindow,
+  formatCompanyLocalDateStr,
+  hasExplicitReconciliationScope,
+  MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE,
+  MAX_NORMAL_RECONCILIATION_BATCH_SIZE,
+  normalizeReconciliationScope,
+  parseStrictEnforcedTimeWindow,
+  ReconciliationActorInput,
+  ReconciliationWindowScope,
+  ResolvedReconciliationTimeWindow,
+  resolveStrictCompanyTimezone,
+  TRUSTED_WINDOW_BACKWARD_CLOCK_SKEW_MS,
+  TRUSTED_WINDOW_TTL_MS,
+  TrustedWindowPunchContext,
+  VerifiedTrustedReconciliationWindow,
+} from './biometric-safety.js';
 
 const DEBOUNCE_THRESHOLD_MS = 2 * 60 * 1000; // 2 minutes
 const UUID_REGEX =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+interface TrustedWindowRegistryEntry extends VerifiedTrustedReconciliationWindow {
+  usedCount: number;
+}
+
+// Module-private trusted-window registry owned exclusively by PunchReconciliationService.
+// No external module, service, or callback API can mint or register a trusted window.
+// Every window is bound to tenant, mode, immutable timestamps, TTL, local calendar date,
+// explicit scope, and a hard server-side usage budget, and is revoked unconditionally in finally.
+const trustedWindowRegistry = new WeakMap<
+  ResolvedReconciliationTimeWindow,
+  TrustedWindowRegistryEntry
+>();
+const revokedTrustedWindows = new WeakSet<ResolvedReconciliationTimeWindow>();
+
+function mintScopedTrustedWindow(
+  evaluated: EvaluatedReconciliationWindow,
+  scope: ReconciliationWindowScope,
+  maxUses: number
+): ResolvedReconciliationTimeWindow {
+  const normalizedScope = normalizeReconciliationScope(scope);
+  if (evaluated.mode === 'HISTORICAL' && !hasExplicitReconciliationScope(normalizedScope)) {
+    throw createBiometricSafetyError(
+      'Historical biometric punch reconciliation requires an explicit target scope (terminalId, employeeId, userEnrollmentId, or punchId). Company-wide historical reconciliation is not permitted.',
+      400,
+      'BIOMETRIC_HISTORICAL_SCOPE_REQUIRED'
+    );
+  }
+
+  const serverMaxCap =
+    evaluated.mode === 'HISTORICAL'
+      ? MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE
+      : MAX_NORMAL_RECONCILIATION_BATCH_SIZE;
+  const boundedMaxUses = Math.min(serverMaxCap, Math.max(1, Math.floor(maxUses)));
+  const expiresAtMs = evaluated.issuedAtMs + TRUSTED_WINDOW_TTL_MS;
+
+  const windowObj: ResolvedReconciliationTimeWindow = Object.freeze({
+    companyId: evaluated.companyId,
+    mode: evaluated.mode,
+    companyTimezone: evaluated.companyTimezone,
+    currentDayStartUtc: new Date(evaluated.currentDayStartUtc.getTime()),
+    currentDayUpperBoundUtc: new Date(evaluated.currentDayUpperBoundUtc.getTime()),
+    effectiveFrom: new Date(evaluated.effectiveFrom.getTime()),
+    effectiveTo: new Date(evaluated.effectiveTo.getTime()),
+    requestedFrom: evaluated.requestedFrom ? new Date(evaluated.requestedFrom.getTime()) : undefined,
+    requestedTo: evaluated.requestedTo ? new Date(evaluated.requestedTo.getTime()) : undefined,
+    emptyWindow: evaluated.emptyWindow,
+    issuedAt: new Date(evaluated.issuedAtMs),
+    expiresAt: new Date(expiresAtMs),
+    scope: normalizedScope,
+    maxUses: boundedMaxUses,
+  });
+
+  if (!evaluated.emptyWindow) {
+    trustedWindowRegistry.set(windowObj, {
+      companyId: evaluated.companyId,
+      mode: evaluated.mode,
+      companyTimezone: evaluated.companyTimezone,
+      issuedAtMs: evaluated.issuedAtMs,
+      expiresAtMs,
+      issuedLocalDateStr: evaluated.issuedLocalDateStr,
+      currentDayStartUtcMs: evaluated.currentDayStartUtc.getTime(),
+      currentDayUpperBoundUtcMs: evaluated.currentDayUpperBoundUtc.getTime(),
+      effectiveFromMs: evaluated.effectiveFrom.getTime(),
+      effectiveToMs: evaluated.effectiveTo.getTime(),
+      scope: normalizedScope,
+      maxUses: boundedMaxUses,
+      usedCount: 0,
+    });
+  }
+
+  return windowObj;
+}
+
+function revokeTrustedWindow(windowObj: ResolvedReconciliationTimeWindow): void {
+  revokedTrustedWindows.add(windowObj);
+  trustedWindowRegistry.delete(windowObj);
+}
+
+function verifyTrustedReconciliationTimeWindow(
+  candidate: ResolvedReconciliationTimeWindow | undefined,
+  context: TrustedWindowPunchContext
+): VerifiedTrustedReconciliationWindow | null {
+  if (!candidate || typeof candidate !== 'object') {
+    return null;
+  }
+  if (revokedTrustedWindows.has(candidate)) {
+    return null;
+  }
+
+  const entry = trustedWindowRegistry.get(candidate);
+  if (!entry) {
+    return null;
+  }
+
+  if (!context.companyId || entry.companyId !== context.companyId) {
+    return null;
+  }
+
+  if (entry.mode === 'HISTORICAL' && !hasExplicitReconciliationScope(entry.scope)) {
+    return null;
+  }
+
+  const now = new Date();
+  const nowMs = now.getTime();
+  if (Number.isNaN(nowMs)) {
+    return null;
+  }
+
+  // Enforce TTL and guard against backward clock jumps
+  if (nowMs > entry.expiresAtMs || nowMs < entry.issuedAtMs - TRUSTED_WINDOW_BACKWARD_CLOCK_SKEW_MS) {
+    return null;
+  }
+
+  // Enforce local-midnight rollover invalidation for CURRENT_DAY windows
+  if (entry.mode === 'CURRENT_DAY') {
+    const currentLocalDateStr = formatCompanyLocalDateStr(entry.companyTimezone, now);
+    if (currentLocalDateStr !== entry.issuedLocalDateStr) {
+      return null;
+    }
+  }
+
+  // Enforce scope bindings (punchId, terminalId, userEnrollmentId, and matchedEmployeeId when already known)
+  if (entry.scope.punchId !== undefined && context.punchId !== entry.scope.punchId) {
+    return null;
+  }
+  if (entry.scope.terminalId !== undefined && context.terminalId !== entry.scope.terminalId) {
+    return null;
+  }
+  if (entry.scope.userEnrollmentId !== undefined) {
+    const normalizedPunchEnrollment =
+      typeof context.userEnrollmentId === 'string' ? context.userEnrollmentId.trim() : '';
+    if (normalizedPunchEnrollment !== entry.scope.userEnrollmentId) {
+      return null;
+    }
+  }
+  if (
+    entry.scope.employeeId !== undefined &&
+    context.matchedEmployeeId &&
+    context.matchedEmployeeId !== entry.scope.employeeId
+  ) {
+    return null;
+  }
+
+  // Enforce server-side per-window usage budget (fail-closed)
+  if (entry.usedCount >= entry.maxUses) {
+    return null;
+  }
+  entry.usedCount += 1;
+
+  return Object.freeze({
+    companyId: entry.companyId,
+    mode: entry.mode,
+    companyTimezone: entry.companyTimezone,
+    issuedAtMs: entry.issuedAtMs,
+    expiresAtMs: entry.expiresAtMs,
+    issuedLocalDateStr: entry.issuedLocalDateStr,
+    currentDayStartUtcMs: entry.currentDayStartUtcMs,
+    currentDayUpperBoundUtcMs: entry.currentDayUpperBoundUtcMs,
+    effectiveFromMs: entry.effectiveFromMs,
+    effectiveToMs: entry.effectiveToMs,
+    scope: entry.scope,
+    maxUses: entry.maxUses,
+  });
+}
 
 export interface PairablePunchEvent {
   id: string;
@@ -195,28 +380,11 @@ export interface LocalTimeParts {
 
 export class PunchReconciliationService {
   /**
-   * Resolves the canonical timezone for the company.
-   * Enforces policy: If Company.timezone is valid IANA, use it.
-   * If missing or invalid, explicitly documents and enforces UTC reference timezone.
+   * Resolves the canonical IANA timezone for the company.
+   * P0-B Fail-Closed Policy: NEVER falls back to UTC when timezone is missing, invalid, or cannot be loaded.
    */
   static async resolveCompanyTimezone(companyId: string, tx?: any): Promise<string> {
-    const client = tx || prisma;
-    const company = await client.company.findUnique({
-      where: { id: companyId },
-      select: { timezone: true },
-    });
-
-    const tzCandidate = company?.timezone?.trim();
-    if (tzCandidate) {
-      try {
-        Intl.DateTimeFormat(undefined, { timeZone: tzCandidate });
-        return tzCandidate;
-      } catch {
-        // Invalid timezone string: fallback to canonical UTC policy
-      }
-    }
-
-    return 'UTC';
+    return resolveStrictCompanyTimezone(companyId, tx || prisma);
   }
 
   /**
@@ -384,8 +552,17 @@ export class PunchReconciliationService {
   static async reconcilePunch(
     punchId: string,
     correlationId?: string,
-    options?: { keepUnmappedPending?: boolean; expectedCompanyId?: string; companyTimezone?: string }
+    options?: {
+      keepUnmappedPending?: boolean;
+      expectedCompanyId?: string;
+      companyTimezone?: string;
+      enforcedTimeWindow?: { effectiveFrom: Date; effectiveTo?: Date };
+      trustedTimeWindow?: ResolvedReconciliationTimeWindow;
+    }
   ): Promise<PunchReconciliationItemResult> {
+    // F4: Strictly validate enforcedTimeWindow fail-closed BEFORE any database transaction or mutation.
+    const parsedEnforcedWindow = parseStrictEnforcedTimeWindow(options?.enforcedTimeWindow);
+
     return prisma.$transaction(async (tx) => {
       // Acquire an exclusive PostgreSQL row-level lock on RawPunchLog BEFORE reading syncStatus
       // so concurrent transactions serialize on the same punch and re-read committed state.
@@ -456,6 +633,89 @@ export class PunchReconciliationService {
         };
       }
 
+      // P0-B Mandatory Independent Cutoff, Upper-Bound, Scope & Intersection Enforcement:
+      // 1. If the caller passed a trustedTimeWindow, verify it against the server-private registry
+      //    (tenant, non-revoked, within TTL, non-rolled-over local day, and batch scope). Any forged,
+      //    revoked, expired, rolled-over, cross-tenant, or out-of-scope trusted window is rejected
+      //    immediately without mutating RawPunchLog or Attendance.
+      // 2. Otherwise (direct call without trustedTimeWindow), resolve the authoritative Company
+      //    timezone fail-closed inside this transaction and independently enforce BOTH the
+      //    current-company-day lower cutoff and current-day upper bound (now + skew, <= local day end).
+      // 3. If enforcedTimeWindow was supplied, ALWAYS intersect it with the active bounds so it can
+      //    only tighten (never broaden) either lower or upper bound.
+      let verifiedTrustedWindow: ReturnType<typeof verifyTrustedReconciliationTimeWindow> = null;
+      let resolvedCompanyTimezone: string;
+      let effectiveMinMs: number;
+      let effectiveMaxMs: number;
+
+      if (options?.trustedTimeWindow !== undefined) {
+        verifiedTrustedWindow = verifyTrustedReconciliationTimeWindow(options.trustedTimeWindow, {
+          companyId: punch.companyId,
+          punchId: punch.id,
+          terminalId: punch.terminalId,
+          userEnrollmentId: punch.userEnrollmentId,
+          matchedEmployeeId: punch.matchedEmployeeId,
+        });
+
+        if (!verifiedTrustedWindow) {
+          return {
+            punchId: punch.id,
+            userEnrollmentId: punch.userEnrollmentId,
+            matchedEmployeeId: punch.matchedEmployeeId,
+            workDate: null,
+            status: punch.syncStatus,
+            message:
+              'Punch falls outside the authorized reconciliation time window and was left untouched.',
+          };
+        }
+
+        resolvedCompanyTimezone = verifiedTrustedWindow.companyTimezone;
+        effectiveMinMs = verifiedTrustedWindow.effectiveFromMs;
+        effectiveMaxMs = verifiedTrustedWindow.effectiveToMs;
+
+        if (verifiedTrustedWindow.mode === 'CURRENT_DAY') {
+          const liveUpperBoundMs = computeCurrentDayUpperBoundUtc(resolvedCompanyTimezone).getTime();
+          if (liveUpperBoundMs < effectiveMaxMs) {
+            effectiveMaxMs = liveUpperBoundMs;
+          }
+        }
+      } else {
+        resolvedCompanyTimezone = await this.resolveCompanyTimezone(punch.companyId, tx);
+        const now = new Date();
+        effectiveMinMs = computeCurrentLocalDayStartUtc(resolvedCompanyTimezone, now).getTime();
+        effectiveMaxMs = computeCurrentDayUpperBoundUtc(resolvedCompanyTimezone, now).getTime();
+      }
+
+      if (parsedEnforcedWindow) {
+        if (parsedEnforcedWindow.effectiveFromMs > effectiveMinMs) {
+          effectiveMinMs = parsedEnforcedWindow.effectiveFromMs;
+        }
+        if (
+          parsedEnforcedWindow.effectiveToMs !== undefined &&
+          parsedEnforcedWindow.effectiveToMs < effectiveMaxMs
+        ) {
+          effectiveMaxMs = parsedEnforcedWindow.effectiveToMs;
+        }
+      }
+
+      const punchMs = new Date(punch.punchTime).getTime();
+      if (
+        Number.isNaN(punchMs) ||
+        effectiveMinMs > effectiveMaxMs ||
+        punchMs < effectiveMinMs ||
+        punchMs > effectiveMaxMs
+      ) {
+        return {
+          punchId: punch.id,
+          userEnrollmentId: punch.userEnrollmentId,
+          matchedEmployeeId: punch.matchedEmployeeId,
+          workDate: null,
+          status: punch.syncStatus,
+          message:
+            'Punch falls outside the authorized reconciliation time window and was left untouched.',
+        };
+      }
+
       // A. Employee Mapping Resolution (Terminal-scoped mapping -> legacy fallback)
       let employee = punch.matchedEmployee;
       if (!employee) {
@@ -468,6 +728,18 @@ export class PunchReconciliationService {
         const foundEmployee = resolution.employee;
 
         if (!foundEmployee) {
+          if (verifiedTrustedWindow?.scope.employeeId) {
+            return {
+              punchId: punch.id,
+              userEnrollmentId: punch.userEnrollmentId,
+              matchedEmployeeId: punch.matchedEmployeeId,
+              workDate: null,
+              status: punch.syncStatus,
+              message:
+                'Punch falls outside the authorized reconciliation scope and was left untouched.',
+            };
+          }
+
           if (options?.keepUnmappedPending) {
             const pendingReason = `Pending enrollment mapping: No employee mapped for enrollment ID '${punch.userEnrollmentId}' on this terminal.`;
             await tx.rawPunchLog.update({
@@ -524,6 +796,22 @@ export class PunchReconciliationService {
           };
         }
 
+        // F3: Enforce employee scope BEFORE mutating matchedEmployeeId on RawPunchLog
+        if (
+          verifiedTrustedWindow?.scope.employeeId &&
+          foundEmployee.id !== verifiedTrustedWindow.scope.employeeId
+        ) {
+          return {
+            punchId: punch.id,
+            userEnrollmentId: punch.userEnrollmentId,
+            matchedEmployeeId: punch.matchedEmployeeId,
+            workDate: null,
+            status: punch.syncStatus,
+            message:
+              'Punch falls outside the authorized reconciliation scope and was left untouched.',
+          };
+        }
+
         // Link matched employee for audit traceability
         await tx.rawPunchLog.update({
           where: { id: punch.id },
@@ -545,6 +833,19 @@ export class PunchReconciliationService {
           workDate: null,
           status: 'ERROR',
           message: reason,
+        };
+      } else if (
+        verifiedTrustedWindow?.scope.employeeId &&
+        employee.id !== verifiedTrustedWindow.scope.employeeId
+      ) {
+        return {
+          punchId: punch.id,
+          userEnrollmentId: punch.userEnrollmentId,
+          matchedEmployeeId: punch.matchedEmployeeId,
+          workDate: null,
+          status: punch.syncStatus,
+          message:
+            'Punch falls outside the authorized reconciliation scope and was left untouched.',
         };
       }
 
@@ -571,9 +872,7 @@ export class PunchReconciliationService {
       }
 
       // B. Resolve Timezone, Work Date, and Effective-Dated Work Policy
-      const timeZone =
-        options?.companyTimezone ||
-        (await this.resolveCompanyTimezone(punch.companyId, tx));
+      const timeZone = resolvedCompanyTimezone;
       let shift: ShiftDurationShape | null = employee.shift || null;
       let policyRevisions = await WorkPolicyService.listRevisionsForEmployee(
         punch.companyId,
@@ -1308,7 +1607,7 @@ export class PunchReconciliationService {
   static async reconcilePendingPunches(
     companyId: string,
     options?: PunchReconciliationOptions,
-    actorUserId?: string,
+    actorOrUserId?: ReconciliationActorInput,
     correlationId?: string
   ): Promise<PunchReconciliationResponse> {
     if (options?.punchId !== undefined && (typeof options.punchId !== 'string' || !options.punchId.trim())) {
@@ -1340,51 +1639,76 @@ export class PunchReconciliationService {
     const targetTerminalId = options?.terminalId?.trim();
     const targetEnrollmentId = options?.userEnrollmentId?.trim();
 
-    const batchLimit = targetPunchId
-      ? 1
-      : Math.min(500, Math.max(1, options?.batchSize || 100));
     const keepUnmappedPending = options?.keepUnmappedPending !== false;
 
-    const where: {
-      id?: string;
-      companyId: string;
-      syncStatus: PunchSyncStatus | { in: PunchSyncStatus[] };
-      terminalId?: string;
-      userEnrollmentId?: string;
-      punchTime?: { gte?: Date };
-      OR?: Array<Record<string, unknown>>;
-    } = {
-      companyId,
-      syncStatus: options?.retryErrors
-        ? { in: ['PENDING', 'ERROR'] }
-        : 'PENDING',
-    };
+    // P0-B Mandatory Safety Gate (F1, F2, F3, F5, SEC-1, SEC-2):
+    // 1. Evaluates request WITHOUT minting a trusted window:
+    //    - Verifies non-forgeable SUPER_ADMIN provenance + live DB user status + explicit non-empty
+    //      scope + bounded <= 90-day range for historical mode BEFORE any target/punch lookup.
+    //    - Resolves company timezone fail-closed using real Prisma client and server clock.
+    //    - Enforces mandatory current-company-day lower cutoff AND upper bound across ALL paths.
+    const evaluated = await evaluateReconciliationWindow(companyId, options, actorOrUserId);
 
-    if (targetPunchId) {
-      where.id = targetPunchId;
+    const actorContext = evaluated.actor;
+    const actorUserId = actorContext.userId;
+    const effectiveCutoffIso = evaluated.effectiveFrom.toISOString();
+    const effectiveToIso = evaluated.effectiveTo.toISOString();
+    const isHistoricalMode = evaluated.mode === 'HISTORICAL';
+
+    // 2. Enforce server-side maximum batch cap (historical operations capped independently of caller batchSize)
+    const maxBatchLimit = isHistoricalMode
+      ? MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE
+      : MAX_NORMAL_RECONCILIATION_BATCH_SIZE;
+    const defaultBatchLimit = isHistoricalMode ? MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE : 100;
+    const batchLimit = targetPunchId
+      ? 1
+      : Math.min(maxBatchLimit, Math.max(1, options?.batchSize || defaultBatchLimit));
+
+    if (evaluated.emptyWindow) {
+      return {
+        success: true,
+        totalEvaluated: 0,
+        processed: 0,
+        pending: 0,
+        ignored: 0,
+        errors: 0,
+        effectiveCutoffIso,
+        effectiveToIso,
+        companyTimezone: evaluated.companyTimezone,
+        historicalMode: false,
+        results: [],
+      };
     }
-    if (targetTerminalId) {
-      where.terminalId = targetTerminalId;
-    }
-    if (targetEnrollmentId) {
-      where.userEnrollmentId = targetEnrollmentId;
-    }
-    let resolvedCompanyTimezone: string | undefined;
-    if (options?.fromPunchTime !== undefined && options?.fromPunchTime !== null) {
-      const fromDate =
-        options.fromPunchTime instanceof Date
-          ? options.fromPunchTime
-          : new Date(options.fromPunchTime);
-      if (isNaN(fromDate.getTime())) {
-        const err = new Error('Invalid fromPunchTime filter format.');
-        (err as { statusCode?: number }).statusCode = 400;
-        throw err;
+
+    // 3. Validate explicit target entities (terminal, employee, punch, enrollment) strictly BEFORE
+    //    writing any BIOMETRIC_HISTORICAL_RECONCILE audit record or minting a trusted window.
+    if (isHistoricalMode && targetTerminalId) {
+      if (typeof prisma.biometricTerminal?.findFirst !== 'function') {
+        throw createBiometricSafetyError(
+          'Terminal validation store is unavailable for historical reconciliation (fail-closed).',
+          503,
+          'BIOMETRIC_TARGET_VALIDATION_UNAVAILABLE'
+        );
       }
-      where.punchTime = { gte: fromDate };
-    } else if (!targetPunchId && !targetEmployeeId && !targetEnrollmentId) {
-      resolvedCompanyTimezone = await WorkPolicyService.resolveCompanyTimezone(companyId, prisma);
-      where.punchTime = { gte: getStartOfLocalDayUtc(resolvedCompanyTimezone) };
+      const targetTerminal = await prisma.biometricTerminal.findFirst({
+        where: { id: targetTerminalId, companyId },
+        select: { id: true, companyId: true },
+      });
+      if (!targetTerminal || (targetTerminal.companyId && targetTerminal.companyId !== companyId)) {
+        throw createBiometricSafetyError(
+          'Biometric terminal not found for this company.',
+          404,
+          'TERMINAL_NOT_FOUND'
+        );
+      }
     }
+
+    let employeeOrConditions: Array<Record<string, unknown>> | undefined;
+    let validatedEmployee: {
+      id: string;
+      companyId: string;
+      biometricDeviceId: string | null;
+    } | null = null;
 
     if (targetEmployeeId) {
       const targetEmployee =
@@ -1395,23 +1719,45 @@ export class PunchReconciliationService {
             })
           : null;
 
-      if (!targetEmployee) {
-        const err = new Error('Selected employee record not found in this company.');
-        (err as { statusCode?: number }).statusCode = 404;
-        throw err;
+      if (!targetEmployee || (targetEmployee.companyId && targetEmployee.companyId !== companyId)) {
+        throw createBiometricSafetyError(
+          'Selected employee record not found in this company.',
+          404,
+          'BIOMETRIC_TARGET_NOT_FOUND'
+        );
       }
 
+      validatedEmployee = targetEmployee;
       const activeMappings = await BiometricMappingService.listMappingsForEmployee(
         companyId,
         targetEmployee.id
       );
 
-      const employeeOrConditions: Array<Record<string, unknown>> = [
+      if (isHistoricalMode && targetEnrollmentId) {
+        const matchesActiveMapping = activeMappings.some(
+          (m) =>
+            m.enrollmentId === targetEnrollmentId &&
+            (!targetTerminalId || m.terminalId === targetTerminalId)
+        );
+        const matchesLegacyEnrollment =
+          activeMappings.length === 0 &&
+          targetEmployee.biometricDeviceId?.trim() === targetEnrollmentId;
+
+        if (!matchesActiveMapping && !matchesLegacyEnrollment) {
+          throw createBiometricSafetyError(
+            'Requested userEnrollmentId does not belong to the selected employee in this company.',
+            400,
+            'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+          );
+        }
+      }
+
+      const conditions: Array<Record<string, unknown>> = [
         { matchedEmployeeId: targetEmployee.id },
       ];
 
       for (const mapping of activeMappings) {
-        employeeOrConditions.push({
+        conditions.push({
           terminalId: mapping.terminalId,
           userEnrollmentId: mapping.enrollmentId,
           OR: [{ matchedEmployeeId: null }, { matchedEmployeeId: targetEmployee.id }],
@@ -1419,128 +1765,322 @@ export class PunchReconciliationService {
       }
 
       if (activeMappings.length === 0 && targetEmployee.biometricDeviceId?.trim()) {
-        employeeOrConditions.push({
+        conditions.push({
           userEnrollmentId: targetEmployee.biometricDeviceId.trim(),
           OR: [{ matchedEmployeeId: null }, { matchedEmployeeId: targetEmployee.id }],
         });
       }
 
-      where.OR = employeeOrConditions;
+      employeeOrConditions = conditions;
     }
 
-    const pendingPunches = await prisma.rawPunchLog.findMany({
-      where,
-      take: batchLimit,
-      orderBy: [{ punchTime: 'asc' }],
-      select: { id: true },
-    });
+    if (isHistoricalMode && targetPunchId) {
+      const targetPunch =
+        typeof prisma.rawPunchLog?.findUnique === 'function'
+          ? await prisma.rawPunchLog.findUnique({
+              where: { id: targetPunchId },
+              select: {
+                id: true,
+                companyId: true,
+                terminalId: true,
+                userEnrollmentId: true,
+                matchedEmployeeId: true,
+              },
+            })
+          : null;
 
-    const results: PunchReconciliationItemResult[] = [];
-    let processedCount = 0;
-    let pendingCount = 0;
-    let ignoredCount = 0;
-    let errorCount = 0;
+      if (!targetPunch || targetPunch.companyId !== companyId) {
+        throw createBiometricSafetyError(
+          'Target biometric punch record not found in this company.',
+          404,
+          'BIOMETRIC_TARGET_NOT_FOUND'
+        );
+      }
 
-    for (const punch of pendingPunches) {
-      try {
-        const itemResult = await this.reconcilePunch(punch.id, correlationId, {
-          keepUnmappedPending,
-          expectedCompanyId: companyId,
-          companyTimezone: resolvedCompanyTimezone,
-        });
-        results.push(itemResult);
-
-        if (itemResult.status === 'PROCESSED') processedCount++;
-        else if (itemResult.status === 'PENDING') pendingCount++;
-        else if (itemResult.status === 'IGNORED') ignoredCount++;
-        else errorCount++;
-      } catch (err: unknown) {
-        errorCount++;
-        const errorMessage = (err as Error).message || 'Reconciliation failed';
-        const hasMockedUpdate =
-          typeof (prisma.rawPunchLog.update as { mock?: unknown })?.mock === 'object';
-        const hasMockedUpdateMany =
-          typeof (prisma.rawPunchLog.updateMany as { mock?: unknown })?.mock === 'object';
-
-        if (
-          typeof prisma.rawPunchLog.updateMany === 'function' &&
-          (!hasMockedUpdate || hasMockedUpdateMany)
-        ) {
-          await prisma.rawPunchLog.updateMany({
-            where: {
-              id: punch.id,
-              syncStatus: { notIn: ['PROCESSED', 'IGNORED'] },
-            },
-            data: {
-              syncStatus: 'ERROR',
-              errorMessage,
-            },
-          });
-        } else {
-          await prisma.rawPunchLog.update({
-            where: { id: punch.id },
-            data: {
-              syncStatus: 'ERROR',
-              errorMessage,
-            },
-          });
-        }
-        results.push({
-          punchId: punch.id,
-          userEnrollmentId: '',
-          matchedEmployeeId: null,
-          workDate: null,
-          status: 'ERROR',
-          message: errorMessage,
-        });
+      if (targetTerminalId && targetPunch.terminalId !== targetTerminalId) {
+        throw createBiometricSafetyError(
+          'Target punchId does not belong to the requested terminalId.',
+          400,
+          'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+        );
+      }
+      if (targetEnrollmentId && targetPunch.userEnrollmentId.trim() !== targetEnrollmentId) {
+        throw createBiometricSafetyError(
+          'Target punchId does not match the requested userEnrollmentId.',
+          400,
+          'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+        );
+      }
+      if (
+        validatedEmployee &&
+        targetPunch.matchedEmployeeId &&
+        targetPunch.matchedEmployeeId !== validatedEmployee.id
+      ) {
+        throw createBiometricSafetyError(
+          'Target punchId does not belong to the selected employee.',
+          400,
+          'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+        );
       }
     }
 
-    if (actorUserId) {
+    if (isHistoricalMode && targetEnrollmentId) {
+      if (targetEnrollmentId.length > 128 || /[\r\n\0]/.test(targetEnrollmentId)) {
+        throw createBiometricSafetyError(
+          "Invalid targeted reconciliation filter 'userEnrollmentId'.",
+          400,
+          'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+        );
+      }
+
+      // When userEnrollmentId is not already validated via employeeId or punchId, verify that the
+      // enrollment target resolves to an employee or existing punch within the tenant.
+      if (!validatedEmployee && !targetPunchId) {
+        let enrollmentExistsInTenant = false;
+
+        if (targetTerminalId) {
+          const resolution = await BiometricMappingService.resolveEmployeeForPunch(
+            companyId,
+            targetTerminalId,
+            targetEnrollmentId
+          );
+          if (resolution.employee && resolution.employee.companyId === companyId) {
+            enrollmentExistsInTenant = true;
+          }
+        }
+
+        if (!enrollmentExistsInTenant && typeof prisma.rawPunchLog?.findMany === 'function') {
+          const matchingPunches = await prisma.rawPunchLog.findMany({
+            where: {
+              companyId,
+              ...(targetTerminalId ? { terminalId: targetTerminalId } : {}),
+              userEnrollmentId: targetEnrollmentId,
+            },
+            take: 1,
+            select: { id: true },
+          });
+          enrollmentExistsInTenant = matchingPunches.length > 0;
+        }
+
+        if (!enrollmentExistsInTenant) {
+          throw createBiometricSafetyError(
+            'Requested biometric userEnrollmentId target was not found in this company.',
+            404,
+            'BIOMETRIC_TARGET_NOT_FOUND'
+          );
+        }
+      }
+    }
+
+    const validatedScope = normalizeReconciliationScope({
+      punchId: targetPunchId,
+      terminalId: targetTerminalId,
+      userEnrollmentId: targetEnrollmentId,
+      employeeId: targetEmployeeId,
+    });
+
+    // 4. Mandatory historical audit log AFTER live SUPER_ADMIN auth and target validation,
+    //    and strictly BEFORE trusted-window minting or any punch query/mutation.
+    if (isHistoricalMode) {
       await AuditService.log({
         companyId,
-        userId: actorUserId,
-        action: 'BIOMETRIC_PUNCH_RECONCILE',
+        userId: actorUserId!,
+        action: 'BIOMETRIC_HISTORICAL_RECONCILE',
         entity: 'RawPunchLog',
-        entityId: targetPunchId || companyId,
+        entityId:
+          targetPunchId || targetTerminalId || targetEmployeeId || targetEnrollmentId || companyId,
         correlationId,
         details: {
-          punchId: targetPunchId || null,
-          employeeId: targetEmployeeId || null,
-          terminalId: targetTerminalId || null,
-          userEnrollmentId: targetEnrollmentId || null,
-          totalEvaluated: pendingPunches.length,
-          processed: processedCount,
-          pending: pendingCount,
-          ignored: ignoredCount,
-          errors: errorCount,
+          companyId,
+          actorUserId: actorUserId!,
+          actorRole: actorContext.role,
+          authorizedAt: new Date().toISOString(),
+          companyTimezone: evaluated.companyTimezone,
+          currentDayCutoffUtc: evaluated.currentDayStartUtc.toISOString(),
+          requestedFromPunchTime: evaluated.requestedFrom?.toISOString() || null,
+          requestedToPunchTime: evaluated.requestedTo?.toISOString() || null,
+          validatedScope: {
+            punchId: validatedScope.punchId || null,
+            employeeId: validatedScope.employeeId || null,
+            terminalId: validatedScope.terminalId || null,
+            userEnrollmentId: validatedScope.userEnrollmentId || null,
+          },
+          scope: {
+            punchId: targetPunchId || null,
+            employeeId: targetEmployeeId || null,
+            terminalId: targetTerminalId || null,
+            userEnrollmentId: targetEnrollmentId || null,
+            batchSize: batchLimit,
+            maxBatchLimit,
+            retryErrors: Boolean(options?.retryErrors),
+          },
         },
       });
     }
 
-    return {
-      success: true,
-      totalEvaluated: pendingPunches.length,
-      processed: processedCount,
-      pending: pendingCount,
-      ignored: ignoredCount,
-      errors: errorCount,
-      results,
-    };
+    // 5. Mint private, scope-bound, TTL-limited, usage-capped trusted window and guarantee
+    //    unconditional revocation in finally on normal completion, early return, or thrown error.
+    const timeWindow = mintScopedTrustedWindow(evaluated, validatedScope, batchLimit);
+
+    try {
+      const where: {
+        id?: string;
+        companyId: string;
+        syncStatus: PunchSyncStatus | { in: PunchSyncStatus[] };
+        terminalId?: string;
+        userEnrollmentId?: string;
+        punchTime: { gte: Date; lte: Date };
+        OR?: Array<Record<string, unknown>>;
+      } = {
+        companyId,
+        syncStatus: options?.retryErrors
+          ? { in: ['PENDING', 'ERROR'] }
+          : 'PENDING',
+        punchTime: {
+          gte: timeWindow.effectiveFrom,
+          lte: timeWindow.effectiveTo,
+        },
+      };
+
+      if (targetPunchId) {
+        where.id = targetPunchId;
+      }
+      if (targetTerminalId) {
+        where.terminalId = targetTerminalId;
+      }
+      if (targetEnrollmentId) {
+        where.userEnrollmentId = targetEnrollmentId;
+      }
+      if (employeeOrConditions) {
+        where.OR = employeeOrConditions;
+      }
+
+      const fetchedPendingPunches = await prisma.rawPunchLog.findMany({
+        where,
+        take: batchLimit,
+        orderBy: [{ punchTime: 'asc' }],
+        select: { id: true },
+      });
+      const pendingPunches = fetchedPendingPunches.slice(0, batchLimit);
+
+      const results: PunchReconciliationItemResult[] = [];
+      let processedCount = 0;
+      let pendingCount = 0;
+      let ignoredCount = 0;
+      let errorCount = 0;
+
+      for (const punch of pendingPunches) {
+        try {
+          const itemResult = await this.reconcilePunch(punch.id, correlationId, {
+            keepUnmappedPending,
+            expectedCompanyId: companyId,
+            companyTimezone: timeWindow.companyTimezone,
+            trustedTimeWindow: timeWindow,
+          });
+          results.push(itemResult);
+
+          if (itemResult.status === 'PROCESSED') processedCount++;
+          else if (itemResult.status === 'PENDING') pendingCount++;
+          else if (itemResult.status === 'IGNORED') ignoredCount++;
+          else errorCount++;
+        } catch (err: unknown) {
+          errorCount++;
+          const errorMessage = (err as Error).message || 'Reconciliation failed';
+          const hasMockedUpdate =
+            typeof (prisma.rawPunchLog.update as { mock?: unknown })?.mock === 'object';
+          const hasMockedUpdateMany =
+            typeof (prisma.rawPunchLog.updateMany as { mock?: unknown })?.mock === 'object';
+
+          if (
+            typeof prisma.rawPunchLog.updateMany === 'function' &&
+            (!hasMockedUpdate || hasMockedUpdateMany)
+          ) {
+            await prisma.rawPunchLog.updateMany({
+              where: {
+                id: punch.id,
+                syncStatus: { notIn: ['PROCESSED', 'IGNORED'] },
+              },
+              data: {
+                syncStatus: 'ERROR',
+                errorMessage,
+              },
+            });
+          } else {
+            await prisma.rawPunchLog.update({
+              where: { id: punch.id },
+              data: {
+                syncStatus: 'ERROR',
+                errorMessage,
+              },
+            });
+          }
+          results.push({
+            punchId: punch.id,
+            userEnrollmentId: '',
+            matchedEmployeeId: null,
+            workDate: null,
+            status: 'ERROR',
+            message: errorMessage,
+          });
+        }
+      }
+
+      if (actorUserId) {
+        await AuditService.log({
+          companyId,
+          userId: actorUserId,
+          action: 'BIOMETRIC_PUNCH_RECONCILE',
+          entity: 'RawPunchLog',
+          entityId: targetPunchId || companyId,
+          correlationId,
+          details: {
+            punchId: targetPunchId || null,
+            employeeId: targetEmployeeId || null,
+            terminalId: targetTerminalId || null,
+            userEnrollmentId: targetEnrollmentId || null,
+            historicalMode: isHistoricalMode,
+            companyTimezone: timeWindow.companyTimezone,
+            effectiveCutoffIso,
+            effectiveToIso,
+            totalEvaluated: pendingPunches.length,
+            processed: processedCount,
+            pending: pendingCount,
+            ignored: ignoredCount,
+            errors: errorCount,
+          },
+        });
+      }
+
+      return {
+        success: true,
+        totalEvaluated: pendingPunches.length,
+        processed: processedCount,
+        pending: pendingCount,
+        ignored: ignoredCount,
+        errors: errorCount,
+        effectiveCutoffIso,
+        effectiveToIso,
+        companyTimezone: timeWindow.companyTimezone,
+        historicalMode: isHistoricalMode,
+        results,
+      };
+    } finally {
+      revokeTrustedWindow(timeWindow);
+    }
   }
 
   /**
    * Reconciles eligible current-day pending (and previously unmapped error) punches strictly for an exact
    * (terminalId, userEnrollmentId) mapping without touching other unmapped enrollment IDs or historical punches.
-   * Defaults to the start of the current company-local calendar day (UTC) unless an explicit fromPunchTime is supplied.
+   * Always enforces the fail-closed company timezone and mandatory current-day cutoff unless authorized historical mode is supplied.
    */
   static async reconcileForEmployeeMapping(
     companyId: string,
     terminalId: string,
     userEnrollmentId: string,
-    actorUserId?: string,
+    actorOrUserId?: ReconciliationActorInput,
     correlationId?: string,
-    options?: { fromPunchTime?: Date | string }
+    options?: { fromPunchTime?: Date | string; toPunchTime?: Date | string; allowHistorical?: boolean }
   ): Promise<PunchReconciliationResponse> {
     const trimmedEnrollmentId = userEnrollmentId.trim();
     if (!terminalId || !trimmedEnrollmentId) {
@@ -1555,14 +2095,6 @@ export class PunchReconciliationService {
       };
     }
 
-    let effectiveFromPunchTime: Date | string;
-    if (options?.fromPunchTime !== undefined && options?.fromPunchTime !== null) {
-      effectiveFromPunchTime = options.fromPunchTime;
-    } else {
-      const companyTimezone = await WorkPolicyService.resolveCompanyTimezone(companyId, prisma);
-      effectiveFromPunchTime = getStartOfLocalDayUtc(companyTimezone);
-    }
-
     return this.reconcilePendingPunches(
       companyId,
       {
@@ -1571,9 +2103,11 @@ export class PunchReconciliationService {
         batchSize: 500,
         retryErrors: true,
         keepUnmappedPending: true,
-        fromPunchTime: effectiveFromPunchTime,
+        fromPunchTime: options?.fromPunchTime,
+        toPunchTime: options?.toPunchTime,
+        allowHistorical: options?.allowHistorical,
       },
-      actorUserId,
+      actorOrUserId,
       correlationId
     );
   }

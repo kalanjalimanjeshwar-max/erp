@@ -744,6 +744,8 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       const telemetryAfterTest = JSON.parse(store.get('comp-1::BIOMETRIC_BRIDGE_TELEMETRY_V1') || '{}');
       expect(telemetryAfterTest['term-x2008-1']?.lastTestConnectionStatus).toBe('UNREACHABLE');
 
+      vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'Asia/Kolkata' } as any);
+
       const reconcileSpy = vi
         .spyOn(PunchReconciliationService, 'reconcilePendingPunches')
         .mockResolvedValueOnce({
@@ -767,7 +769,7 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
       expect(reconcileSpy).toHaveBeenCalledWith(
         'comp-1',
         expect.objectContaining({ terminalId: 'term-x2008-1' }),
-        'u-admin',
+        expect.objectContaining({ userId: 'u-admin', role: 'ADMIN' }),
         expect.any(String)
       );
 
@@ -1269,86 +1271,100 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
     it('should ingest unmapped employee punch and mark ERROR during reconciliation without corrupting attendance', async () => {
       const { store, findUniqueSpy } = createInMemoryCompanySettingStore();
 
-      vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]);
-      vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]);
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-11-15T06:00:00.000Z'));
+        vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'Asia/Kolkata' } as any);
+        vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]);
+        vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]);
 
-      const createManySpy = vi.fn().mockResolvedValue({ count: 1 });
-      const terminalUpdateSpy = vi.fn().mockResolvedValue({});
-      vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) =>
-        cb({
-          rawPunchLog: { createMany: createManySpy },
-          biometricTerminal: { update: terminalUpdateSpy },
-        })
-      );
+        const createManySpy = vi.fn().mockResolvedValue({ count: 1 });
+        const terminalUpdateSpy = vi.fn().mockResolvedValue({});
+        vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) =>
+          cb({
+            rawPunchLog: { createMany: createManySpy },
+            biometricTerminal: { update: terminalUpdateSpy },
+          })
+        );
 
-      const ingestRes = await BiometricService.ingestPunches(
-        {
-          id: 'term-1',
-          companyId: 'comp-1',
-          name: 'eSSL X2008',
-          deviceSerialNumber: 'NFZ8252800275',
-          registeredByUserId: 'u-1',
-        },
-        {
-          deviceSerialNumber: 'NFZ8252800275',
-          punches: [
-            {
-              devicePunchId: 'NFZ8252800275:UNMAPPED99:2026-11-15T09:00:00:CHECK_IN',
-              userEnrollmentId: 'UNMAPPED99',
-              punchTime: '2026-11-15T03:30:00.000Z',
-              verifyType: 'FINGERPRINT',
-              inOutMode: 'CHECK_IN',
+        const ingestRes = await BiometricService.ingestPunches(
+          {
+            id: 'term-1',
+            companyId: 'comp-1',
+            name: 'eSSL X2008',
+            deviceSerialNumber: 'NFZ8252800275',
+            registeredByUserId: 'u-1',
+          },
+          {
+            deviceSerialNumber: 'NFZ8252800275',
+            punches: [
+              {
+                devicePunchId: 'NFZ8252800275:UNMAPPED99:2026-11-15T09:00:00:CHECK_IN',
+                userEnrollmentId: 'UNMAPPED99',
+                punchTime: '2026-11-15T03:30:00.000Z',
+                verifyType: 'FINGERPRINT',
+                inOutMode: 'CHECK_IN',
+              },
+            ],
+          }
+        );
+
+        expect(ingestRes.inserted).toBe(1);
+        expect(ingestRes.unmappedEmployees).toBe(1);
+        expect(createManySpy).toHaveBeenCalledTimes(1);
+        expect(terminalUpdateSpy).toHaveBeenCalledTimes(1);
+
+        const savedTelemetry = JSON.parse(store.get('comp-1::BIOMETRIC_BRIDGE_TELEMETRY_V1') || '{}');
+        expect(savedTelemetry['term-1']?.lastProcessedPunchCount).toBe(1);
+      } finally {
+        vi.useRealTimers();
+      }
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-15T04:00:00.000Z'));
+      try {
+        const rawPunchUpdate = vi.fn().mockResolvedValue({});
+        const attendanceCreate = vi.fn();
+        vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) =>
+          cb({
+            company: { findUnique: vi.fn().mockResolvedValue({ timezone: 'Asia/Kolkata' }) },
+            companySetting: { findUnique: findUniqueSpy },
+            rawPunchLog: {
+              findUnique: vi.fn().mockResolvedValue({
+                id: 'raw-1',
+                companyId: 'comp-1',
+                terminalId: 'term-1',
+                userEnrollmentId: 'UNMAPPED99',
+                punchTime: new Date('2026-11-15T03:30:00.000Z'),
+                inOutMode: 'CHECK_IN',
+                syncStatus: 'PENDING',
+                matchedEmployee: null,
+                company: { id: 'comp-1', timezone: 'Asia/Kolkata' },
+                terminal: { id: 'term-1', name: 'eSSL X2008', location: 'Main' },
+              }),
+              update: rawPunchUpdate,
             },
-          ],
-        }
-      );
+            employee: {
+              findUnique: vi.fn().mockResolvedValue(null),
+              findFirst: vi.fn().mockResolvedValue(null),
+            },
+            attendance: { create: attendanceCreate },
+          })
+        );
 
-      expect(ingestRes.inserted).toBe(1);
-      expect(ingestRes.unmappedEmployees).toBe(1);
-      expect(createManySpy).toHaveBeenCalledTimes(1);
-      expect(terminalUpdateSpy).toHaveBeenCalledTimes(1);
-
-      const savedTelemetry = JSON.parse(store.get('comp-1::BIOMETRIC_BRIDGE_TELEMETRY_V1') || '{}');
-      expect(savedTelemetry['term-1']?.lastProcessedPunchCount).toBe(1);
-
-      const rawPunchUpdate = vi.fn().mockResolvedValue({});
-      const attendanceCreate = vi.fn();
-      vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) =>
-        cb({
-          companySetting: { findUnique: findUniqueSpy },
-          rawPunchLog: {
-            findUnique: vi.fn().mockResolvedValue({
-              id: 'raw-1',
-              companyId: 'comp-1',
-              terminalId: 'term-1',
-              userEnrollmentId: 'UNMAPPED99',
-              punchTime: new Date('2026-11-15T03:30:00.000Z'),
-              inOutMode: 'CHECK_IN',
-              syncStatus: 'PENDING',
-              matchedEmployee: null,
-              company: { id: 'comp-1', timezone: 'Asia/Kolkata' },
-              terminal: { id: 'term-1', name: 'eSSL X2008', location: 'Main' },
-            }),
-            update: rawPunchUpdate,
-          },
-          employee: {
-            findUnique: vi.fn().mockResolvedValue(null),
-            findFirst: vi.fn().mockResolvedValue(null),
-          },
-          attendance: { create: attendanceCreate },
-        })
-      );
-
-      const recRes = await PunchReconciliationService.reconcilePunch('raw-1');
-      expect(recRes.status).toBe('ERROR');
-      expect(recRes.message).toMatch(/Unmapped biometric enrollment ID/);
-      expect(rawPunchUpdate).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: 'raw-1' },
-          data: expect.objectContaining({ syncStatus: 'ERROR' }),
-        })
-      );
-      expect(attendanceCreate).not.toHaveBeenCalled();
+        const recRes = await PunchReconciliationService.reconcilePunch('raw-1');
+        expect(recRes.status).toBe('ERROR');
+        expect(recRes.message).toMatch(/Unmapped biometric enrollment ID/);
+        expect(rawPunchUpdate).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: 'raw-1' },
+            data: expect.objectContaining({ syncStatus: 'ERROR' }),
+          })
+        );
+        expect(attendanceCreate).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('keeps terminal & tenant isolation when reconciling unmapped punch alongside mappings on other terminals or companies', async () => {
@@ -1400,50 +1416,57 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
         ])
       );
 
-      const rawPunchUpdate = vi.fn().mockResolvedValue({});
-      const attendanceCreate = vi.fn();
-      const employeeFindUnique = vi.fn();
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-15T04:00:00.000Z'));
+      try {
+        const rawPunchUpdate = vi.fn().mockResolvedValue({});
+        const attendanceCreate = vi.fn();
+        const employeeFindUnique = vi.fn();
 
-      vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) =>
-        cb({
-          companySetting: { findUnique: findUniqueSpy },
-          rawPunchLog: {
-            findUnique: vi.fn().mockResolvedValue({
-              id: 'raw-isolated-1',
-              companyId: 'comp-1',
-              terminalId: 'term-1',
-              userEnrollmentId: 'UNMAPPED99',
-              punchTime: new Date('2026-11-15T03:30:00.000Z'),
-              inOutMode: 'CHECK_IN',
-              syncStatus: 'PENDING',
-              matchedEmployee: null,
-              company: { id: 'comp-1', timezone: 'Asia/Kolkata' },
-              terminal: { id: 'term-1', name: 'eSSL X2008', location: 'Main' },
+        vi.spyOn(prisma, '$transaction').mockImplementationOnce(async (cb: any) =>
+          cb({
+            company: { findUnique: vi.fn().mockResolvedValue({ timezone: 'Asia/Kolkata' }) },
+            companySetting: { findUnique: findUniqueSpy },
+            rawPunchLog: {
+              findUnique: vi.fn().mockResolvedValue({
+                id: 'raw-isolated-1',
+                companyId: 'comp-1',
+                terminalId: 'term-1',
+                userEnrollmentId: 'UNMAPPED99',
+                punchTime: new Date('2026-11-15T03:30:00.000Z'),
+                inOutMode: 'CHECK_IN',
+                syncStatus: 'PENDING',
+                matchedEmployee: null,
+                company: { id: 'comp-1', timezone: 'Asia/Kolkata' },
+                terminal: { id: 'term-1', name: 'eSSL X2008', location: 'Main' },
+              }),
+              update: rawPunchUpdate,
+            },
+            employee: {
+              findUnique: employeeFindUnique,
+              findFirst: vi.fn().mockResolvedValue(null),
+            },
+            attendance: { create: attendanceCreate },
+          })
+        );
+
+        const recRes = await PunchReconciliationService.reconcilePunch('raw-isolated-1');
+        expect(recRes.status).toBe('ERROR');
+        expect(recRes.matchedEmployeeId).toBeNull();
+        expect(employeeFindUnique).not.toHaveBeenCalled();
+        expect(attendanceCreate).not.toHaveBeenCalled();
+        expect(rawPunchUpdate).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: 'raw-isolated-1' },
+            data: expect.objectContaining({
+              syncStatus: 'ERROR',
+              errorMessage: expect.stringContaining('UNMAPPED99'),
             }),
-            update: rawPunchUpdate,
-          },
-          employee: {
-            findUnique: employeeFindUnique,
-            findFirst: vi.fn().mockResolvedValue(null),
-          },
-          attendance: { create: attendanceCreate },
-        })
-      );
-
-      const recRes = await PunchReconciliationService.reconcilePunch('raw-isolated-1');
-      expect(recRes.status).toBe('ERROR');
-      expect(recRes.matchedEmployeeId).toBeNull();
-      expect(employeeFindUnique).not.toHaveBeenCalled();
-      expect(attendanceCreate).not.toHaveBeenCalled();
-      expect(rawPunchUpdate).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: 'raw-isolated-1' },
-          data: expect.objectContaining({
-            syncStatus: 'ERROR',
-            errorMessage: expect.stringContaining('UNMAPPED99'),
-          }),
-        })
-      );
+          })
+        );
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

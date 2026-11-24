@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { prisma } from '../../src/server/db/client.js';
 import {
   PunchReconciliationService,
@@ -347,7 +347,13 @@ describe('Biometric Chronological IN/OUT Alternation & Reconciliation Regression
 
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-20T19:00:00.000Z'));
     setupMockStore('UTC');
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   describe('1. Repeated eSSL CHECK_IN alternation (IN -> OUT -> IN -> OUT)', () => {
@@ -530,6 +536,7 @@ describe('Biometric Chronological IN/OUT Alternation & Reconciliation Regression
         }
       );
 
+      vi.setSystemTime(new Date('2026-11-21T18:00:00.000Z'));
       const r1 = await PunchReconciliationService.reconcilePunch('p-in-1');
       expect(r1.status).toBe('PROCESSED');
 
@@ -612,6 +619,7 @@ describe('Biometric Chronological IN/OUT Alternation & Reconciliation Regression
         }
       );
 
+      vi.setSystemTime(new Date('2026-11-22T19:00:00.000Z'));
       for (const id of ['p-oof-3', 'p-oof-4', 'p-oof-1', 'p-oof-2']) {
         const res = await PunchReconciliationService.reconcilePunch(id);
         expect(res.status).toBe('PROCESSED');
@@ -726,6 +734,7 @@ describe('Biometric Chronological IN/OUT Alternation & Reconciliation Regression
         }
       }) as any);
 
+      vi.setSystemTime(new Date('2026-11-23T18:00:00.000Z'));
       const [res1, res2] = await Promise.all([
         PunchReconciliationService.reconcilePunch(p1Id, undefined, { expectedCompanyId: companyId }),
         PunchReconciliationService.reconcilePunch(p2Id, undefined, { expectedCompanyId: companyId }),
@@ -789,7 +798,9 @@ describe('Biometric Chronological IN/OUT Alternation & Reconciliation Regression
         }
       );
 
+      vi.setSystemTime(new Date('2026-11-20T18:20:00.000Z')); // 2026-11-20 23:50 IST
       const r1 = await PunchReconciliationService.reconcilePunch('p-ist-day1');
+      vi.setSystemTime(new Date('2026-11-20T18:50:00.000Z')); // 2026-11-21 00:20 IST
       const r2 = await PunchReconciliationService.reconcilePunch('p-ist-day2');
 
       expect(r1.workDate).toBe('2026-11-20');
@@ -854,7 +865,13 @@ describe('Biometric Chronological IN/OUT Alternation & Reconciliation Regression
         }
       );
 
-      for (const id of ['p-night-1', 'p-night-2', 'p-night-3', 'p-night-4']) {
+      vi.setSystemTime(new Date('2026-11-20T18:25:00.000Z')); // 2026-11-20 23:55 IST (same IST day as 22:00 IST start)
+      const firstNightRes = await PunchReconciliationService.reconcilePunch('p-night-1');
+      expect(firstNightRes.status).toBe('PROCESSED');
+      expect(firstNightRes.workDate).toBe('2026-11-20');
+
+      vi.setSystemTime(new Date('2026-11-21T01:00:00.000Z')); // 2026-11-21 06:30 IST (same IST day as post-midnight punches)
+      for (const id of ['p-night-2', 'p-night-3', 'p-night-4']) {
         const res = await PunchReconciliationService.reconcilePunch(id);
         expect(res.status).toBe('PROCESSED');
         expect(res.workDate).toBe('2026-11-20');
@@ -916,6 +933,7 @@ describe('Biometric Chronological IN/OUT Alternation & Reconciliation Regression
         matchedEmployeeId: employeeDayId,
       });
 
+      vi.setSystemTime(new Date('2026-11-15T12:00:00.000Z'));
       const lockedRes = await PunchReconciliationService.reconcilePunch('p-locked-day');
       expect(lockedRes.status).toBe('ERROR');
       expect(lockedRes.message).toContain('Protected payroll period');

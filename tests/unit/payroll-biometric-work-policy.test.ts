@@ -210,54 +210,61 @@ describe('Step 2 Stage 5: PayrollService & BiometricService Integration Tests', 
     expect(ps.notes).toContain('5h short, 2h extra informational only');
   });
 
-  it('BiometricService.triggerTerminalSync forwards optional fromPunchTime to PunchReconciliationService.reconcilePendingPunches', async () => {
-    vi.spyOn(prisma.biometricTerminal, 'findFirst').mockResolvedValue({
-      id: 'term-1',
-      companyId,
-      deviceSerialNumber: 'SN-100',
-      name: 'Gate 1',
-      terminalModel: 'eSSL',
-      ipAddress: '192.168.1.50',
-      port: 4370,
-      isActive: true,
-      status: 'ONLINE',
-      lastSyncAt: null,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-      registeredByUser: { fullName: adminActor.fullName },
-    } as any);
-    vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValue(null);
-    vi.spyOn(prisma.companySetting, 'upsert').mockResolvedValue({} as any);
-    vi.spyOn(BiometricService as any, 'upsertTerminalTelemetry').mockResolvedValue({});
+  it('BiometricService.triggerTerminalSync forwards optional fromPunchTime (clamped to current-day cutoff) to PunchReconciliationService.reconcilePendingPunches', async () => {
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-11-19T12:00:00.000Z'));
+      vi.spyOn(prisma.biometricTerminal, 'findFirst').mockResolvedValue({
+        id: 'term-1',
+        companyId,
+        deviceSerialNumber: 'SN-100',
+        name: 'Gate 1',
+        terminalModel: 'eSSL',
+        ipAddress: '192.168.1.50',
+        port: 4370,
+        isActive: true,
+        status: 'ONLINE',
+        lastSyncAt: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+        registeredByUser: { fullName: adminActor.fullName },
+      } as any);
+      vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
+      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValue(null);
+      vi.spyOn(prisma.companySetting, 'upsert').mockResolvedValue({} as any);
+      vi.spyOn(BiometricService as any, 'upsertTerminalTelemetry').mockResolvedValue({});
 
-    const reconcileSpy = vi
-      .spyOn(PunchReconciliationService, 'reconcilePendingPunches')
-      .mockResolvedValue({
-        success: true,
-        totalEvaluated: 0,
-        processed: 0,
-        pending: 0,
-        ignored: 0,
-        errors: 0,
-        results: [],
-      });
+      const reconcileSpy = vi
+        .spyOn(PunchReconciliationService, 'reconcilePendingPunches')
+        .mockResolvedValue({
+          success: true,
+          totalEvaluated: 0,
+          processed: 0,
+          pending: 0,
+          ignored: 0,
+          errors: 0,
+          results: [],
+        });
 
-    const cutoff = '2026-11-19T00:00:00.000Z';
-    await BiometricService.triggerTerminalSync(adminActor, 'term-1', {
-      batchSize: 50,
-      fromPunchTime: cutoff,
-    });
-
-    expect(reconcileSpy).toHaveBeenCalledWith(
-      companyId,
-      expect.objectContaining({
-        terminalId: 'term-1',
+      const cutoff = '2026-11-19T06:00:00.000Z';
+      await BiometricService.triggerTerminalSync(adminActor, 'term-1', {
         batchSize: 50,
         fromPunchTime: cutoff,
-      }),
-      adminActor.userId,
-      undefined
-    );
+      });
+
+      expect(reconcileSpy).toHaveBeenCalledWith(
+        companyId,
+        expect.objectContaining({
+          terminalId: 'term-1',
+          batchSize: 50,
+          fromPunchTime: new Date(cutoff),
+        }),
+        adminActor,
+        undefined
+      );
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('BiometricService.triggerTerminalSync(actor, terminalId) without fromPunchTime applies company-local start-of-day cutoff to protect historical PENDING punches', async () => {
@@ -308,7 +315,7 @@ describe('Step 2 Stage 5: PayrollService & BiometricService Integration Tests', 
           terminalId: 'term-1',
           fromPunchTime: new Date('2026-11-19T18:30:00.000Z'),
         }),
-        adminActor.userId,
+        adminActor,
         undefined
       );
     } finally {

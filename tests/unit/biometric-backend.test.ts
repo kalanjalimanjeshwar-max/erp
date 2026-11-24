@@ -331,6 +331,16 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
       return { txSpy, createMany, update };
     }
 
+    beforeEach(() => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-19T12:00:00.000Z'));
+      vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
+    });
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
     it('should ingest valid punches, map employees by biometricDeviceId, and record logs', async () => {
       vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]); // No duplicates
       vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([
@@ -852,58 +862,73 @@ describe('Phase 8.1: Biometric Hardware LAN Bridge Backend & Database Tests', ()
         return cb(mockTx);
       });
 
-      const result = await BiometricService.ingestPunches(mockTerminal, {
-        punches: [
-          {
-            userEnrollmentId: '2001',
-            punchTime: '2026-10-19T08:00:00.000Z',
-          },
-          {
-            userEnrollmentId: '2002',
-            punchTime: '2026-10-19T08:05:00.000Z',
-          },
-        ],
-      });
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-10-19T12:00:00.000Z'));
+        vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
 
-      expect(result.success).toBe(true);
-      expect(result.totalReceived).toBe(2);
-      expect(result.inserted).toBe(1);
-      expect(result.duplicates).toBe(1);
-      expect(createManyMock).toHaveBeenCalledTimes(1);
-      expect(createManyMock).toHaveBeenCalledWith(
-        expect.objectContaining({
-          skipDuplicates: true,
-        })
-      );
-      expect(createManyMock.mock.calls[0][0].data).toHaveLength(2);
-      expect(terminalUpdateMock).toHaveBeenCalledTimes(1);
-      expect(terminalUpdateMock).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: mockTerminal.id },
-          data: expect.objectContaining({
-            status: 'ONLINE',
-          }),
-        })
-      );
+        const result = await BiometricService.ingestPunches(mockTerminal, {
+          punches: [
+            {
+              userEnrollmentId: '2001',
+              punchTime: '2026-10-19T08:00:00.000Z',
+            },
+            {
+              userEnrollmentId: '2002',
+              punchTime: '2026-10-19T08:05:00.000Z',
+            },
+          ],
+        });
+
+        expect(result.success).toBe(true);
+        expect(result.totalReceived).toBe(2);
+        expect(result.inserted).toBe(1);
+        expect(result.duplicates).toBe(1);
+        expect(createManyMock).toHaveBeenCalledTimes(1);
+        expect(createManyMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            skipDuplicates: true,
+          })
+        );
+        expect(createManyMock.mock.calls[0][0].data).toHaveLength(2);
+        expect(terminalUpdateMock).toHaveBeenCalledTimes(1);
+        expect(terminalUpdateMock).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: mockTerminal.id },
+            data: expect.objectContaining({
+              status: 'ONLINE',
+            }),
+          })
+        );
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('should propagate database failures without masking as false success', async () => {
-      vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]);
-      vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]);
-      vi.spyOn(prisma, '$transaction').mockRejectedValueOnce(
-        new Error('Database connection failed')
-      );
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-10-19T12:00:00.000Z'));
+        vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
+        vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]);
+        vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([]);
+        vi.spyOn(prisma, '$transaction').mockRejectedValueOnce(
+          new Error('Database connection failed')
+        );
 
-      await expect(
-        BiometricService.ingestPunches(mockTerminal, {
-          punches: [
-            {
-              userEnrollmentId: '3001',
-              punchTime: '2026-10-19T08:00:00.000Z',
-            },
-          ],
-        })
-      ).rejects.toThrowError('Database connection failed');
+        await expect(
+          BiometricService.ingestPunches(mockTerminal, {
+            punches: [
+              {
+                userEnrollmentId: '3001',
+                punchTime: '2026-10-19T08:00:00.000Z',
+              },
+            ],
+          })
+        ).rejects.toThrowError('Database connection failed');
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('should accurately derive effective ONLINE/OFFLINE status based on 5-minute heartbeat freshness', () => {

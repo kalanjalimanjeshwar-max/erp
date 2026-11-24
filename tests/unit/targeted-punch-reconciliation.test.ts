@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../../src/server/app.js';
 import { prisma } from '../../src/server/db/client.js';
@@ -423,6 +423,18 @@ describe('Targeted Biometric Punch Reconciliation (Single-Punch, Enrollment ID &
       return all.filter((t) => !args?.where?.companyId || t.companyId === args.where.companyId) as any;
     }) as any);
 
+    vi.spyOn(prisma.biometricTerminal, 'findFirst').mockImplementation((async (args: any) => {
+      const all = [terminalAlpha, terminalBeta];
+      const w = args?.where || {};
+      return (
+        all.find((t) => {
+          if (w.id && t.id !== w.id) return false;
+          if (w.companyId && t.companyId !== w.companyId) return false;
+          return true;
+        }) || null
+      ) as any;
+    }) as any);
+
     vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
 
     vi.spyOn(prisma.employee, 'findFirst').mockImplementation((async (args: any) => {
@@ -543,8 +555,14 @@ describe('Targeted Biometric Punch Reconciliation (Single-Punch, Enrollment ID &
   }
 
   beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-20T18:30:00.000Z'));
     vi.clearAllMocks();
     setupStatefulStore();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('reconciling Enrollment ID 101 processes ONLY Enrollment ID 101 punches and leaves 103, 105 & other tenant punches PENDING', async () => {
@@ -774,19 +792,48 @@ describe('Targeted Biometric Punch Reconciliation (Single-Punch, Enrollment ID &
     expect(punchesStore.find((p) => p.id === 'punch-105-pending')?.syncStatus).toBe('IGNORED');
   });
 
-  it('protects historical PENDING punches when fromPunchTime is omitted and processes explicit fromPunchTime batch runs', async () => {
+  it('protects historical PENDING punches when fromPunchTime is omitted and processes SUPER_ADMIN authorized bounded historical runs', async () => {
+    // Advance clock to next day so 2026-10-20 punches are strictly historical
+    vi.setSystemTime(new Date('2026-10-21T12:00:00.000Z'));
+
     const protectedRes = await PunchReconciliationService.reconcilePendingPunches(
       companyAlphaId,
       { batchSize: 100 },
-      adminActor.userId
+      adminActor
     );
     expect(protectedRes.totalEvaluated).toBe(0);
     expect(punchesStore.every((p) => p.syncStatus === 'PENDING')).toBe(true);
 
+    vi.spyOn(prisma.user, 'findUnique').mockResolvedValue({
+      id: 'user-super-alpha',
+      companyId: companyAlphaId,
+      email: 'super@alpha.local',
+      fullName: 'Alpha Super Admin',
+      role: 'SUPER_ADMIN',
+      isActive: true,
+      lastLoginAt: null,
+      tokenVersion: 1,
+    } as any);
+    const superAdminToken = AuthService.generateSessionToken({
+      userId: 'user-super-alpha',
+      companyId: companyAlphaId,
+      email: 'super@alpha.local',
+      role: 'SUPER_ADMIN',
+      tokenVersion: 1,
+    });
+    const verifiedSuperPayload = AuthService.verifySessionToken(superAdminToken)!;
+    const superAdminActor = (await AuthService.validateSessionUser(verifiedSuperPayload))!;
+
     const result = await PunchReconciliationService.reconcilePendingPunches(
       companyAlphaId,
-      { batchSize: 100, fromPunchTime: '2026-10-20T00:00:00.000Z' },
-      adminActor.userId
+      {
+        batchSize: 100,
+        allowHistorical: true,
+        terminalId: terminalAlpha.id,
+        fromPunchTime: '2026-10-20T00:00:00.000Z',
+        toPunchTime: '2026-10-20T23:59:59.000Z',
+      },
+      superAdminActor
     );
 
     // Alpha has 4 pending punches (101x2, 103, 105); Beta punch stays isolated

@@ -1836,7 +1836,12 @@ export interface BatchPunchSubmissionResponse {
   totalReceived: number;
   inserted: number;
   duplicates: number;
+  rejectedHistorical?: number;
+  rejectedFuture?: number;
   unmappedEmployees: number;
+  effectiveCutoffIso?: string;
+  effectiveUpperBoundIso?: string;
+  companyTimezone?: string;
   terminalId: string;
   terminalName: string;
 }
@@ -2023,6 +2028,8 @@ export interface PunchReconciliationOptions {
   retryErrors?: boolean;
   keepUnmappedPending?: boolean;
   fromPunchTime?: string | Date;
+  toPunchTime?: string | Date;
+  allowHistorical?: boolean;
 }
 
 export interface PunchReconciliationItemResult {
@@ -2041,6 +2048,10 @@ export interface PunchReconciliationResponse {
   pending?: number;
   ignored: number;
   errors: number;
+  effectiveCutoffIso?: string;
+  effectiveToIso?: string;
+  companyTimezone?: string;
+  historicalMode?: boolean;
   results: PunchReconciliationItemResult[];
 }
 

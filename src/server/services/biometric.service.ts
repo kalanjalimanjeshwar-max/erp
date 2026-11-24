@@ -37,7 +37,14 @@ import { isValidLanHost, redactSensitiveText } from '../../shared/biometric.js';
 import { AuditService } from './audit.service.js';
 import { BiometricMappingService } from './biometric-mapping.service.js';
 import { PunchReconciliationService } from './punch-reconciliation.service.js';
-import { WorkPolicyService, getStartOfLocalDayUtc } from './work-policy.service.js';
+import {
+  computeCurrentDayUpperBoundUtc,
+  computeCurrentLocalDayStartUtc,
+  createBiometricSafetyError,
+  evaluateReconciliationWindow,
+  resolveStrictCompanyTimezone,
+  validateReconciliationRequestPreDb,
+} from './biometric-safety.js';
 
 const VALID_VERIFY_TYPES: BiometricVerifyType[] = ['FINGERPRINT', 'CARD', 'PASSWORD', 'FACE'];
 const VALID_IN_OUT_MODES: PunchInOutMode[] = ['CHECK_IN', 'CHECK_OUT', 'BREAK_OUT', 'BREAK_IN'];
@@ -1508,6 +1515,17 @@ export class BiometricService {
     options?: Omit<PunchReconciliationOptions, 'terminalId'>,
     correlationId?: string
   ): Promise<TriggerTerminalSyncResponse> {
+    // Perform role, allowHistorical, strict date parsing, bounded historical range, and explicit scope
+    // validation BEFORE terminal lookup, telemetry mutation, or any database access.
+    validateReconciliationRequestPreDb(
+      actor.companyId,
+      {
+        ...options,
+        terminalId,
+      },
+      actor
+    );
+
     const terminal = await prisma.biometricTerminal.findFirst({
       where: {
         id: terminalId,
@@ -1532,25 +1550,30 @@ export class BiometricService {
       throw err;
     }
 
+    // Fail-closed live historical actor re-verification, timezone resolution, current-day clamping,
+    // and clamped-window consistency check BEFORE mutating terminal telemetry or executing reconciliation.
+    // Does NOT mint a trusted window token (F2/F6).
+    const evaluatedWindow = await evaluateReconciliationWindow(
+      actor.companyId,
+      {
+        ...options,
+        terminalId: terminal.id,
+      },
+      actor
+    );
+
+    if (evaluatedWindow.emptyWindow) {
+      throw createBiometricSafetyError(
+        'Requested reconciliation time window is empty or reversed after enforcing the mandatory current-company-day bounds. No terminal telemetry or attendance state was modified.',
+        400,
+        'BIOMETRIC_EMPTY_RECONCILIATION_WINDOW'
+      );
+    }
+
     const syncRequestedAt = new Date().toISOString();
     const updatedTel = await this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
       syncRequestedAt,
     });
-
-    const hasTargetedFilter = Boolean(
-      options?.punchId?.trim() ||
-        options?.employeeId?.trim() ||
-        options?.userEnrollmentId?.trim()
-    );
-
-    let effectiveFromPunchTime = options?.fromPunchTime;
-    if (effectiveFromPunchTime === undefined && !hasTargetedFilter) {
-      const companyTimezone = await WorkPolicyService.resolveCompanyTimezone(
-        actor.companyId,
-        prisma
-      );
-      effectiveFromPunchTime = getStartOfLocalDayUtc(companyTimezone);
-    }
 
     const reconciliation = await PunchReconciliationService.reconcilePendingPunches(
       actor.companyId,
@@ -1562,9 +1585,11 @@ export class BiometricService {
         userEnrollmentId: options?.userEnrollmentId,
         employeeId: options?.employeeId,
         punchId: options?.punchId,
-        fromPunchTime: effectiveFromPunchTime,
+        fromPunchTime: evaluatedWindow.effectiveFrom,
+        toPunchTime: evaluatedWindow.effectiveTo,
+        allowHistorical: options?.allowHistorical,
       },
-      actor.userId || actor.id,
+      actor,
       correlationId
     );
 
@@ -1853,19 +1878,7 @@ export class BiometricService {
       throw err;
     }
 
-    if (punches.length === 0) {
-      return {
-        success: true,
-        totalReceived: 0,
-        inserted: 0,
-        duplicates: 0,
-        unmappedEmployees: 0,
-        terminalId: terminal.id,
-        terminalName: terminal.name,
-      };
-    }
-
-    // 1. Pre-validate all punch items in batch
+    // 1. Pre-validate all punch items in batch (schema/timestamp validation)
     const validatedPunches: Array<{
       input: RawPunchEventInput;
       punchTime: Date;
@@ -1926,60 +1939,105 @@ export class BiometricService {
       });
     }
 
-    // 2. Batch query existing idempotency keys to detect duplicates
-    const incomingKeys = validatedPunches.map((vp) => vp.idempotencyKey);
-    const existingLogs = await prisma.rawPunchLog.findMany({
-      where: {
-        companyId: terminal.companyId,
-        idempotencyKey: { in: incomingKeys },
-      },
-      select: { idempotencyKey: true },
-    });
-    const existingKeySet = new Set(existingLogs.map((l) => l.idempotencyKey));
+    // 2. P0-B Fail-Closed Company Timezone & Mandatory Current-Day Bounds (Lower Cutoff + Upper Bound)
+    // Resolves authoritative Company.timezone and NEVER falls back to UTC.
+    const companyTimezone = await resolveStrictCompanyTimezone(terminal.companyId, prisma);
+    const ingestionNow = new Date();
+    const ingestionCutoffUtc = computeCurrentLocalDayStartUtc(companyTimezone, ingestionNow);
+    const ingestionUpperBoundUtc = computeCurrentDayUpperBoundUtc(companyTimezone, ingestionNow);
+    const effectiveCutoffIso = ingestionCutoffUtc.toISOString();
+    const effectiveUpperBoundIso = ingestionUpperBoundUtc.toISOString();
 
-    // 3. Batch resolve active employees via terminal-scoped biometric mappings (+ legacy fallback)
-    const enrollmentIds = [...new Set(validatedPunches.map((vp) => vp.input.userEnrollmentId))];
-    const employeeMap = await BiometricMappingService.resolveBatchForTerminal(
-      terminal.companyId,
-      terminal.id,
-      enrollmentIds
-    );
+    if (punches.length === 0) {
+      return {
+        success: true,
+        totalReceived: 0,
+        inserted: 0,
+        duplicates: 0,
+        rejectedHistorical: 0,
+        rejectedFuture: 0,
+        unmappedEmployees: 0,
+        effectiveCutoffIso,
+        effectiveUpperBoundIso,
+        companyTimezone,
+        terminalId: terminal.id,
+        terminalName: terminal.name,
+      };
+    }
 
-    // 4. Ingest new punches
+    // 3. Enforce BOTH current-day lower cutoff AND current-day upper bound BEFORE queue persistence:
+    // - Punches strictly older than current company-local day start are rejected as historical.
+    // - Punches strictly later than min(local day end, serverNow + clockSkew) are rejected as future-dated.
+    const eligiblePunches: typeof validatedPunches = [];
+    let rejectedHistoricalCount = 0;
+    let rejectedFutureCount = 0;
+
+    for (const vp of validatedPunches) {
+      const punchMs = vp.punchTime.getTime();
+      if (punchMs < ingestionCutoffUtc.getTime()) {
+        rejectedHistoricalCount++;
+      } else if (punchMs > ingestionUpperBoundUtc.getTime()) {
+        rejectedFutureCount++;
+      } else {
+        eligiblePunches.push(vp);
+      }
+    }
+
     let insertedCount = 0;
     let duplicateCount = 0;
     let unmappedCount = 0;
-
     const punchesToCreate: any[] = [];
 
-    for (const vp of validatedPunches) {
-      if (existingKeySet.has(vp.idempotencyKey)) {
-        duplicateCount++;
-        continue;
-      }
-
-      const matchedEmpId = employeeMap.get(vp.input.userEnrollmentId) || null;
-      if (!matchedEmpId) {
-        unmappedCount++;
-      }
-
-      punchesToCreate.push({
-        companyId: terminal.companyId,
-        terminalId: terminal.id,
-        devicePunchId: vp.input.devicePunchId ? vp.input.devicePunchId.toString().trim() : null,
-        userEnrollmentId: vp.input.userEnrollmentId,
-        punchTime: vp.punchTime,
-        verifyType: vp.verifyType,
-        inOutMode: vp.inOutMode,
-        syncStatus: 'PENDING',
-        rawPayload: JSON.stringify(vp.input),
-        idempotencyKey: vp.idempotencyKey,
-        matchedEmployeeId: matchedEmpId,
+    if (eligiblePunches.length > 0) {
+      // 4. Batch query existing idempotency keys to detect duplicates for eligible current-day punches
+      const incomingKeys = eligiblePunches.map((vp) => vp.idempotencyKey);
+      const existingLogs = await prisma.rawPunchLog.findMany({
+        where: {
+          companyId: terminal.companyId,
+          idempotencyKey: { in: incomingKeys },
+        },
+        select: { idempotencyKey: true },
       });
+      const existingKeySet = new Set(existingLogs.map((l) => l.idempotencyKey));
 
-      // Mark key in set to handle duplicate items within the SAME batch
-      existingKeySet.add(vp.idempotencyKey);
-      insertedCount++;
+      // 5. Batch resolve active employees via terminal-scoped biometric mappings (+ legacy fallback)
+      const enrollmentIds = [...new Set(eligiblePunches.map((vp) => vp.input.userEnrollmentId))];
+      const employeeMap = await BiometricMappingService.resolveBatchForTerminal(
+        terminal.companyId,
+        terminal.id,
+        enrollmentIds
+      );
+
+      // 6. Prepare eligible current-day PENDING rows (never automatically reconciling or mutating Attendance)
+      for (const vp of eligiblePunches) {
+        if (existingKeySet.has(vp.idempotencyKey)) {
+          duplicateCount++;
+          continue;
+        }
+
+        const matchedEmpId = employeeMap.get(vp.input.userEnrollmentId) || null;
+        if (!matchedEmpId) {
+          unmappedCount++;
+        }
+
+        punchesToCreate.push({
+          companyId: terminal.companyId,
+          terminalId: terminal.id,
+          devicePunchId: vp.input.devicePunchId ? vp.input.devicePunchId.toString().trim() : null,
+          userEnrollmentId: vp.input.userEnrollmentId,
+          punchTime: vp.punchTime,
+          verifyType: vp.verifyType,
+          inOutMode: vp.inOutMode,
+          syncStatus: 'PENDING',
+          rawPayload: JSON.stringify(vp.input),
+          idempotencyKey: vp.idempotencyKey,
+          matchedEmployeeId: matchedEmpId,
+        });
+
+        // Mark key in set to handle duplicate items within the SAME batch
+        existingKeySet.add(vp.idempotencyKey);
+        insertedCount++;
+      }
     }
 
     if (punchesToCreate.length > 0) {
@@ -2012,7 +2070,7 @@ export class BiometricService {
         duplicateCount += concurrentConflictDuplicates;
       }
     } else {
-      // Still refresh terminal status
+      // Refresh terminal heartbeat status without persisting historical punches
       await prisma.biometricTerminal.update({
         where: { id: terminal.id },
         data: {
@@ -2029,7 +2087,7 @@ export class BiometricService {
       bridgeVersion: payload.bridgeVersion?.trim() || undefined,
       lastBridgeHeartbeatAt: nowIso,
       lastSyncAttemptAt: nowIso,
-      lastProcessedPunchCount: punches.length,
+      lastProcessedPunchCount: insertedCount,
       lastConnectionError: null,
       syncRequestedAt: null,
     });
@@ -2045,7 +2103,12 @@ export class BiometricService {
         totalReceived: punches.length,
         inserted: insertedCount,
         duplicates: duplicateCount,
+        rejectedHistorical: rejectedHistoricalCount,
+        rejectedFuture: rejectedFutureCount,
         unmappedEmployees: unmappedCount,
+        companyTimezone,
+        effectiveCutoffIso,
+        effectiveUpperBoundIso,
       },
     });
 
@@ -2054,7 +2117,12 @@ export class BiometricService {
       totalReceived: punches.length,
       inserted: insertedCount,
       duplicates: duplicateCount,
+      rejectedHistorical: rejectedHistoricalCount,
+      rejectedFuture: rejectedFutureCount,
       unmappedEmployees: unmappedCount,
+      effectiveCutoffIso,
+      effectiveUpperBoundIso,
+      companyTimezone,
       terminalId: terminal.id,
       terminalName: terminal.name,
     };

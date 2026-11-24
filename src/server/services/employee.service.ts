@@ -922,7 +922,7 @@ export class EmployeeService {
           actor.companyId,
           mapping.terminalId,
           mapping.enrollmentId,
-          actor.userId || actor.id,
+          actor,
           correlationId
         );
         aggregate.totalEvaluated += res.totalEvaluated;

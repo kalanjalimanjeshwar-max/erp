@@ -413,29 +413,36 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
         matchedEmployee: null,
       };
 
-      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(rawPunch as any);
-      vi.spyOn(prisma.employee, 'findFirst').mockResolvedValueOnce(inactiveEmployee as any);
-      const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValue({} as any);
-      const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
-      const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-10-19T05:00:00.000Z'));
+      try {
+        vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'Asia/Kolkata' } as any);
+        vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(rawPunch as any);
+        vi.spyOn(prisma.employee, 'findFirst').mockResolvedValueOnce(inactiveEmployee as any);
+        const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValue({} as any);
+        const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+        const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
 
-      const result = await PunchReconciliationService.reconcilePunch('punch-inactive-101');
+        const result = await PunchReconciliationService.reconcilePunch('punch-inactive-101');
 
-      expect(result.status).toBe('IGNORED');
-      expect(result.matchedEmployeeId).toBe('emp-101');
-      expect(result.message).toContain('INACTIVE');
-      expect(attCreateSpy).not.toHaveBeenCalled();
-      expect(attUpdateSpy).not.toHaveBeenCalled();
-      expect(rawUpdateSpy).toHaveBeenCalledWith(
-        expect.objectContaining({
-          where: { id: 'punch-inactive-101' },
-          data: expect.objectContaining({
-            syncStatus: 'IGNORED',
-            matchedEmployeeId: 'emp-101',
-            errorMessage: expect.stringContaining('INACTIVE'),
-          }),
-        })
-      );
+        expect(result.status).toBe('IGNORED');
+        expect(result.matchedEmployeeId).toBe('emp-101');
+        expect(result.message).toContain('INACTIVE');
+        expect(attCreateSpy).not.toHaveBeenCalled();
+        expect(attUpdateSpy).not.toHaveBeenCalled();
+        expect(rawUpdateSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: 'punch-inactive-101' },
+            data: expect.objectContaining({
+              syncStatus: 'IGNORED',
+              matchedEmployeeId: 'emp-101',
+              errorMessage: expect.stringContaining('INACTIVE'),
+            }),
+          })
+        );
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -591,54 +598,61 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
         return found as any;
       }) as any);
 
-      // Step 1: Map eSSL X2008 enrollment 101 while employee is still INACTIVE -> no Attendance created
-      const preActivateMap = await EmployeeService.updateEmployeeBiometricMappings(adminActor, emp101.id, [
-        { terminalId: esslTerminal.id, enrollmentId: '101', source: 'EXPLICIT' },
-      ]);
-      expect(preActivateMap.employee.biometricMappings).toHaveLength(1);
-      expect(attendanceRecords).toHaveLength(0);
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-10-19T14:00:00.000Z'));
 
-      // Step 2: Activate Employee 101 -> safely preserves notes/salary and reconciles ONLY enrollment 101 punches
-      const activated = await EmployeeService.activateEmployee(adminActor, emp101.id);
-      expect(activated.status).toBe('ACTIVE');
-      expect(activated.notes).toBe('Historical onboarding notes preserved');
-      expect(activated.currentSalary).toBe('35000.00');
+        // Step 1: Map eSSL X2008 enrollment 101 while employee is still INACTIVE -> no Attendance created
+        const preActivateMap = await EmployeeService.updateEmployeeBiometricMappings(adminActor, emp101.id, [
+          { terminalId: esslTerminal.id, enrollmentId: '101', source: 'EXPLICIT' },
+        ]);
+        expect(preActivateMap.employee.biometricMappings).toHaveLength(1);
+        expect(attendanceRecords).toHaveLength(0);
 
-      expect(attendanceRecords).toHaveLength(1);
-      expect(attendanceRecords[0]).toMatchObject({
-        companyId: companyAlphaId,
-        employeeId: emp101.id,
-        status: 'PRESENT',
-        source: 'BIOMETRIC',
-        overtimeMinutes: 30,
-      });
+        // Step 2: Activate Employee 101 -> safely preserves notes/salary and reconciles ONLY enrollment 101 punches
+        const activated = await EmployeeService.activateEmployee(adminActor, emp101.id);
+        expect(activated.status).toBe('ACTIVE');
+        expect(activated.notes).toBe('Historical onboarding notes preserved');
+        expect(activated.currentSalary).toBe('35000.00');
 
-      expect(rawPunches.find((p) => p.id === 'punch-101-in')?.syncStatus).toBe('PROCESSED');
-      expect(rawPunches.find((p) => p.id === 'punch-101-out')?.syncStatus).toBe('PROCESSED');
-      // Crucial invariant: 102 and 103 remain PENDING!
-      expect(rawPunches.find((p) => p.id === 'punch-102-unmapped')?.syncStatus).toBe('PENDING');
-      expect(rawPunches.find((p) => p.id === 'punch-103-unmapped')?.syncStatus).toBe('PENDING');
+        expect(attendanceRecords).toHaveLength(1);
+        expect(attendanceRecords[0]).toMatchObject({
+          companyId: companyAlphaId,
+          employeeId: emp101.id,
+          status: 'PRESENT',
+          source: 'BIOMETRIC',
+          overtimeMinutes: 30,
+        });
 
-      // Step 3: General pending sync counts remaining unmapped 102 & 103 accurately as `pending`
-      const syncResult = await PunchReconciliationService.reconcilePendingPunches(
-        companyAlphaId,
-        { batchSize: 100 },
-        adminActor.userId
-      );
-      expect(syncResult.totalEvaluated).toBe(2);
-      expect(syncResult.processed).toBe(0);
-      expect(syncResult.pending).toBe(2);
-      expect(syncResult.errors).toBe(0);
+        expect(rawPunches.find((p) => p.id === 'punch-101-in')?.syncStatus).toBe('PROCESSED');
+        expect(rawPunches.find((p) => p.id === 'punch-101-out')?.syncStatus).toBe('PROCESSED');
+        // Crucial invariant: 102 and 103 remain PENDING!
+        expect(rawPunches.find((p) => p.id === 'punch-102-unmapped')?.syncStatus).toBe('PENDING');
+        expect(rawPunches.find((p) => p.id === 'punch-103-unmapped')?.syncStatus).toBe('PENDING');
 
-      // Step 4: Targeted re-run for 101 is completely idempotent (no duplicate attendance)
-      const secondRun = await PunchReconciliationService.reconcileForEmployeeMapping(
-        companyAlphaId,
-        esslTerminal.id,
-        '101',
-        adminActor.userId
-      );
-      expect(secondRun.totalEvaluated).toBe(0);
-      expect(attendanceRecords).toHaveLength(1);
+        // Step 3: General pending sync counts remaining unmapped 102 & 103 accurately as `pending`
+        const syncResult = await PunchReconciliationService.reconcilePendingPunches(
+          companyAlphaId,
+          { batchSize: 100 },
+          adminActor
+        );
+        expect(syncResult.totalEvaluated).toBe(2);
+        expect(syncResult.processed).toBe(0);
+        expect(syncResult.pending).toBe(2);
+        expect(syncResult.errors).toBe(0);
+
+        // Step 4: Targeted re-run for 101 is completely idempotent (no duplicate attendance)
+        const secondRun = await PunchReconciliationService.reconcileForEmployeeMapping(
+          companyAlphaId,
+          esslTerminal.id,
+          '101',
+          adminActor
+        );
+        expect(secondRun.totalEvaluated).toBe(0);
+        expect(attendanceRecords).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 
@@ -898,7 +912,7 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
           userEnrollmentId: '101',
           keepUnmappedPending: true,
         }),
-        adminActor.userId,
+        expect.objectContaining({ userId: adminActor.userId, role: 'ADMIN' }),
         expect.any(String)
       );
     });
@@ -1438,14 +1452,19 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
       expect(rawPunches.find((p) => p.id === 'explicit-hist-in-range')?.syncStatus).toBe('PENDING');
       expect(rawPunches.find((p) => p.id === 'explicit-hist-error-in-range')?.syncStatus).toBe('ERROR');
 
-      // Explicit administrator historical reconciliation with fromPunchTime processes only punches >= cutoff for this mapping
+      // Explicit SUPER_ADMIN authorized historical reconciliation with allowHistorical + bounded range processes only punches in range for this mapping
+      const superAdminActor = { ...adminActor, role: 'SUPER_ADMIN' as const };
       const explicitRes = await PunchReconciliationService.reconcileForEmployeeMapping(
         companyAlphaId,
         esslTerminal.id,
         '101',
-        adminActor.userId,
+        superAdminActor,
         undefined,
-        { fromPunchTime: '2026-11-18T00:00:00.000Z' }
+        {
+          allowHistorical: true,
+          fromPunchTime: '2026-11-18T00:00:00.000Z',
+          toPunchTime: '2026-11-18T23:59:59.000Z',
+        }
       );
       expect(explicitRes.totalEvaluated).toBe(2);
       expect(explicitRes.processed).toBe(2);

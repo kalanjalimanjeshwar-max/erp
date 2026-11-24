@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../../src/server/app.js';
 import { prisma } from '../../src/server/db/client.js';
@@ -81,6 +81,9 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
 
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-10-19T20:00:00.000Z'));
+    vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
     vi.spyOn(prisma.leaveRequest, 'findFirst').mockResolvedValue(null as any);
     vi.spyOn(prisma, '$transaction').mockImplementation(async (callback: any) => {
       if (typeof callback === 'function') {
@@ -88,6 +91,10 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
       }
       return callback;
     });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
 
@@ -101,17 +108,19 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
       expect(tz).toBe('America/New_York');
     });
 
-    it('should fallback to canonical UTC policy when timezone is missing or invalid', async () => {
+    it('should fail closed when company timezone is missing or invalid (P0-B, never falls back to UTC)', async () => {
       vi.spyOn(prisma.company, 'findUnique').mockResolvedValueOnce({
         timezone: 'Invalid/Non_Existent_Timezone',
       } as any);
 
-      const tz = await PunchReconciliationService.resolveCompanyTimezone(companyAlphaId);
-      expect(tz).toBe('UTC');
+      await expect(
+        PunchReconciliationService.resolveCompanyTimezone(companyAlphaId)
+      ).rejects.toMatchObject({ statusCode: 422, code: 'BIOMETRIC_TIMEZONE_INVALID' });
 
       vi.spyOn(prisma.company, 'findUnique').mockResolvedValueOnce(null);
-      const tz2 = await PunchReconciliationService.resolveCompanyTimezone(companyAlphaId);
-      expect(tz2).toBe('UTC');
+      await expect(
+        PunchReconciliationService.resolveCompanyTimezone(companyAlphaId)
+      ).rejects.toMatchObject({ statusCode: 422, code: 'BIOMETRIC_TIMEZONE_MISSING' });
     });
 
     it('should correctly determine workDate for standard daytime shifts', () => {
@@ -562,6 +571,7 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
     };
 
     it('should block punch reconciliation if payroll period for workDate is POSTED or PROCESSED', async () => {
+      vi.setSystemTime(new Date('2026-09-15T12:00:00.000Z'));
       const punchInLockedPeriod = {
         id: 'punch-locked-payroll',
         companyId: companyAlphaId,
@@ -692,24 +702,31 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         tokenVersion: employeeUser.tokenVersion,
       });
 
+      vi.spyOn(prisma.user, 'findUnique').mockResolvedValue({
+        id: employeeUser.userId,
+        companyId: employeeUser.companyId,
+        email: employeeUser.email,
+        fullName: employeeUser.fullName,
+        role: employeeUser.role,
+        isActive: true,
+        tokenVersion: 1,
+      } as any);
+      vi.spyOn(prisma.rolePermission, 'findUnique').mockResolvedValue(null as any);
+
       const resSync = await request(app)
         .post('/api/biometric/sync')
         .set('Authorization', `Bearer ${empToken}`)
         .send({});
 
-      expect([401, 403]).toContain(resSync.status);
-      if (resSync.status === 403) {
-        expect(resSync.body.error.code).toBe('FORBIDDEN_PERMISSION_DENIED');
-      }
+      expect(resSync.status).toBe(403);
+      expect(resSync.body.error.code).toBe('FORBIDDEN_PERMISSION_DENIED');
 
       const resPunches = await request(app)
         .get('/api/biometric/punches')
         .set('Authorization', `Bearer ${empToken}`);
 
-      expect([401, 403]).toContain(resPunches.status);
-      if (resPunches.status === 403) {
-        expect(resPunches.body.error.code).toBe('FORBIDDEN_PERMISSION_DENIED');
-      }
+      expect(resPunches.status).toBe(403);
+      expect(resPunches.body.error.code).toBe('FORBIDDEN_PERMISSION_DENIED');
     });
 
     it('should allow authorized sync and log administrative action', async () => {
@@ -730,7 +747,7 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         isActive: true,
         tokenVersion: 1,
       } as any);
-
+      vi.spyOn(prisma.company, 'findUnique').mockResolvedValueOnce({ timezone: 'UTC' } as any);
       vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([]); // No pending punches
 
       const res = await request(app)
@@ -751,58 +768,64 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
     });
 
     it('should support safe bounded retry sync with retryErrors: true', async () => {
-      const saToken = AuthService.generateSessionToken({
-        userId: superAdminUser.userId,
-        companyId: superAdminUser.companyId,
-        email: superAdminUser.email,
-        role: superAdminUser.role,
-        tokenVersion: superAdminUser.tokenVersion,
-      });
+      vi.useFakeTimers();
+      try {
+        vi.setSystemTime(new Date('2026-10-19T12:00:00.000Z'));
+        const saToken = AuthService.generateSessionToken({
+          userId: superAdminUser.userId,
+          companyId: superAdminUser.companyId,
+          email: superAdminUser.email,
+          role: superAdminUser.role,
+          tokenVersion: superAdminUser.tokenVersion,
+        });
 
-      vi.spyOn(prisma.user, 'findUnique').mockResolvedValueOnce({
-        id: superAdminUser.userId,
-        companyId: superAdminUser.companyId,
-        email: superAdminUser.email,
-        fullName: superAdminUser.fullName,
-        role: superAdminUser.role,
-        isActive: true,
-        tokenVersion: 1,
-      } as any);
+        vi.spyOn(prisma.user, 'findUnique').mockResolvedValueOnce({
+          id: superAdminUser.userId,
+          companyId: superAdminUser.companyId,
+          email: superAdminUser.email,
+          fullName: superAdminUser.fullName,
+          role: superAdminUser.role,
+          isActive: true,
+          tokenVersion: 1,
+        } as any);
 
-      const errorPunch = {
-        id: 'punch-err-retry',
-        companyId: companyAlphaId,
-        userEnrollmentId: 'BIO-NEW-EMP',
-        punchTime: new Date('2026-10-19T08:50:00.000Z'),
-        inOutMode: 'CHECK_IN' as const,
-        syncStatus: 'ERROR' as const,
-        matchedEmployee: null,
-      };
+        const errorPunch = {
+          id: 'punch-err-retry',
+          companyId: companyAlphaId,
+          userEnrollmentId: 'BIO-NEW-EMP',
+          punchTime: new Date('2026-10-19T08:50:00.000Z'),
+          inOutMode: 'CHECK_IN' as const,
+          syncStatus: 'ERROR' as const,
+          matchedEmployee: null,
+        };
 
-      vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([{ id: 'punch-err-retry' }] as any);
-      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(errorPunch as any);
-      vi.spyOn(prisma.employee, 'findFirst').mockResolvedValueOnce({
-        id: 'new-emp-uuid',
-        companyId: companyAlphaId,
-        biometricDeviceId: 'BIO-NEW-EMP',
-        status: 'ACTIVE',
-        shift: standardShift,
-      } as any);
-      vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValue({} as any);
-      vi.spyOn(prisma.company, 'findUnique').mockResolvedValueOnce({ timezone: 'UTC' } as any);
-      vi.spyOn(prisma.payrollPeriod, 'findFirst').mockResolvedValueOnce(null);
-      vi.spyOn(prisma.attendance, 'findUnique').mockResolvedValueOnce(null);
-      vi.spyOn(prisma.attendance, 'create').mockResolvedValueOnce({} as any);
+        vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
+        vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([{ id: 'punch-err-retry' }] as any);
+        vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(errorPunch as any);
+        vi.spyOn(prisma.employee, 'findFirst').mockResolvedValueOnce({
+          id: 'new-emp-uuid',
+          companyId: companyAlphaId,
+          biometricDeviceId: 'BIO-NEW-EMP',
+          status: 'ACTIVE',
+          shift: standardShift,
+        } as any);
+        vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValue({} as any);
+        vi.spyOn(prisma.payrollPeriod, 'findFirst').mockResolvedValueOnce(null);
+        vi.spyOn(prisma.attendance, 'findUnique').mockResolvedValueOnce(null);
+        vi.spyOn(prisma.attendance, 'create').mockResolvedValueOnce({} as any);
 
-      const res = await request(app)
-        .post('/api/biometric/sync')
-        .set('Authorization', `Bearer ${saToken}`)
-        .send({ retryErrors: true });
+        const res = await request(app)
+          .post('/api/biometric/sync')
+          .set('Authorization', `Bearer ${saToken}`)
+          .send({ retryErrors: true });
 
-      expect(res.status).toBe(200);
-      expect(res.body.success).toBe(true);
-      expect(res.body.processed).toBe(1);
-      expect(res.body.errors).toBe(0);
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.processed).toBe(1);
+        expect(res.body.errors).toBe(0);
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     it('should return sync summary counts via GET /api/biometric/sync/summary', async () => {
@@ -905,15 +928,16 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
       expect(otMins).toBe(90);
     });
 
-    it('should safely fall back to UTC when company timezone is missing or invalid', async () => {
+    it('should fail closed when company timezone is missing or invalid (P0-B, never falls back to UTC)', async () => {
       // 1. Timezone is null
       const mockTxNull = {
         company: {
           findUnique: vi.fn().mockResolvedValue({ timezone: null }),
         },
       } as any;
-      const tzNull = await PunchReconciliationService.resolveCompanyTimezone('c1', mockTxNull);
-      expect(tzNull).toBe('UTC');
+      await expect(
+        PunchReconciliationService.resolveCompanyTimezone('c1', mockTxNull)
+      ).rejects.toMatchObject({ statusCode: 422, code: 'BIOMETRIC_TIMEZONE_MISSING' });
 
       // 2. Timezone is invalid string
       const mockTxInvalid = {
@@ -921,8 +945,9 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
           findUnique: vi.fn().mockResolvedValue({ timezone: 'Invalid/NonExistent_Zone' }),
         },
       } as any;
-      const tzInvalid = await PunchReconciliationService.resolveCompanyTimezone('c1', mockTxInvalid);
-      expect(tzInvalid).toBe('UTC');
+      await expect(
+        PunchReconciliationService.resolveCompanyTimezone('c1', mockTxInvalid)
+      ).rejects.toMatchObject({ statusCode: 422, code: 'BIOMETRIC_TIMEZONE_INVALID' });
     });
 
     it('should protect approved leave when no Attendance row exists yet and ignore punch', async () => {
@@ -1225,6 +1250,12 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         }
       }) as any);
 
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-19T12:00:00.000Z'));
+      const companyTzSpy = vi
+        .spyOn(prisma.company, 'findUnique')
+        .mockResolvedValue({ timezone: 'UTC' } as any);
+
       try {
         const [resA, resB] = await Promise.all([
           PunchReconciliationService.reconcilePendingPunches(uuidCompanyId, {
@@ -1252,6 +1283,8 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         expect(committedPunch.matchedEmployeeId).toBe(defaultMockEmployee.id);
         expect(committedAttendance).toHaveLength(1);
       } finally {
+        vi.useRealTimers();
+        companyTzSpy.mockRestore();
         findManySpy.mockRestore();
         txSpy.mockRestore();
       }
@@ -1327,6 +1360,12 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
           return { count: 0 } as any;
         }) as any);
 
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-10-19T12:00:00.000Z'));
+      const companyTzSpy = vi
+        .spyOn(prisma.company, 'findUnique')
+        .mockResolvedValue({ timezone: 'UTC' } as any);
+
       try {
         // 1. Direct reconcilePunch throws and leaves committed store rolled back
         await expect(
@@ -1353,6 +1392,8 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         );
         expect(committedPunch.syncStatus).toBe('PROCESSED');
       } finally {
+        vi.useRealTimers();
+        companyTzSpy.mockRestore();
         txSpy.mockRestore();
         findManySpy.mockRestore();
         updateManySpy.mockRestore();

@@ -3,8 +3,12 @@ import { prisma } from '../db/client.js';
 import { BiometricService } from '../services/biometric.service.js';
 import { BiometricMappingService } from '../services/biometric-mapping.service.js';
 import { PunchReconciliationService } from '../services/punch-reconciliation.service.js';
-import { WorkPolicyService, getStartOfLocalDayUtc } from '../services/work-policy.service.js';
-import { localDateTimeToUtcIso } from '../../shared/timezone.js';
+import {
+  assertAuthorizedHistoricalActor,
+  computeLocalDateEndUtc,
+  computeLocalDateStartUtc,
+  resolveStrictCompanyTimezone,
+} from '../services/biometric-safety.js';
 import { AuthUser, BiometricTerminalStatus } from '../../shared/types.js';
 import { AuthenticatedDeviceRequest } from '../middleware/device-auth.middleware.js';
 
@@ -194,18 +198,38 @@ export class BiometricController {
     return value;
   }
 
-  /**
-   * Validates and normalizes optional `fromPunchTime`:
-   * - `undefined`: returns `undefined` so Step 2 preserves its company-local today-only default cutoff.
-   * - `YYYY-MM-DD`: normalized to the start of that calendar day in the company's configured timezone
-   *   via `WorkPolicyService.resolveCompanyTimezone` + `getStartOfLocalDayUtc`.
-   * - ISO-8601 datetime with explicit `Z` or `±HH:MM` offset: preserves the explicitly supplied instant.
-   */
-  static async parseFromPunchTime(value: unknown, companyId: string): Promise<Date | undefined> {
+  private static rejectHistoricalQueryOverrides(query: Request['query']): void {
+    if (!query || typeof query !== 'object') return;
+    for (const forbiddenKey of ['allowHistorical', 'fromPunchTime', 'toPunchTime']) {
+      if (query[forbiddenKey] !== undefined) {
+        throw createControllerError(
+          `Query parameter '${forbiddenKey}' is not permitted for biometric reconciliation.`,
+          400,
+          'VALIDATION_ERROR'
+        );
+      }
+    }
+  }
+
+  private static assertHistoricalAuthorizationIfRequested(
+    actor: AuthUser,
+    allowHistorical: boolean | undefined
+  ): void {
+    if (allowHistorical === true) {
+      assertAuthorizedHistoricalActor(actor?.companyId || '', actor);
+    }
+  }
+
+  private static async parsePunchBoundaryTime(
+    value: unknown,
+    companyId: string,
+    fieldName: 'fromPunchTime' | 'toPunchTime',
+    boundary: 'start' | 'end'
+  ): Promise<Date | undefined> {
     if (value === undefined) return undefined;
     if (typeof value !== 'string' || !value.trim()) {
       throw createControllerError(
-        "Invalid 'fromPunchTime': expected a valid YYYY-MM-DD calendar date or ISO-8601 datetime string with timezone offset.",
+        `Invalid '${fieldName}': expected a valid YYYY-MM-DD calendar date or ISO-8601 datetime string with timezone offset.`,
         400,
         'VALIDATION_ERROR'
       );
@@ -220,15 +244,16 @@ export class BiometricController {
       const day = Number(dateMatch[3]);
       if (!isValidCalendarDateParts(year, month, day)) {
         throw createControllerError(
-          `Invalid 'fromPunchTime' calendar date '${trimmed}'.`,
+          `Invalid '${fieldName}' calendar date '${trimmed}'.`,
           400,
           'VALIDATION_ERROR'
         );
       }
 
-      const companyTimezone = await WorkPolicyService.resolveCompanyTimezone(companyId, prisma);
-      const localNoonUtcIso = localDateTimeToUtcIso(trimmed, '12:00:00', companyTimezone);
-      return getStartOfLocalDayUtc(companyTimezone, new Date(localNoonUtcIso));
+      const companyTimezone = await resolveStrictCompanyTimezone(companyId, prisma);
+      return boundary === 'start'
+        ? computeLocalDateStartUtc(trimmed, companyTimezone)
+        : computeLocalDateEndUtc(trimmed, companyTimezone);
     }
 
     const isoMatch = ISO_DATETIME_WITH_TZ_REGEX.exec(trimmed);
@@ -243,14 +268,14 @@ export class BiometricController {
 
       if (!isValidCalendarDateParts(year, month, day)) {
         throw createControllerError(
-          `Invalid 'fromPunchTime' calendar date in '${trimmed}'.`,
+          `Invalid '${fieldName}' calendar date in '${trimmed}'.`,
           400,
           'VALIDATION_ERROR'
         );
       }
       if (hour > 23 || minute > 59 || second > 59) {
         throw createControllerError(
-          `Invalid 'fromPunchTime' time component in '${trimmed}'.`,
+          `Invalid '${fieldName}' time component in '${trimmed}'.`,
           400,
           'VALIDATION_ERROR'
         );
@@ -260,7 +285,7 @@ export class BiometricController {
         const offsetMinute = Number(tzPart.slice(4, 6));
         if (offsetHour > 23 || offsetMinute > 59) {
           throw createControllerError(
-            `Invalid 'fromPunchTime' timezone offset in '${trimmed}'.`,
+            `Invalid '${fieldName}' timezone offset in '${trimmed}'.`,
             400,
             'VALIDATION_ERROR'
           );
@@ -270,7 +295,7 @@ export class BiometricController {
       const parsed = new Date(trimmed);
       if (Number.isNaN(parsed.getTime())) {
         throw createControllerError(
-          `Invalid 'fromPunchTime' ISO-8601 timestamp '${trimmed}'.`,
+          `Invalid '${fieldName}' ISO-8601 timestamp '${trimmed}'.`,
           400,
           'VALIDATION_ERROR'
         );
@@ -279,30 +304,54 @@ export class BiometricController {
     }
 
     throw createControllerError(
-      "Invalid 'fromPunchTime': expected a valid YYYY-MM-DD calendar date or ISO-8601 datetime string with timezone offset (Z or ±HH:MM).",
+      `Invalid '${fieldName}': expected a valid YYYY-MM-DD calendar date or ISO-8601 datetime string with timezone offset (Z or ±HH:MM).`,
       400,
       'VALIDATION_ERROR'
     );
   }
 
   /**
+   * Validates and normalizes optional `fromPunchTime`:
+   * - `undefined`: returns `undefined` so reconciliation preserves its company-local today-only default cutoff.
+   * - `YYYY-MM-DD`: normalized to the start of that calendar day in the company's configured timezone (fail-closed).
+   * - ISO-8601 datetime with explicit `Z` or `±HH:MM` offset: preserves the explicitly supplied instant.
+   */
+  static async parseFromPunchTime(value: unknown, companyId: string): Promise<Date | undefined> {
+    return BiometricController.parsePunchBoundaryTime(value, companyId, 'fromPunchTime', 'start');
+  }
+
+  static async parseToPunchTime(value: unknown, companyId: string): Promise<Date | undefined> {
+    return BiometricController.parsePunchBoundaryTime(value, companyId, 'toPunchTime', 'end');
+  }
+
+  /**
    * POST /api/biometric/devices/:id/sync
-   * Queues immediate bridge pull and reconciles pending raw punches for this terminal (requires BIOMETRIC:EDIT)
+   * Queues immediate bridge pull and reconciles pending raw punches for this terminal (requires BIOMETRIC:EDIT;
+   * historical reconciliation additionally requires SUPER_ADMIN + explicit allowHistorical: true + bounded range)
    */
   static async syncTerminal(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;
       const { id } = req.params;
+      BiometricController.rejectHistoricalQueryOverrides(req.query);
       const body = BiometricController.parseSyncRequestBody(req.body);
       const {
         batchSize,
         retryErrors,
         keepUnmappedPending,
         fromPunchTime,
+        toPunchTime,
+        allowHistorical,
         userEnrollmentId,
         employeeId,
         punchId,
       } = body;
+
+      const parsedAllowHistorical = BiometricController.parseOptionalBoolean(
+        allowHistorical,
+        'allowHistorical'
+      );
+      BiometricController.assertHistoricalAuthorizationIfRequested(actor, parsedAllowHistorical);
 
       const parsedBatchSize = BiometricController.parseBatchSize(batchSize);
       const parsedRetryErrors = BiometricController.parseOptionalBoolean(retryErrors, 'retryErrors');
@@ -320,6 +369,10 @@ export class BiometricController {
         fromPunchTime,
         actor.companyId
       );
+      const parsedToPunchTime = await BiometricController.parseToPunchTime(
+        toPunchTime,
+        actor.companyId
+      );
 
       const result = await BiometricService.triggerTerminalSync(
         actor,
@@ -329,6 +382,8 @@ export class BiometricController {
           retryErrors: parsedRetryErrors ?? false,
           keepUnmappedPending: parsedKeepUnmappedPending,
           fromPunchTime: parsedFromPunchTime,
+          toPunchTime: parsedToPunchTime,
+          allowHistorical: parsedAllowHistorical,
           userEnrollmentId: parsedEnrollmentId,
           employeeId: parsedEmployeeId,
           punchId: parsedPunchId,
@@ -343,7 +398,9 @@ export class BiometricController {
         error: {
           code:
             explicitCode ||
-            (status === 404
+            (status === 403
+              ? 'BIOMETRIC_HISTORICAL_FORBIDDEN'
+              : status === 404
               ? 'TERMINAL_NOT_FOUND'
               : status === 400
               ? 'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
@@ -516,9 +573,10 @@ export class BiometricController {
       res.json(result);
     } catch (err: unknown) {
       const status = (err as { statusCode?: number }).statusCode || 500;
+      const explicitCode = (err as { code?: string }).code;
       res.status(status).json({
         error: {
-          code: 'BIOMETRIC_PUNCH_INGEST_FAILED',
+          code: explicitCode || 'BIOMETRIC_PUNCH_INGEST_FAILED',
           message: (err as Error).message,
         },
       });
@@ -593,6 +651,7 @@ export class BiometricController {
   static async triggerSync(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;
+      BiometricController.rejectHistoricalQueryOverrides(req.query);
       const body = BiometricController.parseSyncRequestBody(req.body);
       const {
         batchSize,
@@ -603,7 +662,15 @@ export class BiometricController {
         retryErrors,
         keepUnmappedPending,
         fromPunchTime,
+        toPunchTime,
+        allowHistorical,
       } = body;
+
+      const parsedAllowHistorical = BiometricController.parseOptionalBoolean(
+        allowHistorical,
+        'allowHistorical'
+      );
+      BiometricController.assertHistoricalAuthorizationIfRequested(actor, parsedAllowHistorical);
 
       const parsedBatchSize = BiometricController.parseBatchSize(batchSize);
       const parsedRetryErrors = BiometricController.parseOptionalBoolean(retryErrors, 'retryErrors');
@@ -620,6 +687,10 @@ export class BiometricController {
       const parsedPunchId = BiometricController.parseTargetedFilter(punchId, 'punchId');
       const parsedFromPunchTime = await BiometricController.parseFromPunchTime(
         fromPunchTime,
+        actor.companyId
+      );
+      const parsedToPunchTime = await BiometricController.parseToPunchTime(
+        toPunchTime,
         actor.companyId
       );
 
@@ -648,8 +719,10 @@ export class BiometricController {
           retryErrors: parsedRetryErrors ?? false,
           keepUnmappedPending: parsedKeepUnmappedPending,
           fromPunchTime: parsedFromPunchTime,
+          toPunchTime: parsedToPunchTime,
+          allowHistorical: parsedAllowHistorical,
         },
-        actor.userId || actor.id,
+        actor,
         req.correlationId
       );
 
@@ -661,7 +734,9 @@ export class BiometricController {
         error: {
           code:
             explicitCode ||
-            (status === 400
+            (status === 403
+              ? 'BIOMETRIC_HISTORICAL_FORBIDDEN'
+              : status === 400
               ? 'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
               : status === 404
               ? 'BIOMETRIC_TARGET_NOT_FOUND'

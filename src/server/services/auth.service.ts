@@ -15,6 +15,42 @@ export interface SessionPayload {
   exp: number; // Expiration timestamp in seconds
 }
 
+export interface AuthenticatedActorProvenance {
+  readonly userId: string;
+  readonly companyId: string;
+  readonly role: Role;
+  readonly tokenVersion: number;
+  readonly isActive: true;
+  readonly isPreview: false;
+  readonly authenticatedAtMs: number;
+  readonly source: 'SESSION_VALIDATION';
+}
+
+// Module-private WeakMap binding frozen AuthUser objects minted strictly by
+// AuthService.validateSessionUser() to immutable server-verified session claims.
+// Plain caller-created objects, cloned copies, prototype-inherited objects, and
+// preview accounts can never acquire an entry in this registry.
+const authenticatedActorRegistry = new WeakMap<AuthUser, AuthenticatedActorProvenance>();
+
+interface VerifiedSessionPayloadSnapshot {
+  readonly userId: string;
+  readonly companyId: string;
+  readonly email: string;
+  readonly role: Role;
+  readonly tokenVersion: number;
+  readonly exp: number;
+}
+
+// Module-private registries binding exact frozen SessionPayload objects produced exclusively by
+// AuthService.verifySessionToken() to immutable snapshots, and enforcing single-use consumption
+// inside AuthService.validateSessionUser() so fabricated, mutated, expired, or replayed payloads
+// can never mint authenticated actor provenance.
+const verifiedSessionPayloadRegistry = new WeakMap<
+  SessionPayload,
+  VerifiedSessionPayloadSnapshot
+>();
+const consumedSessionPayloads = new WeakSet<SessionPayload>();
+
 export const SESSION_COOKIE_NAME = 'coreerp_session';
 export const SESSION_DURATION_SECONDS = 24 * 60 * 60; // 24 hours
 
@@ -152,7 +188,28 @@ export class AuthService {
         return null; // Expired
       }
 
-      return decoded as SessionPayload;
+      const verifiedPayload: SessionPayload = Object.freeze({
+        userId: decoded.userId,
+        companyId: decoded.companyId,
+        email: decoded.email,
+        role: decoded.role as Role,
+        tokenVersion: decoded.tokenVersion,
+        exp: decoded.exp,
+      });
+
+      verifiedSessionPayloadRegistry.set(
+        verifiedPayload,
+        Object.freeze({
+          userId: verifiedPayload.userId,
+          companyId: verifiedPayload.companyId,
+          email: verifiedPayload.email,
+          role: verifiedPayload.role,
+          tokenVersion: verifiedPayload.tokenVersion,
+          exp: verifiedPayload.exp,
+        })
+      );
+
+      return verifiedPayload;
     } catch {
       return null;
     }
@@ -484,30 +541,154 @@ export class AuthService {
   }
 
   /**
-   * Validates active account status, tenant binding, and tokenVersion to retrieve fresh session context
+   * Verifies whether an actor reference was genuinely minted by AuthService.validateSessionUser()
+   * and returns its immutable server-verified provenance record.
+   * Returns null for plain objects, cloned objects, prototype-inherited objects, strings,
+   * preview sessions, or any tampered/unfrozen object.
+   */
+  static getAuthenticatedActorProvenance(actor: unknown): AuthenticatedActorProvenance | null {
+    if (!actor || typeof actor !== 'object' || Array.isArray(actor)) {
+      return null;
+    }
+
+    const candidate = actor as AuthUser;
+    const provenance = authenticatedActorRegistry.get(candidate);
+    if (!provenance) {
+      return null;
+    }
+
+    if (!Object.isFrozen(candidate)) {
+      return null;
+    }
+
+    const hasOwn = (prop: string): boolean => Object.prototype.hasOwnProperty.call(candidate, prop);
+    if (
+      !hasOwn('id') ||
+      !hasOwn('userId') ||
+      !hasOwn('companyId') ||
+      !hasOwn('role') ||
+      !hasOwn('isActive') ||
+      !hasOwn('tokenVersion')
+    ) {
+      return null;
+    }
+
+    if (hasOwn('isPreview') && candidate.isPreview === true) {
+      return null;
+    }
+
+    if (
+      candidate.id !== provenance.userId ||
+      candidate.userId !== provenance.userId ||
+      candidate.companyId !== provenance.companyId ||
+      candidate.role !== provenance.role ||
+      candidate.isActive !== true ||
+      candidate.tokenVersion !== provenance.tokenVersion
+    ) {
+      return null;
+    }
+
+    return provenance;
+  }
+
+  /**
+   * Validates a cryptographically verified SessionPayload (registered exclusively by
+   * AuthService.verifySessionToken()), enforces single-use consumption, immutability, and server-clock
+   * expiry, then verifies active account status, tenant binding, and tokenVersion in PostgreSQL.
+   * This is the sole production provenance boundary that seals and registers authenticated AuthUser objects.
    */
   static async validateSessionUser(session: SessionPayload): Promise<AuthUser | null> {
+    if (!session || typeof session !== 'object' || Array.isArray(session)) {
+      return null;
+    }
+
+    if (consumedSessionPayloads.has(session)) {
+      return null;
+    }
+
+    const snapshot = verifiedSessionPayloadRegistry.get(session);
+    if (!snapshot) {
+      return null;
+    }
+
+    // Consume immediately before expiry/DB checks so a verified payload can mint provenance at most once
+    // and cannot be replayed on retry or concurrency.
+    consumedSessionPayloads.add(session);
+    verifiedSessionPayloadRegistry.delete(session);
+
+    if (!Object.isFrozen(session)) {
+      return null;
+    }
+
+    const hasOwn = (prop: string): boolean => Object.prototype.hasOwnProperty.call(session, prop);
+    if (
+      !hasOwn('userId') ||
+      !hasOwn('companyId') ||
+      !hasOwn('email') ||
+      !hasOwn('role') ||
+      !hasOwn('tokenVersion') ||
+      !hasOwn('exp')
+    ) {
+      return null;
+    }
+
+    if (
+      session.userId !== snapshot.userId ||
+      session.companyId !== snapshot.companyId ||
+      session.email !== snapshot.email ||
+      session.role !== snapshot.role ||
+      session.tokenVersion !== snapshot.tokenVersion ||
+      session.exp !== snapshot.exp
+    ) {
+      return null;
+    }
+
+    if (typeof snapshot.exp !== 'number' || !Number.isFinite(snapshot.exp)) {
+      return null;
+    }
+
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    if (snapshot.exp <= nowSeconds) {
+      return null;
+    }
+
     try {
       const user = await prisma.user.findUnique({
-        where: { id: session.userId },
+        where: { id: snapshot.userId },
       });
 
       if (!user) return null;
       if (!user.isActive) return null;
-      if (user.companyId !== session.companyId) return null; // Strict tenant isolation check
-      if (user.tokenVersion !== session.tokenVersion) return null; // Stale or revoked session
+      if (user.companyId !== snapshot.companyId) return null; // Strict tenant isolation check
+      if (user.tokenVersion !== snapshot.tokenVersion) return null; // Stale or revoked session
 
-      return {
+      const authenticatedUser: AuthUser = Object.freeze({
         id: user.id,
         userId: user.id,
         companyId: user.companyId,
         email: user.email,
         fullName: user.fullName,
         role: user.role,
-        isActive: user.isActive,
+        isActive: true,
         lastLoginAt: user.lastLoginAt ? user.lastLoginAt.toISOString() : null,
         tokenVersion: user.tokenVersion,
-      };
+      });
+
+      authenticatedActorRegistry.set(
+        authenticatedUser,
+        Object.freeze({
+          userId: user.id,
+          companyId: user.companyId,
+          role: user.role,
+          tokenVersion: user.tokenVersion,
+          isActive: true,
+          isPreview: false,
+          authenticatedAtMs: Date.now(),
+          source: 'SESSION_VALIDATION',
+        })
+      );
+
+      return authenticatedUser;
     } catch (err: unknown) {
       if (isDatabaseConnectivityOrSchemaError(err)) {
         const dbErr = new Error(
