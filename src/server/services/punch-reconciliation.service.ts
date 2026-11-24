@@ -2234,7 +2234,8 @@ export class PunchReconciliationService {
         terminalId: normalizedTerminalId,
         userEnrollmentId: normalizedEnrollmentId,
         employeeId: options?.employeeId,
-        batchSize: options?.batchSize ?? defaultMappingBatchSize,
+        batchSize:
+          options?.batchSize !== undefined ? options.batchSize : defaultMappingBatchSize,
         retryErrors: true,
         keepUnmappedPending: true,
         fromPunchTime: options?.fromPunchTime,

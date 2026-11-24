@@ -15,6 +15,7 @@ import {
   CURRENT_DAY_FUTURE_CLOCK_SKEW_MS,
   evaluateReconciliationWindow,
   MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE,
+  MAX_NORMAL_RECONCILIATION_BATCH_SIZE,
   resolveStrictCompanyTimezone,
   TRUSTED_WINDOW_TTL_MS,
 } from '../../src/server/services/biometric-safety.js';
@@ -3306,9 +3307,56 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
       expect(auditLogs.filter((l) => l.action === 'BIOMETRIC_HISTORICAL_RECONCILE')).toHaveLength(1);
     });
 
-    it('AUDIT-4: BiometricService.triggerTerminalSync never persists syncRequestedAt telemetry when target validation or historical audit fails, and preserves sync contract on success', async () => {
+    it('AUDIT-4: BiometricService.triggerTerminalSync never persists syncRequestedAt telemetry or queues bridge poll when target validation or historical audit fails, and preserves sync contract on success', async () => {
       const { telemetryUpsertSpy, rawPunchFindManySpy, auditLogs } =
         setupInMemoryReconciliationHarness(buildAuditSeed(), 'Asia/Kolkata');
+
+      let storedBridgeTelemetryJson: string | null = null;
+      const order: string[] = [];
+
+      vi.spyOn(prisma.companySetting, 'findUnique').mockImplementation((async (args: any) => {
+        if (
+          args?.where?.companyId_key?.companyId === companyId &&
+          args?.where?.companyId_key?.key === 'BIOMETRIC_BRIDGE_TELEMETRY_V1' &&
+          storedBridgeTelemetryJson !== null
+        ) {
+          return {
+            companyId,
+            key: 'BIOMETRIC_BRIDGE_TELEMETRY_V1',
+            value: storedBridgeTelemetryJson,
+          } as any;
+        }
+        return null;
+      }) as any);
+
+      telemetryUpsertSpy.mockImplementation((async (args: any) => {
+        if (args?.where?.companyId_key?.key === 'BIOMETRIC_BRIDGE_TELEMETRY_V1') {
+          storedBridgeTelemetryJson = args?.update?.value ?? args?.create?.value ?? null;
+          order.push('TELEMETRY_UPSERT');
+        }
+        return args;
+      }) as any);
+
+      const terminalUpdateSpy = vi
+        .spyOn(prisma.biometricTerminal, 'update')
+        .mockResolvedValue({
+          id: terminalId,
+          companyId,
+          name: 'Main Gate eSSL X2008',
+          deviceSerialNumber: 'SN-X2008-001',
+          isActive: true,
+          status: 'ONLINE',
+        } as any);
+
+      const bridgeTerminalFixture = {
+        id: terminalId,
+        companyId,
+        name: 'Main Gate eSSL X2008',
+        deviceSerialNumber: 'SN-X2008-001',
+        isActive: true,
+        status: 'ONLINE',
+        lastHeartbeatAt: FIXED_NOW_UTC,
+      };
 
       const baseRange = {
         allowHistorical: true,
@@ -3316,7 +3364,7 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
         toPunchTime: '2026-11-21T23:59:59.000Z',
       };
 
-      // 1. Target validation failure (nonexistent employeeId) -> 404, ZERO telemetry writes
+      // 1. Target validation failure (nonexistent employeeId) -> 404, ZERO telemetry writes & ZERO bridge polls
       await expect(
         BiometricService.triggerTerminalSync(superAdminActor, terminalId, {
           ...baseRange,
@@ -3324,7 +3372,7 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
         })
       ).rejects.toMatchObject({ statusCode: 404, code: 'BIOMETRIC_TARGET_NOT_FOUND' });
 
-      // 2. Target validation failure (unmapped punchId mismatched with employeeId) -> 400, ZERO telemetry writes
+      // 2. Target validation failure (unmapped punchId mismatched with employeeId) -> 400, ZERO telemetry writes & ZERO bridge polls
       await expect(
         BiometricService.triggerTerminalSync(superAdminActor, terminalId, {
           ...baseRange,
@@ -3333,7 +3381,7 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
         })
       ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_INVALID_RECONCILIATION_FILTER' });
 
-      // 3. Mandatory audit sink failure -> rejects, ZERO telemetry writes, ZERO punch queries
+      // 3. Mandatory audit sink failure -> rejects, ZERO telemetry writes, ZERO bridge polls, ZERO punch queries
       vi.spyOn(AuditService, 'log').mockRejectedValueOnce(new Error('Audit DB unreachable'));
       await expect(
         BiometricService.triggerTerminalSync(superAdminActor, terminalId, {
@@ -3343,20 +3391,27 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
       ).rejects.toThrow('Audit DB unreachable');
 
       expect(telemetryUpsertSpy).not.toHaveBeenCalled();
+      expect(storedBridgeTelemetryJson).toBeNull();
+      expect(terminalUpdateSpy).not.toHaveBeenCalled();
       expect(rawPunchFindManySpy).not.toHaveBeenCalled();
       expect(auditLogs.filter((l) => l.action === 'BIOMETRIC_HISTORICAL_RECONCILE')).toHaveLength(0);
 
-      // 4. Valid historical terminal sync: audit -> reconciliation -> syncRequestedAt telemetry (preserves response contract)
-      const order: string[] = [];
+      // Verify actual bridge-poll handshake observes ZERO queued sync triggers after failed calls
+      const heartbeatAfterFailures = await BiometricService.recordHeartbeat(bridgeTerminalFixture, {
+        bridgeConnected: true,
+        deviceReachable: true,
+      });
+      expect(heartbeatAfterFailures.syncRequested).toBe(false);
+      expect(heartbeatAfterFailures.syncRequestedAt).toBeNull();
+
+      // 4. Valid historical terminal sync: audit -> reconciliation -> syncRequestedAt telemetry -> bridge poll queued
+      order.length = 0;
+      telemetryUpsertSpy.mockClear();
       vi.spyOn(AuditService, 'log').mockImplementation(async (entry: any) => {
         order.push(`AUDIT:${entry.action}`);
         auditLogs.push(entry);
         return {} as any;
       });
-      telemetryUpsertSpy.mockImplementation((async (args: any) => {
-        order.push('TELEMETRY_UPSERT');
-        return args;
-      }) as any);
 
       const syncRes = await BiometricService.triggerTerminalSync(superAdminActor, terminalId, {
         ...baseRange,
@@ -3366,11 +3421,21 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
       expect(syncRes.success).toBe(true);
       expect(syncRes.bridgeSyncQueued).toBe(true);
       expect(typeof syncRes.syncRequestedAt).toBe('string');
+      expect(syncRes.terminal.syncRequestedAt).toBe(syncRes.syncRequestedAt);
       expect(syncRes.reconciliation.processed).toBe(1);
+      expect(telemetryUpsertSpy).toHaveBeenCalledTimes(1);
       expect(order.indexOf('AUDIT:BIOMETRIC_HISTORICAL_RECONCILE')).toBeGreaterThanOrEqual(0);
       expect(order.indexOf('TELEMETRY_UPSERT')).toBeGreaterThan(
         order.indexOf('AUDIT:BIOMETRIC_HISTORICAL_RECONCILE')
       );
+
+      // Verify bridge-poll handshake now receives the queued trigger with exact syncRequestedAt
+      const heartbeatAfterValidSync = await BiometricService.recordHeartbeat(bridgeTerminalFixture, {
+        bridgeConnected: true,
+        deviceReachable: true,
+      });
+      expect(heartbeatAfterValidSync.syncRequested).toBe(true);
+      expect(heartbeatAfterValidSync.syncRequestedAt).toBe(syncRes.syncRequestedAt);
     });
 
     it('AUDIT-5: rejects malformed service-layer batchSize values fail-closed (400 VALIDATION_ERROR) and hardens reconcileForEmployeeMapping()', async () => {
@@ -3470,23 +3535,54 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
         ).rejects.toMatchObject({ statusCode: 400, code: 'VALIDATION_ERROR' });
       }
 
-      // 4. Invalid batchSize forwarded through reconcileForEmployeeMapping() fails closed with 400
-      await expect(
-        PunchReconciliationService.reconcileForEmployeeMapping(
-          companyId,
-          terminalId,
-          '101',
-          biometricEditAdminActor,
-          undefined,
-          { batchSize: 1.5 }
-        )
-      ).rejects.toMatchObject({ statusCode: 400, code: 'VALIDATION_ERROR' });
+      // 4. Explicit null and all other malformed batchSize values forwarded through
+      //    reconcileForEmployeeMapping() fail closed with 400 VALIDATION_ERROR before any DB query, update, or audit
+      for (const [_label, badBatchSize] of malformedBatchSizes) {
+        await expect(
+          PunchReconciliationService.reconcileForEmployeeMapping(
+            companyId,
+            terminalId,
+            '101',
+            biometricEditAdminActor,
+            undefined,
+            { batchSize: badBatchSize as any }
+          )
+        ).rejects.toMatchObject({ statusCode: 400, code: 'VALIDATION_ERROR' });
+
+        await expect(
+          PunchReconciliationService.reconcileForEmployeeMapping(
+            companyId,
+            terminalId,
+            '101',
+            superAdminActor,
+            undefined,
+            {
+              allowHistorical: true,
+              fromPunchTime: '2026-11-19T00:00:00.000Z',
+              toPunchTime: '2026-11-21T23:59:59.000Z',
+              batchSize: badBatchSize as any,
+            }
+          )
+        ).rejects.toMatchObject({ statusCode: 400, code: 'VALIDATION_ERROR' });
+      }
 
       expect(rawPunchFindManySpy).not.toHaveBeenCalled();
       expect(rawPunchUpdateSpy).not.toHaveBeenCalled();
       expect(auditLogs).toHaveLength(0);
 
-      // 5. Valid padded terminalId/userEnrollmentId trims cleanly and enforces historical cap (100)
+      // 5. Omitted batchSize (undefined) preserves default mapping batch limit (500 normal)
+      const normalMapRes = await PunchReconciliationService.reconcileForEmployeeMapping(
+        companyId,
+        terminalId,
+        '101',
+        biometricEditAdminActor,
+        undefined,
+        {}
+      );
+      expect(normalMapRes.success).toBe(true);
+      expect(rawPunchFindManySpy.mock.calls[0][0].take).toBe(MAX_NORMAL_RECONCILIATION_BATCH_SIZE);
+
+      // 6. Valid padded terminalId/userEnrollmentId trims cleanly and enforces historical cap (100)
       const histMapRes = await PunchReconciliationService.reconcileForEmployeeMapping(
         companyId,
         `  ${terminalId}  `,
@@ -3501,7 +3597,7 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
         }
       );
       expect(histMapRes.processed).toBe(1);
-      expect(rawPunchFindManySpy.mock.calls[0][0].take).toBe(MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE);
+      expect(rawPunchFindManySpy.mock.calls[1][0].take).toBe(MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE);
     });
   });
 });
