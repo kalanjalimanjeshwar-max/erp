@@ -40,6 +40,7 @@ import {
   TRUSTED_WINDOW_BACKWARD_CLOCK_SKEW_MS,
   TRUSTED_WINDOW_TTL_MS,
   TrustedWindowPunchContext,
+  validateReconciliationRequestPreDb,
   VerifiedTrustedReconciliationWindow,
 } from './biometric-safety.js';
 
@@ -61,6 +62,29 @@ const trustedWindowRegistry = new WeakMap<
 >();
 const revokedTrustedWindows = new WeakSet<ResolvedReconciliationTimeWindow>();
 
+function parseStrictReconciliationBatchSize(
+  rawBatchSize: unknown,
+  defaultBatchLimit: number,
+  maxBatchLimit: number
+): number {
+  if (rawBatchSize === undefined) {
+    return Math.min(maxBatchLimit, defaultBatchLimit);
+  }
+  if (
+    typeof rawBatchSize !== 'number' ||
+    !Number.isFinite(rawBatchSize) ||
+    !Number.isInteger(rawBatchSize) ||
+    rawBatchSize <= 0
+  ) {
+    throw createBiometricSafetyError(
+      "Invalid 'batchSize': value must be a positive finite integer.",
+      400,
+      'VALIDATION_ERROR'
+    );
+  }
+  return Math.min(maxBatchLimit, rawBatchSize);
+}
+
 function mintScopedTrustedWindow(
   evaluated: EvaluatedReconciliationWindow,
   scope: ReconciliationWindowScope,
@@ -75,11 +99,24 @@ function mintScopedTrustedWindow(
     );
   }
 
+  if (
+    typeof maxUses !== 'number' ||
+    !Number.isFinite(maxUses) ||
+    !Number.isInteger(maxUses) ||
+    maxUses <= 0
+  ) {
+    throw createBiometricSafetyError(
+      'Invalid trusted reconciliation window usage limit: expected a positive finite integer.',
+      400,
+      'VALIDATION_ERROR'
+    );
+  }
+
   const serverMaxCap =
     evaluated.mode === 'HISTORICAL'
       ? MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE
       : MAX_NORMAL_RECONCILIATION_BATCH_SIZE;
-  const boundedMaxUses = Math.min(serverMaxCap, Math.max(1, Math.floor(maxUses)));
+  const boundedMaxUses = Math.min(serverMaxCap, maxUses);
   const expiresAtMs = evaluated.issuedAtMs + TRUSTED_WINDOW_TTL_MS;
 
   const windowObj: ResolvedReconciliationTimeWindow = Object.freeze({
@@ -191,7 +228,12 @@ function verifyTrustedReconciliationTimeWindow(
   }
 
   // Enforce server-side per-window usage budget (fail-closed)
-  if (entry.usedCount >= entry.maxUses) {
+  if (
+    !Number.isFinite(entry.maxUses) ||
+    !Number.isInteger(entry.maxUses) ||
+    entry.maxUses <= 0 ||
+    entry.usedCount >= entry.maxUses
+  ) {
     return null;
   }
   entry.usedCount += 1;
@@ -1655,14 +1697,18 @@ export class PunchReconciliationService {
     const effectiveToIso = evaluated.effectiveTo.toISOString();
     const isHistoricalMode = evaluated.mode === 'HISTORICAL';
 
-    // 2. Enforce server-side maximum batch cap (historical operations capped independently of caller batchSize)
+    // 2. Strictly validate batchSize (positive finite integer only, fail-closed 400 VALIDATION_ERROR)
+    //    and enforce server-side maximum batch cap independently of caller batchSize (AUDIT-5).
     const maxBatchLimit = isHistoricalMode
       ? MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE
       : MAX_NORMAL_RECONCILIATION_BATCH_SIZE;
     const defaultBatchLimit = isHistoricalMode ? MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE : 100;
-    const batchLimit = targetPunchId
-      ? 1
-      : Math.min(maxBatchLimit, Math.max(1, options?.batchSize || defaultBatchLimit));
+    const validatedBatchLimit = parseStrictReconciliationBatchSize(
+      options?.batchSize,
+      defaultBatchLimit,
+      maxBatchLimit
+    );
+    const batchLimit = targetPunchId ? 1 : validatedBatchLimit;
 
     if (evaluated.emptyWindow) {
       return {
@@ -1733,14 +1779,35 @@ export class PunchReconciliationService {
         targetEmployee.id
       );
 
+      let conflictingLegacyTerminalIds: string[] = [];
+      if (activeMappings.length === 0 && targetEmployee.biometricDeviceId?.trim()) {
+        const legacyEnrollmentId = targetEmployee.biometricDeviceId.trim();
+        const companyMappings = await BiometricMappingService.readCompanyMappings(companyId);
+        conflictingLegacyTerminalIds = [
+          ...new Set(
+            companyMappings
+              .filter(
+                (m) =>
+                  m.isActive &&
+                  m.employeeId !== targetEmployee.id &&
+                  m.enrollmentId === legacyEnrollmentId
+              )
+              .map((m) => m.terminalId)
+          ),
+        ];
+      }
+
       if (isHistoricalMode && targetEnrollmentId) {
         const matchesActiveMapping = activeMappings.some(
           (m) =>
             m.enrollmentId === targetEnrollmentId &&
             (!targetTerminalId || m.terminalId === targetTerminalId)
         );
+        const legacyBlockedByOtherMapping =
+          Boolean(targetTerminalId) && conflictingLegacyTerminalIds.includes(targetTerminalId!);
         const matchesLegacyEnrollment =
           activeMappings.length === 0 &&
+          !legacyBlockedByOtherMapping &&
           targetEmployee.biometricDeviceId?.trim() === targetEnrollmentId;
 
         if (!matchesActiveMapping && !matchesLegacyEnrollment) {
@@ -1767,6 +1834,9 @@ export class PunchReconciliationService {
       if (activeMappings.length === 0 && targetEmployee.biometricDeviceId?.trim()) {
         conditions.push({
           userEnrollmentId: targetEmployee.biometricDeviceId.trim(),
+          ...(conflictingLegacyTerminalIds.length > 0
+            ? { terminalId: { notIn: conflictingLegacyTerminalIds } }
+            : {}),
           OR: [{ matchedEmployeeId: null }, { matchedEmployeeId: targetEmployee.id }],
         });
       }
@@ -1811,16 +1881,41 @@ export class PunchReconciliationService {
           'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
         );
       }
-      if (
-        validatedEmployee &&
-        targetPunch.matchedEmployeeId &&
-        targetPunch.matchedEmployeeId !== validatedEmployee.id
-      ) {
-        throw createBiometricSafetyError(
-          'Target punchId does not belong to the selected employee.',
-          400,
-          'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
-        );
+      if (validatedEmployee) {
+        if (targetPunch.matchedEmployeeId) {
+          if (targetPunch.matchedEmployeeId !== validatedEmployee.id) {
+            throw createBiometricSafetyError(
+              'Target punchId does not belong to the selected employee.',
+              400,
+              'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+            );
+          }
+        } else {
+          // AUDIT-3: When matchedEmployeeId is null, resolve authoritative ownership via
+          // explicit terminal/enrollment mappings and legacy fallback BEFORE auditing or minting.
+          const punchResolution = await BiometricMappingService.resolveEmployeeForPunch(
+            companyId,
+            targetPunch.terminalId,
+            targetPunch.userEnrollmentId
+          );
+          if (!punchResolution.employee) {
+            throw createBiometricSafetyError(
+              'Target punchId is unmapped and does not belong to the selected employee.',
+              400,
+              'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+            );
+          }
+          if (
+            punchResolution.employee.companyId !== companyId ||
+            punchResolution.employee.id !== validatedEmployee.id
+          ) {
+            throw createBiometricSafetyError(
+              'Target punchId does not belong to the selected employee.',
+              400,
+              'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+            );
+          }
+        }
       }
     }
 
@@ -2080,27 +2175,66 @@ export class PunchReconciliationService {
     userEnrollmentId: string,
     actorOrUserId?: ReconciliationActorInput,
     correlationId?: string,
-    options?: { fromPunchTime?: Date | string; toPunchTime?: Date | string; allowHistorical?: boolean }
-  ): Promise<PunchReconciliationResponse> {
-    const trimmedEnrollmentId = userEnrollmentId.trim();
-    if (!terminalId || !trimmedEnrollmentId) {
-      return {
-        success: true,
-        totalEvaluated: 0,
-        processed: 0,
-        pending: 0,
-        ignored: 0,
-        errors: 0,
-        results: [],
-      };
+    options?: {
+      fromPunchTime?: Date | string;
+      toPunchTime?: Date | string;
+      allowHistorical?: boolean;
+      batchSize?: number;
+      employeeId?: string;
     }
+  ): Promise<PunchReconciliationResponse> {
+    if (
+      options !== undefined &&
+      (options === null || typeof options !== 'object' || Array.isArray(options))
+    ) {
+      throw createBiometricSafetyError(
+        "Invalid reconciliation 'options': expected an options object.",
+        400,
+        'VALIDATION_ERROR'
+      );
+    }
+
+    const normalizedTerminalId = typeof terminalId === 'string' ? terminalId.trim() : '';
+    const normalizedEnrollmentId =
+      typeof userEnrollmentId === 'string' ? userEnrollmentId.trim() : '';
+
+    // Enforce historical authorization & options validation BEFORE rejecting empty IDs
+    // so unauthorized historical callers cannot bypass 403 via empty terminalId/userEnrollmentId.
+    if (options?.allowHistorical !== undefined) {
+      validateReconciliationRequestPreDb(
+        companyId,
+        {
+          terminalId: normalizedTerminalId || undefined,
+          userEnrollmentId: normalizedEnrollmentId || undefined,
+          employeeId: options.employeeId,
+          fromPunchTime: options.fromPunchTime,
+          toPunchTime: options.toPunchTime,
+          allowHistorical: options.allowHistorical,
+        },
+        actorOrUserId
+      );
+    }
+
+    if (!normalizedTerminalId || !normalizedEnrollmentId) {
+      throw createBiometricSafetyError(
+        'Both terminalId and userEnrollmentId must be non-empty strings for employee mapping reconciliation.',
+        400,
+        'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+      );
+    }
+
+    const defaultMappingBatchSize =
+      options?.allowHistorical === true
+        ? MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE
+        : MAX_NORMAL_RECONCILIATION_BATCH_SIZE;
 
     return this.reconcilePendingPunches(
       companyId,
       {
-        terminalId,
-        userEnrollmentId: trimmedEnrollmentId,
-        batchSize: 500,
+        terminalId: normalizedTerminalId,
+        userEnrollmentId: normalizedEnrollmentId,
+        employeeId: options?.employeeId,
+        batchSize: options?.batchSize ?? defaultMappingBatchSize,
         retryErrors: true,
         keepUnmappedPending: true,
         fromPunchTime: options?.fromPunchTime,

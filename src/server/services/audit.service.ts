@@ -1,6 +1,11 @@
 import { prisma } from '../db/client.js';
 import { AuditSeverity } from '../../shared/types.js';
 
+// Explicit allowlist of non-secret audit metadata keys whose names contain substrings
+// matched by SENSITIVE_KEY_PATTERNS (e.g., `authorizedAt` matches `/auth/i`).
+// Values remain subject to recursive sanitization so embedded credentials are scrubbed.
+const ALLOWED_AUDIT_METADATA_KEYS = new Set(['authorizedAt']);
+
 // Keys that must NEVER be written to audit log records
 const SENSITIVE_KEY_PATTERNS = [
   /password/i,
@@ -40,7 +45,9 @@ export function sanitizeAuditMetadata(data: unknown): unknown {
   if (typeof data === 'object') {
     const sanitizedObj: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(data as Record<string, unknown>)) {
-      const isSensitiveKey = SENSITIVE_KEY_PATTERNS.some((pattern) => pattern.test(key));
+      const isSensitiveKey =
+        !ALLOWED_AUDIT_METADATA_KEYS.has(key) &&
+        SENSITIVE_KEY_PATTERNS.some((pattern) => pattern.test(key));
       if (isSensitiveKey) {
         sanitizedObj[key] = '[REDACTED]';
       } else {

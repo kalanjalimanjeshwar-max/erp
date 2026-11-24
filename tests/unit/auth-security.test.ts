@@ -201,6 +201,7 @@ describe('Phase 3 Authentication, Passwords & Session Security Tests', () => {
         isActive: true,
         isPreview: false,
         authenticatedAtMs: mockDbUser.lastLoginAt.getTime(),
+        sessionExpiresAtMs: verifiedPayload!.exp * 1000,
         source: 'SESSION_VALIDATION',
       });
       expect(findUniqueMock).toHaveBeenCalledTimes(1);
@@ -395,8 +396,70 @@ describe('Phase 3 Authentication, Passwords & Session Security Tests', () => {
           isActive: true,
           isPreview: false,
           authenticatedAtMs: (verifiedPayload.exp - 1) * 1000,
+          sessionExpiresAtMs: verifiedPayload.exp * 1000,
           source: 'SESSION_VALIDATION',
         });
+      });
+
+      it('AUDIT-2: captures a single post-DB timestamp for both expiry check and authenticatedAtMs, and enforces sessionExpiresAtMs in getAuthenticatedActorProvenance()', async () => {
+        vi.useFakeTimers();
+        const issuedAt = new Date('2026-11-23T04:00:00.000Z');
+        vi.setSystemTime(issuedAt);
+
+        const token = AuthService.generateSessionToken({
+          userId: mockDbUser.id,
+          companyId: mockDbUser.companyId,
+          email: mockDbUser.email,
+          role: mockDbUser.role,
+          tokenVersion: mockDbUser.tokenVersion,
+        });
+
+        const verifiedPayload = AuthService.verifySessionToken(token)!;
+        expect(verifiedPayload).not.toBeNull();
+        const expiresAtMs = verifiedPayload.exp * 1000;
+
+        // Move to 500ms before exact expiry boundary
+        const preMintNowMs = expiresAtMs - 500;
+        vi.setSystemTime(preMintNowMs);
+
+        const findUniqueMock = vi.mocked(prisma.user.findUnique);
+        findUniqueMock.mockResolvedValueOnce(mockDbUser as any);
+
+        // Spy on Date.now() to prove validateSessionUser reads the clock once before DB
+        // and strictly ONCE after DB (reusing that exact timestamp for authenticatedAtMs).
+        const dateNowSpy = vi.spyOn(Date, 'now');
+        try {
+          const authUser = await AuthService.validateSessionUser(verifiedPayload);
+          expect(authUser).not.toBeNull();
+          expect(dateNowSpy).toHaveBeenCalledTimes(2);
+
+          const provenance = AuthService.getAuthenticatedActorProvenance(authUser);
+          expect(provenance).toEqual({
+            userId: mockDbUser.id,
+            companyId: mockDbUser.companyId,
+            role: 'SUPER_ADMIN',
+            tokenVersion: 1,
+            isActive: true,
+            isPreview: false,
+            authenticatedAtMs: preMintNowMs,
+            sessionExpiresAtMs: expiresAtMs,
+            source: 'SESSION_VALIDATION',
+          });
+
+          // 1ms before expiry -> still valid
+          vi.setSystemTime(expiresAtMs - 1);
+          expect(AuthService.getAuthenticatedActorProvenance(authUser)).not.toBeNull();
+
+          // At exact expiry boundary -> rejected (fail-closed)
+          vi.setSystemTime(expiresAtMs);
+          expect(AuthService.getAuthenticatedActorProvenance(authUser)).toBeNull();
+
+          // After expiry -> rejected (fail-closed)
+          vi.setSystemTime(expiresAtMs + 5000);
+          expect(AuthService.getAuthenticatedActorProvenance(authUser)).toBeNull();
+        } finally {
+          dateNowSpy.mockRestore();
+        }
       });
     });
   });

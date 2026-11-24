@@ -3001,6 +3001,509 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
       expect(punchesStore.find((p) => p.id === 'sec-hist-2')?.syncStatus).toBe('PENDING');
     });
   });
+
+  describe('Final Security Audit Remediation (AUDIT-1 through AUDIT-5)', () => {
+    const buildAuditSeed = (): InMemoryPunch[] => [
+      {
+        id: 'audit-unmapped-punch',
+        companyId,
+        terminalId,
+        devicePunchId: 'dp-audit-unmapped',
+        userEnrollmentId: '999',
+        punchTime: new Date('2026-11-20T03:30:00.000Z'),
+        verifyType: 'FINGERPRINT',
+        inOutMode: 'CHECK_IN',
+        syncStatus: 'PENDING',
+        errorMessage: null,
+        idempotencyKey: 'k-audit-unmapped',
+        matchedEmployeeId: null,
+        createdAt: new Date('2026-11-20T03:30:00.000Z'),
+        updatedAt: new Date('2026-11-20T03:30:00.000Z'),
+      },
+      {
+        id: 'audit-other-emp-unlinked',
+        companyId,
+        terminalId,
+        devicePunchId: 'dp-audit-other',
+        userEnrollmentId: '202',
+        punchTime: new Date('2026-11-20T04:00:00.000Z'),
+        verifyType: 'FINGERPRINT',
+        inOutMode: 'CHECK_IN',
+        syncStatus: 'PENDING',
+        errorMessage: null,
+        idempotencyKey: 'k-audit-other',
+        matchedEmployeeId: null,
+        createdAt: new Date('2026-11-20T04:00:00.000Z'),
+        updatedAt: new Date('2026-11-20T04:00:00.000Z'),
+      },
+      {
+        id: 'audit-active-emp-unlinked',
+        companyId,
+        terminalId,
+        devicePunchId: 'dp-audit-active',
+        userEnrollmentId: '101',
+        punchTime: new Date('2026-11-20T04:30:00.000Z'),
+        verifyType: 'FINGERPRINT',
+        inOutMode: 'CHECK_IN',
+        syncStatus: 'PENDING',
+        errorMessage: null,
+        idempotencyKey: 'k-audit-active',
+        matchedEmployeeId: null,
+        createdAt: new Date('2026-11-20T04:30:00.000Z'),
+        updatedAt: new Date('2026-11-20T04:30:00.000Z'),
+      },
+      {
+        id: 'audit-today-punch',
+        companyId,
+        terminalId,
+        devicePunchId: 'dp-audit-today',
+        userEnrollmentId: '101',
+        punchTime: new Date('2026-11-23T03:30:00.000Z'),
+        verifyType: 'FINGERPRINT',
+        inOutMode: 'CHECK_IN',
+        syncStatus: 'PENDING',
+        errorMessage: null,
+        idempotencyKey: 'k-audit-today',
+        matchedEmployeeId: activeEmployee.id,
+        createdAt: new Date('2026-11-23T03:30:00.000Z'),
+        updatedAt: new Date('2026-11-23T03:30:00.000Z'),
+      },
+    ];
+
+    it('AUDIT-1: persists intact authorizedAt ISO timestamp in real AuditService.log() JSON during historical reconciliation', async () => {
+      setupInMemoryReconciliationHarness(buildAuditSeed(), 'Asia/Kolkata');
+
+      // Restore real AuditService.log() and spy only on prisma.auditLog.create() to inspect persisted JSON
+      vi.mocked(AuditService.log).mockRestore();
+      const persistedAuditRows: Array<Record<string, any>> = [];
+      const auditCreateSpy = vi
+        .spyOn(prisma.auditLog, 'create')
+        .mockImplementation((async (args: any) => {
+          persistedAuditRows.push(args.data);
+          return { id: `audit-row-${persistedAuditRows.length}`, ...args.data };
+        }) as any);
+
+      const res = await PunchReconciliationService.reconcilePendingPunches(
+        companyId,
+        {
+          allowHistorical: true,
+          punchId: 'audit-active-emp-unlinked',
+          employeeId: activeEmployee.id,
+          fromPunchTime: '2026-11-19T00:00:00.000Z',
+          toPunchTime: '2026-11-21T23:59:59.000Z',
+        },
+        superAdminActor
+      );
+
+      expect(res.processed).toBe(1);
+      expect(auditCreateSpy).toHaveBeenCalled();
+
+      const histRow = persistedAuditRows.find((r) => r.action === 'BIOMETRIC_HISTORICAL_RECONCILE');
+      expect(histRow).toBeDefined();
+      expect(typeof histRow?.details).toBe('string');
+
+      const parsedDetails = JSON.parse(histRow!.details);
+      expect(parsedDetails.authorizedAt).toBe(FIXED_NOW_UTC.toISOString());
+      expect(parsedDetails.authorizedAt).not.toBe('[REDACTED]');
+    });
+
+    it('AUDIT-2: rejects expired server-provenanced SUPER_ADMIN actor at historical authorization boundary with zero DB queries or audits', async () => {
+      const { userFindUniqueSpy, rawPunchFindManySpy, auditLogs } =
+        setupInMemoryReconciliationHarness(buildAuditSeed(), 'Asia/Kolkata');
+
+      const provenanceBeforeExpiry = AuthService.getAuthenticatedActorProvenance(superAdminActor);
+      expect(provenanceBeforeExpiry).not.toBeNull();
+
+      // Advance fake clock to exact session expiry boundary after actor was minted
+      vi.setSystemTime(provenanceBeforeExpiry!.sessionExpiresAtMs);
+      expect(AuthService.getAuthenticatedActorProvenance(superAdminActor)).toBeNull();
+
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          {
+            allowHistorical: true,
+            terminalId,
+            fromPunchTime: '2026-11-19T00:00:00.000Z',
+            toPunchTime: '2026-11-21T23:59:59.000Z',
+          },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 403, code: 'BIOMETRIC_HISTORICAL_FORBIDDEN' });
+
+      expect(userFindUniqueSpy).not.toHaveBeenCalled();
+      expect(rawPunchFindManySpy).not.toHaveBeenCalled();
+      expect(auditLogs).toHaveLength(0);
+    });
+
+    it('AUDIT-3: rejects unmapped, cross-employee, and legacy-collision punchId+employeeId historical requests BEFORE auditing or minting a trusted window', async () => {
+      const legacyTerminalId = 'term-legacy-collision';
+      const legacyEmployee = {
+        ...activeEmployee,
+        id: 'emp-legacy-303',
+        employeeCode: 'EMP303',
+        firstName: 'Legacy',
+        lastName: 'User',
+        biometricDeviceId: '101',
+      };
+
+      const seedWithCollision: InMemoryPunch[] = [
+        ...buildAuditSeed(),
+        {
+          id: 'audit-legacy-collision-punch',
+          companyId,
+          terminalId: legacyTerminalId,
+          devicePunchId: 'dp-legacy-col',
+          userEnrollmentId: '101',
+          punchTime: new Date('2026-11-20T05:00:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          errorMessage: null,
+          idempotencyKey: 'k-legacy-col',
+          matchedEmployeeId: null,
+          createdAt: new Date('2026-11-20T05:00:00.000Z'),
+          updatedAt: new Date('2026-11-20T05:00:00.000Z'),
+        },
+      ];
+
+      const { auditLogs, rawPunchFindManySpy, rawPunchUpdateSpy, attendanceCreateSpy } =
+        setupInMemoryReconciliationHarness(seedWithCollision, 'Asia/Kolkata');
+
+      // Extend mocks to include legacyEmployee (no explicit mappings, legacy biometricDeviceId='101')
+      // and otherEmployee explicitly mapped to (legacyTerminalId, '101').
+      vi.spyOn(prisma.biometricTerminal, 'findFirst').mockImplementation((async (args: any) => {
+        if (
+          args?.where?.companyId === companyId &&
+          (args?.where?.id === terminalId || args?.where?.id === legacyTerminalId)
+        ) {
+          return { ...mockTerminal, id: args.where.id } as any;
+        }
+        return null;
+      }) as any);
+
+      vi.spyOn(prisma.employee, 'findFirst').mockImplementation((async (args: any) => {
+        if (args?.where?.companyId === companyId) {
+          if (args?.where?.id === activeEmployee.id) return activeEmployee as any;
+          if (args?.where?.id === otherEmployee.id) return otherEmployee as any;
+          if (args?.where?.id === legacyEmployee.id) return legacyEmployee as any;
+        }
+        return null;
+      }) as any);
+
+      vi.spyOn(BiometricMappingService, 'readCompanyMappings').mockResolvedValue([
+        {
+          id: 'map-101',
+          companyId,
+          employeeId: activeEmployee.id,
+          terminalId,
+          enrollmentId: '101',
+          isActive: true,
+          source: 'EXPLICIT',
+          createdAt: FIXED_NOW_UTC.toISOString(),
+          updatedAt: FIXED_NOW_UTC.toISOString(),
+        },
+        {
+          id: 'map-202',
+          companyId,
+          employeeId: otherEmployee.id,
+          terminalId,
+          enrollmentId: '202',
+          isActive: true,
+          source: 'EXPLICIT',
+          createdAt: FIXED_NOW_UTC.toISOString(),
+          updatedAt: FIXED_NOW_UTC.toISOString(),
+        },
+        {
+          id: 'map-collision-other',
+          companyId,
+          employeeId: otherEmployee.id,
+          terminalId: legacyTerminalId,
+          enrollmentId: '101',
+          isActive: true,
+          source: 'EXPLICIT',
+          createdAt: FIXED_NOW_UTC.toISOString(),
+          updatedAt: FIXED_NOW_UTC.toISOString(),
+        },
+      ]);
+
+      vi.spyOn(BiometricMappingService, 'resolveEmployeeForPunch').mockImplementation(
+        async (cId: string, tId: string | null | undefined, enrollmentId: string) => {
+          if (cId !== companyId) return { employee: null, matchedVia: null };
+          if (tId === legacyTerminalId && enrollmentId === '101') {
+            // Explicit mapping on legacyTerminalId overrides legacyEmployee's biometricDeviceId='101'
+            return { employee: otherEmployee as any, matchedVia: 'MAPPING' as const };
+          }
+          if (tId === terminalId && enrollmentId === '101') {
+            return { employee: activeEmployee as any, matchedVia: 'MAPPING' as const };
+          }
+          if (tId === terminalId && enrollmentId === '202') {
+            return { employee: otherEmployee as any, matchedVia: 'MAPPING' as const };
+          }
+          return { employee: null, matchedVia: null };
+        }
+      );
+
+      const baseRange = {
+        allowHistorical: true,
+        fromPunchTime: '2026-11-19T00:00:00.000Z',
+        toPunchTime: '2026-11-21T23:59:59.000Z',
+      };
+
+      // 1. Unmapped punch (matchedEmployeeId: null, unknown enrollment '999') + employeeId -> 400 before audit
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          { ...baseRange, punchId: 'audit-unmapped-punch', employeeId: activeEmployee.id },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_INVALID_RECONCILIATION_FILTER' });
+
+      // 2. Unlinked punch belonging via explicit mapping to otherEmployee + activeEmployee -> 400 before audit
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          { ...baseRange, punchId: 'audit-other-emp-unlinked', employeeId: activeEmployee.id },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_INVALID_RECONCILIATION_FILTER' });
+
+      // 3. Legacy biometricDeviceId collision: punch on legacyTerminalId with '101' resolves to otherEmployee, NOT legacyEmployee
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          { ...baseRange, punchId: 'audit-legacy-collision-punch', employeeId: legacyEmployee.id },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_INVALID_RECONCILIATION_FILTER' });
+
+      // 4. Legacy collision via terminalId + userEnrollmentId + employeeId -> 400 before audit
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          {
+            ...baseRange,
+            terminalId: legacyTerminalId,
+            userEnrollmentId: '101',
+            employeeId: legacyEmployee.id,
+          },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_INVALID_RECONCILIATION_FILTER' });
+
+      expect(auditLogs.filter((l) => l.action === 'BIOMETRIC_HISTORICAL_RECONCILE')).toHaveLength(0);
+      expect(rawPunchFindManySpy).not.toHaveBeenCalled();
+      expect(rawPunchUpdateSpy).not.toHaveBeenCalled();
+      expect(attendanceCreateSpy).not.toHaveBeenCalled();
+
+      // 5. Valid unlinked punch genuinely mapped to activeEmployee succeeds cleanly
+      const validRes = await PunchReconciliationService.reconcilePendingPunches(
+        companyId,
+        { ...baseRange, punchId: 'audit-active-emp-unlinked', employeeId: activeEmployee.id },
+        superAdminActor
+      );
+      expect(validRes.processed).toBe(1);
+      expect(auditLogs.filter((l) => l.action === 'BIOMETRIC_HISTORICAL_RECONCILE')).toHaveLength(1);
+    });
+
+    it('AUDIT-4: BiometricService.triggerTerminalSync never persists syncRequestedAt telemetry when target validation or historical audit fails, and preserves sync contract on success', async () => {
+      const { telemetryUpsertSpy, rawPunchFindManySpy, auditLogs } =
+        setupInMemoryReconciliationHarness(buildAuditSeed(), 'Asia/Kolkata');
+
+      const baseRange = {
+        allowHistorical: true,
+        fromPunchTime: '2026-11-19T00:00:00.000Z',
+        toPunchTime: '2026-11-21T23:59:59.000Z',
+      };
+
+      // 1. Target validation failure (nonexistent employeeId) -> 404, ZERO telemetry writes
+      await expect(
+        BiometricService.triggerTerminalSync(superAdminActor, terminalId, {
+          ...baseRange,
+          employeeId: 'emp-nonexistent-audit4',
+        })
+      ).rejects.toMatchObject({ statusCode: 404, code: 'BIOMETRIC_TARGET_NOT_FOUND' });
+
+      // 2. Target validation failure (unmapped punchId mismatched with employeeId) -> 400, ZERO telemetry writes
+      await expect(
+        BiometricService.triggerTerminalSync(superAdminActor, terminalId, {
+          ...baseRange,
+          punchId: 'audit-unmapped-punch',
+          employeeId: activeEmployee.id,
+        })
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_INVALID_RECONCILIATION_FILTER' });
+
+      // 3. Mandatory audit sink failure -> rejects, ZERO telemetry writes, ZERO punch queries
+      vi.spyOn(AuditService, 'log').mockRejectedValueOnce(new Error('Audit DB unreachable'));
+      await expect(
+        BiometricService.triggerTerminalSync(superAdminActor, terminalId, {
+          ...baseRange,
+          employeeId: activeEmployee.id,
+        })
+      ).rejects.toThrow('Audit DB unreachable');
+
+      expect(telemetryUpsertSpy).not.toHaveBeenCalled();
+      expect(rawPunchFindManySpy).not.toHaveBeenCalled();
+      expect(auditLogs.filter((l) => l.action === 'BIOMETRIC_HISTORICAL_RECONCILE')).toHaveLength(0);
+
+      // 4. Valid historical terminal sync: audit -> reconciliation -> syncRequestedAt telemetry (preserves response contract)
+      const order: string[] = [];
+      vi.spyOn(AuditService, 'log').mockImplementation(async (entry: any) => {
+        order.push(`AUDIT:${entry.action}`);
+        auditLogs.push(entry);
+        return {} as any;
+      });
+      telemetryUpsertSpy.mockImplementation((async (args: any) => {
+        order.push('TELEMETRY_UPSERT');
+        return args;
+      }) as any);
+
+      const syncRes = await BiometricService.triggerTerminalSync(superAdminActor, terminalId, {
+        ...baseRange,
+        employeeId: activeEmployee.id,
+      });
+
+      expect(syncRes.success).toBe(true);
+      expect(syncRes.bridgeSyncQueued).toBe(true);
+      expect(typeof syncRes.syncRequestedAt).toBe('string');
+      expect(syncRes.reconciliation.processed).toBe(1);
+      expect(order.indexOf('AUDIT:BIOMETRIC_HISTORICAL_RECONCILE')).toBeGreaterThanOrEqual(0);
+      expect(order.indexOf('TELEMETRY_UPSERT')).toBeGreaterThan(
+        order.indexOf('AUDIT:BIOMETRIC_HISTORICAL_RECONCILE')
+      );
+    });
+
+    it('AUDIT-5: rejects malformed service-layer batchSize values fail-closed (400 VALIDATION_ERROR) and hardens reconcileForEmployeeMapping()', async () => {
+      const { rawPunchFindManySpy, rawPunchUpdateSpy, auditLogs } =
+        setupInMemoryReconciliationHarness(buildAuditSeed(), 'Asia/Kolkata');
+
+      const malformedBatchSizes: Array<[string, unknown]> = [
+        ['zero', 0],
+        ['negative', -5],
+        ['fractional', 1.5],
+        ['NaN', Number.NaN],
+        ['Infinity', Number.POSITIVE_INFINITY],
+        ['-Infinity', Number.NEGATIVE_INFINITY],
+        ['numeric string', '10'],
+        ['non-numeric string', 'abc'],
+        ['plain object', {}],
+        ['null', null],
+      ];
+
+      for (const [_label, badBatchSize] of malformedBatchSizes) {
+        // Normal mode
+        await expect(
+          PunchReconciliationService.reconcilePendingPunches(
+            companyId,
+            { batchSize: badBatchSize as any },
+            biometricEditAdminActor
+          )
+        ).rejects.toMatchObject({ statusCode: 400, code: 'VALIDATION_ERROR' });
+
+        // Historical mode (even with punchId set)
+        await expect(
+          PunchReconciliationService.reconcilePendingPunches(
+            companyId,
+            {
+              allowHistorical: true,
+              terminalId,
+              punchId: 'audit-active-emp-unlinked',
+              batchSize: badBatchSize as any,
+              fromPunchTime: '2026-11-19T00:00:00.000Z',
+              toPunchTime: '2026-11-21T23:59:59.000Z',
+            },
+            superAdminActor
+          )
+        ).rejects.toMatchObject({ statusCode: 400, code: 'VALIDATION_ERROR' });
+      }
+
+      // reconcileForEmployeeMapping() hardening:
+      // 1. Unauthorized allowHistorical: true with empty IDs MUST still throw 403 (never silent success)
+      await expect(
+        PunchReconciliationService.reconcileForEmployeeMapping(
+          companyId,
+          '',
+          '',
+          biometricEditAdminActor,
+          undefined,
+          {
+            allowHistorical: true,
+            fromPunchTime: '2026-11-19T00:00:00.000Z',
+            toPunchTime: '2026-11-21T23:59:59.000Z',
+          }
+        )
+      ).rejects.toMatchObject({ statusCode: 403, code: 'BIOMETRIC_HISTORICAL_FORBIDDEN' });
+
+      // 2. Empty or whitespace terminalId / userEnrollmentId fails closed with 400
+      for (const [tId, eId] of [
+        ['', '101'],
+        ['   ', '101'],
+        [terminalId, ''],
+        [terminalId, '   '],
+        [null as any, '101'],
+        [terminalId, undefined as any],
+      ]) {
+        await expect(
+          PunchReconciliationService.reconcileForEmployeeMapping(
+            companyId,
+            tId,
+            eId,
+            biometricEditAdminActor
+          )
+        ).rejects.toMatchObject({
+          statusCode: 400,
+          code: 'BIOMETRIC_INVALID_RECONCILIATION_FILTER',
+        });
+      }
+
+      // 3. Invalid non-object options fails closed with 400 VALIDATION_ERROR
+      for (const badOpts of [null, 'invalid', [], 123]) {
+        await expect(
+          PunchReconciliationService.reconcileForEmployeeMapping(
+            companyId,
+            terminalId,
+            '101',
+            biometricEditAdminActor,
+            undefined,
+            badOpts as any
+          )
+        ).rejects.toMatchObject({ statusCode: 400, code: 'VALIDATION_ERROR' });
+      }
+
+      // 4. Invalid batchSize forwarded through reconcileForEmployeeMapping() fails closed with 400
+      await expect(
+        PunchReconciliationService.reconcileForEmployeeMapping(
+          companyId,
+          terminalId,
+          '101',
+          biometricEditAdminActor,
+          undefined,
+          { batchSize: 1.5 }
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'VALIDATION_ERROR' });
+
+      expect(rawPunchFindManySpy).not.toHaveBeenCalled();
+      expect(rawPunchUpdateSpy).not.toHaveBeenCalled();
+      expect(auditLogs).toHaveLength(0);
+
+      // 5. Valid padded terminalId/userEnrollmentId trims cleanly and enforces historical cap (100)
+      const histMapRes = await PunchReconciliationService.reconcileForEmployeeMapping(
+        companyId,
+        `  ${terminalId}  `,
+        '  101  ',
+        superAdminActor,
+        undefined,
+        {
+          allowHistorical: true,
+          fromPunchTime: '2026-11-19T00:00:00.000Z',
+          toPunchTime: '2026-11-21T23:59:59.000Z',
+          batchSize: 500,
+        }
+      );
+      expect(histMapRes.processed).toBe(1);
+      expect(rawPunchFindManySpy.mock.calls[0][0].take).toBe(MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE);
+    });
+  });
 });
 
 

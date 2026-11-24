@@ -1570,11 +1570,8 @@ export class BiometricService {
       );
     }
 
-    const syncRequestedAt = new Date().toISOString();
-    const updatedTel = await this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
-      syncRequestedAt,
-    });
-
+    // Run target validation, mandatory historical audit authorization, and reconciliation
+    // strictly BEFORE persisting syncRequestedAt telemetry or queuing a bridge poll (AUDIT-4).
     const reconciliation = await PunchReconciliationService.reconcilePendingPunches(
       actor.companyId,
       {
@@ -1592,6 +1589,11 @@ export class BiometricService {
       actor,
       correlationId
     );
+
+    const syncRequestedAt = new Date().toISOString();
+    const updatedTel = await this.upsertTerminalTelemetry(actor.companyId, terminal.id, {
+      syncRequestedAt,
+    });
 
     const bridgeFresh = this.isBridgeFresh(terminal, updatedTel);
     const message = bridgeFresh

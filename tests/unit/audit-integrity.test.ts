@@ -1,7 +1,12 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import { sanitizeAuditMetadata, AuditService } from '../../src/server/services/audit.service.js';
+import { prisma } from '../../src/server/db/client.js';
 
 describe('Audit Log Integrity & Safe Metadata Tests', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('should deeply redact sensitive passwords, hashes, tokens and secrets', () => {
     const rawMetadata = {
       ip: '192.168.1.100',
@@ -47,6 +52,70 @@ describe('Audit Log Integrity & Safe Metadata Tests', () => {
     expect(sec.sessionSecret).toBe('[REDACTED]');
     expect(sec.creditCard).toBe('[REDACTED]');
     expect(sanitized.directSecret).toBe('[REDACTED]');
+  });
+
+  it('AUDIT-1: preserves authorizedAt in sanitizeAuditMetadata() and persisted AuditService.log() JSON while redacting auth credentials and secrets', async () => {
+    const authorizedAtIso = '2026-11-23T04:00:00.000Z';
+    const rawDetails = {
+      companyId: 'company-uuid-1',
+      actorUserId: 'user-super-1',
+      actorRole: 'SUPER_ADMIN',
+      authorizedAt: authorizedAtIso,
+      authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.secret',
+      authHeader: 'Basic dXNlcjpwYXNz',
+      authToken: 'tok_live_secret_123',
+      auth: 'raw-auth-credential',
+      cookie: 'coreerp_session=abc123',
+      sessionId: 'sess-secret-999',
+      password: 'PlainPassword123!',
+      nested: {
+        authorizedAt: 'postgresql://dbuser:pw123@localhost:5432/core_erp',
+        privateKey: '-----BEGIN PRIVATE KEY-----',
+      },
+    };
+
+    const sanitized = sanitizeAuditMetadata(rawDetails) as Record<string, any>;
+    expect(sanitized.authorizedAt).toBe(authorizedAtIso);
+    expect(sanitized.authorization).toBe('[REDACTED]');
+    expect(sanitized.authHeader).toBe('[REDACTED]');
+    expect(sanitized.authToken).toBe('[REDACTED]');
+    expect(sanitized.auth).toBe('[REDACTED]');
+    expect(sanitized.cookie).toBe('[REDACTED]');
+    expect(sanitized.sessionId).toBe('[REDACTED]');
+    expect(sanitized.password).toBe('[REDACTED]');
+    // Even allowlisted keys still have embedded DB credentials scrubbed
+    expect(sanitized.nested.authorizedAt).toBe('postgresql://***:***@localhost:5432/core_erp');
+    expect(sanitized.nested.privateKey).toBe('[REDACTED]');
+
+    // Exercise the real AuditService.log() -> prisma.auditLog.create() JSON persistence path
+    let persistedCreateArg: any = null;
+    const createSpy = vi
+      .spyOn(prisma.auditLog, 'create')
+      .mockImplementation((async (args: any) => {
+        persistedCreateArg = args;
+        return { id: 'audit-1', ...args.data };
+      }) as any);
+
+    await AuditService.log({
+      companyId: 'company-uuid-1',
+      userId: 'user-super-1',
+      action: 'BIOMETRIC_HISTORICAL_RECONCILE',
+      entity: 'RawPunchLog',
+      entityId: 'term-1',
+      details: rawDetails,
+    });
+
+    expect(createSpy).toHaveBeenCalledTimes(1);
+    expect(typeof persistedCreateArg?.data?.details).toBe('string');
+    const persistedJson = JSON.parse(persistedCreateArg.data.details);
+    expect(persistedJson.authorizedAt).toBe(authorizedAtIso);
+    expect(persistedJson.authorization).toBe('[REDACTED]');
+    expect(persistedJson.authHeader).toBe('[REDACTED]');
+    expect(persistedJson.authToken).toBe('[REDACTED]');
+    expect(persistedJson.auth).toBe('[REDACTED]');
+    expect(persistedJson.cookie).toBe('[REDACTED]');
+    expect(persistedJson.password).toBe('[REDACTED]');
+    expect(persistedJson.nested.privateKey).toBe('[REDACTED]');
   });
 
   it('should sanitize credentials embedded inside database connection strings', () => {

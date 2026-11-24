@@ -23,6 +23,7 @@ export interface AuthenticatedActorProvenance {
   readonly isActive: true;
   readonly isPreview: false;
   readonly authenticatedAtMs: number;
+  readonly sessionExpiresAtMs: number;
   readonly source: 'SESSION_VALIDATION';
 }
 
@@ -588,6 +589,15 @@ export class AuthService {
       return null;
     }
 
+    if (
+      !Number.isFinite(provenance.sessionExpiresAtMs) ||
+      !Number.isFinite(provenance.authenticatedAtMs) ||
+      provenance.authenticatedAtMs >= provenance.sessionExpiresAtMs ||
+      Date.now() >= provenance.sessionExpiresAtMs
+    ) {
+      return null;
+    }
+
     return provenance;
   }
 
@@ -657,10 +667,12 @@ export class AuthService {
         where: { id: snapshot.userId },
       });
 
-      // Re-check expiry immediately after the async DB lookup to prevent TOCTOU
-      // provenance minting if the session expired while the query was pending.
-      const postQueryNowSeconds = Math.floor(Date.now() / 1000);
-      if (snapshot.exp <= postQueryNowSeconds) {
+      // Capture a single validated timestamp immediately after the async DB lookup and reuse it
+      // for both expiry enforcement and provenance minting to prevent TOCTOU or clock-tick races.
+      const postQueryNowMs = Date.now();
+      const postQueryNowSeconds = Math.floor(postQueryNowMs / 1000);
+      const sessionExpiresAtMs = snapshot.exp * 1000;
+      if (snapshot.exp <= postQueryNowSeconds || postQueryNowMs >= sessionExpiresAtMs) {
         return null;
       }
 
@@ -690,7 +702,8 @@ export class AuthService {
           tokenVersion: user.tokenVersion,
           isActive: true,
           isPreview: false,
-          authenticatedAtMs: Date.now(),
+          authenticatedAtMs: postQueryNowMs,
+          sessionExpiresAtMs,
           source: 'SESSION_VALIDATION',
         })
       );
