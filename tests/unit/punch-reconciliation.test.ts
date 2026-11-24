@@ -8,6 +8,7 @@ import {
 } from '../../src/server/services/punch-reconciliation.service.js';
 import { AuthService } from '../../src/server/services/auth.service.js';
 import { AuditService } from '../../src/server/services/audit.service.js';
+import { BiometricMappingService } from '../../src/server/services/biometric-mapping.service.js';
 import { AuthUser } from '../../src/shared/types.ts';
 
 vi.mock('../../src/server/services/audit.service.js', () => ({
@@ -84,6 +85,8 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
     vi.useFakeTimers({ toFake: ['Date'] });
     vi.setSystemTime(new Date('2026-10-19T20:00:00.000Z'));
     vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
+    vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValue(null as any);
+    vi.spyOn(prisma.employee, 'findMany').mockResolvedValue([defaultMockEmployee] as any);
     vi.spyOn(prisma.leaveRequest, 'findFirst').mockResolvedValue(null as any);
     vi.spyOn(prisma, '$transaction').mockImplementation(async (callback: any) => {
       if (typeof callback === 'function') {
@@ -164,7 +167,7 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
       };
 
       vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(rawPunch as any);
-      vi.spyOn(prisma.employee, 'findFirst').mockResolvedValueOnce(matchedEmp as any);
+      vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([matchedEmp] as any);
       vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValue({} as any);
       vi.spyOn(prisma.company, 'findUnique').mockResolvedValueOnce({ timezone: 'UTC' } as any);
       vi.spyOn(prisma.payrollPeriod, 'findFirst').mockResolvedValueOnce(null); // No locked payroll
@@ -231,7 +234,7 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
       };
 
       vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(rawPunch as any);
-      vi.spyOn(prisma.employee, 'findFirst').mockResolvedValueOnce(null); // Not found
+      vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([] as any); // Not found
       const updateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
 
       const result = await PunchReconciliationService.reconcilePunch('punch-unmapped');
@@ -802,13 +805,15 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
         vi.spyOn(prisma.rawPunchLog, 'findMany').mockResolvedValueOnce([{ id: 'punch-err-retry' }] as any);
         vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(errorPunch as any);
-        vi.spyOn(prisma.employee, 'findFirst').mockResolvedValueOnce({
-          id: 'new-emp-uuid',
-          companyId: companyAlphaId,
-          biometricDeviceId: 'BIO-NEW-EMP',
-          status: 'ACTIVE',
-          shift: standardShift,
-        } as any);
+        vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([
+          {
+            id: 'new-emp-uuid',
+            companyId: companyAlphaId,
+            biometricDeviceId: 'BIO-NEW-EMP',
+            status: 'ACTIVE',
+            shift: standardShift,
+          },
+        ] as any);
         vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValue({} as any);
         vi.spyOn(prisma.payrollPeriod, 'findFirst').mockResolvedValueOnce(null);
         vi.spyOn(prisma.attendance, 'findUnique').mockResolvedValueOnce(null);
@@ -1053,6 +1058,8 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
           $queryRaw: txQueryRaw,
           $executeRaw: txExecuteRaw,
           rawPunchLog: { findUnique: txFindUnique, update: vi.fn().mockResolvedValue({}) },
+          companySetting: { findUnique: vi.fn().mockResolvedValue(null) },
+          employee: { findMany: vi.fn().mockResolvedValue([{ ...defaultMockEmployee, id: uuidEmpId, companyId: uuidCompanyA }]) },
           company: { findUnique: vi.fn().mockResolvedValue({ timezone: 'UTC' }) },
           payrollPeriod: { findFirst: vi.fn().mockResolvedValue(null) },
           attendance: { findUnique: txAttFindUnique, create: txAttCreate },
@@ -1200,10 +1207,12 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
               findUnique: vi.fn(async () => null),
             },
             employee: {
-              findFirst: vi.fn(async () => ({
-                ...defaultMockEmployee,
-                companyId: uuidCompanyId,
-              })),
+              findMany: vi.fn(async () => [
+                {
+                  ...defaultMockEmployee,
+                  companyId: uuidCompanyId,
+                },
+              ]),
             },
             company: {
               findUnique: vi.fn(async () => ({ timezone: 'UTC' })),
@@ -1326,6 +1335,10 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
               throw new Error('Simulated DB connection drop before commit');
             }),
           },
+          companySetting: { findUnique: vi.fn(async () => null) },
+          employee: {
+            findMany: vi.fn(async () => [{ ...defaultMockEmployee, companyId: uuidCompanyId }]),
+          },
           company: { findUnique: vi.fn(async () => ({ timezone: 'UTC' })) },
           payrollPeriod: { findFirst: vi.fn(async () => null) },
           attendance: {
@@ -1446,6 +1459,556 @@ describe('Phase 8.2: Biometric Punch Reconciliation Engine and Sync Service Test
         attUpdateSpy.mockRestore();
         rawUpdateSpy.mockRestore();
       }
+    });
+  });
+
+  describe('9. GAP 2: Pre-matched RawPunchLog re-verification on legacy ambiguity & tenant integrity', () => {
+    it('fails closed without Attendance mutation when a previously legacy-matched punch becomes ambiguous after a second employee acquires the same biometricDeviceId', async () => {
+      const empA = {
+        ...defaultMockEmployee,
+        id: 'emp-legacy-pre-a',
+        biometricDeviceId: 'BIO-SHARED-901',
+      };
+      const empB = {
+        ...defaultMockEmployee,
+        id: 'emp-legacy-pre-b',
+        employeeCode: 'EMP-002',
+        biometricDeviceId: 'BIO-SHARED-901',
+      };
+
+      const preMatchedPunch = {
+        id: 'punch-prematched-ambiguous',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-1',
+        userEnrollmentId: 'BIO-SHARED-901',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: empA.id,
+        matchedEmployee: empA,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(preMatchedPunch as any);
+      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValueOnce(null as any);
+      vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([empA, empB] as any);
+      const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+      const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+
+      const result = await PunchReconciliationService.reconcilePunch('punch-prematched-ambiguous');
+
+      expect(result.status).toBe('ERROR');
+      expect(result.workDate).toBeNull();
+      expect(result.message).toContain('Ambiguous legacy biometric enrollment mapping');
+      expect(attCreateSpy).not.toHaveBeenCalled();
+      expect(attUpdateSpy).not.toHaveBeenCalled();
+      expect(rawUpdateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'punch-prematched-ambiguous' },
+          data: expect.objectContaining({
+            syncStatus: 'ERROR',
+            errorMessage: expect.stringContaining('Ambiguous legacy biometric enrollment mapping'),
+          }),
+        })
+      );
+      // Must NOT blindly reassign matchedEmployeeId on RawPunchLog
+      const updatePayload = rawUpdateSpy.mock.calls[0][0].data as Record<string, unknown>;
+      expect(updatePayload.matchedEmployeeId).toBeUndefined();
+    });
+
+    it('continues to reconcile a unique pre-matched legacy punch cleanly', async () => {
+      const uniqueEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-legacy-unique-902',
+        biometricDeviceId: 'BIO-UNIQUE-902',
+      };
+
+      const preMatchedUniquePunch = {
+        id: 'punch-prematched-unique',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-1',
+        userEnrollmentId: 'BIO-UNIQUE-902',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: uniqueEmp.id,
+        matchedEmployee: uniqueEmp,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(preMatchedUniquePunch as any);
+      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValueOnce(null as any);
+      vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([uniqueEmp] as any);
+      vi.spyOn(prisma.payrollPeriod, 'findFirst').mockResolvedValueOnce(null);
+      vi.spyOn(prisma.attendance, 'findUnique').mockResolvedValueOnce(null);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create').mockResolvedValueOnce({} as any);
+      vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValue({} as any);
+
+      const result = await PunchReconciliationService.reconcilePunch('punch-prematched-unique');
+
+      expect(result.status).toBe('PROCESSED');
+      expect(result.matchedEmployeeId).toBe(uniqueEmp.id);
+      expect(attCreateSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('reconciles a pre-matched punch backed by a valid explicit terminal mapping even when other legacy employees share the enrollment ID', async () => {
+      const explicitEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-explicit-903',
+        biometricDeviceId: 'BIO-EXPLICIT-903',
+      };
+
+      const explicitPunch = {
+        id: 'punch-prematched-explicit',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-explicit',
+        userEnrollmentId: 'BIO-EXPLICIT-903',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: explicitEmp.id,
+        matchedEmployee: explicitEmp,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(explicitPunch as any);
+      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValueOnce({
+        id: 'setting-explicit',
+        companyId: companyAlphaId,
+        key: 'BIOMETRIC_EMPLOYEE_MAPPINGS_V1',
+        value: JSON.stringify([
+          {
+            id: 'map-903',
+            companyId: companyAlphaId,
+            employeeId: explicitEmp.id,
+            terminalId: 'term-gate-explicit',
+            enrollmentId: 'BIO-EXPLICIT-903',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-10-01T00:00:00.000Z',
+            updatedAt: '2026-10-01T00:00:00.000Z',
+          },
+        ]),
+      } as any);
+      vi.spyOn(prisma.employee, 'findUnique').mockResolvedValueOnce(explicitEmp as any);
+      const legacyFindManySpy = vi.spyOn(prisma.employee, 'findMany');
+      vi.spyOn(prisma.payrollPeriod, 'findFirst').mockResolvedValueOnce(null);
+      vi.spyOn(prisma.attendance, 'findUnique').mockResolvedValueOnce(null);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create').mockResolvedValueOnce({} as any);
+      vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValue({} as any);
+
+      const result = await PunchReconciliationService.reconcilePunch('punch-prematched-explicit');
+
+      expect(result.status).toBe('PROCESSED');
+      expect(result.matchedEmployeeId).toBe(explicitEmp.id);
+      expect(attCreateSpy).toHaveBeenCalledTimes(1);
+      expect(legacyFindManySpy).not.toHaveBeenCalled();
+    });
+
+    it('rejects a previously matched punch whose matchedEmployee belongs to another company without bypassing tenant checks', async () => {
+      const betaEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-beta-904',
+        companyId: companyBetaId,
+        biometricDeviceId: 'BIO-904',
+      };
+
+      const crossTenantPreMatched = {
+        id: 'punch-prematched-cross-tenant',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-1',
+        userEnrollmentId: 'BIO-904',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: betaEmp.id,
+        matchedEmployee: betaEmp,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(crossTenantPreMatched as any);
+      const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+
+      const result = await PunchReconciliationService.reconcilePunch('punch-prematched-cross-tenant');
+
+      expect(result.status).toBe('ERROR');
+      expect(result.matchedEmployeeId).toBeNull();
+      expect(result.message).toContain('Security violation');
+      expect(attCreateSpy).not.toHaveBeenCalled();
+      expect(rawUpdateSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { id: 'punch-prematched-cross-tenant' },
+          data: expect.objectContaining({
+            syncStatus: 'ERROR',
+            errorMessage: expect.stringContaining('Security violation'),
+          }),
+        })
+      );
+    });
+
+    it('fails closed without Attendance mutation or matchedEmployeeId reassignment when current resolution returns employee=null', async () => {
+      const staleEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-stale-905',
+        biometricDeviceId: 'BIO-STALE-905',
+      };
+
+      const stalePunch = {
+        id: 'punch-prematched-emp-null',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-1',
+        userEnrollmentId: 'BIO-STALE-905',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: staleEmp.id,
+        matchedEmployee: staleEmp,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(stalePunch as any);
+      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValueOnce(null as any);
+      // No legacy employee currently matches BIO-STALE-905 -> resolveEmployeeForPunch returns { employee: null, matchedVia: null }
+      vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([] as any);
+      const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+      const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+
+      const result = await PunchReconciliationService.reconcilePunch('punch-prematched-emp-null');
+
+      expect(result.status).toBe('ERROR');
+      expect(result.workDate).toBeNull();
+      expect(result.matchedEmployeeId).toBe(staleEmp.id);
+      expect(result.message).toContain('Biometric enrollment mapping mismatch');
+      expect(attCreateSpy).not.toHaveBeenCalled();
+      expect(attUpdateSpy).not.toHaveBeenCalled();
+      expect(rawUpdateSpy).toHaveBeenCalledTimes(1);
+      const updatePayload = rawUpdateSpy.mock.calls[0][0].data as Record<string, unknown>;
+      expect(updatePayload.syncStatus).toBe('ERROR');
+      expect(updatePayload.matchedEmployeeId).toBeUndefined();
+    });
+
+    it('fails closed without Attendance mutation or matchedEmployeeId reassignment when current resolution returns matchedVia=null', async () => {
+      const preEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-matchedvia-null-906',
+        biometricDeviceId: 'BIO-906',
+      };
+
+      const punch = {
+        id: 'punch-prematched-via-null',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-1',
+        userEnrollmentId: 'BIO-906',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: preEmp.id,
+        matchedEmployee: preEmp,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(punch as any);
+      vi.spyOn(BiometricMappingService, 'resolveEmployeeForPunch').mockResolvedValueOnce({
+        employee: preEmp,
+        matchedVia: null,
+      });
+      const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+      const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+
+      const result = await PunchReconciliationService.reconcilePunch('punch-prematched-via-null');
+
+      expect(result.status).toBe('ERROR');
+      expect(result.workDate).toBeNull();
+      expect(result.matchedEmployeeId).toBe(preEmp.id);
+      expect(result.message).toContain('Biometric enrollment mapping mismatch');
+      expect(attCreateSpy).not.toHaveBeenCalled();
+      expect(attUpdateSpy).not.toHaveBeenCalled();
+      const updatePayload = rawUpdateSpy.mock.calls[0][0].data as Record<string, unknown>;
+      expect(updatePayload.syncStatus).toBe('ERROR');
+      expect(updatePayload.matchedEmployeeId).toBeUndefined();
+    });
+
+    it('fails closed without Attendance mutation or reassignment when active explicit mapping now points to another employee', async () => {
+      const oldEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-old-907',
+        biometricDeviceId: 'BIO-907',
+      };
+      const newExplicitEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-new-explicit-907',
+        employeeCode: 'EMP-907B',
+        biometricDeviceId: 'BIO-907',
+      };
+
+      const punch = {
+        id: 'punch-prematched-explicit-other',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-907',
+        userEnrollmentId: 'BIO-907',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: oldEmp.id,
+        matchedEmployee: oldEmp,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(punch as any);
+      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValueOnce({
+        id: 'setting-907',
+        companyId: companyAlphaId,
+        key: 'BIOMETRIC_EMPLOYEE_MAPPINGS_V1',
+        value: JSON.stringify([
+          {
+            id: 'map-907',
+            companyId: companyAlphaId,
+            employeeId: newExplicitEmp.id,
+            terminalId: 'term-gate-907',
+            enrollmentId: 'BIO-907',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-10-01T00:00:00.000Z',
+            updatedAt: '2026-10-01T00:00:00.000Z',
+          },
+        ]),
+      } as any);
+      vi.spyOn(prisma.employee, 'findUnique').mockResolvedValueOnce(newExplicitEmp as any);
+      const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+      const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+
+      const result = await PunchReconciliationService.reconcilePunch('punch-prematched-explicit-other');
+
+      expect(result.status).toBe('ERROR');
+      expect(result.workDate).toBeNull();
+      expect(result.matchedEmployeeId).toBe(oldEmp.id);
+      expect(result.message).toContain('Biometric enrollment mapping mismatch');
+      expect(attCreateSpy).not.toHaveBeenCalled();
+      expect(attUpdateSpy).not.toHaveBeenCalled();
+      const updatePayload = rawUpdateSpy.mock.calls[0][0].data as Record<string, unknown>;
+      expect(updatePayload.syncStatus).toBe('ERROR');
+      expect(updatePayload.matchedEmployeeId).toBeUndefined();
+    });
+
+    it('fails closed without Attendance mutation or reassignment when active explicit mapping points to an inactive or missing employee', async () => {
+      const legacyPreEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-legacy-pre-908',
+        biometricDeviceId: 'BIO-908',
+      };
+      const inactiveExplicitEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-inactive-explicit-908',
+        status: 'INACTIVE',
+      };
+
+      // Case A: Active explicit mapping points to an INACTIVE different employee
+      const punchInactive = {
+        id: 'punch-prematched-explicit-inactive',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-908',
+        userEnrollmentId: 'BIO-908',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: legacyPreEmp.id,
+        matchedEmployee: legacyPreEmp,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(punchInactive as any);
+      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValueOnce({
+        id: 'setting-908-inactive',
+        companyId: companyAlphaId,
+        key: 'BIOMETRIC_EMPLOYEE_MAPPINGS_V1',
+        value: JSON.stringify([
+          {
+            id: 'map-908-inactive',
+            companyId: companyAlphaId,
+            employeeId: inactiveExplicitEmp.id,
+            terminalId: 'term-gate-908',
+            enrollmentId: 'BIO-908',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-10-01T00:00:00.000Z',
+            updatedAt: '2026-10-01T00:00:00.000Z',
+          },
+        ]),
+      } as any);
+      vi.spyOn(prisma.employee, 'findUnique').mockResolvedValueOnce(inactiveExplicitEmp as any);
+      const rawUpdateSpyA = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+      const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+
+      const resInactive = await PunchReconciliationService.reconcilePunch('punch-prematched-explicit-inactive');
+      expect(resInactive.status).toBe('ERROR');
+      expect(resInactive.workDate).toBeNull();
+      expect(resInactive.message).toContain('Biometric enrollment mapping mismatch');
+      expect(attCreateSpy).not.toHaveBeenCalled();
+      expect(attUpdateSpy).not.toHaveBeenCalled();
+      expect((rawUpdateSpyA.mock.calls[0][0].data as Record<string, unknown>).matchedEmployeeId).toBeUndefined();
+
+      // Case B: Active explicit mapping points to a MISSING (deleted/stale) employee
+      const punchMissing = {
+        ...punchInactive,
+        id: 'punch-prematched-explicit-missing',
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(punchMissing as any);
+      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValueOnce({
+        id: 'setting-908-missing',
+        companyId: companyAlphaId,
+        key: 'BIOMETRIC_EMPLOYEE_MAPPINGS_V1',
+        value: JSON.stringify([
+          {
+            id: 'map-908-missing',
+            companyId: companyAlphaId,
+            employeeId: 'emp-deleted-908',
+            terminalId: 'term-gate-908',
+            enrollmentId: 'BIO-908',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-10-01T00:00:00.000Z',
+            updatedAt: '2026-10-01T00:00:00.000Z',
+          },
+        ]),
+      } as any);
+      vi.spyOn(prisma.employee, 'findUnique').mockResolvedValueOnce(null);
+      const rawUpdateSpyB = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+
+      const resMissing = await PunchReconciliationService.reconcilePunch('punch-prematched-explicit-missing');
+      expect(resMissing.status).toBe('ERROR');
+      expect(resMissing.workDate).toBeNull();
+      expect(resMissing.message).toContain('Biometric enrollment mapping mismatch');
+      expect(attCreateSpy).not.toHaveBeenCalled();
+      expect(attUpdateSpy).not.toHaveBeenCalled();
+      expect((rawUpdateSpyB.mock.calls[0][0].data as Record<string, unknown>).matchedEmployeeId).toBeUndefined();
+    });
+
+    it('fails closed without Attendance mutation or reassignment when legacy mapping now resolves to a different employee', async () => {
+      const oldLegacyEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-legacy-old-909',
+        biometricDeviceId: 'BIO-909',
+      };
+      const newLegacyEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-legacy-new-909',
+        employeeCode: 'EMP-909B',
+        biometricDeviceId: 'BIO-909',
+      };
+
+      const punch = {
+        id: 'punch-prematched-legacy-other',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-1',
+        userEnrollmentId: 'BIO-909',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: oldLegacyEmp.id,
+        matchedEmployee: oldLegacyEmp,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(punch as any);
+      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValueOnce(null as any);
+      // Only newLegacyEmp now holds biometricDeviceId 'BIO-909'
+      vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([newLegacyEmp] as any);
+      const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+      const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+
+      const result = await PunchReconciliationService.reconcilePunch('punch-prematched-legacy-other');
+
+      expect(result.status).toBe('ERROR');
+      expect(result.workDate).toBeNull();
+      expect(result.matchedEmployeeId).toBe(oldLegacyEmp.id);
+      expect(result.message).toContain('Biometric enrollment mapping mismatch');
+      expect(attCreateSpy).not.toHaveBeenCalled();
+      expect(attUpdateSpy).not.toHaveBeenCalled();
+      const updatePayload = rawUpdateSpy.mock.calls[0][0].data as Record<string, unknown>;
+      expect(updatePayload.syncStatus).toBe('ERROR');
+      expect(updatePayload.matchedEmployeeId).toBeUndefined();
+    });
+
+    it('fails closed without Attendance mutation or reassignment when pre-matched resolution omits employee.companyId', async () => {
+      const preEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-missing-company-910',
+        biometricDeviceId: 'BIO-910',
+      };
+      const { companyId: _omittedCompanyId, ...empWithoutCompanyId } = preEmp;
+
+      const punch = {
+        id: 'punch-prematched-missing-company',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-1',
+        userEnrollmentId: 'BIO-910',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: preEmp.id,
+        matchedEmployee: preEmp,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(punch as any);
+      vi.spyOn(BiometricMappingService, 'resolveEmployeeForPunch').mockResolvedValueOnce({
+        employee: empWithoutCompanyId,
+        matchedVia: 'MAPPING',
+      });
+      const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+      const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+
+      const result = await PunchReconciliationService.reconcilePunch('punch-prematched-missing-company');
+
+      expect(result.status).toBe('ERROR');
+      expect(result.workDate).toBeNull();
+      expect(result.matchedEmployeeId).toBe(preEmp.id);
+      expect(result.message).toContain('Biometric enrollment mapping mismatch');
+      expect(attCreateSpy).not.toHaveBeenCalled();
+      expect(attUpdateSpy).not.toHaveBeenCalled();
+      const updatePayload = rawUpdateSpy.mock.calls[0][0].data as Record<string, unknown>;
+      expect(updatePayload.syncStatus).toBe('ERROR');
+      expect(updatePayload.matchedEmployeeId).toBeUndefined();
+    });
+
+    it('fails closed without Attendance mutation or reassignment when pre-matched resolution returns a different employee.companyId', async () => {
+      const preEmp = {
+        ...defaultMockEmployee,
+        id: 'emp-wrong-company-911',
+        biometricDeviceId: 'BIO-911',
+      };
+
+      const punch = {
+        id: 'punch-prematched-wrong-company',
+        companyId: companyAlphaId,
+        terminalId: 'term-gate-1',
+        userEnrollmentId: 'BIO-911',
+        punchTime: new Date('2026-10-19T08:55:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: preEmp.id,
+        matchedEmployee: preEmp,
+      };
+
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(punch as any);
+      vi.spyOn(BiometricMappingService, 'resolveEmployeeForPunch').mockResolvedValueOnce({
+        employee: { ...preEmp, companyId: companyBetaId },
+        matchedVia: 'LEGACY',
+      });
+      const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValueOnce({} as any);
+      const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+      const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+
+      const result = await PunchReconciliationService.reconcilePunch('punch-prematched-wrong-company');
+
+      expect(result.status).toBe('ERROR');
+      expect(result.workDate).toBeNull();
+      expect(result.matchedEmployeeId).toBe(preEmp.id);
+      expect(result.message).toContain('Biometric enrollment mapping mismatch');
+      expect(attCreateSpy).not.toHaveBeenCalled();
+      expect(attUpdateSpy).not.toHaveBeenCalled();
+      const updatePayload = rawUpdateSpy.mock.calls[0][0].data as Record<string, unknown>;
+      expect(updatePayload.syncStatus).toBe('ERROR');
+      expect(updatePayload.matchedEmployeeId).toBeUndefined();
     });
   });
 });

@@ -582,6 +582,35 @@ export class PunchReconciliationService {
     return 0;
   }
 
+  /**
+   * Authoritative pre-match verification for punches that already carry a matchedEmployeeId.
+   * Allows reconciliation to proceed ONLY when current mapping resolution is non-ambiguous,
+   * resolves via EXPLICIT ('MAPPING') or unique 'LEGACY' (never null), returns a non-null
+   * employee in the same company, and matches the exact pre-matched employee ID.
+   */
+  private static isAuthoritativePreMatchValid(
+    resolution: {
+      employee: { id?: unknown; companyId?: unknown } | null;
+      matchedVia: 'MAPPING' | 'LEGACY' | null;
+      ambiguous?: boolean;
+    },
+    expectedEmployeeId: string,
+    companyId: string
+  ): boolean {
+    if (resolution.ambiguous) {
+      return false;
+    }
+    if (!resolution.employee || typeof resolution.employee.id !== 'string') {
+      return false;
+    }
+    if (resolution.matchedVia !== 'MAPPING' && resolution.matchedVia !== 'LEGACY') {
+      return false;
+    }
+    if (resolution.employee.companyId !== companyId) {
+      return false;
+    }
+    return resolution.employee.id === expectedEmployeeId;
+  }
 
   /**
    * Reconciles a single raw punch record within an atomic transaction.
@@ -782,6 +811,26 @@ export class PunchReconciliationService {
             };
           }
 
+          if (resolution.ambiguous) {
+            const reason = `Ambiguous legacy biometric enrollment mapping: Multiple employees share biometricDeviceId '${punch.userEnrollmentId}' in this company. Configure explicit terminal enrollment mappings before reconciling.`;
+            await tx.rawPunchLog.update({
+              where: { id: punch.id },
+              data: {
+                syncStatus: 'ERROR',
+                errorMessage: reason,
+              },
+            });
+
+            return {
+              punchId: punch.id,
+              userEnrollmentId: punch.userEnrollmentId,
+              matchedEmployeeId: null,
+              workDate: null,
+              status: 'ERROR',
+              message: reason,
+            };
+          }
+
           if (options?.keepUnmappedPending) {
             const pendingReason = `Pending enrollment mapping: No employee mapped for enrollment ID '${punch.userEnrollmentId}' on this terminal.`;
             await tx.rawPunchLog.update({
@@ -889,6 +938,39 @@ export class PunchReconciliationService {
           message:
             'Punch falls outside the authorized reconciliation scope and was left untouched.',
         };
+      } else {
+        // FIND-1 pre-matched fail-closed verification: reconciliation may continue ONLY if
+        // current authoritative mapping resolution is non-ambiguous, has a non-null matchedVia
+        // ('MAPPING' or 'LEGACY'), returns a non-null employee in the same company, and resolves
+        // to the exact same employee ID as punch.matchedEmployee.id. Never blindly reassigns
+        // punch.matchedEmployeeId.
+        const currentResolution = await BiometricMappingService.resolveEmployeeForPunch(
+          punch.companyId,
+          punch.terminalId,
+          punch.userEnrollmentId,
+          tx
+        );
+
+        if (!this.isAuthoritativePreMatchValid(currentResolution, employee.id, punch.companyId)) {
+          const reason = currentResolution.ambiguous
+            ? `Ambiguous legacy biometric enrollment mapping: Multiple employees share biometricDeviceId '${punch.userEnrollmentId}' in this company. Configure explicit terminal enrollment mappings before reconciling.`
+            : `Biometric enrollment mapping mismatch: Pre-matched employee '${employee.id}' is no longer authoritatively resolved for enrollment '${punch.userEnrollmentId}'. Configure explicit terminal enrollment mappings before reconciling.`;
+          await tx.rawPunchLog.update({
+            where: { id: punch.id },
+            data: {
+              syncStatus: 'ERROR',
+              errorMessage: reason,
+            },
+          });
+          return {
+            punchId: punch.id,
+            userEnrollmentId: punch.userEnrollmentId,
+            matchedEmployeeId: punch.matchedEmployeeId ?? employee.id,
+            workDate: null,
+            status: 'ERROR',
+            message: reason,
+          };
+        }
       }
 
       // A2. Inactive Employee Policy Enforcement
@@ -1780,9 +1862,13 @@ export class PunchReconciliationService {
       );
 
       let conflictingLegacyTerminalIds: string[] = [];
+      let isAmbiguousLegacyEmployee = false;
       if (activeMappings.length === 0 && targetEmployee.biometricDeviceId?.trim()) {
         const legacyEnrollmentId = targetEmployee.biometricDeviceId.trim();
         const companyMappings = await BiometricMappingService.readCompanyMappings(companyId);
+        const explicitMappedEmployeeIds = new Set(
+          companyMappings.filter((m) => m.isActive).map((m) => m.employeeId)
+        );
         conflictingLegacyTerminalIds = [
           ...new Set(
             companyMappings
@@ -1795,6 +1881,12 @@ export class PunchReconciliationService {
               .map((m) => m.terminalId)
           ),
         ];
+        const legacyPeers = await BiometricMappingService.findLegacyEmployeesForEnrollment(
+          companyId,
+          legacyEnrollmentId,
+          explicitMappedEmployeeIds
+        );
+        isAmbiguousLegacyEmployee = legacyPeers.length > 1;
       }
 
       if (isHistoricalMode && targetEnrollmentId) {
@@ -1810,6 +1902,14 @@ export class PunchReconciliationService {
           !legacyBlockedByOtherMapping &&
           targetEmployee.biometricDeviceId?.trim() === targetEnrollmentId;
 
+        if (!matchesActiveMapping && matchesLegacyEnrollment && isAmbiguousLegacyEmployee) {
+          throw createBiometricSafetyError(
+            `Ambiguous legacy biometric enrollment mapping: Multiple employees share biometricDeviceId '${targetEnrollmentId}' in this company. Configure explicit terminal enrollment mappings before reconciling.`,
+            400,
+            'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING'
+          );
+        }
+
         if (!matchesActiveMapping && !matchesLegacyEnrollment) {
           throw createBiometricSafetyError(
             'Requested userEnrollmentId does not belong to the selected employee in this company.',
@@ -1817,6 +1917,20 @@ export class PunchReconciliationService {
             'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
           );
         }
+      }
+
+      if (
+        isHistoricalMode &&
+        !targetPunchId &&
+        !targetEnrollmentId &&
+        isAmbiguousLegacyEmployee &&
+        targetEmployee.biometricDeviceId?.trim()
+      ) {
+        throw createBiometricSafetyError(
+          `Ambiguous legacy biometric enrollment mapping: Multiple employees share biometricDeviceId '${targetEmployee.biometricDeviceId.trim()}' in this company. Configure explicit terminal enrollment mappings before reconciling.`,
+          400,
+          'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING'
+        );
       }
 
       const conditions: Array<Record<string, unknown>> = [
@@ -1831,7 +1945,11 @@ export class PunchReconciliationService {
         });
       }
 
-      if (activeMappings.length === 0 && targetEmployee.biometricDeviceId?.trim()) {
+      if (
+        activeMappings.length === 0 &&
+        !isAmbiguousLegacyEmployee &&
+        targetEmployee.biometricDeviceId?.trim()
+      ) {
         conditions.push({
           userEnrollmentId: targetEmployee.biometricDeviceId.trim(),
           ...(conflictingLegacyTerminalIds.length > 0
@@ -1881,23 +1999,57 @@ export class PunchReconciliationService {
           'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
         );
       }
-      if (validatedEmployee) {
-        if (targetPunch.matchedEmployeeId) {
-          if (targetPunch.matchedEmployeeId !== validatedEmployee.id) {
+      if (targetPunch.matchedEmployeeId) {
+        if (validatedEmployee && targetPunch.matchedEmployeeId !== validatedEmployee.id) {
+          throw createBiometricSafetyError(
+            'Target punchId does not belong to the selected employee.',
+            400,
+            'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+          );
+        }
+
+        const punchResolution = await BiometricMappingService.resolveEmployeeForPunch(
+          companyId,
+          targetPunch.terminalId,
+          targetPunch.userEnrollmentId
+        );
+
+        if (
+          !this.isAuthoritativePreMatchValid(
+            punchResolution,
+            targetPunch.matchedEmployeeId,
+            companyId
+          )
+        ) {
+          if (punchResolution.ambiguous) {
             throw createBiometricSafetyError(
-              'Target punchId does not belong to the selected employee.',
+              `Ambiguous legacy biometric enrollment mapping: Multiple employees share biometricDeviceId '${targetPunch.userEnrollmentId}' in this company. Configure explicit terminal enrollment mappings before reconciling.`,
               400,
-              'BIOMETRIC_INVALID_RECONCILIATION_FILTER'
+              'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING'
             );
           }
-        } else {
-          // AUDIT-3: When matchedEmployeeId is null, resolve authoritative ownership via
-          // explicit terminal/enrollment mappings and legacy fallback BEFORE auditing or minting.
-          const punchResolution = await BiometricMappingService.resolveEmployeeForPunch(
-            companyId,
-            targetPunch.terminalId,
-            targetPunch.userEnrollmentId
+          throw createBiometricSafetyError(
+            `Biometric enrollment mapping mismatch: Target punchId pre-matched employee '${targetPunch.matchedEmployeeId}' is no longer authoritatively resolved for enrollment '${targetPunch.userEnrollmentId}'. Configure explicit terminal enrollment mappings before reconciling.`,
+            400,
+            'BIOMETRIC_MAPPING_MISMATCH'
           );
+        }
+      } else {
+        // AUDIT-3 & FIND-1: When matchedEmployeeId is null, resolve authoritative ownership via
+        // explicit terminal/enrollment mappings and legacy fallback BEFORE auditing or minting.
+        const punchResolution = await BiometricMappingService.resolveEmployeeForPunch(
+          companyId,
+          targetPunch.terminalId,
+          targetPunch.userEnrollmentId
+        );
+        if (punchResolution.ambiguous) {
+          throw createBiometricSafetyError(
+            `Ambiguous legacy biometric enrollment mapping: Multiple employees share biometricDeviceId '${targetPunch.userEnrollmentId}' in this company. Configure explicit terminal enrollment mappings before reconciling.`,
+            400,
+            'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING'
+          );
+        }
+        if (validatedEmployee) {
           if (!punchResolution.employee) {
             throw createBiometricSafetyError(
               'Target punchId is unmapped and does not belong to the selected employee.',
@@ -1929,7 +2081,7 @@ export class PunchReconciliationService {
       }
 
       // When userEnrollmentId is not already validated via employeeId or punchId, verify that the
-      // enrollment target resolves to an employee or existing punch within the tenant.
+      // enrollment target resolves unambiguously to an employee or existing punch within the tenant.
       if (!validatedEmployee && !targetPunchId) {
         let enrollmentExistsInTenant = false;
 
@@ -1939,8 +2091,39 @@ export class PunchReconciliationService {
             targetTerminalId,
             targetEnrollmentId
           );
+          if (resolution.ambiguous) {
+            throw createBiometricSafetyError(
+              `Ambiguous legacy biometric enrollment mapping: Multiple employees share biometricDeviceId '${targetEnrollmentId}' in this company. Configure explicit terminal enrollment mappings before reconciling.`,
+              400,
+              'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING'
+            );
+          }
           if (resolution.employee && resolution.employee.companyId === companyId) {
             enrollmentExistsInTenant = true;
+          }
+        } else {
+          const companyMappings = await BiometricMappingService.readCompanyMappings(companyId);
+          const hasExplicitMappingForEnrollment = companyMappings.some(
+            (m) => m.isActive && m.enrollmentId === targetEnrollmentId
+          );
+          if (hasExplicitMappingForEnrollment) {
+            enrollmentExistsInTenant = true;
+          } else {
+            const resolution = await BiometricMappingService.resolveEmployeeForPunch(
+              companyId,
+              undefined,
+              targetEnrollmentId
+            );
+            if (resolution.ambiguous) {
+              throw createBiometricSafetyError(
+                `Ambiguous legacy biometric enrollment mapping: Multiple employees share biometricDeviceId '${targetEnrollmentId}' in this company. Configure explicit terminal enrollment mappings before reconciling.`,
+                400,
+                'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING'
+              );
+            }
+            if (resolution.employee && resolution.employee.companyId === companyId) {
+              enrollmentExistsInTenant = true;
+            }
           }
         }
 

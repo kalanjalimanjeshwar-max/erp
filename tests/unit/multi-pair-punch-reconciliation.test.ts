@@ -143,6 +143,15 @@ describe('Step 2 Stage 3: Multi-Pair Chronological Punch Reconciliation Tests', 
       return null;
     }) as any);
 
+    vi.spyOn(prisma.employee, 'findMany').mockImplementation((async (args: any) => {
+      const w = args?.where || {};
+      if (w.companyId === companyId && w.biometricDeviceId === '200') {
+        if (w.id?.notIn?.includes(activeEmployee.id)) return [] as any;
+        return [activeEmployee] as any;
+      }
+      return [] as any;
+    }) as any);
+
     vi.spyOn(prisma.rawPunchLog, 'findMany').mockImplementation((async (args: any) => {
       const w = args?.where || {};
       const filtered = rawPunches

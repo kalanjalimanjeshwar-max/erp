@@ -418,7 +418,7 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
       try {
         vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'Asia/Kolkata' } as any);
         vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValueOnce(rawPunch as any);
-        vi.spyOn(prisma.employee, 'findFirst').mockResolvedValueOnce(inactiveEmployee as any);
+        vi.spyOn(prisma.employee, 'findMany').mockResolvedValueOnce([inactiveEmployee] as any);
         const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValue({} as any);
         const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
         const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
@@ -534,7 +534,7 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
         if (args.where.id === emp101.id) return { ...emp101 };
         return null;
       }) as any);
-      vi.spyOn(prisma.employee, 'findFirst').mockResolvedValue(null);
+      vi.spyOn(prisma.employee, 'findMany').mockResolvedValue([] as any);
       vi.spyOn(prisma.employee, 'update').mockImplementation((async (args: any) => {
         Object.assign(emp101, args.data, { updatedAt: new Date() });
         return { ...emp101 };
@@ -1509,6 +1509,640 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
       expect(rawPunches.find((p) => p.id === 'explicit-hist-in-range')?.syncStatus).toBe('PROCESSED');
       expect(rawPunches.find((p) => p.id === 'explicit-hist-error-in-range')?.syncStatus).toBe('PROCESSED');
       expect(rawPunches.find((p) => p.id === 'explicit-other-enrollment')?.syncStatus).toBe('PENDING');
+    });
+  });
+
+  describe('FIND-1: Ambiguous Legacy Employee.biometricDeviceId Fail-Closed Resolution', () => {
+    it('fails closed in real BiometricMappingService.resolveEmployeeForPunch when two employees in the same company share a legacy biometricDeviceId and never mutates Attendance', async () => {
+      createInMemorySettingStore();
+
+      const legacyEmpA = {
+        id: 'emp-legacy-a',
+        companyId: companyAlphaId,
+        employeeCode: 'LEG-A',
+        fullName: 'Legacy Employee A',
+        status: 'ACTIVE',
+        biometricDeviceId: '501',
+        shift: standardShift,
+      };
+      const legacyEmpB = {
+        id: 'emp-legacy-b',
+        companyId: companyAlphaId,
+        employeeCode: 'LEG-B',
+        fullName: 'Legacy Employee B',
+        status: 'ACTIVE',
+        biometricDeviceId: '501',
+        shift: standardShift,
+      };
+      const uniqueLegacyEmp = {
+        id: 'emp-legacy-unique',
+        companyId: companyAlphaId,
+        employeeCode: 'LEG-U',
+        fullName: 'Unique Legacy Employee',
+        status: 'ACTIVE',
+        biometricDeviceId: '502',
+        shift: standardShift,
+      };
+      const otherCompanyEmp = {
+        id: 'emp-beta-502',
+        companyId: companyBetaId,
+        employeeCode: 'BETA-502',
+        fullName: 'Beta Company Employee',
+        status: 'ACTIVE',
+        biometricDeviceId: '502',
+        shift: standardShift,
+      };
+      const otherCompanySharedEmp = {
+        id: 'emp-beta-501',
+        companyId: companyBetaId,
+        employeeCode: 'BETA-501',
+        fullName: 'Beta Single 501',
+        status: 'ACTIVE',
+        biometricDeviceId: '501',
+        shift: standardShift,
+      };
+
+      const allEmployees = [
+        legacyEmpA,
+        legacyEmpB,
+        uniqueLegacyEmp,
+        otherCompanyEmp,
+        otherCompanySharedEmp,
+      ];
+
+      vi.spyOn(prisma.employee, 'findMany').mockImplementation((async (args: any) => {
+        const where = args?.where || {};
+        return allEmployees.filter((emp) => {
+          if (where.companyId && emp.companyId !== where.companyId) return false;
+          if (typeof where.biometricDeviceId === 'string' && emp.biometricDeviceId !== where.biometricDeviceId) {
+            return false;
+          }
+          if (where.biometricDeviceId?.in && !where.biometricDeviceId.in.includes(emp.biometricDeviceId)) {
+            return false;
+          }
+          if (where.id?.in && !where.id.in.includes(emp.id)) return false;
+          if (where.id?.notIn && where.id.notIn.includes(emp.id)) return false;
+          return true;
+        }) as any;
+      }) as any);
+
+      vi.spyOn(prisma.employee, 'findUnique').mockImplementation((async (args: any) => {
+        return (allEmployees.find((e) => e.id === args?.where?.id) || null) as any;
+      }) as any);
+
+      // 1. Ambiguous legacy mapping in Company Alpha -> fail closed, neither employee selected
+      const ambiguousRes = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        esslTerminal.id,
+        '501'
+      );
+      expect(ambiguousRes.employee).toBeNull();
+      expect(ambiguousRes.matchedVia).toBeNull();
+      expect(ambiguousRes.ambiguous).toBe(true);
+      expect(ambiguousRes.ambiguousEmployeeIds?.sort()).toEqual(['emp-legacy-a', 'emp-legacy-b']);
+
+      // 2. Unique legacy mapping in Company Alpha still resolves cleanly even though Company Beta also has '502'
+      const alphaUniqueRes = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        esslTerminal.id,
+        '502'
+      );
+      expect(alphaUniqueRes.employee?.id).toBe('emp-legacy-unique');
+      expect(alphaUniqueRes.matchedVia).toBe('LEGACY');
+      expect(alphaUniqueRes.ambiguous).toBeUndefined();
+
+      // 3. Company Beta has a single employee for '501' and '502' -> zero cross-tenant ambiguity from Alpha's duplicates
+      const betaSingle501 = await BiometricMappingService.resolveEmployeeForPunch(
+        companyBetaId,
+        'term-beta-1',
+        '501'
+      );
+      expect(betaSingle501.employee?.id).toBe('emp-beta-501');
+      expect(betaSingle501.matchedVia).toBe('LEGACY');
+      expect(betaSingle501.ambiguous).toBeUndefined();
+
+      const betaSingle502 = await BiometricMappingService.resolveEmployeeForPunch(
+        companyBetaId,
+        'term-beta-1',
+        '502'
+      );
+      expect(betaSingle502.employee?.id).toBe('emp-beta-502');
+      expect(betaSingle502.matchedVia).toBe('LEGACY');
+
+      // 4. Real PunchReconciliationService.reconcilePunch() marks ambiguous punch ERROR and never mutates Attendance
+      const rawPunch = {
+        id: 'punch-ambiguous-501',
+        companyId: companyAlphaId,
+        terminalId: esslTerminal.id,
+        userEnrollmentId: '501',
+        punchTime: new Date('2026-10-19T03:45:00.000Z'),
+        inOutMode: 'CHECK_IN' as const,
+        syncStatus: 'PENDING' as const,
+        matchedEmployeeId: null,
+        matchedEmployee: null,
+      };
+
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-10-19T05:00:00.000Z'));
+      try {
+        vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'Asia/Kolkata' } as any);
+        vi.spyOn(prisma.rawPunchLog, 'findUnique').mockResolvedValue(rawPunch as any);
+        const rawUpdateSpy = vi.spyOn(prisma.rawPunchLog, 'update').mockResolvedValue({} as any);
+        const attCreateSpy = vi.spyOn(prisma.attendance, 'create');
+        const attUpdateSpy = vi.spyOn(prisma.attendance, 'update');
+
+        const reconcileRes = await PunchReconciliationService.reconcilePunch(
+          'punch-ambiguous-501',
+          undefined,
+          { keepUnmappedPending: true }
+        );
+
+        expect(reconcileRes.status).toBe('ERROR');
+        expect(reconcileRes.matchedEmployeeId).toBeNull();
+        expect(reconcileRes.message).toContain('Ambiguous legacy biometric enrollment mapping');
+        expect(attCreateSpy).not.toHaveBeenCalled();
+        expect(attUpdateSpy).not.toHaveBeenCalled();
+        expect(rawUpdateSpy).toHaveBeenCalledWith(
+          expect.objectContaining({
+            where: { id: 'punch-ambiguous-501' },
+            data: expect.objectContaining({
+              syncStatus: 'ERROR',
+              errorMessage: expect.stringContaining('Ambiguous legacy biometric enrollment mapping'),
+            }),
+          })
+        );
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('preserves explicit terminal/enrollment mapping precedence and fails closed for ambiguous legacy mappings in resolveBatchForTerminal', async () => {
+      const store = createInMemorySettingStore();
+      const secondTerminalId = 'term-essl-2';
+
+      // Explicit mapping on esslTerminal for enrollment '601' -> emp-explicit-601
+      // Explicit mapping on esslTerminal for enrollment '603' -> emp-explicit-inactive (INACTIVE)
+      store.set(
+        `${companyAlphaId}::BIOMETRIC_EMPLOYEE_MAPPINGS_V1`,
+        JSON.stringify([
+          {
+            id: 'map-explicit-601',
+            companyId: companyAlphaId,
+            employeeId: 'emp-explicit-601',
+            terminalId: esslTerminal.id,
+            enrollmentId: '601',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-10-01T00:00:00.000Z',
+            updatedAt: '2026-10-01T00:00:00.000Z',
+          },
+          {
+            id: 'map-explicit-inactive-603',
+            companyId: companyAlphaId,
+            employeeId: 'emp-explicit-inactive',
+            terminalId: esslTerminal.id,
+            enrollmentId: '603',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-10-01T00:00:00.000Z',
+            updatedAt: '2026-10-01T00:00:00.000Z',
+          },
+        ])
+      );
+
+      const employees = [
+        {
+          id: 'emp-explicit-601',
+          companyId: companyAlphaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '601',
+          shift: standardShift,
+        },
+        // Two legacy employees sharing '601' (ambiguous on terminals without explicit mapping)
+        {
+          id: 'emp-legacy-601-a',
+          companyId: companyAlphaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '601',
+          shift: standardShift,
+        },
+        {
+          id: 'emp-legacy-601-b',
+          companyId: companyAlphaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '601',
+          shift: standardShift,
+        },
+        // Two legacy employees sharing '602' (one ACTIVE, one INACTIVE -> still ambiguous!)
+        {
+          id: 'emp-legacy-602-active',
+          companyId: companyAlphaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '602',
+          shift: standardShift,
+        },
+        {
+          id: 'emp-legacy-602-inactive',
+          companyId: companyAlphaId,
+          status: 'INACTIVE',
+          biometricDeviceId: '602',
+          shift: standardShift,
+        },
+        // Explicit INACTIVE mapping for '603' plus a legacy employee with '603'
+        {
+          id: 'emp-explicit-inactive',
+          companyId: companyAlphaId,
+          status: 'INACTIVE',
+          biometricDeviceId: '603',
+          shift: standardShift,
+        },
+        {
+          id: 'emp-legacy-603',
+          companyId: companyAlphaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '603',
+          shift: standardShift,
+        },
+        // Unambiguous legacy employee '604'
+        {
+          id: 'emp-legacy-604',
+          companyId: companyAlphaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '604',
+          shift: standardShift,
+        },
+        // Cross-tenant employee with '604' (must NOT cause ambiguity for Company Alpha)
+        {
+          id: 'emp-beta-604',
+          companyId: companyBetaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '604',
+          shift: standardShift,
+        },
+      ];
+
+      vi.spyOn(prisma.employee, 'findMany').mockImplementation((async (args: any) => {
+        const where = args?.where || {};
+        return employees.filter((emp) => {
+          if (where.companyId && emp.companyId !== where.companyId) return false;
+          if (typeof where.biometricDeviceId === 'string' && emp.biometricDeviceId !== where.biometricDeviceId) {
+            return false;
+          }
+          if (where.biometricDeviceId?.in && !where.biometricDeviceId.in.includes(emp.biometricDeviceId)) {
+            return false;
+          }
+          if (where.id?.in && !where.id.in.includes(emp.id)) return false;
+          if (where.id?.notIn && where.id.notIn.includes(emp.id)) return false;
+          return true;
+        }) as any;
+      }) as any);
+
+      vi.spyOn(prisma.employee, 'findUnique').mockImplementation((async (args: any) => {
+        return (employees.find((e) => e.id === args?.where?.id) || null) as any;
+      }) as any);
+
+      // 1. Explicit mapping on esslTerminal for '601' takes precedence even with 2 legacy '601' collisions
+      const explicitRes = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        esslTerminal.id,
+        '601'
+      );
+      expect(explicitRes.employee?.id).toBe('emp-explicit-601');
+      expect(explicitRes.matchedVia).toBe('MAPPING');
+      expect(explicitRes.ambiguous).toBeUndefined();
+
+      // 2. On secondTerminalId (no explicit mapping for '601'), the two legacy employees fail closed
+      const unmappedTerminalRes = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        secondTerminalId,
+        '601'
+      );
+      expect(unmappedTerminalRes.employee).toBeNull();
+      expect(unmappedTerminalRes.ambiguous).toBe(true);
+      expect(unmappedTerminalRes.ambiguousEmployeeIds?.sort()).toEqual([
+        'emp-legacy-601-a',
+        'emp-legacy-601-b',
+      ]);
+
+      // 3. On secondTerminalId for '603', emp-explicit-inactive is excluded from legacy fallback,
+      //    leaving exactly one legacy employee (emp-legacy-603)
+      const singleRemainingLegacy = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        secondTerminalId,
+        '603'
+      );
+      expect(singleRemainingLegacy.employee?.id).toBe('emp-legacy-603');
+      expect(singleRemainingLegacy.matchedVia).toBe('LEGACY');
+
+      // 4. resolveBatchForTerminal on esslTerminal:
+      //    - '601' -> explicit 'emp-explicit-601'
+      //    - '602' -> OMITTED (ambiguous between active + inactive legacy employees)
+      //    - '603' -> OMITTED (explicit mapping points to INACTIVE employee; must NOT fall through to legacy)
+      //    - '604' -> 'emp-legacy-604' (unique within Alpha despite Beta's '604')
+      const batchOnEssl = await BiometricMappingService.resolveBatchForTerminal(
+        companyAlphaId,
+        esslTerminal.id,
+        ['601', '602', '603', '604']
+      );
+      expect(batchOnEssl.get('601')).toBe('emp-explicit-601');
+      expect(batchOnEssl.has('602')).toBe(false);
+      expect(batchOnEssl.has('603')).toBe(false);
+      expect(batchOnEssl.get('604')).toBe('emp-legacy-604');
+
+      // 5. resolveBatchForTerminal on secondTerminalId:
+      //    - '601' -> OMITTED (ambiguous legacy '601')
+      //    - '602' -> OMITTED (ambiguous legacy '602')
+      //    - '603' -> 'emp-legacy-603' (single legacy candidate)
+      //    - '604' -> 'emp-legacy-604' (single legacy candidate)
+      const batchOnSecond = await BiometricMappingService.resolveBatchForTerminal(
+        companyAlphaId,
+        secondTerminalId,
+        ['601', '602', '603', '604']
+      );
+      expect(batchOnSecond.has('601')).toBe(false);
+      expect(batchOnSecond.has('602')).toBe(false);
+      expect(batchOnSecond.get('603')).toBe('emp-legacy-603');
+      expect(batchOnSecond.get('604')).toBe('emp-legacy-604');
+    });
+
+    it('keeps single-punch and batch resolution consistent on the same terminal for inactive and missing explicit mappings while preserving legacy fallback on another terminal', async () => {
+      const store = createInMemorySettingStore();
+      const otherTerminalId = 'term-essl-other';
+
+      // On esslTerminal:
+      // - '701' has an active explicit mapping pointing to an INACTIVE employee (emp-701-inactive)
+      // - '702' has an active explicit mapping pointing to a MISSING/stale employee (emp-702-missing)
+      // - '703' has an active explicit mapping pointing to a cross-tenant employee (emp-703-beta)
+      store.set(
+        `${companyAlphaId}::BIOMETRIC_EMPLOYEE_MAPPINGS_V1`,
+        JSON.stringify([
+          {
+            id: 'map-701-inactive',
+            companyId: companyAlphaId,
+            employeeId: 'emp-701-inactive',
+            terminalId: esslTerminal.id,
+            enrollmentId: '701',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-10-01T00:00:00.000Z',
+            updatedAt: '2026-10-01T00:00:00.000Z',
+          },
+          {
+            id: 'map-702-missing',
+            companyId: companyAlphaId,
+            employeeId: 'emp-702-missing',
+            terminalId: esslTerminal.id,
+            enrollmentId: '702',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-10-01T00:00:00.000Z',
+            updatedAt: '2026-10-01T00:00:00.000Z',
+          },
+          {
+            id: 'map-703-cross-tenant',
+            companyId: companyAlphaId,
+            employeeId: 'emp-703-beta',
+            terminalId: esslTerminal.id,
+            enrollmentId: '703',
+            isActive: true,
+            source: 'EXPLICIT',
+            createdAt: '2026-10-01T00:00:00.000Z',
+            updatedAt: '2026-10-01T00:00:00.000Z',
+          },
+        ])
+      );
+
+      const employees = [
+        {
+          id: 'emp-701-inactive',
+          companyId: companyAlphaId,
+          status: 'INACTIVE',
+          biometricDeviceId: '701',
+          shift: standardShift,
+        },
+        {
+          id: 'emp-701-legacy',
+          companyId: companyAlphaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '701',
+          shift: standardShift,
+        },
+        {
+          id: 'emp-702-legacy',
+          companyId: companyAlphaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '702',
+          shift: standardShift,
+        },
+        {
+          id: 'emp-703-beta',
+          companyId: companyBetaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '703',
+          shift: standardShift,
+        },
+        {
+          id: 'emp-703-legacy',
+          companyId: companyAlphaId,
+          status: 'ACTIVE',
+          biometricDeviceId: '703',
+          shift: standardShift,
+        },
+      ];
+
+      vi.spyOn(prisma.employee, 'findMany').mockImplementation((async (args: any) => {
+        const where = args?.where || {};
+        return employees.filter((emp) => {
+          if (where.companyId && emp.companyId !== where.companyId) return false;
+          if (typeof where.biometricDeviceId === 'string' && emp.biometricDeviceId !== where.biometricDeviceId) {
+            return false;
+          }
+          if (where.biometricDeviceId?.in && !where.biometricDeviceId.in.includes(emp.biometricDeviceId)) {
+            return false;
+          }
+          if (where.id?.in && !where.id.in.includes(emp.id)) return false;
+          if (where.id?.notIn && where.id.notIn.includes(emp.id)) return false;
+          return true;
+        }) as any;
+      }) as any);
+
+      vi.spyOn(prisma.employee, 'findUnique').mockImplementation((async (args: any) => {
+        return (employees.find((e) => e.id === args?.where?.id) || null) as any;
+      }) as any);
+
+      // --- SAME TERMINAL (esslTerminal): active explicit mapping retains precedence; NEVER falls through to legacy ---
+      // 1. Inactive explicitly-mapped employee:
+      //    - Single resolution returns the INACTIVE mapped employee (preserving Inactive Employee Policy), NOT emp-701-legacy
+      //    - Batch resolution omits '701' (ACTIVE-only batch resolution), NOT emp-701-legacy
+      const sameTermInactiveSingle = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        esslTerminal.id,
+        '701'
+      );
+      expect(sameTermInactiveSingle.employee?.id).toBe('emp-701-inactive');
+      expect(sameTermInactiveSingle.employee?.status).toBe('INACTIVE');
+      expect(sameTermInactiveSingle.matchedVia).toBe('MAPPING');
+      expect(sameTermInactiveSingle.ambiguous).toBeUndefined();
+
+      // 2. Missing/stale explicitly-mapped employee:
+      //    - Single resolution returns null (never falls through to emp-702-legacy)
+      //    - Batch resolution omits '702' (never falls through to emp-702-legacy)
+      const sameTermMissingSingle = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        esslTerminal.id,
+        '702'
+      );
+      expect(sameTermMissingSingle.employee).toBeNull();
+      expect(sameTermMissingSingle.matchedVia).toBeNull();
+      expect(sameTermMissingSingle.ambiguous).toBeUndefined();
+
+      // 3. Cross-tenant corrupted explicit mapping:
+      //    - Single resolution returns null (never leaks Beta employee and never falls through to emp-703-legacy)
+      //    - Batch resolution omits '703'
+      const sameTermCrossTenantSingle = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        esslTerminal.id,
+        '703'
+      );
+      expect(sameTermCrossTenantSingle.employee).toBeNull();
+      expect(sameTermCrossTenantSingle.matchedVia).toBeNull();
+      expect(sameTermCrossTenantSingle.ambiguous).toBeUndefined();
+
+      const sameTermBatch = await BiometricMappingService.resolveBatchForTerminal(
+        companyAlphaId,
+        esslTerminal.id,
+        ['701', '702', '703']
+      );
+      expect(sameTermBatch.has('701')).toBe(false);
+      expect(sameTermBatch.has('702')).toBe(false);
+      expect(sameTermBatch.has('703')).toBe(false);
+
+      // --- DIFFERENT TERMINAL (otherTerminalId): no explicit mapping for this terminal -> documented legacy fallback ---
+      const otherTerm701Single = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        otherTerminalId,
+        '701'
+      );
+      expect(otherTerm701Single.employee?.id).toBe('emp-701-legacy');
+      expect(otherTerm701Single.matchedVia).toBe('LEGACY');
+
+      const otherTerm702Single = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        otherTerminalId,
+        '702'
+      );
+      expect(otherTerm702Single.employee?.id).toBe('emp-702-legacy');
+      expect(otherTerm702Single.matchedVia).toBe('LEGACY');
+
+      const otherTerm703Single = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        otherTerminalId,
+        '703'
+      );
+      expect(otherTerm703Single.employee?.id).toBe('emp-703-legacy');
+      expect(otherTerm703Single.matchedVia).toBe('LEGACY');
+
+      const otherTermBatch = await BiometricMappingService.resolveBatchForTerminal(
+        companyAlphaId,
+        otherTerminalId,
+        ['701', '702', '703']
+      );
+      expect(otherTermBatch.get('701')).toBe('emp-701-legacy');
+      expect(otherTermBatch.get('702')).toBe('emp-702-legacy');
+      expect(otherTermBatch.get('703')).toBe('emp-703-legacy');
+    });
+
+    it('GAP 1: permits legacy fallback when setting is genuinely absent, and fails closed on DB read failure or corrupt JSON without querying legacy employees (single & batch)', async () => {
+      const legacyEmp = {
+        id: 'emp-gap1-legacy',
+        companyId: companyAlphaId,
+        status: 'ACTIVE',
+        biometricDeviceId: '801',
+        shift: standardShift,
+      };
+
+      const empFindManySpy = vi.spyOn(prisma.employee, 'findMany').mockImplementation((async (args: any) => {
+        const where = args?.where || {};
+        if (where.companyId === companyAlphaId) {
+          if (where.biometricDeviceId === '801' || where.biometricDeviceId?.in?.includes('801')) {
+            return [legacyEmp] as any;
+          }
+        }
+        return [] as any;
+      }) as any);
+
+      // 1. Genuinely absent CompanySetting row (null) -> legacy fallback is permitted for single and batch
+      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValue(null);
+
+      const absentSingle = await BiometricMappingService.resolveEmployeeForPunch(
+        companyAlphaId,
+        esslTerminal.id,
+        '801'
+      );
+      expect(absentSingle.employee?.id).toBe('emp-gap1-legacy');
+      expect(absentSingle.matchedVia).toBe('LEGACY');
+
+      const absentBatch = await BiometricMappingService.resolveBatchForTerminal(
+        companyAlphaId,
+        esslTerminal.id,
+        ['801']
+      );
+      expect(absentBatch.get('801')).toBe('emp-gap1-legacy');
+
+      // 2. Database read failure -> fails closed (503 BIOMETRIC_MAPPING_STORE_UNAVAILABLE) with ZERO legacy queries
+      empFindManySpy.mockClear();
+      vi.spyOn(prisma.companySetting, 'findUnique').mockRejectedValue(
+        new Error('Simulated PostgreSQL read timeout')
+      );
+
+      await expect(
+        BiometricMappingService.resolveEmployeeForPunch(companyAlphaId, esslTerminal.id, '801')
+      ).rejects.toMatchObject({
+        statusCode: 503,
+        code: 'BIOMETRIC_MAPPING_STORE_UNAVAILABLE',
+      });
+
+      await expect(
+        BiometricMappingService.resolveBatchForTerminal(companyAlphaId, esslTerminal.id, ['801'])
+      ).rejects.toMatchObject({
+        statusCode: 503,
+        code: 'BIOMETRIC_MAPPING_STORE_UNAVAILABLE',
+      });
+
+      expect(empFindManySpy).not.toHaveBeenCalled();
+
+      // 3. Invalid / corrupt JSON payloads -> fail closed (500 BIOMETRIC_MAPPING_STORE_CORRUPT) with ZERO legacy queries
+      const corruptPayloads = [
+        '{not-valid-json',
+        '{"not":"an-array"}',
+        '[{"companyId":"' + companyAlphaId + '","employeeId":"e1"}]', // missing required fields
+      ];
+
+      for (const badValue of corruptPayloads) {
+        empFindManySpy.mockClear();
+        vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValue({
+          id: 'setting-corrupt',
+          companyId: companyAlphaId,
+          key: 'BIOMETRIC_EMPLOYEE_MAPPINGS_V1',
+          value: badValue,
+        } as any);
+
+        await expect(
+          BiometricMappingService.resolveEmployeeForPunch(companyAlphaId, esslTerminal.id, '801')
+        ).rejects.toMatchObject({
+          statusCode: 500,
+          code: 'BIOMETRIC_MAPPING_STORE_CORRUPT',
+        });
+
+        await expect(
+          BiometricMappingService.resolveBatchForTerminal(companyAlphaId, esslTerminal.id, ['801'])
+        ).rejects.toMatchObject({
+          statusCode: 500,
+          code: 'BIOMETRIC_MAPPING_STORE_CORRUPT',
+        });
+
+        expect(empFindManySpy).not.toHaveBeenCalled();
+      }
     });
   });
 });

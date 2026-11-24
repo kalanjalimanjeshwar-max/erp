@@ -191,6 +191,20 @@ describe('Biometric Chronological IN/OUT Alternation & Reconciliation Regression
       return null;
     }) as any);
 
+    vi.spyOn(prisma.employee, 'findMany').mockImplementation((async (args: any) => {
+      const w = args?.where || {};
+      if (w.companyId !== companyId) return [] as any;
+      const pool = [dayEmployee, nightEmployee];
+      return pool.filter((emp) => {
+        if (typeof w.biometricDeviceId === 'string' && emp.biometricDeviceId !== w.biometricDeviceId) {
+          return false;
+        }
+        if (w.id?.notIn && w.id.notIn.includes(emp.id)) return false;
+        if (w.id?.in && !w.id.in.includes(emp.id)) return false;
+        return true;
+      }) as any;
+    }) as any);
+
     vi.spyOn(prisma.rawPunchLog, 'findMany').mockImplementation((async (args: any) => {
       const w = args?.where || {};
       const filtered = rawPunches
