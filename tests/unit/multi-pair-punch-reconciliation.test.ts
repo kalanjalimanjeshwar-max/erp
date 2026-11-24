@@ -577,34 +577,52 @@ describe('Step 2 Stage 3: Multi-Pair Chronological Punch Reconciliation Tests', 
       );
 
       vi.spyOn(prisma.company, 'findUnique').mockResolvedValue({ timezone: 'UTC' } as any);
-      vi.spyOn(prisma.user, 'findUnique').mockResolvedValue({
+      const superAdminDbUser = {
         id: 'super-admin-1',
         companyId,
         email: 'super@multipair.test',
         fullName: 'Super Admin',
-        role: 'SUPER_ADMIN',
+        role: 'SUPER_ADMIN' as const,
         isActive: true,
         lastLoginAt: null,
         tokenVersion: 1,
-      } as any);
-      const authenticatedSuperAdmin = (await AuthService.validateSessionUser({
-        userId: 'super-admin-1',
-        companyId,
-        email: 'super@multipair.test',
-        role: 'SUPER_ADMIN',
-        tokenVersion: 1,
-        exp: Math.floor(Date.now() / 1000) + 3600,
-      }))!;
+      };
+      vi.spyOn(prisma.user, 'findUnique').mockImplementation((async (args: any) => {
+        if (args?.where?.id === superAdminDbUser.id) {
+          return superAdminDbUser as any;
+        }
+        return null;
+      }) as any);
+      vi.spyOn(prisma.biometricTerminal, 'findFirst').mockImplementation((async (args: any) => {
+        if (args?.where?.id === terminalId && args?.where?.companyId === companyId) {
+          return { id: terminalId, companyId } as any;
+        }
+        return null;
+      }) as any);
+      const signedSuperAdminToken = AuthService.generateSessionToken({
+        userId: superAdminDbUser.id,
+        companyId: superAdminDbUser.companyId,
+        email: superAdminDbUser.email,
+        role: superAdminDbUser.role,
+        tokenVersion: superAdminDbUser.tokenVersion,
+      });
+      const verifiedSuperAdminPayload = AuthService.verifySessionToken(signedSuperAdminToken);
+      expect(verifiedSuperAdminPayload).not.toBeNull();
+      const authenticatedSuperAdmin = await AuthService.validateSessionUser(
+        verifiedSuperAdminPayload!
+      );
+      expect(authenticatedSuperAdmin).not.toBeNull();
 
       // Reconcile only from Nov 18..19 via authorized SUPER_ADMIN historical mode -> p-historical (Nov 05) remains untouched PENDING!
       const res = await PunchReconciliationService.reconcilePendingPunches(
         companyId,
         {
           allowHistorical: true,
+          terminalId,
           fromPunchTime: '2026-11-18T00:00:00.000Z',
           toPunchTime: '2026-11-19T23:59:59.000Z',
         },
-        authenticatedSuperAdmin
+        authenticatedSuperAdmin!
       );
 
       expect(res.totalEvaluated).toBe(1);

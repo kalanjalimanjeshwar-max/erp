@@ -90,6 +90,7 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
     tokenVersion?: number;
   }): Promise<AuthUser> {
     const tokenVersion = overrides.tokenVersion ?? 1;
+    const wasAlreadyMocked = vi.isMockFunction(prisma.user.findUnique);
     const spy = vi.spyOn(prisma.user, 'findUnique').mockResolvedValueOnce({
       id: overrides.id,
       companyId: overrides.companyId,
@@ -118,7 +119,9 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
       }
       return actor;
     } finally {
-      spy.mockRestore();
+      if (!wasAlreadyMocked) {
+        spy.mockRestore();
+      }
     }
   }
 

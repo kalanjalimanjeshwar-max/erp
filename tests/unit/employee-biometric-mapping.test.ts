@@ -1453,12 +1453,45 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
       expect(rawPunches.find((p) => p.id === 'explicit-hist-error-in-range')?.syncStatus).toBe('ERROR');
 
       // Explicit SUPER_ADMIN authorized historical reconciliation with allowHistorical + bounded range processes only punches in range for this mapping
-      const superAdminActor = { ...adminActor, role: 'SUPER_ADMIN' as const };
+      const superAdminDbUser = {
+        id: 'user-super-alpha',
+        companyId: companyAlphaId,
+        email: 'super@alpha.local',
+        fullName: 'Alpha Super Admin',
+        role: 'SUPER_ADMIN' as const,
+        isActive: true,
+        lastLoginAt: new Date('2026-11-20T12:00:00.000Z'),
+        tokenVersion: 1,
+      };
+      vi.spyOn(prisma.user, 'findUnique').mockImplementation((async (args: any) => {
+        if (args?.where?.id === superAdminDbUser.id) {
+          return superAdminDbUser as any;
+        }
+        return null;
+      }) as any);
+      vi.spyOn(prisma.biometricTerminal, 'findFirst').mockImplementation((async (args: any) => {
+        if (args?.where?.id === esslTerminal.id && args?.where?.companyId === companyAlphaId) {
+          return { id: esslTerminal.id, companyId: companyAlphaId } as any;
+        }
+        return null;
+      }) as any);
+      const signedSuperAdminToken = AuthService.generateSessionToken({
+        userId: superAdminDbUser.id,
+        companyId: superAdminDbUser.companyId,
+        email: superAdminDbUser.email,
+        role: superAdminDbUser.role,
+        tokenVersion: superAdminDbUser.tokenVersion,
+      });
+      const verifiedSuperAdminPayload = AuthService.verifySessionToken(signedSuperAdminToken);
+      expect(verifiedSuperAdminPayload).not.toBeNull();
+      const superAdminActor = await AuthService.validateSessionUser(verifiedSuperAdminPayload!);
+      expect(superAdminActor).not.toBeNull();
+
       const explicitRes = await PunchReconciliationService.reconcileForEmployeeMapping(
         companyAlphaId,
         esslTerminal.id,
         '101',
-        superAdminActor,
+        superAdminActor!,
         undefined,
         {
           allowHistorical: true,
