@@ -657,6 +657,13 @@ export class AuthService {
         where: { id: snapshot.userId },
       });
 
+      // Re-check expiry immediately after the async DB lookup to prevent TOCTOU
+      // provenance minting if the session expired while the query was pending.
+      const postQueryNowSeconds = Math.floor(Date.now() / 1000);
+      if (snapshot.exp <= postQueryNowSeconds) {
+        return null;
+      }
+
       if (!user) return null;
       if (!user.isActive) return null;
       if (user.companyId !== snapshot.companyId) return null; // Strict tenant isolation check

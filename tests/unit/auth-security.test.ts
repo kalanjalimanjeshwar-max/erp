@@ -160,6 +160,9 @@ describe('Phase 3 Authentication, Passwords & Session Security Tests', () => {
     });
 
     it('mints server-provenanced AuthUser from verifySessionToken() once and rejects replay on second call', async () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(mockDbUser.lastLoginAt);
+
       const findUniqueMock = vi.mocked(prisma.user.findUnique);
       findUniqueMock.mockResolvedValue(mockDbUser as any);
 
@@ -197,6 +200,8 @@ describe('Phase 3 Authentication, Passwords & Session Security Tests', () => {
         tokenVersion: 1,
         isActive: true,
         isPreview: false,
+        authenticatedAtMs: mockDbUser.lastLoginAt.getTime(),
+        source: 'SESSION_VALIDATION',
       });
       expect(findUniqueMock).toHaveBeenCalledTimes(1);
 
@@ -283,6 +288,116 @@ describe('Phase 3 Authentication, Passwords & Session Security Tests', () => {
       const authUser = await AuthService.validateSessionUser(verifiedPayload!);
       expect(authUser).toBeNull();
       expect(findUniqueMock).toHaveBeenCalledTimes(1);
+    });
+
+    describe('P2-1: Session Expiry TOCTOU Protection Across Async DB Lookup', () => {
+      it('rejects a session that was valid before prisma.user.findUnique() but expired while the DB query was pending, without minting provenance', async () => {
+        vi.useFakeTimers();
+        const issuedAt = new Date('2026-11-23T04:00:00.000Z');
+        vi.setSystemTime(issuedAt);
+
+        const token = AuthService.generateSessionToken({
+          userId: mockDbUser.id,
+          companyId: mockDbUser.companyId,
+          email: mockDbUser.email,
+          role: mockDbUser.role,
+          tokenVersion: mockDbUser.tokenVersion,
+        });
+
+        const verifiedPayload = AuthService.verifySessionToken(token)!;
+        expect(verifiedPayload).not.toBeNull();
+
+        // Advance clock to 2 seconds before expiration so pre-query check succeeds
+        const preQueryTimeMs = (verifiedPayload.exp - 2) * 1000;
+        vi.setSystemTime(preQueryTimeMs);
+
+        let resolveDbLookup!: (value: unknown) => void;
+        const pendingDbLookup = new Promise((resolve) => {
+          resolveDbLookup = resolve;
+        });
+
+        const findUniqueMock = vi.mocked(prisma.user.findUnique);
+        findUniqueMock.mockImplementationOnce(() => pendingDbLookup as any);
+
+        const weakMapSetSpy = vi.spyOn(WeakMap.prototype, 'set');
+        try {
+          const validationPromise = AuthService.validateSessionUser(verifiedPayload);
+          expect(findUniqueMock).toHaveBeenCalledTimes(1);
+
+          // Advance clock past exact expiry boundary while the DB lookup is still in flight
+          vi.advanceTimersByTime(2000);
+          expect(Math.floor(Date.now() / 1000)).toBe(verifiedPayload.exp);
+
+          resolveDbLookup(mockDbUser);
+          const result = await validationPromise;
+
+          expect(result).toBeNull();
+          expect(AuthService.getAuthenticatedActorProvenance(result)).toBeNull();
+
+          const mintedProvenanceCalls = weakMapSetSpy.mock.calls.filter(
+            ([, value]) =>
+              value !== null &&
+              typeof value === 'object' &&
+              (value as { source?: string }).source === 'SESSION_VALIDATION'
+          );
+          expect(mintedProvenanceCalls).toHaveLength(0);
+        } finally {
+          weakMapSetSpy.mockRestore();
+        }
+      });
+
+      it('accepts a session and mints provenance when it remains valid after a delayed prisma.user.findUnique() lookup', async () => {
+        vi.useFakeTimers();
+        const issuedAt = new Date('2026-11-23T04:00:00.000Z');
+        vi.setSystemTime(issuedAt);
+
+        const token = AuthService.generateSessionToken({
+          userId: mockDbUser.id,
+          companyId: mockDbUser.companyId,
+          email: mockDbUser.email,
+          role: mockDbUser.role,
+          tokenVersion: mockDbUser.tokenVersion,
+        });
+
+        const verifiedPayload = AuthService.verifySessionToken(token)!;
+        expect(verifiedPayload).not.toBeNull();
+
+        // Advance clock to 5 seconds before expiration
+        const preQueryTimeMs = (verifiedPayload.exp - 5) * 1000;
+        vi.setSystemTime(preQueryTimeMs);
+
+        let resolveDbLookup!: (value: unknown) => void;
+        const pendingDbLookup = new Promise((resolve) => {
+          resolveDbLookup = resolve;
+        });
+
+        const findUniqueMock = vi.mocked(prisma.user.findUnique);
+        findUniqueMock.mockImplementationOnce(() => pendingDbLookup as any);
+
+        const validationPromise = AuthService.validateSessionUser(verifiedPayload);
+        expect(findUniqueMock).toHaveBeenCalledTimes(1);
+
+        // Advance clock by 4 seconds while DB lookup is pending (1 second before expiry — still valid)
+        vi.advanceTimersByTime(4000);
+        expect(Math.floor(Date.now() / 1000)).toBe(verifiedPayload.exp - 1);
+
+        resolveDbLookup(mockDbUser);
+        const authUser = await validationPromise;
+
+        expect(authUser).not.toBeNull();
+        expect(Object.isFrozen(authUser)).toBe(true);
+        expect(authUser?.id).toBe(mockDbUser.id);
+        expect(AuthService.getAuthenticatedActorProvenance(authUser)).toEqual({
+          userId: mockDbUser.id,
+          companyId: mockDbUser.companyId,
+          role: 'SUPER_ADMIN',
+          tokenVersion: 1,
+          isActive: true,
+          isPreview: false,
+          authenticatedAtMs: (verifiedPayload.exp - 1) * 1000,
+          source: 'SESSION_VALIDATION',
+        });
+      });
     });
   });
 });
