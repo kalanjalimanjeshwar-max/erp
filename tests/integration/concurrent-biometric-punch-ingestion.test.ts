@@ -247,17 +247,21 @@ describe('PostgreSQL 16 Concurrency Integration Test: Biometric Raw Punch Ingest
       },
     });
 
+    const getCurrentUtcDayStart = (now = new Date()): Date =>
+      new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+    const currentUtcDayStart = getCurrentUtcDayStart();
+
     const batchPayload = {
       punches: [
         {
           devicePunchId: 'int-concurrent-p1',
           userEnrollmentId: '101',
-          punchTime: '2026-10-19T08:00:00.000Z',
+          punchTime: new Date(currentUtcDayStart.getTime() + 60_000).toISOString(),
         },
         {
           devicePunchId: 'int-concurrent-p2',
           userEnrollmentId: '102',
-          punchTime: '2026-10-19T08:05:00.000Z',
+          punchTime: new Date(currentUtcDayStart.getTime() + 120_000).toISOString(),
         },
       ],
     };

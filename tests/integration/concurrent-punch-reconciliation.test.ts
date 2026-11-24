@@ -10,6 +10,7 @@ import {
   verifyDatabaseUrlConsistency,
 } from '../../src/server/db/client.js';
 import { PunchReconciliationService } from '../../src/server/services/punch-reconciliation.service.js';
+import { WorkPolicyService } from '../../src/server/services/work-policy.service.js';
 
 /**
  * Real PostgreSQL 16 Concurrency Integration Test Suite:
@@ -33,6 +34,9 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
   let testPrisma: PrismaClient | null = null;
 
   const createdCompanyIds = new Set<string>();
+
+  const getCurrentUtcDayStart = (now = new Date()): Date =>
+    new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
 
   const cleanupCompanyFixtures = async (
     client: PrismaClient,
@@ -281,8 +285,8 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     const client = await assertDatabaseSafety(ctx);
     const { companyId, employeeId, terminalId } = await seedCompanyFixture(client);
     const punchId = crypto.randomUUID();
-    const punchTime = new Date('2026-10-19T09:30:00.000Z');
-    const workDateObj = new Date('2026-10-19T00:00:00.000Z');
+    const workDateObj = getCurrentUtcDayStart();
+    const punchTime = new Date(workDateObj.getTime() + 60_000);
 
     await client.rawPunchLog.create({
       data: {
@@ -445,9 +449,9 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     const { companyId, employeeId, terminalId } = await seedCompanyFixture(client);
     const punchInId = crypto.randomUUID();
     const punchOutId = crypto.randomUUID();
-    const checkInTime = new Date('2026-10-20T09:30:00.000Z');
-    const checkOutTime = new Date('2026-10-20T18:15:00.000Z');
-    const workDateObj = new Date('2026-10-20T00:00:00.000Z');
+    const workDateObj = getCurrentUtcDayStart();
+    const checkInTime = new Date(workDateObj.getTime() + 30_000);
+    const checkOutTime = new Date(workDateObj.getTime() + 210_000); // 3 minutes after check-in (> 2-min debounce, <= 4 min after UTC midnight)
 
     await client.rawPunchLog.createMany({
       data: [
@@ -484,24 +488,24 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     // (after each transaction has already locked its own distinct RawPunchLog row FOR UPDATE)
     // so both concurrent transactions observe no pre-existing Attendance row and race into
     // PostgreSQL pg_advisory_xact_lock(companyId, employeeId, workDate).
-    const origResolveTz = PunchReconciliationService.resolveCompanyTimezone.bind(
-      PunchReconciliationService
-    );
+    const origListRevisions = WorkPolicyService.listRevisionsForEmployee.bind(WorkPolicyService);
     let arrivedBeforeAdvisoryLock = 0;
     let releaseBeforeAdvisoryLock!: () => void;
     const bothReadyForAdvisoryLock = new Promise<void>((resolve) => {
       releaseBeforeAdvisoryLock = resolve;
     });
-    const tzBarrierSpy = vi
-      .spyOn(PunchReconciliationService, 'resolveCompanyTimezone')
-      .mockImplementation((async (cid: string, tx?: any) => {
-        const tz = await origResolveTz(cid, tx);
-        arrivedBeforeAdvisoryLock += 1;
-        if (arrivedBeforeAdvisoryLock >= 2) {
-          releaseBeforeAdvisoryLock();
+    const policyBarrierSpy = vi
+      .spyOn(WorkPolicyService, 'listRevisionsForEmployee')
+      .mockImplementation((async (cid: string, empId: string, db?: any, opts?: any) => {
+        const revisions = await origListRevisions(cid, empId, db, opts);
+        if (cid === companyId && empId === employeeId) {
+          arrivedBeforeAdvisoryLock += 1;
+          if (arrivedBeforeAdvisoryLock >= 2) {
+            releaseBeforeAdvisoryLock();
+          }
+          await bothReadyForAdvisoryLock;
         }
-        await bothReadyForAdvisoryLock;
-        return tz;
+        return revisions;
       }) as any);
 
     const runTargeted = (targetPunchId: string) =>
@@ -517,7 +521,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     try {
       [resIn, resOut] = await Promise.all([runTargeted(punchInId), runTargeted(punchOutId)]);
     } finally {
-      tzBarrierSpy.mockRestore();
+      policyBarrierSpy.mockRestore();
     }
 
     expect(arrivedBeforeAdvisoryLock).toBe(2);
@@ -574,7 +578,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     expect(attendanceRows[0].source).toBe('BIOMETRIC');
     expect(attendanceRows[0].hasIncompletePunch).toBe(false);
     expect(attendanceRows[0].punchPairsCount).toBe(1);
-    expect(attendanceRows[0].actualWorkedMinutes).toBe(525);
+    expect(attendanceRows[0].actualWorkedMinutes).toBe(3);
 
     const punchEvents = await client.attendancePunchEvent.findMany({
       where: { companyId, attendanceId: attendanceRows[0].id },
@@ -595,7 +599,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     expect(intervals).toHaveLength(1);
     expect(intervals[0].sequence).toBe(1);
     expect(intervals[0].isComplete).toBe(true);
-    expect(intervals[0].durationMinutes).toBe(525);
+    expect(intervals[0].durationMinutes).toBe(3);
     expect(intervals[0].inEventId).toBe(punchEvents[0].id);
     expect(intervals[0].outEventId).toBe(punchEvents[1].id);
     expect(intervals[0].checkIn?.toISOString()).toBe(checkInTime.toISOString());
@@ -607,9 +611,9 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     const { companyId, employeeId, terminalId } = await seedCompanyFixture(client);
     const punch1Id = crypto.randomUUID();
     const punch2Id = crypto.randomUUID();
-    const t1 = new Date('2026-10-21T09:30:00.000Z');
-    const t2 = new Date('2026-10-21T09:30:45.000Z'); // 45s apart -> debounced by business rules
-    const workDateObj = new Date('2026-10-21T00:00:00.000Z');
+    const workDateObj = getCurrentUtcDayStart();
+    const t1 = new Date(workDateObj.getTime() + 60_000);
+    const t2 = new Date(workDateObj.getTime() + 105_000); // 45s apart -> debounced by business rules
 
     await client.rawPunchLog.createMany({
       data: [
@@ -642,24 +646,24 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
       ],
     });
 
-    const origResolveTz = PunchReconciliationService.resolveCompanyTimezone.bind(
-      PunchReconciliationService
-    );
+    const origListRevisions = WorkPolicyService.listRevisionsForEmployee.bind(WorkPolicyService);
     let arrivedBeforeAdvisoryLock = 0;
     let releaseBeforeAdvisoryLock!: () => void;
     const bothReadyForAdvisoryLock = new Promise<void>((resolve) => {
       releaseBeforeAdvisoryLock = resolve;
     });
-    const tzBarrierSpy = vi
-      .spyOn(PunchReconciliationService, 'resolveCompanyTimezone')
-      .mockImplementation((async (cid: string, tx?: any) => {
-        const tz = await origResolveTz(cid, tx);
-        arrivedBeforeAdvisoryLock += 1;
-        if (arrivedBeforeAdvisoryLock >= 2) {
-          releaseBeforeAdvisoryLock();
+    const policyBarrierSpy = vi
+      .spyOn(WorkPolicyService, 'listRevisionsForEmployee')
+      .mockImplementation((async (cid: string, empId: string, db?: any, opts?: any) => {
+        const revisions = await origListRevisions(cid, empId, db, opts);
+        if (cid === companyId && empId === employeeId) {
+          arrivedBeforeAdvisoryLock += 1;
+          if (arrivedBeforeAdvisoryLock >= 2) {
+            releaseBeforeAdvisoryLock();
+          }
+          await bothReadyForAdvisoryLock;
         }
-        await bothReadyForAdvisoryLock;
-        return tz;
+        return revisions;
       }) as any);
 
     const runTargeted = (targetPunchId: string) =>
@@ -675,7 +679,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     try {
       [res1, res2] = await Promise.all([runTargeted(punch1Id), runTargeted(punch2Id)]);
     } finally {
-      tzBarrierSpy.mockRestore();
+      policyBarrierSpy.mockRestore();
     }
 
     expect(arrivedBeforeAdvisoryLock).toBe(2);
@@ -742,7 +746,9 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     const { companyId, employeeId, terminalId } = await seedCompanyFixture(client);
     const rollbackPunchId = crypto.randomUUID();
     const guardedPunchId = crypto.randomUUID();
-    const workDateObj = new Date('2026-10-22T00:00:00.000Z');
+    const workDateObj = getCurrentUtcDayStart();
+    const rollbackPunchTime = new Date(workDateObj.getTime() + 60_000);
+    const guardedPunchTime = new Date(workDateObj.getTime() + 120_000);
 
     await client.rawPunchLog.createMany({
       data: [
@@ -752,7 +758,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
           terminalId,
           devicePunchId: `dp-rb-${rollbackPunchId.slice(0, 8)}`,
           userEnrollmentId: '101',
-          punchTime: new Date('2026-10-22T09:05:00.000Z'),
+          punchTime: rollbackPunchTime,
           verifyType: 'FINGERPRINT',
           inOutMode: 'CHECK_IN',
           syncStatus: 'PENDING',
@@ -765,7 +771,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
           terminalId,
           devicePunchId: `dp-guard-${guardedPunchId.slice(0, 8)}`,
           userEnrollmentId: '101',
-          punchTime: new Date('2026-10-23T09:05:00.000Z'),
+          punchTime: guardedPunchTime,
           verifyType: 'FINGERPRINT',
           inOutMode: 'CHECK_IN',
           syncStatus: 'PENDING',
@@ -873,7 +879,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Concurrent Punch Reconcili
     expect(guardedPunchAfter?.errorMessage).toBeNull();
     expect(
       await client.attendance.count({
-        where: { companyId, employeeId, workDate: new Date('2026-10-23T00:00:00.000Z') },
+        where: { companyId, employeeId, workDate: workDateObj },
       })
     ).toBe(1);
   });
