@@ -6,8 +6,10 @@ import {
   CreateJournalEntryRequest,
 } from '../../shared/types.js';
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
+import { parseCalendarDate } from '../accounting/calendar-date.js';
 import { AuditService } from './audit.service.js';
 import { DocumentSequenceService } from './document-sequence.service.js';
+import { WorkPolicyService, getLocalCalendarDateStr } from './work-policy.service.js';
 
 export class JournalService {
   /**
@@ -37,7 +39,7 @@ export class JournalService {
     const where: {
       companyId: string;
       status?: JournalStatus;
-      entryDate?: { gte?: Date; lte?: Date };
+      entryDate?: { gte?: Date; lt?: Date };
       lines?: { some: { ledgerId: string } };
       OR?: Array<{ voucherNumber?: { contains: string; mode: 'insensitive' }; narration?: { contains: string; mode: 'insensitive' } }>;
     } = { companyId };
@@ -46,8 +48,17 @@ export class JournalService {
 
     if (filters?.fromDate || filters?.toDate) {
       where.entryDate = {};
-      if (filters.fromDate) where.entryDate.gte = new Date(filters.fromDate);
-      if (filters.toDate) where.entryDate.lte = new Date(filters.toDate);
+      const parsedFrom = filters.fromDate ? parseCalendarDate(filters.fromDate, 'fromDate') : null;
+      const parsedTo = filters.toDate ? parseCalendarDate(filters.toDate, 'toDate') : null;
+      if (parsedFrom && parsedTo && parsedFrom.startOfDayUtc.getTime() > parsedTo.startOfDayUtc.getTime()) {
+        const err = new Error(
+          `Invalid date range: fromDate (${parsedFrom.dateStr}) cannot be after toDate (${parsedTo.dateStr}).`
+        );
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+      if (parsedFrom) where.entryDate.gte = parsedFrom.startOfDayUtc;
+      if (parsedTo) where.entryDate.lt = parsedTo.nextDayUtc;
     }
 
     if (filters?.ledgerId) {
@@ -313,14 +324,9 @@ export class JournalService {
       }
     }
 
-    const entryDate = new Date(input.entryDate);
-    if (isNaN(entryDate.getTime())) {
-      const err = new Error('Invalid entry date format.');
-      (err as { statusCode?: number }).statusCode = 400;
-      throw err;
-    }
-
-    const year = entryDate.getFullYear();
+    const parsedEntryDate = parseCalendarDate(input.entryDate, 'entryDate');
+    const entryDate = parsedEntryDate.startOfDayUtc;
+    const year = parsedEntryDate.year;
     const shouldAutoPost = Boolean(input.autoPost);
     const now = new Date();
 
@@ -465,18 +471,29 @@ export class JournalService {
     }
 
     const now = new Date();
-    const year = now.getFullYear();
 
     const result = await prisma.$transaction(async (tx) => {
+      // Resolve reversal accounting calendar date in the company's configured timezone
+      // while preserving exact UTC timestamps in postedAt / reversedAt.
+      const companyTimezone = await WorkPolicyService.resolveCompanyTimezone(actor.companyId, tx);
+      const reversalDate = parseCalendarDate(
+        getLocalCalendarDateStr(companyTimezone, now),
+        'entryDate'
+      );
+
       // 1. Generate voucher for reversal entry
-      const reversalVoucher = await this.generateVoucherNumber(actor.companyId, year, tx);
+      const reversalVoucher = await this.generateVoucherNumber(
+        actor.companyId,
+        reversalDate.year,
+        tx
+      );
 
       // 2. Create the inverse posting lines (swapping debits and credits)
       const reversalJournal = await tx.journalEntry.create({
         data: {
           companyId: actor.companyId,
           voucherNumber: reversalVoucher,
-          entryDate: now,
+          entryDate: reversalDate.startOfDayUtc,
           narration: `Reversal of ${original.voucherNumber}: ${reason.trim()}`,
           reference: `REV-${original.voucherNumber}`,
           status: 'POSTED',

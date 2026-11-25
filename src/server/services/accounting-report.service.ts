@@ -16,6 +16,10 @@ import {
   AccountLedgerItem,
 } from '../../shared/types.js';
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
+import { parseCalendarDate, parseReportDateRange } from '../accounting/calendar-date.js';
+import { WorkPolicyService, getLocalCalendarDateStr } from './work-policy.service.js';
+
+const EFFECTIVE_JOURNAL_STATUSES = ['POSTED', 'REVERSED'] as const;
 
 export class AccountingReportService {
   /**
@@ -84,8 +88,7 @@ export class AccountingReportService {
       throw err;
     }
 
-    const fromDate = options?.fromDate ? new Date(options.fromDate) : new Date('1970-01-01');
-    const toDate = options?.toDate ? new Date(options.toDate) : new Date('2099-12-31');
+    const { from, to } = parseReportDateRange(options);
 
     // 1. Fetch pre-period postings for historical balance prior to fromDate
     const preLines = await prisma.journalLine.findMany({
@@ -93,8 +96,9 @@ export class AccountingReportService {
         ledgerId,
         companyId,
         journal: {
-          status: 'POSTED',
-          entryDate: { lt: fromDate },
+          companyId,
+          status: { in: [...EFFECTIVE_JOURNAL_STATUSES] },
+          entryDate: { lt: from.startOfDayUtc },
         },
       },
       select: { debit: true, credit: true },
@@ -140,14 +144,15 @@ export class AccountingReportService {
       }
     }
 
-    // 2. Fetch period journal postings
+    // 2. Fetch period journal postings (inclusive of fromDate through entire toDate via exclusive nextDay)
     const periodLines = await prisma.journalLine.findMany({
       where: {
         ledgerId,
         companyId,
         journal: {
-          status: 'POSTED',
-          entryDate: { gte: fromDate, lte: toDate },
+          companyId,
+          status: { in: [...EFFECTIVE_JOURNAL_STATUSES] },
+          entryDate: { gte: from.startOfDayUtc, lt: to.nextDayUtc },
         },
       },
       include: {
@@ -262,8 +267,8 @@ export class AccountingReportService {
         openingBalanceType: ledger.openingBalanceType,
         createdAt: ledger.createdAt.toISOString(),
       },
-      fromDate: fromDate.toISOString().split('T')[0],
-      toDate: toDate.toISOString().split('T')[0],
+      fromDate: from.dateStr,
+      toDate: to.dateStr,
       openingBalance: AccountingMath.format(startingBalance),
       openingBalanceType: startingBalanceType,
       lines: statementLines,
@@ -277,14 +282,14 @@ export class AccountingReportService {
   /**
    * Generates Date-Filtered Trial Balance
    * Phase 4 Section 6 Requirement: Includes active & inactive ledgers with postings,
-   * excludes drafts/reversed, explicit reconciliation status.
+   * includes POSTED and REVERSED journals (so originals and inverse reversals net by date),
+   * excludes DRAFT entries, and provides explicit reconciliation status.
    */
   static async getTrialBalance(
     companyId: string,
     options?: { fromDate?: string; toDate?: string }
   ): Promise<TrialBalanceReport> {
-    const fromDate = options?.fromDate ? new Date(options.fromDate) : new Date('1970-01-01');
-    const toDate = options?.toDate ? new Date(options.toDate) : new Date('2099-12-31');
+    const { from, to } = parseReportDateRange(options);
 
     // Fetch all ledgers (both active and inactive to ensure historical accuracy)
     const ledgers = await prisma.accountLedger.findMany({
@@ -293,13 +298,14 @@ export class AccountingReportService {
       orderBy: [{ group: { rootType: 'asc' } }, { code: 'asc' }, { name: 'asc' }],
     });
 
-    // Fetch all posted journal lines in company
+    // Fetch all effective journal lines (POSTED and REVERSED) through end of toDate
     const lines = await prisma.journalLine.findMany({
       where: {
         companyId,
         journal: {
-          status: 'POSTED',
-          entryDate: { lte: toDate },
+          companyId,
+          status: { in: [...EFFECTIVE_JOURNAL_STATUSES] },
+          entryDate: { lt: to.nextDayUtc },
         },
       },
       include: {
@@ -330,7 +336,7 @@ export class AccountingReportService {
       const d = AccountingMath.from(pl.debit);
       const c = AccountingMath.from(pl.credit);
 
-      if (entryDate < fromDate) {
+      if (entryDate < from.startOfDayUtc) {
         bucket.preDebit = bucket.preDebit.plus(d);
         bucket.preCredit = bucket.preCredit.plus(c);
       } else {
@@ -427,8 +433,8 @@ export class AccountingReportService {
 
     return {
       companyId,
-      fromDate: fromDate.toISOString().split('T')[0],
-      toDate: toDate.toISOString().split('T')[0],
+      fromDate: from.dateStr,
+      toDate: to.dateStr,
       rows,
       totalOpeningDebit: AccountingMath.format(grandOpeningDebit),
       totalOpeningCredit: AccountingMath.format(grandOpeningCredit),
@@ -511,7 +517,13 @@ export class AccountingReportService {
     companyId: string,
     options?: { asOfDate?: string }
   ): Promise<BalanceSheetReport> {
-    const toDate = options?.asOfDate || new Date().toISOString().split('T')[0];
+    let toDate: string;
+    if (options?.asOfDate !== undefined && options.asOfDate !== '') {
+      toDate = parseCalendarDate(options.asOfDate, 'asOfDate').dateStr;
+    } else {
+      const companyTimezone = await WorkPolicyService.resolveCompanyTimezone(companyId);
+      toDate = getLocalCalendarDateStr(companyTimezone);
+    }
     const tb = await this.getTrialBalance(companyId, { toDate });
     const pnl = await this.getProfitAndLoss(companyId, { toDate });
 
@@ -622,7 +634,7 @@ export class AccountingReportService {
    * Features:
    * - Tenant isolation
    * - Opening balance calculated from configured opening balance + transactions before fromDate
-   * - Excludes drafts and reversed entries from effective balances (status: POSTED)
+   * - Includes POSTED and REVERSED entries (so originals and inverse reversals net by date) while excluding DRAFT
    * - Includes posted journals and posted Contra Entries (CV-YYYY-XXXX) exactly once
    * - Counterparty account identification
    * - Exact Decimal arithmetic for running balances
@@ -632,8 +644,7 @@ export class AccountingReportService {
     bookType: CashBankBookType,
     options?: { ledgerId?: string; fromDate?: string; toDate?: string }
   ): Promise<CashBankBookReport> {
-    const fromDate = options?.fromDate ? new Date(options.fromDate) : new Date('1970-01-01');
-    const toDate = options?.toDate ? new Date(options.toDate) : new Date('2099-12-31');
+    const { from, to } = parseReportDateRange(options);
 
     // 1. Fetch all asset ledgers in this company
     const assetLedgers = await prisma.accountLedger.findMany({
@@ -706,8 +717,8 @@ export class AccountingReportService {
         bookType,
         ledger: null,
         eligibleLedgers,
-        fromDate: options?.fromDate || '1970-01-01',
-        toDate: options?.toDate || '2099-12-31',
+        fromDate: from.dateStr,
+        toDate: to.dateStr,
         openingBalance: '0.0000',
         openingBalanceType: 'DEBIT',
         lines: [],
@@ -724,8 +735,9 @@ export class AccountingReportService {
         ledgerId: targetLedger.id,
         companyId,
         journal: {
-          status: 'POSTED',
-          entryDate: { lt: fromDate },
+          companyId,
+          status: { in: [...EFFECTIVE_JOURNAL_STATUSES] },
+          entryDate: { lt: from.startOfDayUtc },
         },
       },
       select: { debit: true, credit: true },
@@ -757,14 +769,15 @@ export class AccountingReportService {
     }
 
     // 4. Fetch period journal postings
-    // Explicitly filters journal: { status: 'POSTED' }, excluding DRAFT and REVERSED entries
+    // Includes POSTED and REVERSED entries (excluding DRAFT) across [fromDate, nextDay(toDate))
     const periodLines = await prisma.journalLine.findMany({
       where: {
         ledgerId: targetLedger.id,
         companyId,
         journal: {
-          status: 'POSTED',
-          entryDate: { gte: fromDate, lte: toDate },
+          companyId,
+          status: { in: [...EFFECTIVE_JOURNAL_STATUSES] },
+          entryDate: { gte: from.startOfDayUtc, lt: to.nextDayUtc },
         },
       },
       include: {
@@ -881,8 +894,8 @@ export class AccountingReportService {
       bookType,
       ledger: ledgerItem,
       eligibleLedgers,
-      fromDate: fromDate.toISOString().split('T')[0],
-      toDate: toDate.toISOString().split('T')[0],
+      fromDate: from.dateStr,
+      toDate: to.dateStr,
       openingBalance: AccountingMath.format(startingBalance),
       openingBalanceType: startingBalanceType,
       lines,

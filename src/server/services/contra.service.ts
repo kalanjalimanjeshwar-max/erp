@@ -7,7 +7,9 @@ import {
   JournalStatus,
 } from '../../shared/types.js';
 import { AccountingMath, Decimal } from '../accounting/decimal-math.js';
+import { parseCalendarDate } from '../accounting/calendar-date.js';
 import { AuditService } from './audit.service.js';
+import { WorkPolicyService, getLocalCalendarDateStr } from './work-policy.service.js';
 
 export class ContraService {
   /**
@@ -161,8 +163,17 @@ export class ContraService {
 
     if (filters?.fromDate || filters?.toDate) {
       where.entryDate = {};
-      if (filters.fromDate) where.entryDate.gte = new Date(filters.fromDate);
-      if (filters.toDate) where.entryDate.lte = new Date(filters.toDate);
+      const parsedFrom = filters.fromDate ? parseCalendarDate(filters.fromDate, 'fromDate') : null;
+      const parsedTo = filters.toDate ? parseCalendarDate(filters.toDate, 'toDate') : null;
+      if (parsedFrom && parsedTo && parsedFrom.startOfDayUtc.getTime() > parsedTo.startOfDayUtc.getTime()) {
+        const err = new Error(
+          `Invalid date range: fromDate (${parsedFrom.dateStr}) cannot be after toDate (${parsedTo.dateStr}).`
+        );
+        (err as { statusCode?: number }).statusCode = 400;
+        throw err;
+      }
+      if (parsedFrom) where.entryDate.gte = parsedFrom.startOfDayUtc;
+      if (parsedTo) where.entryDate.lt = parsedTo.nextDayUtc;
     }
 
     if (filters?.search && filters.search.trim()) {
@@ -283,12 +294,8 @@ export class ContraService {
     }
 
     // 4. Validate entry date
-    const entryDate = new Date(input.entryDate);
-    if (isNaN(entryDate.getTime())) {
-      const err = new Error('Invalid entry date format.');
-      (err as { statusCode?: number }).statusCode = 400;
-      throw err;
-    }
+    const parsedEntryDate = parseCalendarDate(input.entryDate, 'entryDate');
+    const entryDate = parsedEntryDate.startOfDayUtc;
 
     // 5. Query and validate both ledgers belong to company, are active, and are ASSET ledgers
     const [sourceLedger, destLedger] = await Promise.all([
@@ -405,7 +412,7 @@ export class ContraService {
       }
     }
 
-    const year = entryDate.getFullYear();
+    const year = parsedEntryDate.year;
     const shouldAutoPost = Boolean(input.autoPost);
     const now = new Date();
     const amountStr = AccountingMath.format(transferAmount);
@@ -622,11 +629,22 @@ export class ContraService {
     }
 
     const now = new Date();
-    const year = now.getFullYear();
 
     const result = await prisma.$transaction(async (tx) => {
+      // Resolve reversal accounting calendar date in the company's configured timezone
+      // while preserving exact UTC timestamps in postedAt / reversedAt.
+      const companyTimezone = await WorkPolicyService.resolveCompanyTimezone(actor.companyId, tx);
+      const reversalDate = parseCalendarDate(
+        getLocalCalendarDateStr(companyTimezone, now),
+        'entryDate'
+      );
+
       // Generate reversal voucher number
-      const reversalVoucherNumber = await this.generateVoucherNumber(actor.companyId, year, tx);
+      const reversalVoucherNumber = await this.generateVoucherNumber(
+        actor.companyId,
+        reversalDate.year,
+        tx
+      );
 
       // Invert lines: original debit becomes credit; original credit becomes debit
       const reversalLines = original.lines.map((line, idx) => ({
@@ -643,7 +661,7 @@ export class ContraService {
         data: {
           companyId: actor.companyId,
           voucherNumber: reversalVoucherNumber,
-          entryDate: now,
+          entryDate: reversalDate.startOfDayUtc,
           fiscalPeriodId: original.fiscalPeriodId,
           narration: `Reversal of Contra Voucher ${original.voucherNumber}. Reason: ${reason}`,
           reference: `REV-${original.voucherNumber}`,
