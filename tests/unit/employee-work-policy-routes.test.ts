@@ -9,8 +9,16 @@ import {
   CompanyService,
   PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
 } from '../../src/server/services/company.service.js';
+import {
+  BIOMETRIC_MAPPINGS_SETTING_KEY,
+  BiometricMappingService,
+} from '../../src/server/services/biometric-mapping.service.js';
 import { PunchReconciliationService } from '../../src/server/services/punch-reconciliation.service.js';
 import { AuthUser, Role } from '../../src/shared/types.js';
+import {
+  mockCompanySettingFindUnique,
+  type CompanySettingMockEntry,
+} from '../helpers/unit-prisma-guard.js';
 
 describe('Employee APIs, Work Policy Endpoints, RBAC, Tenant Isolation & CompanySetting Allowance', () => {
   const app = createApp();
@@ -44,6 +52,22 @@ describe('Employee APIs, Work Policy Endpoints, RBAC, Tenant Isolation & Company
       exp: Date.now() + 60_000,
     });
     vi.spyOn(AuthService, 'validateSessionUser').mockResolvedValue(user);
+  };
+
+  const mockPermittedAllowances = (
+    options: number[] | null,
+    extraSettings: CompanySettingMockEntry[] = [],
+    targetCompanyId: string = companyA
+  ) => {
+    const entries: CompanySettingMockEntry[] = [...extraSettings];
+    if (options !== null) {
+      entries.push({
+        companyId: targetCompanyId,
+        key: PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
+        value: JSON.stringify(options),
+      });
+    }
+    return mockCompanySettingFindUnique(entries);
   };
 
   beforeEach(() => {
@@ -422,11 +446,7 @@ describe('Employee APIs, Work Policy Endpoints, RBAC, Tenant Isolation & Company
     it('enforces company-configured subset from PERMITTED_MONTHLY_LEAVE_ALLOWANCES_V1', async () => {
       authenticateAs(adminA);
 
-      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValue({
-        companyId: companyA,
-        key: PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
-        value: JSON.stringify([5, 6]),
-      } as any);
+      mockPermittedAllowances([5, 6]);
 
       // 4 is excluded by company subset [5, 6]
       const rejected4 = await request(app)
@@ -640,17 +660,6 @@ describe('Employee APIs, Work Policy Endpoints, RBAC, Tenant Isolation & Company
   });
 
   describe('5. P1-2: Strict monthlyLeaveAllowance Null & Omitted Policy Enforcement', () => {
-    const mockPermittedAllowances = (options: number[] | null) => {
-      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValue(
-        options === null
-          ? null
-          : ({
-              companyId: companyA,
-              key: PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
-              value: JSON.stringify(options),
-            } as any)
-      );
-    };
 
     const makeMockEmployeeItem = (overrides: Record<string, unknown> = {}) => ({
       id: 'emp-p12-1',
@@ -1517,11 +1526,7 @@ describe('Employee APIs, Work Policy Endpoints, RBAC, Tenant Isolation & Company
       authenticateAs(adminA);
       const { revRows } = setupScheduledAllowanceMocks();
 
-      vi.spyOn(prisma.companySetting, 'findUnique').mockResolvedValue({
-        companyId: companyA,
-        key: PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
-        value: JSON.stringify([5, 6]),
-      } as any);
+      mockPermittedAllowances([5, 6]);
 
       // Disallowed 4 must be rejected on both POST /work-policies and allowance-only PATCH without touching scheduled 6
       const rejectedRev = await request(app)
@@ -1558,6 +1563,117 @@ describe('Employee APIs, Work Policy Endpoints, RBAC, Tenant Isolation & Company
             .monthlyLeaveAllowance
         )
       ).toBe(5);
+    });
+
+    it('Regression: isolates CompanySetting keys independently so permitted allowances [5, 6] and valid biometric mappings coexist on PATCH and work-policy responses', async () => {
+      authenticateAs(adminA);
+      const { revRows } = setupScheduledAllowanceMocks();
+
+      vi.spyOn(prisma.biometricTerminal, 'findMany').mockResolvedValue([
+        {
+          id: 'term-1',
+          companyId: companyA,
+          name: 'Front Desk X2008',
+          code: 'FD-01',
+          status: 'ONLINE',
+        },
+      ] as any);
+
+      mockPermittedAllowances([5, 6], [
+        {
+          companyId: companyA,
+          key: BIOMETRIC_MAPPINGS_SETTING_KEY,
+          value: JSON.stringify([
+            {
+              id: 'map-p23-1',
+              companyId: companyA,
+              employeeId: 'emp-p23-1',
+              terminalId: 'term-1',
+              enrollmentId: '1042',
+              isActive: true,
+              source: 'MANUAL',
+              createdAt: '2026-10-01T00:00:00.000Z',
+              updatedAt: '2026-10-01T00:00:00.000Z',
+            },
+          ]),
+        },
+      ]);
+
+      // Tenant isolation check: companyA setting [5, 6] does not leak to companyB (which keeps default [4, 5, 6])
+      expect(await CompanyService.getPermittedMonthlyLeaveAllowances(companyA)).toEqual([5, 6]);
+      expect(await CompanyService.getPermittedMonthlyLeaveAllowances(companyB)).toEqual([4, 5, 6]);
+
+      // Unrelated PATCH preserves scheduled Dec 6 and returns the employee's valid biometric mapping
+      const patchRes = await request(app)
+        .patch('/api/employees/emp-p23-1')
+        .set('Authorization', 'Bearer valid-token')
+        .send({ fullName: 'Mapped Worker Updated' });
+
+      expect(patchRes.status).toBe(200);
+      expect(patchRes.body.fullName).toBe('Mapped Worker Updated');
+      expect(patchRes.body.biometricMappings).toHaveLength(1);
+      expect(patchRes.body.biometricMappings[0]).toMatchObject({
+        terminalId: 'term-1',
+        enrollmentId: '1042',
+      });
+      expect(
+        Number(
+          revRows.find((r) => r.effectiveFrom.toISOString().slice(0, 10) === '2026-12-01')
+            .monthlyLeaveAllowance
+        )
+      ).toBe(6);
+
+      // Reversion to permitted 5 succeeds and still returns biometric mappings cleanly
+      const revertRes = await request(app)
+        .post('/api/employees/emp-p23-1/work-policies')
+        .set('Authorization', 'Bearer valid-token')
+        .send({ monthlyLeaveAllowance: 5 });
+
+      expect(revertRes.status).toBe(201);
+      expect(revertRes.body.allowanceEffectiveFrom).toBe('2026-12-01');
+      expect(revertRes.body.employee.biometricMappings).toHaveLength(1);
+      expect(
+        Number(
+          revRows.find((r) => r.effectiveFrom.toISOString().slice(0, 10) === '2026-12-01')
+            .monthlyLeaveAllowance
+        )
+      ).toBe(5);
+    });
+
+    it('Regression: preserves biometric fail-closed security (500 BIOMETRIC_MAPPING_STORE_CORRUPT) when BIOMETRIC_EMPLOYEE_MAPPINGS_V1 itself is corrupted', async () => {
+      authenticateAs(adminA);
+      setupScheduledAllowanceMocks();
+
+      mockPermittedAllowances([5, 6], [
+        {
+          companyId: companyA,
+          key: BIOMETRIC_MAPPINGS_SETTING_KEY,
+          value: '{corrupt-json',
+        },
+      ]);
+
+      await expect(BiometricMappingService.readCompanyMappings(companyA)).rejects.toMatchObject({
+        statusCode: 500,
+        code: 'BIOMETRIC_MAPPING_STORE_CORRUPT',
+      });
+
+      const patchRes = await request(app)
+        .patch('/api/employees/emp-p23-1')
+        .set('Authorization', 'Bearer valid-token')
+        .send({ fullName: 'Should Fail Closed' });
+
+      expect(patchRes.status).toBe(500);
+      expect(patchRes.body.error.code).toBe('EMPLOYEE_UPDATE_FAILED');
+      expect(patchRes.body.error.message).toMatch(/biometric enrollment mappings.*fail-closed/i);
+
+      const revRes = await request(app)
+        .post('/api/employees/emp-p23-1/work-policies')
+        .set('Authorization', 'Bearer valid-token')
+        .send({ monthlyLeaveAllowance: 5 });
+
+      expect(revRes.status).toBe(500);
+      expect(revRes.body.error.code).toBe('WORK_POLICY_REVISION_CREATE_FAILED');
+      expect(revRes.body.error.message).toMatch(/biometric enrollment mappings.*fail-closed/i);
     });
   });
 });
