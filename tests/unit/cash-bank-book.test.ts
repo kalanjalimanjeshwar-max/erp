@@ -199,7 +199,7 @@ describe('Stage 2: Cash Book and Bank Book Reports', () => {
       expect(report.closingBalance).toBe('12000.0000');
       expect(report.lines.length).toBe(0);
 
-      // Verify Prisma query filtered by entryDate < fromDate with status: POSTED
+      // Verify Prisma query filtered by entryDate < fromDate with effective statuses (POSTED + REVERSED)
       expect(prisma.journalLine.findMany).toHaveBeenNthCalledWith(
         1,
         expect.objectContaining({
@@ -207,8 +207,27 @@ describe('Stage 2: Cash Book and Bank Book Reports', () => {
             ledgerId: vaultCashLedger.id,
             companyId: companyAId,
             journal: expect.objectContaining({
-              status: 'POSTED',
-              entryDate: { lt: new Date('2026-02-01') },
+              companyId: companyAId,
+              status: { in: ['POSTED', 'REVERSED'] },
+              entryDate: { lt: new Date('2026-02-01T00:00:00.000Z') },
+            }),
+          }),
+        })
+      );
+      // Verify period query uses inclusive fromDate and exclusive next-day boundary (2026-03-01)
+      expect(prisma.journalLine.findMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          where: expect.objectContaining({
+            ledgerId: vaultCashLedger.id,
+            companyId: companyAId,
+            journal: expect.objectContaining({
+              companyId: companyAId,
+              status: { in: ['POSTED', 'REVERSED'] },
+              entryDate: {
+                gte: new Date('2026-02-01T00:00:00.000Z'),
+                lt: new Date('2026-03-01T00:00:00.000Z'),
+              },
             }),
           }),
         })
@@ -413,10 +432,10 @@ describe('Stage 2: Cash Book and Bank Book Reports', () => {
   });
 
   // ========================================================
-  // 5. Draft & Reversed Entries Exclusion
+  // 5. Draft Exclusion & Reversed Journal Netting (BUG-1 + ADD-1)
   // ========================================================
-  describe('5. Draft & Reversed Entries Exclusion', () => {
-    it('should strictly query only status: POSTED, excluding DRAFT and REVERSED journals', async () => {
+  describe('5. Draft Exclusion & Reversed Journal Netting', () => {
+    it('should query POSTED and REVERSED journals (excluding DRAFT) and use exclusive next-day end boundary', async () => {
       vi.mocked(prisma.accountLedger.findMany).mockResolvedValue([vaultCashLedger as any]);
       vi.mocked(prisma.accountLedger.findUnique).mockResolvedValue(vaultCashLedger as any);
       vi.mocked(prisma.journalLine.findMany).mockResolvedValue([]);
@@ -427,10 +446,86 @@ describe('Stage 2: Cash Book and Bank Book Reports', () => {
         toDate: '2026-02-28',
       });
 
-      // Confirm both preLines and periodLines queries require status: 'POSTED'
-      for (const callArgs of vi.mocked(prisma.journalLine.findMany).mock.calls) {
-        expect(callArgs[0]?.where?.journal?.status).toBe('POSTED');
+      const calls = vi.mocked(prisma.journalLine.findMany).mock.calls;
+      expect(calls).toHaveLength(2);
+
+      // Confirm both preLines and periodLines include POSTED + REVERSED (excluding DRAFT) and tenant filter
+      for (const callArgs of calls) {
+        expect(callArgs[0]?.where?.journal?.companyId).toBe(companyAId);
+        expect(callArgs[0]?.where?.journal?.status).toEqual({ in: ['POSTED', 'REVERSED'] });
       }
+      expect(calls[0]?.[0]?.where?.journal?.entryDate).toEqual({
+        lt: new Date('2026-02-01T00:00:00.000Z'),
+      });
+      expect(calls[1]?.[0]?.where?.journal?.entryDate).toEqual({
+        gte: new Date('2026-02-01T00:00:00.000Z'),
+        lt: new Date('2026-03-01T00:00:00.000Z'),
+      });
+    });
+
+    it('should net original (REVERSED) and inverse (POSTED) entries to zero in Cash Book running balance', async () => {
+      vi.mocked(prisma.accountLedger.findMany).mockResolvedValue([vaultCashLedger as any]);
+      vi.mocked(prisma.accountLedger.findUnique).mockResolvedValue(vaultCashLedger as any);
+
+      vi.mocked(prisma.journalLine.findMany)
+        .mockResolvedValueOnce([]) // preLines
+        .mockResolvedValueOnce([
+          {
+            id: 'line-orig',
+            ledgerId: vaultCashLedger.id,
+            lineNumber: 1,
+            debit: new Decimal('10000.0000'),
+            credit: new Decimal('0.0000'),
+            description: 'Cash receipt (later reversed)',
+            journal: {
+              id: 'j-orig',
+              voucherNumber: 'JV-2026-0001',
+              status: 'REVERSED',
+              entryDate: new Date('2026-02-10T00:00:00.000Z'),
+              reference: 'REF-1',
+              narration: 'Original cash receipt',
+              lines: [
+                { ledgerId: vaultCashLedger.id, debit: '10000.0000', credit: '0.0000', ledger: vaultCashLedger },
+                { ledgerId: revenueLedger.id, debit: '0.0000', credit: '10000.0000', ledger: revenueLedger },
+              ],
+            },
+          },
+          {
+            id: 'line-rev',
+            ledgerId: vaultCashLedger.id,
+            lineNumber: 1,
+            debit: new Decimal('0.0000'),
+            credit: new Decimal('10000.0000'),
+            description: 'Reversal of JV-2026-0001',
+            journal: {
+              id: 'j-rev',
+              voucherNumber: 'JV-2026-0002',
+              status: 'POSTED',
+              entryDate: new Date('2026-02-15T00:00:00.000Z'),
+              reference: 'REV-JV-2026-0001',
+              narration: 'Reversal of JV-2026-0001',
+              lines: [
+                { ledgerId: vaultCashLedger.id, debit: '0.0000', credit: '10000.0000', ledger: vaultCashLedger },
+                { ledgerId: revenueLedger.id, debit: '10000.0000', credit: '0.0000', ledger: revenueLedger },
+              ],
+            },
+          },
+        ] as any);
+
+      const report = await AccountingReportService.getCashBook(companyAId, {
+        ledgerId: vaultCashLedger.id,
+        fromDate: '2026-02-01',
+        toDate: '2026-02-15',
+      });
+
+      expect(report.openingBalance).toBe('10000.0000');
+      expect(report.lines).toHaveLength(2);
+      expect(report.lines[0].runningBalance).toBe('20000.0000');
+      expect(report.lines[1].runningBalance).toBe('10000.0000');
+      expect(report.totalDebit).toBe('10000.0000');
+      expect(report.totalCredit).toBe('10000.0000');
+      expect(report.closingBalance).toBe('10000.0000');
+      expect(report.closingBalanceType).toBe('DEBIT');
     });
   });
 

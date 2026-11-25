@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import {
   PREVIEW_ACCOUNT_GROUPS,
   PREVIEW_ACCOUNT_LEDGERS,
@@ -206,6 +206,116 @@ describe('CoreERP Preview Mode Accounting & Exploration Tests', () => {
       // Balances should return to initial state
       expect(parseFloat(bankAfterReversal.closingBalance)).toBe(parseFloat(initialBank.closingBalance));
       expect(tbAfterReversal.isBalanced).toBe(true);
+    });
+
+    it('should preserve historical pre-reversal balances and net to zero on/after reversal date in preview mode', () => {
+      vi.useFakeTimers();
+      try {
+        // Pin clock to 2026-02-15T12:00:00.000Z so previewStore.reverseJournal() deterministically
+        // books the inverse journal on 2026-02-15 (strictly after the 2026-02-12 historical cutoff).
+        vi.setSystemTime(new Date('2026-02-15T12:00:00.000Z'));
+
+        // Capture independent baselines BEFORE creating any new vouchers
+        const baselineFeb12 = parseFloat(
+          previewStore.getLedgerStatement('preview-ldr-1010', { toDate: '2026-02-12' }).closingBalance
+        );
+        const baselineFeb15 = parseFloat(
+          previewStore.getLedgerStatement('preview-ldr-1010', { toDate: '2026-02-15' }).closingBalance
+        );
+
+        // Create an unposted DRAFT voucher on 2026-02-11 that must stay excluded throughout
+        const draft = previewStore.createJournal({
+          entryDate: '2026-02-11',
+          narration: 'Preview unposted draft cash entry',
+          lines: [
+            { ledgerId: 'preview-ldr-1010', debit: '3333.0000', credit: '0.0000' },
+            { ledgerId: 'preview-ldr-4010', debit: '0.0000', credit: '3333.0000' },
+          ],
+          autoPost: false,
+        });
+        expect(draft.status).toBe('DRAFT');
+
+        // Advance fake clock so previewStore's Date.now()-based IDs remain distinct
+        vi.advanceTimersByTime(1000);
+
+        // Post a voucher on 2026-02-10: Dr Cash 10,000 / Cr Revenue 10,000
+        const posted = previewStore.createJournal({
+          entryDate: '2026-02-10',
+          narration: 'Preview historical receipt',
+          lines: [
+            { ledgerId: 'preview-ldr-1010', debit: '10000.0000', credit: '0.0000' },
+            { ledgerId: 'preview-ldr-4010', debit: '0.0000', credit: '10000.0000' },
+          ],
+          autoPost: true,
+        });
+        expect(posted.id).not.toBe(draft.id);
+
+        // Capture real balances BEFORE reversal (original POSTED included; DRAFT excluded)
+        const preReversalFeb12 = previewStore.getLedgerStatement('preview-ldr-1010', {
+          toDate: '2026-02-12',
+        });
+        const preReversalFeb15 = previewStore.getLedgerStatement('preview-ldr-1010', {
+          toDate: '2026-02-15',
+        });
+        expect(parseFloat(preReversalFeb12.closingBalance)).toBeCloseTo(baselineFeb12 + 10000, 4);
+        expect(parseFloat(preReversalFeb15.closingBalance)).toBeCloseTo(baselineFeb15 + 10000, 4);
+        expect(preReversalFeb15.lines.some((l) => l.journalId === posted.id)).toBe(true);
+        expect(preReversalFeb15.lines.some((l) => l.journalId === draft.id)).toBe(false);
+
+        vi.advanceTimersByTime(1000);
+
+        // Reverse the posted voucher on 2026-02-15
+        const { original, reversal } = previewStore.reverseJournal(
+          posted.id,
+          'Historical boundary check'
+        );
+        expect(reversal.id).not.toBe(original.id);
+        expect(original.status).toBe('REVERSED');
+        expect(reversal.status).toBe('POSTED');
+        expect(reversal.reversalOfId).toBe(original.id);
+        expect(reversal.entryDate).toBe('2026-02-15');
+
+        // 1. Historical report ending 2026-02-12 (before reversal date):
+        //    Retains the original (now REVERSED) +10,000 balance; excludes both reversal and DRAFT.
+        const historicalAfterReversal = previewStore.getLedgerStatement('preview-ldr-1010', {
+          toDate: '2026-02-12',
+        });
+        expect(historicalAfterReversal.lines.some((l) => l.journalId === original.id)).toBe(true);
+        expect(historicalAfterReversal.lines.some((l) => l.journalId === reversal.id)).toBe(false);
+        expect(historicalAfterReversal.lines.some((l) => l.journalId === draft.id)).toBe(false);
+        expect(parseFloat(historicalAfterReversal.closingBalance)).toBeCloseTo(
+          parseFloat(preReversalFeb12.closingBalance),
+          4
+        );
+        expect(parseFloat(historicalAfterReversal.closingBalance)).toBeCloseTo(
+          baselineFeb12 + 10000,
+          4
+        );
+
+        // 2. Post-reversal report through 2026-02-15:
+        //    Includes BOTH original (Dr 10,000) and inverse reversal (Cr 10,000), excludes DRAFT,
+        //    and returns exactly to the independently captured pre-posting baselineFeb15.
+        const postReversalFeb15 = previewStore.getLedgerStatement('preview-ldr-1010', {
+          toDate: '2026-02-15',
+        });
+        const origLine = postReversalFeb15.lines.find((l) => l.journalId === original.id);
+        const revLine = postReversalFeb15.lines.find((l) => l.journalId === reversal.id);
+        expect(origLine).toBeDefined();
+        expect(origLine?.debit).toBe('10000.0000');
+        expect(revLine).toBeDefined();
+        expect(revLine?.credit).toBe('10000.0000');
+        expect(postReversalFeb15.lines.some((l) => l.journalId === draft.id)).toBe(false);
+        expect(parseFloat(postReversalFeb15.closingBalance)).toBeCloseTo(baselineFeb15, 4);
+        expect(parseFloat(postReversalFeb15.closingBalance)).toBeCloseTo(
+          parseFloat(preReversalFeb15.closingBalance) - 10000,
+          4
+        );
+
+        const tbAfterReversal = previewStore.getTrialBalance({ toDate: '2026-02-15' });
+        expect(tbAfterReversal.isBalanced).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

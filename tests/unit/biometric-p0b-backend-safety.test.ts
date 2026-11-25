@@ -3192,6 +3192,20 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
         return null;
       }) as any);
 
+      vi.spyOn(prisma.employee, 'findMany').mockImplementation((async (args: any) => {
+        const where = args?.where || {};
+        const pool = [activeEmployee, otherEmployee, legacyEmployee];
+        return pool.filter((emp) => {
+          if (where.companyId && emp.companyId !== where.companyId) return false;
+          if (typeof where.biometricDeviceId === 'string' && emp.biometricDeviceId !== where.biometricDeviceId) {
+            return false;
+          }
+          if (where.id?.notIn && where.id.notIn.includes(emp.id)) return false;
+          if (where.id?.in && !where.id.in.includes(emp.id)) return false;
+          return true;
+        }) as any;
+      }) as any);
+
       vi.spyOn(BiometricMappingService, 'readCompanyMappings').mockResolvedValue([
         {
           id: 'map-101',
@@ -3598,6 +3612,419 @@ describe('CoreERP P0-B — Backend Biometric Punch Safety (DB-Free Regression Su
       );
       expect(histMapRes.processed).toBe(1);
       expect(rawPunchFindManySpy.mock.calls[1][0].take).toBe(MAX_HISTORICAL_RECONCILIATION_BATCH_SIZE);
+    });
+
+    it('FIND-1: rejects ambiguous legacy biometricDeviceId historical reconciliation BEFORE BIOMETRIC_HISTORICAL_RECONCILE audit, trusted-window minting, or Attendance mutations', async () => {
+      const legacyDupA = {
+        ...activeEmployee,
+        id: 'emp-legacy-dup-a',
+        employeeCode: 'DUP-A',
+        fullName: 'Legacy Duplicate A',
+        biometricDeviceId: '777',
+      };
+      const legacyDupB = {
+        ...otherEmployee,
+        id: 'emp-legacy-dup-b',
+        employeeCode: 'DUP-B',
+        fullName: 'Legacy Duplicate B',
+        biometricDeviceId: '777',
+      };
+
+      const seedPunches: InMemoryPunch[] = [
+        {
+          id: 'hist-ambiguous-punch',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-ambiguous-777',
+          userEnrollmentId: '777',
+          punchTime: new Date('2026-11-20T04:00:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: null,
+          errorMessage: null,
+          idempotencyKey: 'idem-ambiguous-777',
+          createdAt: new Date('2026-11-20T04:00:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:00:01.000Z'),
+        },
+      ];
+
+      const { auditLogs, rawPunchFindManySpy, rawPunchUpdateSpy, attendanceCreateSpy } =
+        setupInMemoryReconciliationHarness(seedPunches, 'Asia/Kolkata');
+
+      // Restore the harness spies so the REAL BiometricMappingService.resolveEmployeeForPunch and
+      // listMappingsForEmployee implementations execute against readCompanyMappings + prisma.employee.findMany!
+      (BiometricMappingService.resolveEmployeeForPunch as any).mockRestore?.();
+      (BiometricMappingService.listMappingsForEmployee as any).mockRestore?.();
+      vi.spyOn(BiometricMappingService, 'readCompanyMappings').mockResolvedValue([]);
+      vi.spyOn(prisma.biometricTerminal, 'findMany').mockResolvedValue([mockTerminal] as any);
+
+      vi.spyOn(prisma.employee, 'findFirst').mockImplementation((async (args: any) => {
+        if (args?.where?.companyId === companyId) {
+          if (args?.where?.id === legacyDupA.id) return legacyDupA as any;
+          if (args?.where?.id === legacyDupB.id) return legacyDupB as any;
+        }
+        return null;
+      }) as any);
+
+      vi.spyOn(prisma.employee, 'findMany').mockImplementation((async (args: any) => {
+        const where = args?.where || {};
+        const pool = [legacyDupA, legacyDupB];
+        return pool.filter((emp) => {
+          if (where.companyId && emp.companyId !== where.companyId) return false;
+          if (typeof where.biometricDeviceId === 'string' && emp.biometricDeviceId !== where.biometricDeviceId) {
+            return false;
+          }
+          if (where.id?.notIn && where.id.notIn.includes(emp.id)) return false;
+          if (where.id?.in && !where.id.in.includes(emp.id)) return false;
+          return true;
+        }) as any;
+      }) as any);
+
+      const reconcilePunchSpy = vi.spyOn(PunchReconciliationService, 'reconcilePunch');
+
+      const baseRange = {
+        allowHistorical: true,
+        fromPunchTime: '2026-11-19T00:00:00.000Z',
+        toPunchTime: '2026-11-21T23:59:59.000Z',
+      };
+
+      // 1. Historical punchId + employeeId where punch resolves via ambiguous legacy biometricDeviceId -> 400 before audit
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          { ...baseRange, punchId: 'hist-ambiguous-punch', employeeId: legacyDupA.id },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING' });
+
+      // 2. Historical punchId (without employeeId) where unlinked punch is ambiguous legacy -> 400 before audit
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          { ...baseRange, punchId: 'hist-ambiguous-punch' },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING' });
+
+      // 3. Historical terminalId + userEnrollmentId where legacy mapping is ambiguous -> 400 before audit
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          { ...baseRange, terminalId, userEnrollmentId: '777' },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING' });
+
+      // 4. Historical userEnrollmentId alone (no terminalId) where legacy mapping is ambiguous -> 400 before audit
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          { ...baseRange, userEnrollmentId: '777' },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING' });
+
+      // 5. Historical employeeId + userEnrollmentId where legacy mapping is ambiguous -> 400 before audit
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          { ...baseRange, employeeId: legacyDupA.id, userEnrollmentId: '777' },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING' });
+
+      // 6. Historical employeeId alone for an employee with an ambiguous legacy biometricDeviceId -> 400 before audit
+      await expect(
+        PunchReconciliationService.reconcilePendingPunches(
+          companyId,
+          { ...baseRange, employeeId: legacyDupA.id },
+          superAdminActor
+        )
+      ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_AMBIGUOUS_LEGACY_MAPPING' });
+
+      // Strictly ZERO historical audit logs, ZERO trusted-window minting / punch queries / mutations / Attendance writes
+      expect(auditLogs).toHaveLength(0);
+      expect(rawPunchFindManySpy).not.toHaveBeenCalled();
+      expect(rawPunchUpdateSpy).not.toHaveBeenCalled();
+      expect(attendanceCreateSpy).not.toHaveBeenCalled();
+      expect(reconcilePunchSpy).not.toHaveBeenCalled();
+    });
+
+    it('FIND-1 pre-matched historical targetPunchId validation rejects every non-matching/null/stale/reassigned resolution before BIOMETRIC_HISTORICAL_RECONCILE audit or trusted-window minting, while permitting valid explicit and unique legacy matches', async () => {
+      const inactiveOtherEmployee = {
+        ...otherEmployee,
+        id: 'emp-inactive-other-find1',
+        employeeCode: 'EMP-INACT-F1',
+        status: 'INACTIVE',
+      };
+      const legacyMatchedEmployee = {
+        ...activeEmployee,
+        id: 'emp-legacy-same-find1',
+        employeeCode: 'EMP-LEG-F1',
+        biometricDeviceId: '886',
+      };
+      const legacyReassignedEmployee = {
+        ...otherEmployee,
+        id: 'emp-legacy-reassigned-find1',
+        employeeCode: 'EMP-LEG-F2',
+        biometricDeviceId: '885',
+      };
+
+      const seedPunches: InMemoryPunch[] = [
+        {
+          id: 'hist-prematched-emp-null',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-pm-881',
+          userEnrollmentId: '881',
+          punchTime: new Date('2026-11-20T04:00:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: activeEmployee.id,
+          errorMessage: null,
+          idempotencyKey: 'idem-pm-881',
+          createdAt: new Date('2026-11-20T04:00:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:00:01.000Z'),
+        },
+        {
+          id: 'hist-prematched-via-null',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-pm-882',
+          userEnrollmentId: '882',
+          punchTime: new Date('2026-11-20T04:05:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: activeEmployee.id,
+          errorMessage: null,
+          idempotencyKey: 'idem-pm-882',
+          createdAt: new Date('2026-11-20T04:05:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:05:01.000Z'),
+        },
+        {
+          id: 'hist-prematched-explicit-other',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-pm-883',
+          userEnrollmentId: '883',
+          punchTime: new Date('2026-11-20T04:10:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: activeEmployee.id,
+          errorMessage: null,
+          idempotencyKey: 'idem-pm-883',
+          createdAt: new Date('2026-11-20T04:10:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:10:01.000Z'),
+        },
+        {
+          id: 'hist-prematched-explicit-inactive',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-pm-884',
+          userEnrollmentId: '884',
+          punchTime: new Date('2026-11-20T04:15:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: activeEmployee.id,
+          errorMessage: null,
+          idempotencyKey: 'idem-pm-884',
+          createdAt: new Date('2026-11-20T04:15:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:15:01.000Z'),
+        },
+        {
+          id: 'hist-prematched-explicit-missing',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-pm-884m',
+          userEnrollmentId: '884M',
+          punchTime: new Date('2026-11-20T04:16:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: activeEmployee.id,
+          errorMessage: null,
+          idempotencyKey: 'idem-pm-884m',
+          createdAt: new Date('2026-11-20T04:16:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:16:01.000Z'),
+        },
+        {
+          id: 'hist-prematched-legacy-other',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-pm-885',
+          userEnrollmentId: '885',
+          punchTime: new Date('2026-11-20T04:20:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: activeEmployee.id,
+          errorMessage: null,
+          idempotencyKey: 'idem-pm-885',
+          createdAt: new Date('2026-11-20T04:20:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:20:01.000Z'),
+        },
+        {
+          id: 'hist-prematched-missing-company-id',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-pm-887',
+          userEnrollmentId: '887',
+          punchTime: new Date('2026-11-20T04:21:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: activeEmployee.id,
+          errorMessage: null,
+          idempotencyKey: 'idem-pm-887',
+          createdAt: new Date('2026-11-20T04:21:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:21:01.000Z'),
+        },
+        {
+          id: 'hist-prematched-wrong-company-id',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-pm-888',
+          userEnrollmentId: '888',
+          punchTime: new Date('2026-11-20T04:22:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: activeEmployee.id,
+          errorMessage: null,
+          idempotencyKey: 'idem-pm-888',
+          createdAt: new Date('2026-11-20T04:22:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:22:01.000Z'),
+        },
+        {
+          id: 'hist-prematched-valid-explicit',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-pm-101',
+          userEnrollmentId: '101',
+          punchTime: new Date('2026-11-20T04:25:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: activeEmployee.id,
+          errorMessage: null,
+          idempotencyKey: 'idem-pm-101',
+          createdAt: new Date('2026-11-20T04:25:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:25:01.000Z'),
+        },
+        {
+          id: 'hist-prematched-valid-legacy',
+          companyId,
+          terminalId,
+          devicePunchId: 'dp-pm-886',
+          userEnrollmentId: '886',
+          punchTime: new Date('2026-11-20T04:30:00.000Z'),
+          verifyType: 'FINGERPRINT',
+          inOutMode: 'CHECK_IN',
+          syncStatus: 'PENDING',
+          matchedEmployeeId: legacyMatchedEmployee.id,
+          errorMessage: null,
+          idempotencyKey: 'idem-pm-886',
+          createdAt: new Date('2026-11-20T04:30:01.000Z'),
+          updatedAt: new Date('2026-11-20T04:30:01.000Z'),
+        },
+      ];
+
+      const { auditLogs, rawPunchFindManySpy, rawPunchUpdateSpy, attendanceCreateSpy } =
+        setupInMemoryReconciliationHarness(seedPunches, 'Asia/Kolkata');
+
+      // Override rawPunchLog.findUnique to include legacyMatchedEmployee on the valid legacy punch
+      const baseRawFindUnique = (prisma.rawPunchLog.findUnique as any).getMockImplementation();
+      vi.spyOn(prisma.rawPunchLog, 'findUnique').mockImplementation((async (args: any) => {
+        const res = await baseRawFindUnique(args);
+        if (res && res.matchedEmployeeId === legacyMatchedEmployee.id) {
+          return { ...res, matchedEmployee: legacyMatchedEmployee };
+        }
+        return res;
+      }) as any);
+
+      vi.spyOn(BiometricMappingService, 'resolveEmployeeForPunch').mockImplementation(
+        async (cId: string, _tId: string | null | undefined, enrollmentId: string) => {
+          if (cId !== companyId) return { employee: null, matchedVia: null };
+          if (enrollmentId === '881') return { employee: null, matchedVia: null };
+          if (enrollmentId === '882') return { employee: activeEmployee as any, matchedVia: null };
+          if (enrollmentId === '883') return { employee: otherEmployee as any, matchedVia: 'MAPPING' as const };
+          if (enrollmentId === '884') return { employee: inactiveOtherEmployee as any, matchedVia: 'MAPPING' as const };
+          if (enrollmentId === '884M') return { employee: null, matchedVia: null };
+          if (enrollmentId === '885') return { employee: legacyReassignedEmployee as any, matchedVia: 'LEGACY' as const };
+          if (enrollmentId === '887') {
+            const { companyId: _omitted, ...empNoCompany } = activeEmployee;
+            return { employee: empNoCompany as any, matchedVia: 'MAPPING' as const };
+          }
+          if (enrollmentId === '888') {
+            return {
+              employee: { ...activeEmployee, companyId: 'company-other-tenant' } as any,
+              matchedVia: 'LEGACY' as const,
+            };
+          }
+          if (enrollmentId === '101') return { employee: activeEmployee as any, matchedVia: 'MAPPING' as const };
+          if (enrollmentId === '886') return { employee: legacyMatchedEmployee as any, matchedVia: 'LEGACY' as const };
+          return { employee: null, matchedVia: null };
+        }
+      );
+
+      const reconcilePunchSpy = vi.spyOn(PunchReconciliationService, 'reconcilePunch');
+
+      const baseRange = {
+        allowHistorical: true,
+        fromPunchTime: '2026-11-19T00:00:00.000Z',
+        toPunchTime: '2026-11-21T23:59:59.000Z',
+      };
+
+      const rejectedPunchIds = [
+        'hist-prematched-emp-null',
+        'hist-prematched-via-null',
+        'hist-prematched-explicit-other',
+        'hist-prematched-explicit-inactive',
+        'hist-prematched-explicit-missing',
+        'hist-prematched-legacy-other',
+        'hist-prematched-missing-company-id',
+        'hist-prematched-wrong-company-id',
+      ];
+
+      for (const badPunchId of rejectedPunchIds) {
+        await expect(
+          PunchReconciliationService.reconcilePendingPunches(
+            companyId,
+            { ...baseRange, punchId: badPunchId },
+            superAdminActor
+          )
+        ).rejects.toMatchObject({ statusCode: 400, code: 'BIOMETRIC_MAPPING_MISMATCH' });
+      }
+
+      // Strictly ZERO historical audit logs, ZERO trusted-window minting / punch queries / mutations / Attendance writes
+      expect(auditLogs).toHaveLength(0);
+      expect(rawPunchFindManySpy).not.toHaveBeenCalled();
+      expect(rawPunchUpdateSpy).not.toHaveBeenCalled();
+      expect(attendanceCreateSpy).not.toHaveBeenCalled();
+      expect(reconcilePunchSpy).not.toHaveBeenCalled();
+
+      // Valid explicit mapping to the SAME pre-matched employee still succeeds cleanly
+      const validExplicitRes = await PunchReconciliationService.reconcilePendingPunches(
+        companyId,
+        { ...baseRange, punchId: 'hist-prematched-valid-explicit' },
+        superAdminActor
+      );
+      expect(validExplicitRes.processed).toBe(1);
+      expect(auditLogs.filter((l) => l.action === 'BIOMETRIC_HISTORICAL_RECONCILE')).toHaveLength(1);
+
+      // Valid unique legacy mapping to the SAME pre-matched employee still succeeds cleanly
+      const validLegacyRes = await PunchReconciliationService.reconcilePendingPunches(
+        companyId,
+        { ...baseRange, punchId: 'hist-prematched-valid-legacy' },
+        superAdminActor
+      );
+      expect(validLegacyRes.processed).toBe(1);
+      expect(auditLogs.filter((l) => l.action === 'BIOMETRIC_HISTORICAL_RECONCILE')).toHaveLength(2);
     });
   });
 });

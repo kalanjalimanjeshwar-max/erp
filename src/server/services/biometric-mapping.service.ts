@@ -11,6 +11,7 @@ import {
   EmployeeStatus,
 } from '../../shared/types.js';
 import { AuditService } from './audit.service.js';
+import { createBiometricSafetyError } from './biometric-safety.js';
 
 export const BIOMETRIC_MAPPINGS_SETTING_KEY = 'BIOMETRIC_EMPLOYEE_MAPPINGS_V1';
 export const BIOMETRIC_DEVICE_USERS_SETTING_KEY = 'BIOMETRIC_DEVICE_USERS_V1';
@@ -93,11 +94,17 @@ export class BiometricMappingService {
     client?: any
   ): Promise<StoredBiometricMappingRecord[]> {
     const db = client || prisma;
+    if (typeof db.companySetting?.findUnique !== 'function') {
+      throw createBiometricSafetyError(
+        'Biometric enrollment mapping store is unavailable (fail-closed).',
+        503,
+        'BIOMETRIC_MAPPING_STORE_UNAVAILABLE'
+      );
+    }
+
+    let row: { value?: unknown } | null | undefined;
     try {
-      if (typeof db.companySetting?.findUnique !== 'function') {
-        return [];
-      }
-      const row = await db.companySetting.findUnique({
+      row = await db.companySetting.findUnique({
         where: {
           companyId_key: {
             companyId,
@@ -105,23 +112,70 @@ export class BiometricMappingService {
           },
         },
       });
-      if (!row?.value) return [];
-      const parsed = JSON.parse(row.value);
-      if (!Array.isArray(parsed)) return [];
-      return parsed.filter(
-        (item): item is StoredBiometricMappingRecord =>
-          Boolean(
-            item &&
-              typeof item === 'object' &&
-              item.companyId === companyId &&
-              typeof item.employeeId === 'string' &&
-              typeof item.terminalId === 'string' &&
-              typeof item.enrollmentId === 'string'
-          )
-      );
     } catch {
+      throw createBiometricSafetyError(
+        'Failed to read biometric enrollment mappings from authoritative store (fail-closed).',
+        503,
+        'BIOMETRIC_MAPPING_STORE_UNAVAILABLE'
+      );
+    }
+
+    // Setting genuinely does not exist -> no explicit mappings configured; documented legacy fallback applies.
+    if (row === null || row === undefined) {
       return [];
     }
+
+    if (typeof row.value !== 'string') {
+      throw createBiometricSafetyError(
+        'Stored biometric enrollment mappings payload is invalid or corrupted (fail-closed).',
+        500,
+        'BIOMETRIC_MAPPING_STORE_CORRUPT'
+      );
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(row.value);
+    } catch {
+      throw createBiometricSafetyError(
+        'Stored biometric enrollment mappings JSON is invalid or corrupted (fail-closed).',
+        500,
+        'BIOMETRIC_MAPPING_STORE_CORRUPT'
+      );
+    }
+
+    if (!Array.isArray(parsed)) {
+      throw createBiometricSafetyError(
+        'Stored biometric enrollment mappings JSON must be an array (fail-closed).',
+        500,
+        'BIOMETRIC_MAPPING_STORE_CORRUPT'
+      );
+    }
+
+    const validRecords: StoredBiometricMappingRecord[] = [];
+    for (const item of parsed) {
+      if (
+        !item ||
+        typeof item !== 'object' ||
+        typeof (item as Record<string, unknown>).companyId !== 'string' ||
+        typeof (item as Record<string, unknown>).employeeId !== 'string' ||
+        typeof (item as Record<string, unknown>).terminalId !== 'string' ||
+        typeof (item as Record<string, unknown>).enrollmentId !== 'string' ||
+        typeof (item as Record<string, unknown>).isActive !== 'boolean'
+      ) {
+        throw createBiometricSafetyError(
+          'Stored biometric enrollment mappings contain a malformed entry (fail-closed).',
+          500,
+          'BIOMETRIC_MAPPING_STORE_CORRUPT'
+        );
+      }
+
+      if ((item as StoredBiometricMappingRecord).companyId === companyId) {
+        validRecords.push(item as StoredBiometricMappingRecord);
+      }
+    }
+
+    return validRecords;
   }
 
   private static async writeCompanyMappings(
@@ -778,10 +832,64 @@ export class BiometricMappingService {
   }
 
   /**
+   * Finds all legacy-fallback Employee candidates in a company for a given enrollment ID.
+   * Excludes employees that have active explicit terminal/enrollment mappings and enforces
+   * strict companyId scoping.
+   */
+  static async findLegacyEmployeesForEnrollment(
+    companyId: string,
+    userEnrollmentId: string,
+    explicitMappedEmployeeIds: Set<string>,
+    client?: any,
+    options?: { includeShift?: boolean }
+  ): Promise<any[]> {
+    const db = client || prisma;
+    const trimmedEnrollmentId = this.normalizeEnrollmentId(userEnrollmentId);
+    if (!trimmedEnrollmentId || typeof db.employee?.findMany !== 'function') {
+      return [];
+    }
+
+    const excludedIds = [...explicitMappedEmployeeIds];
+    const where: Record<string, unknown> = {
+      companyId,
+      biometricDeviceId: trimmedEnrollmentId,
+    };
+    if (excludedIds.length > 0) {
+      where.id = { notIn: excludedIds };
+    }
+
+    const candidates = await db.employee.findMany({
+      where,
+      ...(options?.includeShift ? { include: { shift: true } } : {}),
+    });
+
+    const matches: any[] = [];
+    const seenIds = new Set<string>();
+    for (const candidate of candidates || []) {
+      if (!candidate || typeof candidate.id !== 'string') continue;
+      if (candidate.companyId !== undefined && candidate.companyId !== companyId) continue;
+      if (
+        candidate.biometricDeviceId !== undefined &&
+        (candidate.biometricDeviceId === null ||
+          this.normalizeEnrollmentId(String(candidate.biometricDeviceId)) !== trimmedEnrollmentId)
+      ) {
+        continue;
+      }
+      if (explicitMappedEmployeeIds.has(candidate.id)) continue;
+      if (seenIds.has(candidate.id)) continue;
+      seenIds.add(candidate.id);
+      matches.push(candidate);
+    }
+
+    return matches;
+  }
+
+  /**
    * Resolves a single punch's (companyId, terminalId, enrollmentId) to an Employee record.
    * Priority:
    * 1. Explicit active mapping for (terminalId, enrollmentId) within companyId.
-   * 2. Legacy Employee.biometricDeviceId fallback ONLY for employees without explicit terminal mappings.
+   * 2. Legacy Employee.biometricDeviceId fallback ONLY for employees without explicit terminal mappings,
+   *    failing closed if more than one legacy employee in the company matches.
    * Note: Returns employee regardless of status so caller can enforce Inactive Employee Policy cleanly.
    */
   static async resolveEmployeeForPunch(
@@ -789,7 +897,12 @@ export class BiometricMappingService {
     terminalId: string | null | undefined,
     userEnrollmentId: string,
     client?: any
-  ): Promise<{ employee: any | null; matchedVia: 'MAPPING' | 'LEGACY' | null }> {
+  ): Promise<{
+    employee: any | null;
+    matchedVia: 'MAPPING' | 'LEGACY' | null;
+    ambiguous?: boolean;
+    ambiguousEmployeeIds?: string[];
+  }> {
     const db = client || prisma;
     const trimmedEnrollmentId = this.normalizeEnrollmentId(userEnrollmentId);
     if (!trimmedEnrollmentId) {
@@ -800,13 +913,26 @@ export class BiometricMappingService {
 
     // 1. Check explicit active mapping scoped to this terminal
     if (terminalId) {
-      const activeMapping = mappings.find(
+      const activeMappings = mappings.filter(
         (m) =>
           m.isActive &&
           m.terminalId === terminalId &&
           m.enrollmentId === trimmedEnrollmentId
       );
 
+      if (activeMappings.length > 1) {
+        const distinctEmployeeIds = [...new Set(activeMappings.map((m) => m.employeeId))];
+        if (distinctEmployeeIds.length > 1) {
+          return {
+            employee: null,
+            matchedVia: null,
+            ambiguous: true,
+            ambiguousEmployeeIds: distinctEmployeeIds,
+          };
+        }
+      }
+
+      const activeMapping = activeMappings[0];
       if (activeMapping) {
         const mappedEmployee = await db.employee.findUnique({
           where: { id: activeMapping.employeeId },
@@ -819,21 +945,31 @@ export class BiometricMappingService {
       }
     }
 
-    // 2. Fallback to legacy Employee.biometricDeviceId only if employee does NOT use explicit mappings
+    // 2. Fallback to legacy Employee.biometricDeviceId only for employees without explicit mappings.
+    //    Fail closed if more than one legacy employee in the company shares the same biometricDeviceId.
     const employeesWithExplicitMappings = new Set(
       mappings.filter((m) => m.isActive).map((m) => m.employeeId)
     );
 
-    const legacyEmployee = await db.employee.findFirst({
-      where: {
-        companyId,
-        biometricDeviceId: trimmedEnrollmentId,
-      },
-      include: { shift: true },
-    });
+    const legacyEmployees = await this.findLegacyEmployeesForEnrollment(
+      companyId,
+      trimmedEnrollmentId,
+      employeesWithExplicitMappings,
+      db,
+      { includeShift: true }
+    );
 
-    if (legacyEmployee && !employeesWithExplicitMappings.has(legacyEmployee.id)) {
-      return { employee: legacyEmployee, matchedVia: 'LEGACY' };
+    if (legacyEmployees.length > 1) {
+      return {
+        employee: null,
+        matchedVia: null,
+        ambiguous: true,
+        ambiguousEmployeeIds: legacyEmployees.map((emp) => emp.id),
+      };
+    }
+
+    if (legacyEmployees.length === 1) {
+      return { employee: legacyEmployees[0], matchedVia: 'LEGACY' };
     }
 
     return { employee: null, matchedVia: null };
@@ -842,6 +978,7 @@ export class BiometricMappingService {
   /**
    * Batch resolves ACTIVE employees for punch ingestion on a specific terminal.
    * Preserves backward compatibility with mocked Employee objects that omit `status`.
+   * Fails closed on ambiguous legacy Employee.biometricDeviceId collisions within companyId.
    */
   static async resolveBatchForTerminal(
     companyId: string,
@@ -859,6 +996,16 @@ export class BiometricMappingService {
       (m) => m.isActive && m.terminalId === terminalId && uniqueIds.includes(m.enrollmentId)
     );
 
+    const explicitMappingsByEnrollment = new Map<string, Set<string>>();
+    for (const m of activeMappingsForTerminal) {
+      let empSet = explicitMappingsByEnrollment.get(m.enrollmentId);
+      if (!empSet) {
+        empSet = new Set<string>();
+        explicitMappingsByEnrollment.set(m.enrollmentId, empSet);
+      }
+      empSet.add(m.employeeId);
+    }
+
     const mappedEmpIds = [...new Set(activeMappingsForTerminal.map((m) => m.employeeId))];
     if (mappedEmpIds.length > 0 && typeof db.employee?.findMany === 'function') {
       const mappedEmps = await db.employee.findMany({
@@ -870,17 +1017,26 @@ export class BiometricMappingService {
       });
       const activeEmpSet = new Set(
         mappedEmps
-          .filter((e: any) => e.status === undefined || e.status === 'ACTIVE')
+          .filter(
+            (e: any) =>
+              (e.companyId === undefined || e.companyId === companyId) &&
+              (e.status === undefined || e.status === 'ACTIVE')
+          )
           .map((e: any) => e.id)
       );
-      for (const m of activeMappingsForTerminal) {
-        if (activeEmpSet.has(m.employeeId)) {
-          resolved.set(m.enrollmentId, m.employeeId);
+      for (const [enrollmentId, empSet] of explicitMappingsByEnrollment.entries()) {
+        // Fail closed if corrupted mapping storage maps >1 distinct employee to (terminalId, enrollmentId)
+        if (empSet.size !== 1) continue;
+        const onlyEmpId = [...empSet][0];
+        if (activeEmpSet.has(onlyEmpId)) {
+          resolved.set(enrollmentId, onlyEmpId);
         }
       }
     }
 
-    const remainingIds = uniqueIds.filter((id) => !resolved.has(id));
+    // Any enrollmentId with an active explicit mapping on this terminal must NOT fall back to legacy,
+    // even if its mapped employee is inactive or ambiguous.
+    const remainingIds = uniqueIds.filter((id) => !explicitMappingsByEnrollment.has(id));
     if (remainingIds.length === 0 || typeof db.employee?.findMany !== 'function') {
       return resolved;
     }
@@ -897,12 +1053,28 @@ export class BiometricMappingService {
       select: { id: true, biometricDeviceId: true, status: true },
     });
 
-    for (const emp of legacyEmployees) {
-      if (!emp.biometricDeviceId) continue;
+    const legacyCandidatesByEnrollment = new Map<string, Map<string, any>>();
+    for (const emp of legacyEmployees || []) {
+      if (!emp || typeof emp.id !== 'string' || !emp.biometricDeviceId) continue;
+      if (emp.companyId !== undefined && emp.companyId !== companyId) continue;
       if (employeesWithExplicitMappings.has(emp.id)) continue;
-      if (emp.status !== undefined && emp.status !== 'ACTIVE') continue;
-      if (!resolved.has(emp.biometricDeviceId)) {
-        resolved.set(emp.biometricDeviceId, emp.id);
+      const normalizedKey = this.normalizeEnrollmentId(String(emp.biometricDeviceId));
+      if (!normalizedKey) continue;
+      let candidatesById = legacyCandidatesByEnrollment.get(normalizedKey);
+      if (!candidatesById) {
+        candidatesById = new Map<string, any>();
+        legacyCandidatesByEnrollment.set(normalizedKey, candidatesById);
+      }
+      candidatesById.set(emp.id, emp);
+    }
+
+    for (const [enrollmentId, candidatesById] of legacyCandidatesByEnrollment.entries()) {
+      // Fail closed if more than one legacy employee in this company shares the same biometricDeviceId.
+      if (candidatesById.size !== 1) continue;
+      const onlyCandidate = [...candidatesById.values()][0];
+      if (onlyCandidate.status !== undefined && onlyCandidate.status !== 'ACTIVE') continue;
+      if (!resolved.has(enrollmentId)) {
+        resolved.set(enrollmentId, onlyCandidate.id);
       }
     }
 
