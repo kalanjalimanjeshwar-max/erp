@@ -236,3 +236,59 @@ export function installUnitPrismaGuard(options?: {
 
   return { companySettingStore };
 }
+
+export interface CompanySettingMockEntry {
+  companyId: string;
+  key: string;
+  value: string;
+  id?: string;
+}
+
+/**
+ * Installs a tenant- and key-aware mock on `prisma.companySetting.findUnique`.
+ *
+ * Mirrors PostgreSQL's `@@unique([companyId, key])` lookup so configuring one
+ * CompanySetting key (for example `PERMITTED_MONTHLY_LEAVE_ALLOWANCES_V1`) never
+ * leaks its row into another key (such as `BIOMETRIC_EMPLOYEE_MAPPINGS_V1`) or
+ * another tenant. Any unconfigured `(companyId, key)` lookup resolves to `null`.
+ */
+export function mockCompanySettingFindUnique(entries: CompanySettingMockEntry[] = []) {
+  const store = new Map<string, CompanySettingMockEntry>();
+  const makeKey = (companyId: string, key: string) => `${companyId}::${key}`;
+
+  for (const entry of entries) {
+    store.set(makeKey(entry.companyId, entry.key), { ...entry });
+  }
+
+  const spy = vi.spyOn(prisma.companySetting, 'findUnique').mockImplementation((async (args: any) => {
+    const lookup = args?.where?.companyId_key;
+    if (!lookup || typeof lookup.companyId !== 'string' || typeof lookup.key !== 'string') {
+      return null;
+    }
+
+    const composite = makeKey(lookup.companyId, lookup.key);
+    const hit = store.get(composite);
+    if (!hit) {
+      return null;
+    }
+
+    return {
+      id: hit.id ?? composite,
+      companyId: hit.companyId,
+      key: hit.key,
+      value: hit.value,
+    } as any;
+  }) as any);
+
+  return {
+    spy,
+    store,
+    set(companyId: string, key: string, value: string, id?: string) {
+      store.set(makeKey(companyId, key), { companyId, key, value, id });
+    },
+    delete(companyId: string, key: string) {
+      store.delete(makeKey(companyId, key));
+    },
+  };
+}
+
