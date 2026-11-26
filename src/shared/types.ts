@@ -1371,7 +1371,7 @@ export interface LinkEmployeeLedgerRequest {
 // ============================================================================
 
 export type AttendanceStatus = 'PRESENT' | 'ABSENT' | 'HALF_DAY' | 'LATE' | 'ON_LEAVE';
-export type AttendanceSource = 'MANUAL' | 'BIOMETRIC';
+export type AttendanceSource = 'MANUAL' | 'BIOMETRIC' | 'SYSTEM_GENERATED';
 export type LeaveStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'CANCELLED';
 export type PayrollStatus = 'DRAFT' | 'PROCESSED' | 'ACCOUNTS_APPROVED' | 'POSTED' | 'CANCELLED';
 export type PayslipStatus = 'DRAFT' | 'APPROVED' | 'PAID' | 'CANCELLED';

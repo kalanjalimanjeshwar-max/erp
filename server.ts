@@ -6,6 +6,7 @@ import express from 'express';
 import { createApp } from './src/server/app.js';
 import { checkPostgresHealth } from './src/server/db/health.js';
 import { getPrismaClient, verifyDatabaseUrlConsistency } from './src/server/db/client.js';
+import { defaultAutoCheckoutScheduler } from './src/server/services/auto-checkout.scheduler.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -77,6 +78,12 @@ async function startServer() {
   const port = config.PORT || 3000;
   const server = app.listen(port, '0.0.0.0', () => {
     console.log(`[CoreERP] Server running at http://0.0.0.0:${port}`);
+    if (
+      config.NODE_ENV !== 'test' &&
+      process.env.DISABLE_AUTO_CHECKOUT_SCHEDULER !== 'true'
+    ) {
+      defaultAutoCheckoutScheduler.start();
+    }
   });
 
   server.on('error', (err: NodeJS.ErrnoException) => {
@@ -90,6 +97,7 @@ async function startServer() {
   // Graceful shutdown handling
   const shutdown = async (signal: string) => {
     console.log(`\n[CoreERP] Received ${signal}. Shutting down gracefully...`);
+    defaultAutoCheckoutScheduler.stop();
     server.close(async () => {
       console.log('[CoreERP] HTTP server closed.');
       try {

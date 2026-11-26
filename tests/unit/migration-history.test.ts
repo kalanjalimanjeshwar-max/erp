@@ -259,6 +259,7 @@ describe('Database Migration History & Integrity Tests', () => {
       '20261106000000_phase2_3_bank_account_encryption_capacity',
       '20261112000000_employee_expense_claims_reimbursement',
       '20261119000000_employee_work_policy_and_multi_pair_attendance',
+      '20261126000000_attendance_auto_checkout_system_generated',
     ]);
   });
 
@@ -398,6 +399,24 @@ describe('Database Migration History & Integrity Tests', () => {
     expect(content).toContain('"AttendanceInterval_sequence_chk"');
     expect(content).toContain('"AttendanceInterval_durationMinutes_chk"');
     expect(content).toContain('"AttendanceInterval_check_order_chk"');
+    expect(content).not.toMatch(/^\s*(UPDATE|DELETE|DROP|TRUNCATE)\b/im);
+  });
+
+  it('should include version-controlled additive AttendanceSource SYSTEM_GENERATED migration', () => {
+    const migration17Dir = path.join(
+      migrationsDir,
+      '20261126000000_attendance_auto_checkout_system_generated'
+    );
+    expect(fs.existsSync(migration17Dir)).toBe(true);
+
+    const migration17Sql = path.join(migration17Dir, 'migration.sql');
+    expect(fs.existsSync(migration17Sql)).toBe(true);
+
+    const content = fs.readFileSync(migration17Sql, 'utf-8');
+    expect(content).toContain(
+      `ALTER TYPE "AttendanceSource" ADD VALUE IF NOT EXISTS 'SYSTEM_GENERATED';`
+    );
+    expect(content).not.toMatch(/^\s*(BEGIN|COMMIT)\s*;/m);
     expect(content).not.toMatch(/^\s*(UPDATE|DELETE|DROP|TRUNCATE)\b/im);
   });
 });

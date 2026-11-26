@@ -829,6 +829,20 @@ export class AttendanceService {
       throw err;
     }
 
+    const isProtectedTimingOrAbsenceChange =
+      input.checkIn !== undefined ||
+      input.checkOut !== undefined ||
+      input.status === 'ABSENT' ||
+      input.status === 'ON_LEAVE';
+
+    if (existing.source === 'SYSTEM_GENERATED' && isProtectedTimingOrAbsenceChange) {
+      const err = new Error(
+        'Cannot manually modify timestamps or change status to ABSENT/ON_LEAVE on an attendance record finalized by automatic system check-out (SYSTEM_GENERATED).'
+      );
+      (err as { statusCode?: number }).statusCode = 409;
+      throw err;
+    }
+
     const dataToUpdate: {
       checkIn?: Date | null;
       checkOut?: Date | null;
@@ -960,14 +974,28 @@ export class AttendanceService {
       }
     }
 
-    const updated: any = await prisma.attendance.update({
-      where: { id },
-      data: dataToUpdate,
-      include: {
-        employee: { select: { employeeCode: true, fullName: true } },
-        shift: { select: { name: true } },
-      },
-    });
+    let updated: any;
+    try {
+      updated = await prisma.attendance.update({
+        where: isProtectedTimingOrAbsenceChange
+          ? { id, source: { not: 'SYSTEM_GENERATED' } }
+          : { id },
+        data: dataToUpdate,
+        include: {
+          employee: { select: { employeeCode: true, fullName: true } },
+          shift: { select: { name: true } },
+        },
+      });
+    } catch (err: any) {
+      if (isProtectedTimingOrAbsenceChange && err?.code === 'P2025') {
+        const conflictErr = new Error(
+          'Attendance record was concurrently finalized by automatic system check-out (SYSTEM_GENERATED) and cannot be overwritten.'
+        );
+        (conflictErr as { statusCode?: number }).statusCode = 409;
+        throw conflictErr;
+      }
+      throw err;
+    }
 
     await AuditService.log({
       companyId: actor.companyId,

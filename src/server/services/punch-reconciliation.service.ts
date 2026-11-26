@@ -629,6 +629,7 @@ export class PunchReconciliationService {
       companyTimezone?: string;
       enforcedTimeWindow?: { effectiveFrom: Date; effectiveTo?: Date };
       trustedTimeWindow?: ResolvedReconciliationTimeWindow;
+      historicalCreatedAttendanceIds?: Set<string>;
     }
   ): Promise<PunchReconciliationItemResult> {
     // F4: Strictly validate enforcedTimeWindow fail-closed BEFORE any database transaction or mutation.
@@ -1123,6 +1124,59 @@ export class PunchReconciliationService {
         };
       }
 
+      // E2. Historical Recovery Protection:
+      // During explicit Historical Recovery, NEVER automatically overwrite, recalculate,
+      // or modify pre-existing Attendance records. Only punches belonging to a day with
+      // no pre-existing Attendance record (or paired into an Attendance record newly
+      // created within the same historical recovery batch) may proceed.
+      if (
+        verifiedTrustedWindow?.mode === 'HISTORICAL' &&
+        existingAttendance &&
+        !options?.historicalCreatedAttendanceIds?.has(existingAttendance.id)
+      ) {
+        const reason = `Protected record: Existing attendance record for ${workDateStr} cannot be overwritten or recalculated during historical recovery.`;
+        await tx.rawPunchLog.update({
+          where: { id: punch.id },
+          data: {
+            matchedEmployeeId: employee.id,
+            syncStatus: 'IGNORED',
+            errorMessage: reason,
+          },
+        });
+        return {
+          punchId: punch.id,
+          userEnrollmentId: punch.userEnrollmentId,
+          matchedEmployeeId: employee.id,
+          workDate: workDateStr,
+          status: 'IGNORED',
+          message: reason,
+        };
+      }
+
+      // E3. Automatic Check-Out Immutability Guard:
+      // Once an Attendance record for workDateStr has been finalized by the 11:55 PM
+      // automatic check-out (source === 'SYSTEM_GENERATED'), subsequent biometric punches
+      // targeting that same attendance date must NOT silently overwrite it.
+      if (existingAttendance && existingAttendance.source === 'SYSTEM_GENERATED') {
+        const reason = `Protected record: Attendance for ${workDateStr} was already finalized by automatic system check-out (SYSTEM_GENERATED). Biometric punch flagged for manual review.`;
+        await tx.rawPunchLog.update({
+          where: { id: punch.id },
+          data: {
+            matchedEmployeeId: employee.id,
+            syncStatus: 'IGNORED',
+            errorMessage: reason,
+          },
+        });
+        return {
+          punchId: punch.id,
+          userEnrollmentId: punch.userEnrollmentId,
+          matchedEmployeeId: employee.id,
+          workDate: workDateStr,
+          status: 'IGNORED',
+          message: reason,
+        };
+      }
+
       // F. Process by InOutMode according to explicit business rules
       const punchTime = punch.punchTime;
       const mode = punch.inOutMode;
@@ -1153,6 +1207,9 @@ export class PunchReconciliationService {
                 notes: `Biometric Check-In at ${punchTime.toISOString()}`,
               },
             });
+            if (verifiedTrustedWindow?.mode === 'HISTORICAL') {
+              options?.historicalCreatedAttendanceIds?.add(attendanceRecord.id);
+            }
           }
 
           let existingEvents = (await tx.attendancePunchEvent.findMany({
@@ -1184,7 +1241,7 @@ export class PunchReconciliationService {
               });
               existingEvents.push(seededIn);
             }
-            if (existingAttendance.checkOut) {
+            if (existingAttendance.checkOut && existingAttendance.source !== 'SYSTEM_GENERATED') {
               const seededOut = await tx.attendancePunchEvent.create({
                 data: {
                   companyId: punch.companyId,
@@ -1391,7 +1448,7 @@ export class PunchReconciliationService {
           );
           const status: AttendanceStatus = lateMinutes > 0 ? 'LATE' : 'PRESENT';
 
-          await tx.attendance.create({
+          const createdLegacyAttendance = await tx.attendance.create({
             data: {
               companyId: punch.companyId,
               employeeId: employee.id,
@@ -1409,6 +1466,9 @@ export class PunchReconciliationService {
               notes: `Biometric Check-In at ${punchTime.toISOString()}`,
             },
           });
+          if (verifiedTrustedWindow?.mode === 'HISTORICAL' && createdLegacyAttendance?.id) {
+            options?.historicalCreatedAttendanceIds?.add(createdLegacyAttendance.id);
+          }
 
           await tx.rawPunchLog.update({
             where: { id: punch.id },
@@ -2247,6 +2307,8 @@ export class PunchReconciliationService {
       let ignoredCount = 0;
       let errorCount = 0;
 
+      const historicalCreatedAttendanceIds = isHistoricalMode ? new Set<string>() : undefined;
+
       for (const punch of pendingPunches) {
         try {
           const itemResult = await this.reconcilePunch(punch.id, correlationId, {
@@ -2254,6 +2316,7 @@ export class PunchReconciliationService {
             expectedCompanyId: companyId,
             companyTimezone: timeWindow.companyTimezone,
             trustedTimeWindow: timeWindow,
+            historicalCreatedAttendanceIds,
           });
           results.push(itemResult);
 

@@ -1002,6 +1002,7 @@ enum AttendanceStatus {
 enum AttendanceSource {
   MANUAL
   BIOMETRIC
+  SYSTEM_GENERATED
 }
 
 /// Leave workflow approval lifecycle status
