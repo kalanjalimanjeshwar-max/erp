@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Fingerprint,
   RefreshCw,
@@ -62,6 +62,7 @@ const DATE_ONLY_INPUT_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/;
 const LOCAL_DATETIME_INPUT_REGEX = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/;
 const ISO_DATETIME_TZ_INPUT_REGEX =
   /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,9}))?)?(Z|[+-]\d{2}:\d{2})$/;
+export const TERMINAL_STATUS_REFRESH_INTERVAL_MS = 15000;
 
 function isValidCalendarDate(year: number, month: number, day: number): boolean {
   if (month < 1 || month > 12 || day < 1 || day > 31) return false;
@@ -287,6 +288,8 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   const [terminals, setTerminals] = useState<BiometricTerminalItem[]>([]);
   const [isLoadingTerminals, setIsLoadingTerminals] = useState<boolean>(true);
   const [terminalsError, setTerminalsError] = useState<string | null>(null);
+  const isTerminalsRequestInFlightRef = useRef<boolean>(false);
+  const isMountedRef = useRef<boolean>(true);
 
   // Sync Summary State
   const [syncSummary, setSyncSummary] = useState<PunchSyncSummaryResponse | null>(null);
@@ -363,22 +366,36 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   const [actionSuccessMessage, setActionSuccessMessage] = useState<string | null>(null);
   const [actionErrorMessage, setActionErrorMessage] = useState<string | null>(null);
 
-  // Load Terminals
-  const loadTerminals = useCallback(async () => {
-    setIsLoadingTerminals(true);
-    setTerminalsError(null);
+  // Load Terminals (supports silent background refresh without full-page spinner or overlapping requests)
+  const loadTerminals = useCallback(async (options?: { silent?: boolean }) => {
+    const silent = options?.silent === true;
+    if (isTerminalsRequestInFlightRef.current) {
+      return;
+    }
+
+    isTerminalsRequestInFlightRef.current = true;
+    if (!silent) {
+      setIsLoadingTerminals(true);
+      setTerminalsError(null);
+    }
     try {
       const data = await api.getBiometricDevices({ includeInactive: true });
+      if (!isMountedRef.current) return;
       setTerminals(data);
+      setTerminalsError(null);
     } catch (err: unknown) {
+      if (!isMountedRef.current) return;
       const apiErr = err as ApiError;
       if (apiErr.statusCode === 403) {
         setPermissionDeniedMessage('Permission denied: Elevated role required to view biometric terminals.');
-      } else {
+      } else if (!silent) {
         setTerminalsError(apiErr.message || 'Failed to load biometric terminals.');
       }
     } finally {
-      setIsLoadingTerminals(false);
+      isTerminalsRequestInFlightRef.current = false;
+      if (!silent && isMountedRef.current) {
+        setIsLoadingTerminals(false);
+      }
     }
   }, []);
 
@@ -470,9 +487,27 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
   }, []);
 
   useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
     loadTerminals();
     loadSyncSummary();
   }, [loadTerminals, loadSyncSummary]);
+
+  // Silent 15-second auto-refresh of terminal Bridge & physical Device connection status
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void loadTerminals({ silent: true });
+    }, TERMINAL_STATUS_REFRESH_INTERVAL_MS);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [loadTerminals]);
 
   useEffect(() => {
     if (terminals.length === 0) {
@@ -1008,7 +1043,24 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
             {terminals.length}
           </div>
           <div className="text-[11px] text-slate-400 mt-0.5">
-            {terminals.filter((t) => t.status === 'ONLINE').length} online · {terminals.filter((t) => t.status === 'OFFLINE').length} offline
+            {
+              terminals.filter(
+                (t) =>
+                  (t.deviceConnectionStatus || (t.status === 'ONLINE' ? 'CONNECTED' : 'DISCONNECTED')) ===
+                  'CONNECTED'
+              ).length
+            }{' '}
+            connected ·{' '}
+            {
+              terminals.filter(
+                (t) =>
+                  t.isActive &&
+                  t.status !== 'DEACTIVATED' &&
+                  (t.deviceConnectionStatus || (t.status === 'ONLINE' ? 'CONNECTED' : 'DISCONNECTED')) !==
+                    'CONNECTED'
+              ).length
+            }{' '}
+            disconnected
           </div>
         </div>
 
@@ -1368,7 +1420,7 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
             <div className="p-4 bg-red-950/40 border border-red-800/60 rounded-xl text-center space-y-2">
               <div className="text-xs text-red-200">{terminalsError}</div>
               <button
-                onClick={loadTerminals}
+                onClick={() => void loadTerminals()}
                 className="px-3 py-1 bg-red-900/60 hover:bg-red-800 text-red-100 rounded-lg text-xs font-semibold"
               >
                 Retry
@@ -1538,6 +1590,17 @@ export const BiometricDevicesPage: React.FC<BiometricDevicesPageProps> = ({
                                   })
                                 : 'Never'}
                             </div>
+                            {terminal.lastDeviceContactAt && (
+                              <div
+                                className="text-[11px] text-slate-400 mt-1"
+                                title={`Last physical device contact UTC: ${formatUtcTimestamp(terminal.lastDeviceContactAt)}`}
+                              >
+                                Device:{' '}
+                                {formatDateTimeInTimezone(terminal.lastDeviceContactAt, timezone, {
+                                  includeZoneAbbr: true,
+                                })}
+                              </div>
+                            )}
                             {terminal.bridgeVersion && (
                               <div className="text-[11px] text-slate-500 mt-1">
                                 Bridge v{terminal.bridgeVersion}

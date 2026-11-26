@@ -33,8 +33,10 @@ import {
   computeEffectivePunchCutoff,
 } from '../../bridges/essl-x2008-bridge/src/bridge-runner.js';
 import {
+  DEFAULT_DEVICE_HEALTH_CHECK_INTERVAL_MS,
   loadBridgeConfig,
   parseBridgeSyncMode,
+  parseDeviceHealthCheckIntervalMs,
   validateStrictIsoTimestamp,
 } from '../../bridges/essl-x2008-bridge/src/config.js';
 import { BridgeLogger } from '../../bridges/essl-x2008-bridge/src/logger.js';
@@ -3246,6 +3248,719 @@ describe('eSSL X2008 Biometric LAN Bridge & CoreERP Integration', () => {
 
       // Exact byte-for-byte immutability of checkpoints.json in USER_SYNC_ONLY mode
       expect(fs.readFileSync(store.getFilePath(), 'utf8')).toBe(checkpointBytesBefore);
+    });
+  });
+
+  describe('Automatic LAN Device Health Probe & Connection Detection', () => {
+    const healthTempCleanups: Array<() => void> = [];
+
+    afterEach(() => {
+      while (healthTempCleanups.length > 0) {
+        const fn = healthTempCleanups.pop();
+        fn?.();
+      }
+    });
+
+    function makeHealthTempDirs() {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'essl-health-probe-'));
+      const dataDir = path.join(root, 'data');
+      const logDir = path.join(root, 'logs');
+      fs.mkdirSync(dataDir, { recursive: true });
+      fs.mkdirSync(logDir, { recursive: true });
+      return {
+        root,
+        dataDir,
+        logDir,
+        cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+      };
+    }
+
+    function makeHealthBridgeConfig(
+      dirs: { dataDir: string; logDir: string },
+      overrides?: Partial<BridgeConfig>
+    ): BridgeConfig {
+      return {
+        coreErpBaseUrl: 'http://127.0.0.1:3000',
+        allowInsecureHttp: true,
+        bridgeHost: 'OFFICE-LAN-BRIDGE',
+        bridgeVersion: '1.2.0',
+        syncMode: 'USER_SYNC_ONLY',
+        pollIntervalMs: 30000,
+        heartbeatIntervalMs: 60000,
+        deviceHealthCheckIntervalMs: 15000,
+        connectTimeoutMs: 5000,
+        maxBackoffMs: 120000,
+        batchSize: 50,
+        healthHost: '127.0.0.1',
+        healthPort: 0,
+        dataDir: dirs.dataDir,
+        logDir: dirs.logDir,
+        logLevel: 'info',
+        dpapiStorePath: path.join(dirs.dataDir, 'dpapi.json'),
+        terminals: [
+          {
+            id: 'essl-x2008-lan',
+            name: 'eSSL X2008 Entrance',
+            serialNumber: 'NFZ8252800275',
+            ipAddress: '192.168.1.201',
+            port: 4370,
+            deviceTimezone: 'Asia/Kolkata',
+            apiKey: 'bio_live_health_probe_secret_9876543210',
+          },
+        ],
+        ...overrides,
+      };
+    }
+
+    function makeHealthAdapter(overrides?: Partial<IBiometricProtocolAdapter>): IBiometricProtocolAdapter {
+      return {
+        protocolName: 'mock-x2008-health',
+        connect: vi.fn().mockResolvedValue(undefined),
+        getDeviceInfo: vi.fn().mockResolvedValue({
+          serialNumber: 'NFZ8252800275',
+          platform: 'ZLM60_TFT',
+          fingerprintAlgorithm: 'VX10.0',
+          firmwareVersion: 'Ver 6.60',
+          deviceName: 'eSSL X2008',
+          oemVendor: 'eSSL',
+        } satisfies DeviceInfo),
+        getAttendanceLogs: vi.fn().mockResolvedValue([]),
+        getUsers: vi.fn().mockResolvedValue([
+          { uid: 1, enrollmentId: '101', name: 'Asha Rao', cardNo: '1001' },
+        ]),
+        disconnect: vi.fn().mockResolvedValue(undefined),
+        ...overrides,
+      };
+    }
+
+    function makeMockCoreErpClient(overrides?: Partial<ICoreErpClient>): ICoreErpClient {
+      return {
+        sendHeartbeat: vi.fn().mockResolvedValue({
+          success: true,
+          serverTime: '2026-11-26T05:00:00.000Z',
+          terminalId: 'essl-x2008-lan',
+          terminalName: 'eSSL X2008 Entrance',
+          status: 'ONLINE',
+        }),
+        submitPunches: vi.fn().mockResolvedValue({
+          success: true,
+          inserted: 0,
+          duplicates: 0,
+          rejected: 0,
+          terminalId: 'essl-x2008-lan',
+          terminalName: 'eSSL X2008 Entrance',
+        }),
+        syncUsers: vi.fn().mockResolvedValue({
+          success: true,
+          terminalId: 'essl-x2008-lan',
+          terminalName: 'eSSL X2008 Entrance',
+          discoveredCount: 1,
+          syncedCount: 1,
+          syncedAt: '2026-11-26T05:00:00.000Z',
+        }),
+        ...overrides,
+      };
+    }
+
+    it('HP-1: successful health probe updates deviceReachable/lastDeviceContactAt/deviceInfo, sends immediate heartbeat, and NEVER calls getAttendanceLogs(), getUsers(), or mutates checkpoints.json', async () => {
+      const dirs = makeHealthTempDirs();
+      healthTempCleanups.push(dirs.cleanup);
+
+      const store = new CheckpointStore(dirs.dataDir);
+      const adapter = makeHealthAdapter();
+      const client = makeMockCoreErpClient();
+
+      const runner = new BiometricBridgeRunner({
+        config: makeHealthBridgeConfig(dirs, { syncMode: 'USER_SYNC_ONLY' }),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: store,
+        coreErpClient: client,
+        adapterFactory: () => adapter,
+        nowProvider: () => new Date('2026-11-26T05:00:10.000Z'),
+      });
+
+      const res = await runner.probeTerminalHealth('essl-x2008-lan');
+
+      expect(res.skipped).toBe(false);
+      expect(res.reachable).toBe(true);
+      expect(res.transitioned).toBe(true);
+      expect(res.heartbeatSent).toBe(true);
+      expect(res.error).toBeNull();
+      expect(res.deviceInfo?.serialNumber).toBe('NFZ8252800275');
+
+      // Strictly read-only getDeviceInfo() only
+      expect(adapter.connect).toHaveBeenCalledTimes(1);
+      expect(adapter.getDeviceInfo).toHaveBeenCalledTimes(1);
+      expect(adapter.disconnect).toHaveBeenCalledTimes(1);
+      expect(adapter.getAttendanceLogs).not.toHaveBeenCalled();
+      expect(adapter.getUsers).not.toHaveBeenCalled();
+      expect(client.submitPunches).not.toHaveBeenCalled();
+      expect(fs.existsSync(store.getFilePath())).toBe(false);
+
+      const status = runner.getStatusSnapshot().terminals[0];
+      expect(status.deviceReachable).toBe(true);
+      expect(status.lastDeviceContactAt).toBe('2026-11-26T05:00:10.000Z');
+      expect(status.lastError).toBeNull();
+
+      expect(client.sendHeartbeat).toHaveBeenCalledTimes(1);
+      expect(client.sendHeartbeat).toHaveBeenCalledWith(
+        'bio_live_health_probe_secret_9876543210',
+        'NFZ8252800275',
+        expect.objectContaining({
+          bridgeConnected: true,
+          deviceReachable: true,
+          lastDeviceContactAt: '2026-11-26T05:00:10.000Z',
+          lastConnectionError: null,
+          firmwareVersion: 'Ver 6.60',
+        })
+      );
+
+      // Subsequent steady-state reachable probe does not spam extra transition heartbeats
+      const res2 = await runner.probeTerminalHealth('essl-x2008-lan');
+      expect(res2.reachable).toBe(true);
+      expect(res2.transitioned).toBe(false);
+      expect(res2.heartbeatSent).toBe(false);
+      expect(client.sendHeartbeat).toHaveBeenCalledTimes(1);
+    });
+
+    it('HP-2: device disconnect detection marks deviceReachable=false, sanitizes error, and sends immediate heartbeat', async () => {
+      const dirs = makeHealthTempDirs();
+      healthTempCleanups.push(dirs.cleanup);
+
+      let online = true;
+      let tickMs = Date.parse('2026-11-26T05:00:00.000Z');
+      const client = makeMockCoreErpClient();
+
+      const runner = new BiometricBridgeRunner({
+        config: makeHealthBridgeConfig(dirs),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: new CheckpointStore(dirs.dataDir),
+        coreErpClient: client,
+        adapterFactory: () =>
+          makeHealthAdapter({
+            connect: vi.fn().mockImplementation(async () => {
+              if (!online) {
+                throw new Error(
+                  'connect ETIMEDOUT 192.168.1.201:4370 (bio_live_health_probe_secret_9876543210)'
+                );
+              }
+            }),
+          }),
+        nowProvider: () => new Date(tickMs),
+      });
+
+      const first = await runner.probeTerminalHealth('essl-x2008-lan');
+      expect(first.reachable).toBe(true);
+      expect(client.sendHeartbeat).toHaveBeenCalledTimes(1);
+
+      // Simulate LAN cable unplug
+      online = false;
+      tickMs += 15000;
+      const disconnected = await runner.probeTerminalHealth('essl-x2008-lan');
+
+      expect(disconnected.reachable).toBe(false);
+      expect(disconnected.transitioned).toBe(true);
+      expect(disconnected.heartbeatSent).toBe(true);
+      expect(disconnected.error).toContain('ETIMEDOUT');
+      expect(disconnected.error).not.toContain('bio_live_health_probe_secret_9876543210');
+
+      const status = runner.getStatusSnapshot().terminals[0];
+      expect(status.deviceReachable).toBe(false);
+      expect(status.lastDeviceContactAt).toBe('2026-11-26T05:00:00.000Z');
+      expect(status.lastError).toContain('ETIMEDOUT');
+      expect(status.lastError).not.toContain('bio_live_health_probe_secret_9876543210');
+
+      expect(client.sendHeartbeat).toHaveBeenCalledTimes(2);
+      expect(client.sendHeartbeat).toHaveBeenLastCalledWith(
+        'bio_live_health_probe_secret_9876543210',
+        'NFZ8252800275',
+        expect.objectContaining({
+          bridgeConnected: true,
+          deviceReachable: false,
+          lastDeviceContactAt: '2026-11-26T05:00:00.000Z',
+          lastConnectionError: expect.stringContaining('ETIMEDOUT'),
+        })
+      );
+    });
+
+    it('HP-3: reconnect clears ONLY previous device connection error and preserves unrelated CoreERP auth/heartbeat error', async () => {
+      const dirs = makeHealthTempDirs();
+      healthTempCleanups.push(dirs.cleanup);
+
+      let deviceOnline = false;
+      let coreErpAuthFails = false;
+      let tickMs = Date.parse('2026-11-26T06:00:00.000Z');
+
+      const sendHeartbeat = vi.fn().mockImplementation(async () => {
+        if (coreErpAuthFails) {
+          throw new CoreErpApiError('401 Invalid terminal API key', 401, 'UNAUTHORIZED');
+        }
+        return {
+          success: true,
+          serverTime: new Date(tickMs).toISOString(),
+          terminalId: 'essl-x2008-lan',
+          terminalName: 'eSSL X2008 Entrance',
+          status: 'ONLINE',
+        };
+      });
+
+      const runner = new BiometricBridgeRunner({
+        config: makeHealthBridgeConfig(dirs),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: new CheckpointStore(dirs.dataDir),
+        coreErpClient: makeMockCoreErpClient({ sendHeartbeat }),
+        adapterFactory: () =>
+          makeHealthAdapter({
+            connect: vi.fn().mockImplementation(async () => {
+              if (!deviceOnline) {
+                throw new Error('connect EHOSTUNREACH 192.168.1.201:4370');
+              }
+            }),
+          }),
+        nowProvider: () => new Date(tickMs),
+      });
+
+      // Part A: Pure device disconnect -> reconnect clears device error cleanly
+      const offlineRes = await runner.probeTerminalHealth('essl-x2008-lan');
+      expect(offlineRes.reachable).toBe(false);
+      expect(runner.getStatusSnapshot().terminals[0].lastError).toContain('EHOSTUNREACH');
+
+      deviceOnline = true;
+      tickMs += 15000;
+      const reconnectedRes = await runner.probeTerminalHealth('essl-x2008-lan');
+      expect(reconnectedRes.reachable).toBe(true);
+      expect(reconnectedRes.transitioned).toBe(true);
+      expect(runner.getStatusSnapshot().terminals[0].deviceReachable).toBe(true);
+      expect(runner.getStatusSnapshot().terminals[0].lastDeviceContactAt).toBe('2026-11-26T06:00:15.000Z');
+      expect(runner.getStatusSnapshot().terminals[0].lastError).toBeNull();
+
+      // Part B: Unrelated CoreERP auth error MUST NOT be cleared by device disconnect/reconnect
+      coreErpAuthFails = true;
+      await runner.sendTerminalHeartbeat('essl-x2008-lan');
+      expect(runner.getStatusSnapshot().terminals[0].authError).toBe(true);
+      expect(runner.getStatusSnapshot().terminals[0].lastError).toContain('401 Invalid terminal API key');
+
+      deviceOnline = false;
+      tickMs += 15000;
+      await runner.probeTerminalHealth('essl-x2008-lan');
+      expect(runner.getStatusSnapshot().terminals[0].deviceReachable).toBe(false);
+      // Auth error still preserved in runtime.lastError
+      expect(runner.getStatusSnapshot().terminals[0].lastError).toContain('401 Invalid terminal API key');
+
+      deviceOnline = true;
+      tickMs += 15000;
+      await runner.probeTerminalHealth('essl-x2008-lan');
+      expect(runner.getStatusSnapshot().terminals[0].deviceReachable).toBe(true);
+      // Unrelated CoreERP auth error MUST still be preserved after device reconnect
+      expect(runner.getStatusSnapshot().terminals[0].authError).toBe(true);
+      expect(runner.getStatusSnapshot().terminals[0].lastError).toContain('401 Invalid terminal API key');
+    });
+
+    it('HP-4: serial-number mismatch marks deviceReachable=false, records error, disconnects adapter, and sends immediate heartbeat', async () => {
+      const dirs = makeHealthTempDirs();
+      healthTempCleanups.push(dirs.cleanup);
+
+      const adapter = makeHealthAdapter({
+        getDeviceInfo: vi.fn().mockResolvedValue({
+          serialNumber: 'WRONG_SERIAL_99999',
+          platform: 'ZLM60_TFT',
+          fingerprintAlgorithm: 'VX10.0',
+          firmwareVersion: 'Ver 6.60',
+          deviceName: 'eSSL X2008',
+          oemVendor: 'eSSL',
+        } satisfies DeviceInfo),
+      });
+      const client = makeMockCoreErpClient();
+
+      const runner = new BiometricBridgeRunner({
+        config: makeHealthBridgeConfig(dirs),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: new CheckpointStore(dirs.dataDir),
+        coreErpClient: client,
+        adapterFactory: () => adapter,
+        nowProvider: () => new Date('2026-11-26T07:00:00.000Z'),
+      });
+
+      const res = await runner.probeTerminalHealth('essl-x2008-lan');
+      expect(res.reachable).toBe(false);
+      expect(res.transitioned).toBe(true);
+      expect(res.error).toMatch(/Hardware serial mismatch/i);
+      expect(adapter.disconnect).toHaveBeenCalledTimes(1);
+      expect(adapter.getAttendanceLogs).not.toHaveBeenCalled();
+
+      const status = runner.getStatusSnapshot().terminals[0];
+      expect(status.deviceReachable).toBe(false);
+      expect(status.lastDeviceContactAt).toBeNull();
+      expect(status.lastError).toMatch(/Hardware serial mismatch/i);
+      expect(client.sendHeartbeat).toHaveBeenCalledWith(
+        'bio_live_health_probe_secret_9876543210',
+        'NFZ8252800275',
+        expect.objectContaining({
+          deviceReachable: false,
+          lastConnectionError: expect.stringMatching(/Hardware serial mismatch/i),
+        })
+      );
+    });
+
+    it('HP-5: adapter.disconnect() is always called on connect failure, getDeviceInfo failure, and missing serial', async () => {
+      const dirs = makeHealthTempDirs();
+      healthTempCleanups.push(dirs.cleanup);
+
+      const scenarios: Array<IBiometricProtocolAdapter> = [
+        makeHealthAdapter({
+          connect: vi.fn().mockRejectedValue(new Error('connect ECONNREFUSED 192.168.1.201:4370')),
+        }),
+        makeHealthAdapter({
+          getDeviceInfo: vi.fn().mockRejectedValue(new Error('TCP read timeout during getDeviceInfo')),
+        }),
+        makeHealthAdapter({
+          getDeviceInfo: vi.fn().mockResolvedValue({
+            serialNumber: '',
+            platform: null,
+            fingerprintAlgorithm: null,
+            firmwareVersion: null,
+            deviceName: null,
+            oemVendor: null,
+          } satisfies DeviceInfo),
+        }),
+      ];
+
+      for (const adapter of scenarios) {
+        const runner = new BiometricBridgeRunner({
+          config: makeHealthBridgeConfig(dirs),
+          logger: new BridgeLogger({ silentConsole: true }),
+          checkpointStore: new CheckpointStore(dirs.dataDir),
+          coreErpClient: makeMockCoreErpClient(),
+          adapterFactory: () => adapter,
+        });
+
+        const res = await runner.probeTerminalHealth('essl-x2008-lan');
+        expect(res.reachable).toBe(false);
+        expect(adapter.disconnect).toHaveBeenCalledTimes(1);
+      }
+    });
+
+    it('HP-6: runner.stop() cleanly cancels health-probe timers so no further probes fire after stop', async () => {
+      const dirs = makeHealthTempDirs();
+      healthTempCleanups.push(dirs.cleanup);
+
+      const connectSpy = vi.fn().mockResolvedValue(undefined);
+      const runner = new BiometricBridgeRunner({
+        config: makeHealthBridgeConfig(dirs, {
+          deviceHealthCheckIntervalMs: 30,
+          heartbeatIntervalMs: 60000,
+        }),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: new CheckpointStore(dirs.dataDir),
+        coreErpClient: makeMockCoreErpClient(),
+        adapterFactory: () => makeHealthAdapter({ connect: connectSpy }),
+      });
+
+      await runner.start();
+      await new Promise((r) => setTimeout(r, 85));
+      await runner.stop(1000);
+
+      const callsAtStop = connectSpy.mock.calls.length;
+      expect(callsAtStop).toBeGreaterThanOrEqual(2);
+
+      // Wait multiple probe intervals after stop; zero additional probes may run
+      await new Promise((r) => setTimeout(r, 120));
+      expect(connectSpy.mock.calls.length).toBe(callsAtStop);
+    });
+
+    it('HP-7: overlapping health probes are prevented while a probe is already in flight', async () => {
+      const dirs = makeHealthTempDirs();
+      healthTempCleanups.push(dirs.cleanup);
+
+      let releaseProbe!: () => void;
+      const adapterFactory = vi.fn(() =>
+        makeHealthAdapter({
+          getDeviceInfo: vi.fn().mockImplementation(
+            () =>
+              new Promise<DeviceInfo>((resolve) => {
+                releaseProbe = () =>
+                  resolve({
+                    serialNumber: 'NFZ8252800275',
+                    platform: 'ZLM60_TFT',
+                    fingerprintAlgorithm: 'VX10.0',
+                    firmwareVersion: 'Ver 6.60',
+                    deviceName: 'eSSL X2008',
+                    oemVendor: 'eSSL',
+                  });
+              })
+          ),
+        })
+      );
+
+      const runner = new BiometricBridgeRunner({
+        config: makeHealthBridgeConfig(dirs),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: new CheckpointStore(dirs.dataDir),
+        coreErpClient: makeMockCoreErpClient(),
+        adapterFactory,
+      });
+
+      const firstPromise = runner.probeTerminalHealth('essl-x2008-lan');
+      await new Promise((r) => setTimeout(r, 15));
+
+      // Second concurrent call must skip cleanly without opening another adapter
+      const secondResult = await runner.probeTerminalHealth('essl-x2008-lan');
+      expect(secondResult.skipped).toBe(true);
+      expect(adapterFactory).toHaveBeenCalledTimes(1);
+
+      releaseProbe();
+      const firstResult = await firstPromise;
+      expect(firstResult.skipped).toBe(false);
+      expect(firstResult.reachable).toBe(true);
+    });
+
+    it('HP-8: health probe safely skips during active user sync or punch sync so simultaneous device commands never occur', async () => {
+      const dirs = makeHealthTempDirs();
+      healthTempCleanups.push(dirs.cleanup);
+
+      const store = new CheckpointStore(dirs.dataDir);
+      store.initializeSafeTerminalCheckpoint({
+        terminalKey: 'essl-x2008-lan',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-11-26T00:00:00.000Z',
+      });
+
+      let releaseUserQuery!: () => void;
+      let releasePunchQuery!: () => void;
+      let activeDeviceSessions = 0;
+      let maxConcurrentSessions = 0;
+
+      const makeTrackedAdapter = (mode: 'user' | 'punch'): IBiometricProtocolAdapter => ({
+        protocolName: 'mock-tracked-adapter',
+        connect: vi.fn().mockImplementation(async () => {
+          activeDeviceSessions += 1;
+          maxConcurrentSessions = Math.max(maxConcurrentSessions, activeDeviceSessions);
+        }),
+        getDeviceInfo: vi.fn().mockResolvedValue({
+          serialNumber: 'NFZ8252800275',
+          platform: 'ZLM60_TFT',
+          fingerprintAlgorithm: 'VX10.0',
+          firmwareVersion: 'Ver 6.60',
+          deviceName: 'eSSL X2008',
+          oemVendor: 'eSSL',
+        }),
+        getAttendanceLogs: vi.fn().mockImplementation(
+          () =>
+            new Promise<DeviceAttendanceRecord[]>((resolve) => {
+              if (mode === 'punch') {
+                releasePunchQuery = () => resolve([]);
+              } else {
+                resolve([]);
+              }
+            })
+        ),
+        getUsers: vi.fn().mockImplementation(
+          () =>
+            new Promise((resolve) => {
+              if (mode === 'user') {
+                releaseUserQuery = () =>
+                  resolve([{ uid: 1, enrollmentId: '101', name: 'Asha Rao', cardNo: '1001' }]);
+              } else {
+                resolve([{ uid: 1, enrollmentId: '101', name: 'Asha Rao', cardNo: '1001' }]);
+              }
+            })
+        ),
+        disconnect: vi.fn().mockImplementation(async () => {
+          activeDeviceSessions = Math.max(0, activeDeviceSessions - 1);
+        }),
+      });
+
+      let nextMode: 'user' | 'punch' = 'user';
+      const runner = new BiometricBridgeRunner({
+        config: makeHealthBridgeConfig(dirs, { syncMode: 'FULL' }),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: store,
+        coreErpClient: makeMockCoreErpClient(),
+        adapterFactory: () => makeTrackedAdapter(nextMode),
+        nowProvider: () => new Date('2026-11-26T05:00:00.000Z'),
+      });
+
+      // 1. Probe skips while syncTerminalUsersOnce is active
+      const userSyncPromise = runner.syncTerminalUsersOnce('essl-x2008-lan');
+      await new Promise((r) => setTimeout(r, 15));
+      const skippedDuringUserSync = await runner.probeTerminalHealth('essl-x2008-lan');
+      expect(skippedDuringUserSync.skipped).toBe(true);
+      releaseUserQuery();
+      await userSyncPromise;
+
+      // 2. Probe skips while syncTerminalOnce is active
+      nextMode = 'punch';
+      const punchSyncPromise = runner.syncTerminalOnce('essl-x2008-lan');
+      await new Promise((r) => setTimeout(r, 15));
+      const skippedDuringPunchSync = await runner.probeTerminalHealth('essl-x2008-lan');
+      expect(skippedDuringPunchSync.skipped).toBe(true);
+      releasePunchQuery();
+      await punchSyncPromise;
+
+      expect(maxConcurrentSessions).toBe(1);
+    });
+
+    it('HP-9: USER_SYNC_ONLY periodic loop automatically detects CONNECTED -> DISCONNECTED -> RECONNECTED without calling getAttendanceLogs() or touching checkpoints.json', async () => {
+      const dirs = makeHealthTempDirs();
+      healthTempCleanups.push(dirs.cleanup);
+
+      const store = new CheckpointStore(dirs.dataDir);
+      store.initializeSafeTerminalCheckpoint({
+        terminalKey: 'essl-x2008-lan',
+        serialNumber: 'NFZ8252800275',
+        watermarkIso: '2026-11-25T18:30:00.000Z',
+      });
+      const checkpointBytesBefore = fs.readFileSync(store.getFilePath(), 'utf8');
+
+      let deviceOnline = true;
+      const getAttendanceLogs = vi.fn().mockResolvedValue([]);
+      const submitPunches = vi.fn();
+      const heartbeatPayloads: Array<Record<string, unknown>> = [];
+
+      const client = makeMockCoreErpClient({
+        sendHeartbeat: vi.fn().mockImplementation(async (_apiKey, _serial, payload) => {
+          heartbeatPayloads.push({ ...(payload as Record<string, unknown>) });
+          return {
+            success: true,
+            serverTime: '2026-11-26T08:00:00.000Z',
+            terminalId: 'essl-x2008-lan',
+            terminalName: 'eSSL X2008 Entrance',
+            status: payload.deviceReachable ? 'ONLINE' : 'ERROR',
+            syncRequested: true, // Must still be ignored in USER_SYNC_ONLY mode
+          };
+        }),
+        submitPunches,
+      });
+
+      const runner = new BiometricBridgeRunner({
+        config: makeHealthBridgeConfig(dirs, {
+          syncMode: 'USER_SYNC_ONLY',
+          deviceHealthCheckIntervalMs: 35,
+          heartbeatIntervalMs: 60000, // Long interval proves immediate transition heartbeats drive updates
+        }),
+        logger: new BridgeLogger({ silentConsole: true }),
+        checkpointStore: store,
+        coreErpClient: client,
+        adapterFactory: () =>
+          makeHealthAdapter({
+            connect: vi.fn().mockImplementation(async () => {
+              if (!deviceOnline) {
+                throw new Error('connect ETIMEDOUT 192.168.1.201:4370');
+              }
+            }),
+            getAttendanceLogs,
+          }),
+      });
+
+      await runner.start();
+
+      // Wait for initial CONNECTED detection
+      await new Promise((r) => setTimeout(r, 70));
+      expect(runner.getStatusSnapshot().terminals[0].deviceReachable).toBe(true);
+
+      // Unplug device -> automatic DISCONNECTED detection
+      deviceOnline = false;
+      await new Promise((r) => setTimeout(r, 90));
+      expect(runner.getStatusSnapshot().terminals[0].deviceReachable).toBe(false);
+      expect(runner.getStatusSnapshot().terminals[0].lastError).toContain('ETIMEDOUT');
+
+      // Replug device -> automatic RECONNECTED detection & device error cleared
+      deviceOnline = true;
+      await new Promise((r) => setTimeout(r, 90));
+      expect(runner.getStatusSnapshot().terminals[0].deviceReachable).toBe(true);
+      expect(runner.getStatusSnapshot().terminals[0].lastError).toBeNull();
+
+      await runner.stop(1000);
+
+      // Verify transition heartbeats captured CONNECTED -> DISCONNECTED -> CONNECTED
+      const reachabilitySequence = heartbeatPayloads.map((p) => p.deviceReachable);
+      const firstTrueIdx = reachabilitySequence.indexOf(true);
+      const disconnectIdx = reachabilitySequence.indexOf(false, firstTrueIdx + 1);
+      const reconnectIdx = reachabilitySequence.indexOf(true, disconnectIdx + 1);
+      expect(firstTrueIdx).toBeGreaterThanOrEqual(0);
+      expect(disconnectIdx).toBeGreaterThan(firstTrueIdx);
+      expect(reconnectIdx).toBeGreaterThan(disconnectIdx);
+      expect(heartbeatPayloads[disconnectIdx].lastConnectionError).toEqual(
+        expect.stringContaining('ETIMEDOUT')
+      );
+      expect(heartbeatPayloads[reconnectIdx].lastConnectionError).toBeNull();
+
+      // Attendance safety guarantees strictly preserved
+      expect(getAttendanceLogs).not.toHaveBeenCalled();
+      expect(submitPunches).not.toHaveBeenCalled();
+      expect(fs.readFileSync(store.getFilePath(), 'utf8')).toBe(checkpointBytesBefore);
+    });
+
+    it('HP-10: deviceHealthCheckIntervalMs defaults to 15000ms, accepts valid overrides, and rejects invalid values', () => {
+      expect(DEFAULT_DEVICE_HEALTH_CHECK_INTERVAL_MS).toBe(15000);
+      expect(parseDeviceHealthCheckIntervalMs(undefined)).toBe(15000);
+      expect(parseDeviceHealthCheckIntervalMs(null)).toBe(15000);
+      expect(parseDeviceHealthCheckIntervalMs('')).toBe(15000);
+      expect(parseDeviceHealthCheckIntervalMs(20000)).toBe(20000);
+      expect(parseDeviceHealthCheckIntervalMs('10000')).toBe(10000);
+
+      for (const bad of [0, -5000, 500, 1500.5, NaN, Infinity, true, 'abc']) {
+        expect(() => parseDeviceHealthCheckIntervalMs(bad)).toThrowError(
+          /Invalid deviceHealthCheckIntervalMs/i
+        );
+      }
+
+      const dirs = makeHealthTempDirs();
+      healthTempCleanups.push(dirs.cleanup);
+      const cfgPath = path.join(dirs.root, 'bridge.config.json');
+
+      // Default config without deviceHealthCheckIntervalMs resolves to 15000ms
+      fs.writeFileSync(
+        cfgPath,
+        JSON.stringify({
+          coreErpBaseUrl: 'http://127.0.0.1:3000',
+          allowInsecureHttp: true,
+          terminals: [
+            {
+              id: 'term-1',
+              name: 'Main Terminal',
+              serialNumber: 'NFZ8252800275',
+              ipAddress: '192.168.1.201',
+              port: 4370,
+              deviceTimezone: 'Asia/Kolkata',
+            },
+          ],
+        }),
+        'utf8'
+      );
+
+      const prevEnvInterval = process.env.BRIDGE_DEVICE_HEALTH_CHECK_INTERVAL_MS;
+      try {
+        delete process.env.BRIDGE_DEVICE_HEALTH_CHECK_INTERVAL_MS;
+        const loadedDefault = loadBridgeConfig(dirs.root);
+        expect(loadedDefault.deviceHealthCheckIntervalMs).toBe(15000);
+
+        process.env.BRIDGE_DEVICE_HEALTH_CHECK_INTERVAL_MS = '25000';
+        const loadedFromEnv = loadBridgeConfig(dirs.root);
+        expect(loadedFromEnv.deviceHealthCheckIntervalMs).toBe(25000);
+
+        process.env.BRIDGE_DEVICE_HEALTH_CHECK_INTERVAL_MS = '0';
+        expect(() => loadBridgeConfig(dirs.root)).toThrowError(
+          /Invalid deviceHealthCheckIntervalMs/i
+        );
+      } finally {
+        if (prevEnvInterval === undefined) {
+          delete process.env.BRIDGE_DEVICE_HEALTH_CHECK_INTERVAL_MS;
+        } else {
+          process.env.BRIDGE_DEVICE_HEALTH_CHECK_INTERVAL_MS = prevEnvInterval;
+        }
+      }
+
+      // Runner constructor rejects invalid non-positive interval directly
+      expect(
+        () =>
+          new BiometricBridgeRunner({
+            config: makeHealthBridgeConfig(dirs, { deviceHealthCheckIntervalMs: 0 }),
+            logger: new BridgeLogger({ silentConsole: true }),
+            checkpointStore: new CheckpointStore(dirs.dataDir),
+            coreErpClient: makeMockCoreErpClient(),
+          })
+      ).toThrowError(/Invalid deviceHealthCheckIntervalMs/i);
     });
   });
 });

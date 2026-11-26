@@ -7,6 +7,9 @@ import { LogLevel } from './logger.js';
 const ISO_WITH_TZ_REGEX =
   /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?(?:Z|[+-]\d{2}:\d{2})$/;
 
+export const DEFAULT_DEVICE_HEALTH_CHECK_INTERVAL_MS = 15000;
+export const MIN_DEVICE_HEALTH_CHECK_INTERVAL_MS = 1000;
+
 export function parseBridgeSyncMode(raw?: string | null): BridgeSyncMode {
   if (raw === undefined || raw === null || raw === '') {
     // Fail-closed safe default: never start normal punch polling unless explicitly configured as FULL
@@ -19,6 +22,31 @@ export function parseBridgeSyncMode(raw?: string | null): BridgeSyncMode {
   throw new Error(
     `Invalid bridge syncMode '${raw}'. Supported values are 'USER_SYNC_ONLY' and 'FULL'.`
   );
+}
+
+export function parseDeviceHealthCheckIntervalMs(
+  raw: unknown,
+  fieldName = 'deviceHealthCheckIntervalMs'
+): number {
+  if (raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')) {
+    return DEFAULT_DEVICE_HEALTH_CHECK_INTERVAL_MS;
+  }
+  if (typeof raw === 'boolean') {
+    throw new Error(
+      `Invalid ${fieldName} '${String(raw)}'. Expected an integer >= ${MIN_DEVICE_HEALTH_CHECK_INTERVAL_MS} ms.`
+    );
+  }
+  const parsed = typeof raw === 'number' ? raw : Number(String(raw).trim());
+  if (
+    !Number.isFinite(parsed) ||
+    !Number.isInteger(parsed) ||
+    parsed < MIN_DEVICE_HEALTH_CHECK_INTERVAL_MS
+  ) {
+    throw new Error(
+      `Invalid ${fieldName} '${String(raw)}'. Expected an integer >= ${MIN_DEVICE_HEALTH_CHECK_INTERVAL_MS} ms.`
+    );
+  }
+  return parsed;
 }
 
 export function validateStrictIsoTimestamp(raw: string, fieldName: string): string {
@@ -118,17 +146,26 @@ export function loadBridgeConfig(baseDir = process.cwd()): BridgeConfig {
       ? validateStrictIsoTimestamp(String(rawMinPunchTime), 'minPunchTimeIso')
       : undefined;
 
+  const deviceHealthCheckIntervalMs = parseDeviceHealthCheckIntervalMs(
+    process.env.BRIDGE_DEVICE_HEALTH_CHECK_INTERVAL_MS ?? fileConfig.deviceHealthCheckIntervalMs,
+    'deviceHealthCheckIntervalMs'
+  );
+
   const validatedTerminals = terminals.map((term) => {
+    const validatedTerm: TerminalConfig = { ...term };
     if (term.minPunchTimeIso !== undefined && String(term.minPunchTimeIso).trim() !== '') {
-      return {
-        ...term,
-        minPunchTimeIso: validateStrictIsoTimestamp(
-          String(term.minPunchTimeIso),
-          `terminals['${term.id}'].minPunchTimeIso`
-        ),
-      };
+      validatedTerm.minPunchTimeIso = validateStrictIsoTimestamp(
+        String(term.minPunchTimeIso),
+        `terminals['${term.id}'].minPunchTimeIso`
+      );
     }
-    return term;
+    if (term.deviceHealthCheckIntervalMs !== undefined) {
+      validatedTerm.deviceHealthCheckIntervalMs = parseDeviceHealthCheckIntervalMs(
+        term.deviceHealthCheckIntervalMs,
+        `terminals['${term.id}'].deviceHealthCheckIntervalMs`
+      );
+    }
+    return validatedTerm;
   });
 
   return {
@@ -149,6 +186,7 @@ export function loadBridgeConfig(baseDir = process.cwd()): BridgeConfig {
     heartbeatIntervalMs: Number(
       process.env.BRIDGE_HEARTBEAT_INTERVAL_MS || fileConfig.heartbeatIntervalMs || 30000
     ),
+    deviceHealthCheckIntervalMs,
     jobPollIntervalMs: Number(
       process.env.BRIDGE_JOB_POLL_INTERVAL_MS || fileConfig.jobPollIntervalMs || 5000
     ),

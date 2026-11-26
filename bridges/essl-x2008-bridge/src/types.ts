@@ -35,6 +35,7 @@ export interface TerminalConfig {
   dpapiCredentialName?: string;
   pollIntervalMs?: number;
   heartbeatIntervalMs?: number;
+  deviceHealthCheckIntervalMs?: number;
   jobPollIntervalMs?: number;
   userSyncTimeoutMs?: number;
   connectTimeoutMs?: number;
@@ -57,6 +58,7 @@ export interface BridgeConfig {
   batchSize: number;
   pollIntervalMs: number;
   heartbeatIntervalMs: number;
+  deviceHealthCheckIntervalMs?: number;
   jobPollIntervalMs?: number;
   userSyncTimeoutMs?: number;
   connectTimeoutMs: number;

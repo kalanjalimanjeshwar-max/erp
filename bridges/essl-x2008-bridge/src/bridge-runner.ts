@@ -12,7 +12,11 @@ import {
   TerminalRuntimeStatus,
 } from './types.js';
 import { CheckpointSafetyError, CheckpointStore } from './checkpoint-store.js';
-import { parseBridgeSyncMode, validateStrictIsoTimestamp } from './config.js';
+import {
+  DEFAULT_DEVICE_HEALTH_CHECK_INTERVAL_MS,
+  parseBridgeSyncMode,
+  validateStrictIsoTimestamp,
+} from './config.js';
 import { CoreErpApiError, ICoreErpClient } from './coreerp-client.js';
 import { BridgeLogger, redactSensitiveText } from './logger.js';
 import { ZKTecoTcpAdapter } from './protocol/zkteco-tcp.adapter.js';
@@ -153,18 +157,34 @@ export interface DiagnosticReport {
   error: string | null;
 }
 
+export interface HealthProbeResult {
+  terminalId: string;
+  skipped: boolean;
+  reachable: boolean;
+  transitioned: boolean;
+  heartbeatSent: boolean;
+  deviceInfo: DeviceInfo | null;
+  error: string | null;
+}
+
 interface TerminalController {
   config: TerminalConfig;
   runtime: TerminalRuntimeStatus;
   pollTimer: NodeJS.Timeout | null;
   heartbeatTimer: NodeJS.Timeout | null;
   jobPollTimer: NodeJS.Timeout | null;
+  healthCheckTimer: NodeJS.Timeout | null;
   inFlightSync: boolean;
   inFlightUserSync: boolean;
   inFlightHeartbeat: boolean;
   inFlightJobPoll: boolean;
+  inFlightHealthCheck: boolean;
+  inFlightDeviceIo: boolean;
   deferredUserSyncPending: boolean;
   deferredPunchSyncPending: boolean;
+  deferredHeartbeatPending: boolean;
+  hasHealthSample: boolean;
+  lastDeviceConnectionError: string | null;
   activeTasks: Set<Promise<unknown>>;
   deviceUsers?: DeviceEnrolledUser[];
   pendingUserSync: PendingUserSyncSnapshot | null;
@@ -181,6 +201,7 @@ export class BiometricBridgeRunner {
   private readonly controllers = new Map<string, TerminalController>();
   private readonly startedAt = new Date();
   private running = false;
+  private stopped = false;
   private wakeCheckTimer: NodeJS.Timeout | null = null;
   private lastWakeTickMs = Date.now();
 
@@ -226,6 +247,13 @@ export class BiometricBridgeRunner {
 
     if (this.config.minPunchTimeIso !== undefined && String(this.config.minPunchTimeIso).trim() !== '') {
       validateStrictIsoTimestamp(String(this.config.minPunchTimeIso), 'minPunchTimeIso');
+    }
+
+    if (this.config.deviceHealthCheckIntervalMs !== undefined) {
+      this.validateHealthCheckIntervalMs(
+        this.config.deviceHealthCheckIntervalMs,
+        'deviceHealthCheckIntervalMs'
+      );
     }
 
     for (const term of this.config.terminals) {
@@ -307,12 +335,18 @@ export class BiometricBridgeRunner {
         pollTimer: null,
         heartbeatTimer: null,
         jobPollTimer: null,
+        healthCheckTimer: null,
         inFlightSync: false,
         inFlightUserSync: false,
         inFlightHeartbeat: false,
         inFlightJobPoll: false,
+        inFlightHealthCheck: false,
+        inFlightDeviceIo: false,
         deferredUserSyncPending: false,
         deferredPunchSyncPending: false,
+        deferredHeartbeatPending: false,
+        hasHealthSample: false,
+        lastDeviceConnectionError: null,
         activeTasks: new Set<Promise<unknown>>(),
         deviceUsers: cp?.pendingUserSync?.users,
         pendingUserSync: cp?.pendingUserSync ?? null,
@@ -344,6 +378,28 @@ export class BiometricBridgeRunner {
         `terminals['${term.id}'].minPunchTimeIso`
       );
     }
+    if (term.deviceHealthCheckIntervalMs !== undefined) {
+      this.validateHealthCheckIntervalMs(
+        term.deviceHealthCheckIntervalMs,
+        `terminals['${term.id}'].deviceHealthCheckIntervalMs`
+      );
+    }
+  }
+
+  private validateHealthCheckIntervalMs(value: number, fieldName: string): void {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      throw new Error(
+        `Invalid ${fieldName} '${String(value)}'. Expected a positive finite number in milliseconds.`
+      );
+    }
+  }
+
+  private getDeviceHealthCheckIntervalMs(ctrl: TerminalController): number {
+    return (
+      ctrl.config.deviceHealthCheckIntervalMs ??
+      this.config.deviceHealthCheckIntervalMs ??
+      DEFAULT_DEVICE_HEALTH_CHECK_INTERVAL_MS
+    );
   }
 
   private computeTerminalCutoff(term: TerminalConfig): EffectivePunchCutoffResult {
@@ -418,6 +474,7 @@ export class BiometricBridgeRunner {
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
+    this.stopped = false;
     this.lastWakeTickMs = Date.now();
 
     this.logger.info('bridge_starting', {
@@ -428,6 +485,8 @@ export class BiometricBridgeRunner {
       terminalCount: this.controllers.size,
       coreErpBaseUrl: this.config.coreErpBaseUrl,
       heartbeatIntervalMs: this.config.heartbeatIntervalMs,
+      deviceHealthCheckIntervalMs:
+        this.config.deviceHealthCheckIntervalMs ?? DEFAULT_DEVICE_HEALTH_CHECK_INTERVAL_MS,
       jobPollIntervalMs: this.config.jobPollIntervalMs ?? 5000,
     });
 
@@ -450,6 +509,10 @@ export class BiometricBridgeRunner {
           // Critical error already logged and runtime marked punchSyncBlocked=true
         }
       }
+
+      // Independent hardware reachability probe runs in both USER_SYNC_ONLY and FULL modes
+      // (strictly calls getDeviceInfo() only; never touches attendance logs or checkpoints).
+      void this.trackTask(ctrl, this.runTerminalHealthCheckLoop(ctrl.config.id));
 
       // Heartbeat and user-sync job discovery loops remain operational for UI User Sync jobs
       void this.trackTask(ctrl, this.runTerminalHeartbeatLoop(ctrl.config.id));
@@ -493,6 +556,11 @@ export class BiometricBridgeRunner {
         clearTimeout(ctrl.heartbeatTimer);
         ctrl.heartbeatTimer = null;
       }
+      if (ctrl.healthCheckTimer) {
+        clearTimeout(ctrl.healthCheckTimer);
+        ctrl.healthCheckTimer = null;
+      }
+      void this.trackTask(ctrl, this.runTerminalHealthCheckLoop(ctrl.config.id));
       void this.trackTask(ctrl, this.runTerminalHeartbeatLoop(ctrl.config.id));
       if (typeof this.coreErpClient.claimUserSyncJob === 'function') {
         void this.trackTask(ctrl, this.pollPendingUserSyncJob(ctrl.config.id));
@@ -502,6 +570,7 @@ export class BiometricBridgeRunner {
 
   async stop(graceTimeoutMs = 5000): Promise<void> {
     this.running = false;
+    this.stopped = true;
     if (this.wakeCheckTimer) {
       clearInterval(this.wakeCheckTimer);
       this.wakeCheckTimer = null;
@@ -509,6 +578,9 @@ export class BiometricBridgeRunner {
 
     const pendingTasks: Promise<unknown>[] = [];
     for (const ctrl of this.controllers.values()) {
+      ctrl.deferredHeartbeatPending = false;
+      ctrl.deferredUserSyncPending = false;
+      ctrl.deferredPunchSyncPending = false;
       if (ctrl.pollTimer) {
         clearTimeout(ctrl.pollTimer);
         ctrl.pollTimer = null;
@@ -520,6 +592,10 @@ export class BiometricBridgeRunner {
       if (ctrl.jobPollTimer) {
         clearTimeout(ctrl.jobPollTimer);
         ctrl.jobPollTimer = null;
+      }
+      if (ctrl.healthCheckTimer) {
+        clearTimeout(ctrl.healthCheckTimer);
+        ctrl.healthCheckTimer = null;
       }
       for (const task of ctrl.activeTasks) {
         pendingTasks.push(task);
@@ -653,6 +729,7 @@ export class BiometricBridgeRunner {
     let userQueryAttemptIso: string | null = null;
 
     // 1. Poll physical biometric device over TCP (strictly read-only; never clears device logs)
+    ctrl.inFlightDeviceIo = true;
     try {
       await adapter.connect({
         host: term.ipAddress,
@@ -713,9 +790,20 @@ export class BiometricBridgeRunner {
 
       ctrl.runtime.deviceReachable = true;
       ctrl.runtime.lastDeviceContactAt = this.nowProvider().toISOString();
+      ctrl.hasHealthSample = true;
+      if (
+        ctrl.lastDeviceConnectionError !== null &&
+        ctrl.runtime.lastError === ctrl.lastDeviceConnectionError
+      ) {
+        ctrl.runtime.lastError = null;
+      }
+      ctrl.lastDeviceConnectionError = null;
       this.checkpointStore.updateStatus(term.id, term.serialNumber, { deviceInfo });
     } catch (err: unknown) {
+      const safeErr = redactSensitiveText((err as Error)?.message || 'Sync error');
       ctrl.runtime.deviceReachable = false;
+      ctrl.hasHealthSample = true;
+      ctrl.lastDeviceConnectionError = safeErr;
       throw err;
     } finally {
       try {
@@ -723,6 +811,7 @@ export class BiometricBridgeRunner {
       } catch {
         // Ignore teardown socket error
       }
+      ctrl.inFlightDeviceIo = false;
     }
 
     // 2. Convert timestamps, sort ascending deterministically, and apply mandatory current-day cutoff + watermark
@@ -900,6 +989,7 @@ export class BiometricBridgeRunner {
     const adapter = this.adapterFactory(term);
     let users: DeviceEnrolledUser[] = [];
 
+    ctrl.inFlightDeviceIo = true;
     try {
       await adapter.connect({
         host: term.ipAddress,
@@ -939,10 +1029,27 @@ export class BiometricBridgeRunner {
       ctrl.deviceUsers = users;
       ctrl.runtime.deviceReachable = true;
       ctrl.runtime.lastDeviceContactAt = this.nowProvider().toISOString();
+      ctrl.hasHealthSample = true;
+      if (
+        ctrl.lastDeviceConnectionError !== null &&
+        ctrl.runtime.lastError === ctrl.lastDeviceConnectionError
+      ) {
+        ctrl.runtime.lastError = null;
+      }
+      ctrl.lastDeviceConnectionError = null;
       ctrl.runtime.discoveredUserCount = users.length;
     } catch (err: unknown) {
       const safeErr = redactSensitiveText((err as Error)?.message || 'Hardware user query failed');
+      const prevDeviceErr = ctrl.lastDeviceConnectionError;
       ctrl.runtime.deviceReachable = false;
+      ctrl.hasHealthSample = true;
+      ctrl.lastDeviceConnectionError = safeErr;
+      if (
+        !ctrl.runtime.authError &&
+        (ctrl.runtime.lastError === null || ctrl.runtime.lastError === prevDeviceErr)
+      ) {
+        ctrl.runtime.lastError = safeErr;
+      }
       ctrl.runtime.lastUserSyncError = safeErr;
       this.logger.warn('terminal_user_query_failed', {
         terminalId: term.id,
@@ -959,6 +1066,7 @@ export class BiometricBridgeRunner {
       } catch {
         // Ignore teardown socket error
       }
+      ctrl.inFlightDeviceIo = false;
     }
 
     // Strict P0-A isolation: user-only sync must NEVER alter checkpoints.json
@@ -1086,7 +1194,9 @@ export class BiometricBridgeRunner {
         bridgePid: process.pid,
         deviceReachable: ctrl.runtime.deviceReachable,
         lastDeviceContactAt: ctrl.runtime.lastDeviceContactAt,
-        lastConnectionError: ctrl.runtime.lastError,
+        lastConnectionError: !ctrl.runtime.deviceReachable
+          ? (ctrl.lastDeviceConnectionError ?? ctrl.runtime.lastError)
+          : ctrl.runtime.lastError,
         lastProcessedPunchCount: ctrl.runtime.lastProcessedPunchCount,
         lastSyncAttemptAt: ctrl.runtime.lastSyncAttemptAt || undefined,
         lastSyncAt: ctrl.runtime.lastSuccessfulSyncAt || undefined,
@@ -1118,7 +1228,7 @@ export class BiometricBridgeRunner {
             serialNumber: term.serialNumber,
             jobId: hbRes.pendingUserSyncJob?.jobId,
           });
-          if (!ctrl.inFlightSync && !ctrl.inFlightUserSync) {
+          if (!ctrl.inFlightSync && !ctrl.inFlightUserSync && !ctrl.inFlightHealthCheck) {
             void this.trackTask(
               ctrl,
               this.runTerminalUserSync(term.id, { knownJobId: hbRes.pendingUserSyncJob?.jobId })
@@ -1141,7 +1251,7 @@ export class BiometricBridgeRunner {
               terminalId: term.id,
               serialNumber: term.serialNumber,
             });
-            if (!ctrl.inFlightSync && !ctrl.inFlightUserSync) {
+            if (!ctrl.inFlightSync && !ctrl.inFlightUserSync && !ctrl.inFlightHealthCheck) {
               void this.trackTask(ctrl, this.runTerminalPollCycle(term.id));
             } else {
               ctrl.deferredPunchSyncPending = true;
@@ -1169,7 +1279,195 @@ export class BiometricBridgeRunner {
       return false;
     } finally {
       ctrl.inFlightHeartbeat = false;
+      if (ctrl.deferredHeartbeatPending && !this.stopped) {
+        ctrl.deferredHeartbeatPending = false;
+        void this.trackTask(ctrl, this.sendTerminalHeartbeat(terminalId));
+      }
     }
+  }
+
+  /**
+   * Independent, read-only hardware reachability probe.
+   * Connects to the configured device, calls ONLY getDeviceInfo(), validates serial number,
+   * always disconnects in finally, updates reachability/device error state, and triggers an
+   * immediate heartbeat whenever connection state transitions.
+   *
+   * STRICTLY NEVER calls getAttendanceLogs(), getUsers(), submitPunches(), or CheckpointStore.
+   */
+  async probeTerminalHealth(terminalId: string): Promise<HealthProbeResult> {
+    const ctrl = this.controllers.get(terminalId);
+    if (!ctrl) {
+      throw new Error(`Unknown terminal ID '${terminalId}'.`);
+    }
+
+    if (
+      ctrl.inFlightHealthCheck ||
+      ctrl.inFlightSync ||
+      ctrl.inFlightUserSync ||
+      ctrl.inFlightDeviceIo
+    ) {
+      return {
+        terminalId,
+        skipped: true,
+        reachable: ctrl.runtime.deviceReachable,
+        transitioned: false,
+        heartbeatSent: false,
+        deviceInfo: ctrl.runtime.deviceInfo,
+        error: ctrl.lastDeviceConnectionError,
+      };
+    }
+
+    ctrl.inFlightHealthCheck = true;
+    const term = ctrl.config;
+    const prevReachable = ctrl.runtime.deviceReachable;
+    const hadPreviousSample = ctrl.hasHealthSample;
+    const adapter = this.adapterFactory(term);
+
+    let reachable = false;
+    let deviceInfo: DeviceInfo | null = ctrl.runtime.deviceInfo;
+    let probeError: string | null = null;
+
+    try {
+      await adapter.connect({
+        host: term.ipAddress,
+        port: term.port,
+        commKey: term.commKey ?? 0,
+        timeoutMs: term.connectTimeoutMs ?? this.config.connectTimeoutMs,
+      });
+
+      const info = await adapter.getDeviceInfo();
+
+      if (!term.skipSerialValidation) {
+        if (!info.serialNumber) {
+          throw new Error(
+            `Device at ${term.ipAddress}:${term.port} did not return a serial number (~SerialNumber); unable to verify hardware identity.`
+          );
+        }
+        if (info.serialNumber.trim() !== term.serialNumber.trim()) {
+          throw new Error(
+            `Hardware serial mismatch at ${term.ipAddress}:${term.port}: expected '${term.serialNumber}', got '${info.serialNumber}'.`
+          );
+        }
+      }
+
+      reachable = true;
+      deviceInfo = info;
+      const nowIso = this.nowProvider().toISOString();
+      ctrl.runtime.deviceReachable = true;
+      ctrl.runtime.lastDeviceContactAt = nowIso;
+      ctrl.runtime.deviceInfo = info;
+      ctrl.hasHealthSample = true;
+
+      // Clear only the previous device connection error; preserve unrelated CoreERP auth/heartbeat errors
+      if (
+        ctrl.lastDeviceConnectionError !== null &&
+        ctrl.runtime.lastError === ctrl.lastDeviceConnectionError
+      ) {
+        ctrl.runtime.lastError = null;
+      }
+      ctrl.lastDeviceConnectionError = null;
+    } catch (err: unknown) {
+      reachable = false;
+      const safeErr = redactSensitiveText(
+        (err as Error)?.message || `Device health probe failed for ${term.ipAddress}:${term.port}`
+      );
+      probeError = safeErr;
+      const prevDeviceErr = ctrl.lastDeviceConnectionError;
+      ctrl.runtime.deviceReachable = false;
+      ctrl.hasHealthSample = true;
+      ctrl.lastDeviceConnectionError = safeErr;
+
+      if (
+        !ctrl.runtime.authError &&
+        (ctrl.runtime.lastError === null || ctrl.runtime.lastError === prevDeviceErr)
+      ) {
+        ctrl.runtime.lastError = safeErr;
+      }
+    } finally {
+      try {
+        await adapter.disconnect();
+      } catch {
+        // Ignore teardown socket error
+      }
+      ctrl.inFlightHealthCheck = false;
+    }
+
+    const transitioned = hadPreviousSample ? prevReachable !== reachable : true;
+
+    if (transitioned) {
+      if (reachable) {
+        this.logger.info('terminal_device_connected', {
+          terminalId: term.id,
+          serialNumber: term.serialNumber,
+          ipAddress: term.ipAddress,
+          port: term.port,
+          reconnected: hadPreviousSample && !prevReachable,
+          lastDeviceContactAt: ctrl.runtime.lastDeviceContactAt,
+        });
+      } else {
+        this.logger.warn('terminal_device_disconnected', {
+          terminalId: term.id,
+          serialNumber: term.serialNumber,
+          ipAddress: term.ipAddress,
+          port: term.port,
+          error: probeError,
+        });
+      }
+    }
+
+    let heartbeatSent = false;
+    if (transitioned && !this.stopped) {
+      if (ctrl.inFlightHeartbeat) {
+        ctrl.deferredHeartbeatPending = true;
+      } else {
+        heartbeatSent = await this.sendTerminalHeartbeat(terminalId);
+      }
+    }
+
+    if (this.running && ctrl.deferredUserSyncPending && !ctrl.inFlightUserSync && !ctrl.inFlightSync) {
+      ctrl.deferredUserSyncPending = false;
+      void this.trackTask(ctrl, this.runTerminalUserSync(terminalId));
+    } else if (
+      this.running &&
+      ctrl.deferredPunchSyncPending &&
+      this.syncMode === 'FULL' &&
+      !ctrl.runtime.punchSyncBlocked &&
+      !ctrl.inFlightSync &&
+      !ctrl.inFlightUserSync
+    ) {
+      ctrl.deferredPunchSyncPending = false;
+      void this.trackTask(ctrl, this.runTerminalPollCycle(terminalId));
+    }
+
+    return {
+      terminalId,
+      skipped: false,
+      reachable,
+      transitioned,
+      heartbeatSent,
+      deviceInfo,
+      error: probeError,
+    };
+  }
+
+  private async runTerminalHealthCheckLoop(terminalId: string): Promise<void> {
+    const ctrl = this.controllers.get(terminalId);
+    if (!ctrl || !this.running) return;
+
+    if (ctrl.healthCheckTimer) {
+      clearTimeout(ctrl.healthCheckTimer);
+      ctrl.healthCheckTimer = null;
+    }
+
+    await this.probeTerminalHealth(terminalId);
+
+    if (!this.running) return;
+    const intervalMs = this.getDeviceHealthCheckIntervalMs(ctrl);
+    ctrl.healthCheckTimer = setTimeout(() => {
+      if (this.running) {
+        void this.trackTask(ctrl, this.runTerminalHealthCheckLoop(terminalId));
+      }
+    }, intervalMs);
   }
 
   /**
@@ -1308,7 +1606,7 @@ export class BiometricBridgeRunner {
     const ctrl = this.controllers.get(terminalId);
     if (!ctrl) return false;
     if (typeof this.coreErpClient.claimUserSyncJob !== 'function') return false;
-    if (ctrl.inFlightJobPoll || ctrl.inFlightUserSync || ctrl.inFlightSync) {
+    if (ctrl.inFlightJobPoll || ctrl.inFlightUserSync || ctrl.inFlightSync || ctrl.inFlightHealthCheck) {
       if (this.running) {
         const baseJobPoll = ctrl.config.jobPollIntervalMs ?? this.config.jobPollIntervalMs ?? 5000;
         this.scheduleNextJobPoll(ctrl, baseJobPoll);
@@ -1366,7 +1664,7 @@ export class BiometricBridgeRunner {
     options?: { knownJobId?: string }
   ): Promise<void> {
     const ctrl = this.controllers.get(terminalId);
-    if (!ctrl || ctrl.inFlightUserSync || ctrl.inFlightSync) {
+    if (!ctrl || ctrl.inFlightUserSync || ctrl.inFlightSync || ctrl.inFlightHealthCheck) {
       if (ctrl) ctrl.deferredUserSyncPending = true;
       return;
     }
@@ -1398,7 +1696,7 @@ export class BiometricBridgeRunner {
   }
 
   private async executeClaimedUserSyncJob(ctrl: TerminalController, jobId?: string): Promise<void> {
-    if (ctrl.inFlightUserSync || ctrl.inFlightSync) {
+    if (ctrl.inFlightUserSync || ctrl.inFlightSync || ctrl.inFlightHealthCheck) {
       ctrl.deferredUserSyncPending = true;
       return;
     }
@@ -1493,6 +1791,10 @@ export class BiometricBridgeRunner {
   private async runTerminalPollCycle(terminalId: string): Promise<void> {
     const ctrl = this.controllers.get(terminalId);
     if (!ctrl || ctrl.inFlightSync || ctrl.inFlightUserSync) return;
+    if (ctrl.inFlightHealthCheck) {
+      ctrl.deferredPunchSyncPending = true;
+      return;
+    }
 
     if (this.syncMode === 'USER_SYNC_ONLY') {
       ctrl.runtime.punchSyncBlocked = true;
