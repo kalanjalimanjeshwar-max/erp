@@ -300,10 +300,43 @@ function mapErrorCode(status: number, fallback: string): string {
   return fallback;
 }
 
+async function enforceNonEmployeeViewPermission(actor: AuthUser, res: Response): Promise<boolean> {
+  const canView = await PermissionService.hasPermission(
+    actor.companyId,
+    actor.role,
+    'EMPLOYEE',
+    'VIEW'
+  );
+  if (!canView) {
+    res.status(403).json({
+      error: {
+        code: 'FORBIDDEN_PERMISSION_DENIED',
+        message: `Access denied. Role "${actor.role}" does not have permission "VIEW" on module "EMPLOYEE".`,
+        timestamp: new Date().toISOString(),
+      },
+    });
+    return false;
+  }
+  return true;
+}
+
 export class EmployeeController {
   static async list(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;
+
+      // EMPLOYEE role has default EMPLOYEE:VIEW only for self-service profile access,
+      // never for listing the company-wide employee directory.
+      if (actor.role === 'EMPLOYEE') {
+        res.status(403).json({
+          error: {
+            code: 'FORBIDDEN',
+            message: 'Employees are not authorized to access the company employee directory.',
+          },
+        });
+        return;
+      }
+
       const {
         departmentId,
         designationId,
@@ -346,6 +379,18 @@ export class EmployeeController {
   static async getBiometricOptions(req: Request, res: Response): Promise<void> {
     try {
       const actor = req.user as AuthUser;
+
+      // EMPLOYEE self-service does not require company-wide biometric terminals or employee mappings.
+      if (actor.role === 'EMPLOYEE') {
+        res.status(403).json({
+          error: {
+            code: 'FORBIDDEN',
+            message: 'Employees are not authorized to access company biometric enrollment options.',
+          },
+        });
+        return;
+      }
+
       const options = await BiometricMappingService.getEnrollmentOptionsForCompany(actor.companyId);
       res.json(options);
     } catch (err: unknown) {
@@ -375,6 +420,10 @@ export class EmployeeController {
           return;
         }
         res.json(selfProfile);
+        return;
+      }
+
+      if (!(await enforceNonEmployeeViewPermission(actor, res))) {
         return;
       }
 
@@ -478,11 +527,17 @@ export class EmployeeController {
       );
       res.json(employee);
     } catch (err: unknown) {
-      const status = (err as { statusCode?: number }).statusCode || 500;
+      const typedErr = err as { statusCode?: number; code?: string; message?: string };
+      const status = typedErr.statusCode || 500;
+      const code =
+        typedErr.code === 'FORBIDDEN_PERMISSION_DENIED'
+          ? 'FORBIDDEN_PERMISSION_DENIED'
+          : mapErrorCode(status, 'EMPLOYEE_UPDATE_FAILED');
       res.status(status).json({
         error: {
-          code: mapErrorCode(status, 'EMPLOYEE_UPDATE_FAILED'),
-          message: (err as Error).message,
+          code,
+          message: typedErr.message || (err as Error).message,
+          ...(code === 'FORBIDDEN_PERMISSION_DENIED' ? { timestamp: new Date().toISOString() } : {}),
         },
       });
     }
@@ -540,11 +595,17 @@ export class EmployeeController {
       );
       res.json(employee);
     } catch (err: unknown) {
-      const status = (err as { statusCode?: number }).statusCode || 500;
+      const typedErr = err as { statusCode?: number; code?: string; message?: string };
+      const status = typedErr.statusCode || 500;
+      const code =
+        typedErr.code === 'FORBIDDEN_PERMISSION_DENIED'
+          ? 'FORBIDDEN_PERMISSION_DENIED'
+          : 'EMPLOYEE_DEACTIVATE_FAILED';
       res.status(status).json({
         error: {
-          code: 'EMPLOYEE_DEACTIVATE_FAILED',
-          message: (err as Error).message,
+          code,
+          message: typedErr.message || (err as Error).message,
+          ...(code === 'FORBIDDEN_PERMISSION_DENIED' ? { timestamp: new Date().toISOString() } : {}),
         },
       });
     }
@@ -630,6 +691,8 @@ export class EmployeeController {
           });
           return;
         }
+      } else if (!(await enforceNonEmployeeViewPermission(actor, res))) {
+        return;
       }
 
       const salaries = await EmployeeService.listSalaryRevisions(actor.companyId, req.params.id);

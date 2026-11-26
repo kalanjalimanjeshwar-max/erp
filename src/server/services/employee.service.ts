@@ -614,6 +614,28 @@ export class EmployeeService {
       throw err;
     }
 
+    const isDeactivationTransition =
+      input.status !== undefined &&
+      input.status !== existing.status &&
+      (input.status === 'INACTIVE' || input.status === 'EXITED');
+
+    if (isDeactivationTransition) {
+      const canDeactivate = await PermissionService.hasPermission(
+        actor.companyId,
+        actor.role,
+        'EMPLOYEE',
+        'DEACTIVATE'
+      );
+      if (!canDeactivate) {
+        const err = new Error(
+          `Access denied. Role "${actor.role}" does not have permission "DEACTIVATE" on module "EMPLOYEE".`
+        ) as Error & { statusCode?: number; code?: string };
+        err.statusCode = 403;
+        err.code = 'FORBIDDEN_PERMISSION_DENIED';
+        throw err;
+      }
+    }
+
     const updateData: {
       employeeCode?: string;
       fullName?: string;

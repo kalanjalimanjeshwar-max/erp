@@ -799,6 +799,12 @@ describe('Employee Biometric Enrollment Mapping, Activation & Targeted Reconcili
       vi.spyOn(prisma.user, 'findUnique').mockResolvedValue({ ...employeeActor } as any);
       vi.spyOn(prisma.rolePermission, 'findUnique').mockResolvedValue(null);
 
+      const empBioOptions = await request(app)
+        .get('/api/employees/biometric-options')
+        .set('Authorization', `Bearer ${empToken}`);
+      expect(empBioOptions.status).toBe(403);
+      expect(empBioOptions.body.error.code).toBe('FORBIDDEN');
+
       const empActivate = await request(app)
         .post('/api/employees/e1/activate')
         .set('Authorization', `Bearer ${empToken}`);
