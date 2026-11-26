@@ -150,7 +150,7 @@ Visit `http://localhost:3000` to run the Initial Setup Wizard.
 
 - **Pinned Prisma Tooling**: Both `prisma` and `@prisma/client` are pinned to exact `6.19.3`.
 - **Clean Installs (`npm ci`)**: Automatically runs `"postinstall": "prisma generate"`.
-- **After `git pull`**: If `prisma/schema.prisma` changed without reinstalling `node_modules`, run `npm run db:generate`.
+- **After `git pull`**: If `prisma/schema.prisma` changed without reinstalling `node_modules`, run `npm run db:generate` (recommended project script) or `npx prisma generate` (direct Prisma CLI command used in the `Dockerfile`).
 - **Automatic Pre-Hooks**: `npm run lint`, `npm test`, `npm run build`, and `npm run dev` run `prisma generate` automatically cross-platform.
 - **Target-Isolated Migrations**: Use `npm run db:migrate:target -- --target <dev|test|integration|staging>` (dry-run by default; requires `--execute` to apply). Never targets production.
 - **Authoring New Migrations (Shadow DB on Port 5436)**:
