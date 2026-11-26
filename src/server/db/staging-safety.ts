@@ -5,6 +5,9 @@
  * only ever run against explicitly designated, disposable test databases.
  * NEVER allows silent fallback to production DATABASE_URL.
  */
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 export interface NormalizedDatabaseEndpoint {
   protocol: string;
@@ -324,46 +327,328 @@ export function validateStagingDatabaseUrl(
   };
 }
 
+export interface AppliedMigrationRecord {
+  migration_name: string;
+  finished_at: Date | string | null;
+  rolled_back_at: Date | string | null;
+  applied_steps_count?: number | null;
+  logs?: string | null;
+}
+
+export interface MigrationValidationResult {
+  valid: boolean;
+  expectedCount: number;
+  appliedCount: number;
+  missingMigrations: string[];
+  unexpectedMigrations: string[];
+  failedMigrations: string[];
+  error?: string;
+}
+
+export interface SchemaIndexRecord {
+  tablename: string;
+  indexname: string;
+  indexdef: string;
+}
+
+export interface SchemaDecimalColumnRecord {
+  table_name: string;
+  column_name: string;
+  data_type: string;
+  numeric_precision: number | null;
+  numeric_scale: number | null;
+}
+
+export interface SchemaInvariantValidationResult {
+  valid: boolean;
+  missingIndexes: string[];
+  precisionMismatches: string[];
+  missingEnumValues: string[];
+  error?: string;
+}
+
+export interface StagingVerificationStep {
+  step: number;
+  name: string;
+  description: string;
+  critical: boolean;
+}
+
+export const REQUIRED_STAGING_UNIQUE_INDEXES: ReadonlyArray<{
+  table: string;
+  indexName: string;
+}> = [
+  { table: 'Company', indexName: 'Company_code_key' },
+  { table: 'User', indexName: 'User_companyId_email_key' },
+  { table: 'Attendance', indexName: 'Attendance_companyId_employeeId_workDate_key' },
+];
+
+export const REQUIRED_STAGING_DECIMAL_COLUMNS: ReadonlyArray<{
+  table: string;
+  column: string;
+  precision: number;
+  scale: number;
+}> = [
+  { table: 'CurrencyConfig', column: 'exchangeRate', precision: 18, scale: 6 },
+  { table: 'JournalEntry', column: 'totalDebit', precision: 18, scale: 4 },
+  { table: 'JournalEntry', column: 'totalCredit', precision: 18, scale: 4 },
+  { table: 'JournalLine', column: 'debit', precision: 18, scale: 4 },
+  { table: 'JournalLine', column: 'credit', precision: 18, scale: 4 },
+];
+
+export const REQUIRED_ATTENDANCE_SOURCE_VALUES: ReadonlyArray<string> = [
+  'MANUAL',
+  'BIOMETRIC',
+  'SYSTEM_GENERATED',
+];
+
+const DEFAULT_PRISMA_MIGRATIONS_DIR = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../../../prisma/migrations'
+);
+
 /**
- * Returns structured staging verification workflow definition
+ * Dynamically discovers versioned Prisma migration directories under `prisma/migrations`.
+ * Only directories containing a `migration.sql` file are counted, sorted chronologically.
+ * Fails closed if the directory is missing or contains no versioned migrations.
  */
-export function getStagingVerificationSteps() {
+export function getExpectedPrismaMigrations(
+  migrationsDir: string = DEFAULT_PRISMA_MIGRATIONS_DIR
+): string[] {
+  if (!fs.existsSync(migrationsDir)) {
+    throw new Error(`Prisma migrations directory not found at "${migrationsDir}".`);
+  }
+
+  const entries = fs.readdirSync(migrationsDir, { withFileTypes: true });
+  const migrationNames = entries
+    .filter((entry) => {
+      if (!entry.isDirectory()) return false;
+      return fs.existsSync(path.join(migrationsDir, entry.name, 'migration.sql'));
+    })
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b));
+
+  if (migrationNames.length === 0) {
+    throw new Error(`No versioned Prisma migration directories found in "${migrationsDir}".`);
+  }
+
+  return migrationNames;
+}
+
+/**
+ * Validates `_prisma_migrations` rows against the exact list of repository migration directories.
+ * Fails closed on any failed/incomplete migration, missing migration, unexpected migration,
+ * or count mismatch.
+ */
+export function validateAppliedMigrations(
+  expectedMigrations: readonly string[],
+  appliedRows: readonly AppliedMigrationRecord[]
+): MigrationValidationResult {
+  if (expectedMigrations.length === 0) {
+    return {
+      valid: false,
+      expectedCount: 0,
+      appliedCount: 0,
+      missingMigrations: [],
+      unexpectedMigrations: [],
+      failedMigrations: [],
+      error: 'Expected migration list is empty; refusing to validate migration history.',
+    };
+  }
+
+  const failedMigrations: string[] = [];
+  const appliedSuccessful = new Set<string>();
+
+  for (const row of appliedRows) {
+    const name = typeof row.migration_name === 'string' ? row.migration_name.trim() : '';
+    if (!name) {
+      failedMigrations.push('<unnamed-migration>');
+      continue;
+    }
+
+    const isFinished = row.finished_at !== null && row.finished_at !== undefined;
+    const isRolledBack = row.rolled_back_at !== null && row.rolled_back_at !== undefined;
+
+    if (!isFinished && !isRolledBack) {
+      failedMigrations.push(name);
+    } else if (isFinished && !isRolledBack) {
+      appliedSuccessful.add(name);
+    }
+  }
+
+  const expectedSet = new Set(expectedMigrations);
+  const missingMigrations = expectedMigrations.filter((m) => !appliedSuccessful.has(m));
+  const unexpectedMigrations = Array.from(appliedSuccessful)
+    .filter((m) => !expectedSet.has(m))
+    .sort((a, b) => a.localeCompare(b));
+
+  const issues: string[] = [];
+  if (failedMigrations.length > 0) {
+    issues.push(`failed/incomplete migrations: ${failedMigrations.join(', ')}`);
+  }
+  if (missingMigrations.length > 0) {
+    issues.push(`missing migrations (${missingMigrations.length}): ${missingMigrations.join(', ')}`);
+  }
+  if (unexpectedMigrations.length > 0) {
+    issues.push(
+      `unexpected migrations (${unexpectedMigrations.length}): ${unexpectedMigrations.join(', ')}`
+    );
+  }
+  if (appliedSuccessful.size !== expectedMigrations.length) {
+    issues.push(
+      `applied migration count mismatch (expected ${expectedMigrations.length}, found ${appliedSuccessful.size})`
+    );
+  }
+
+  if (issues.length > 0) {
+    return {
+      valid: false,
+      expectedCount: expectedMigrations.length,
+      appliedCount: appliedSuccessful.size,
+      missingMigrations,
+      unexpectedMigrations,
+      failedMigrations,
+      error: `Migration history verification failed: ${issues.join('; ')}.`,
+    };
+  }
+
+  return {
+    valid: true,
+    expectedCount: expectedMigrations.length,
+    appliedCount: appliedSuccessful.size,
+    missingMigrations: [],
+    unexpectedMigrations: [],
+    failedMigrations: [],
+  };
+}
+
+/**
+ * Validates read-only PostgreSQL catalog results for required unique indexes,
+ * schema-backed Decimal precisions, and AttendanceSource enum values.
+ */
+export function validateSchemaInvariants(params: {
+  indexes: readonly SchemaIndexRecord[];
+  decimalColumns: readonly SchemaDecimalColumnRecord[];
+  attendanceSourceValues: readonly string[];
+}): SchemaInvariantValidationResult {
+  const missingIndexes: string[] = [];
+  for (const required of REQUIRED_STAGING_UNIQUE_INDEXES) {
+    const found = params.indexes.some(
+      (idx) =>
+        idx.tablename === required.table &&
+        idx.indexname === required.indexName &&
+        /CREATE\s+UNIQUE\s+INDEX/i.test(idx.indexdef || '')
+    );
+    if (!found) {
+      missingIndexes.push(`${required.table}.${required.indexName}`);
+    }
+  }
+
+  const precisionMismatches: string[] = [];
+  for (const required of REQUIRED_STAGING_DECIMAL_COLUMNS) {
+    const col = params.decimalColumns.find(
+      (c) => c.table_name === required.table && c.column_name === required.column
+    );
+    if (!col) {
+      precisionMismatches.push(
+        `${required.table}.${required.column} (missing column; expected Decimal(${required.precision},${required.scale}))`
+      );
+      continue;
+    }
+    const actualPrecision = col.numeric_precision !== null ? Number(col.numeric_precision) : null;
+    const actualScale = col.numeric_scale !== null ? Number(col.numeric_scale) : null;
+    if (
+      col.data_type !== 'numeric' ||
+      actualPrecision !== required.precision ||
+      actualScale !== required.scale
+    ) {
+      precisionMismatches.push(
+        `${required.table}.${required.column} (expected numeric(${required.precision},${required.scale}), got ${col.data_type}(${actualPrecision},${actualScale}))`
+      );
+    }
+  }
+
+  const enumSet = new Set(params.attendanceSourceValues);
+  const missingEnumValues = REQUIRED_ATTENDANCE_SOURCE_VALUES.filter((v) => !enumSet.has(v));
+
+  const issues: string[] = [];
+  if (missingIndexes.length > 0) {
+    issues.push(`missing unique indexes: ${missingIndexes.join(', ')}`);
+  }
+  if (precisionMismatches.length > 0) {
+    issues.push(`decimal precision mismatches: ${precisionMismatches.join(', ')}`);
+  }
+  if (missingEnumValues.length > 0) {
+    issues.push(`missing AttendanceSource enum values: ${missingEnumValues.join(', ')}`);
+  }
+
+  if (issues.length > 0) {
+    return {
+      valid: false,
+      missingIndexes,
+      precisionMismatches,
+      missingEnumValues,
+      error: `Schema invariant verification failed: ${issues.join('; ')}.`,
+    };
+  }
+
+  return {
+    valid: true,
+    missingIndexes: [],
+    precisionMismatches: [],
+    missingEnumValues: [],
+  };
+}
+
+/**
+ * Returns structured staging verification workflow definition matching the exact
+ * executable checks performed by scripts/verify-staging-db.ts.
+ */
+export function getStagingVerificationSteps(
+  migrationsDir?: string
+): StagingVerificationStep[] {
+  const expectedMigrationCount = getExpectedPrismaMigrations(migrationsDir).length;
   return [
     {
       step: 1,
       name: 'Safety & Environment Pre-Flight',
-      description: 'Verify target database URL has explicit test/staging designation and differs from production.',
+      description:
+        'Validate STAGING_DATABASE_URL or TEST_DATABASE_URL against disposable naming rules and primary DATABASE_URL without connecting or falling back to DATABASE_URL.',
       critical: true,
     },
     {
       step: 2,
       name: 'Network & Port Reachability Probe',
-      description: 'Check TCP socket connectivity to PostgreSQL port (default 5432 or 5433) without Prisma stderr noise.',
+      description:
+        'Check TCP socket connectivity to the validated staging PostgreSQL host and port before running Prisma commands.',
       critical: true,
     },
     {
       step: 3,
       name: 'Migration Deployment & History Integrity',
-      description: 'Execute npx prisma migrate deploy and verify _prisma_migrations records all 8 versioned migrations.',
+      description: `Execute prisma migrate deploy and prisma migrate status strictly against the validated staging URL, confirm database identity, and verify _prisma_migrations records all ${expectedMigrationCount} versioned migrations with zero failed or missing entries.`,
       critical: true,
     },
     {
       step: 4,
-      name: 'Health & Readiness Endpoint Validation',
-      description: 'Verify GET /api/health (200) and GET /api/ready (200 when connected, 503 when disconnected).',
+      name: 'Schema Constraints, Precision & Enum Verification',
+      description:
+        'Query read-only PostgreSQL catalogs to verify unique constraints (Company_code_key, User_companyId_email_key, Attendance_companyId_employeeId_workDate_key), Decimal precision (CurrencyConfig.exchangeRate 18,6; JournalEntry/JournalLine 18,4), and AttendanceSource enum values without modifying application data.',
       critical: true,
     },
     {
       step: 5,
-      name: 'Relational Invariants & Constraint Verification',
-      description: 'Verify composite unique constraints (User companyId+email), Decimal precision (18,6), and journal balancing.',
+      name: 'Health & Readiness Endpoint Validation',
+      description:
+        'Start an isolated staging server process bound strictly to the validated staging URL (with auto-checkout scheduler disabled) and verify GET /api/health (HTTP 200, status=ok) and GET /api/ready (HTTP 200, postgres=connected).',
       critical: true,
     },
     {
       step: 6,
       name: 'Graceful Shutdown & Pool Drain',
-      description: 'Verify SIGTERM/SIGINT handler closes HTTP server and disconnects Prisma connection pool cleanly.',
-      critical: false,
+      description:
+        'Send SIGTERM to the isolated staging server process and verify clean exit after HTTP server close and Prisma connection pool disconnect.',
+      critical: true,
     },
   ];
 }

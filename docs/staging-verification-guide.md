@@ -99,7 +99,7 @@ When explicitly authorized on a host with Docker Engine installed:
    docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d
    docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml ps
    ```
-3. **Deploy all 16 version-controlled Prisma migrations** to port `5434` only (pass `DATABASE_URL` inline for the explicitly targeted `prisma migrate deploy` and `prisma migrate status` commands only; do not leave it exported for Vitest):
+3. **Deploy all 17 version-controlled Prisma migrations** to port `5434` only (pass `DATABASE_URL` inline for the explicitly targeted `prisma migrate deploy` and `prisma migrate status` commands only; do not leave it exported for Vitest):
    ```bash
    DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy
    DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate status
@@ -141,7 +141,20 @@ Expected result:
 ```
 ✔ Safety validation PASSED for database "core_erp_test" (or "core_erp_staging").
 ✔ Target is confirmed isolated and disposable (non-production).
+✔ Discovered 17 versioned migration directories.
 ```
+
+To execute all 6 automated staging verification checks end-to-end against an explicitly validated, running disposable PostgreSQL target (with zero application data mutation and `DISABLE_AUTO_CHECKOUT_SCHEDULER=true` on the temporary probe server):
+```bash
+STAGING_DATABASE_URL="postgresql://erp_test_user:<password>@localhost:5433/core_erp_staging?schema=public" npm run db:verify:staging -- --execute
+```
+The automated runner executes:
+1. Target URL & primary `DATABASE_URL` isolation validation (fails closed on any ambiguity; never falls back to `DATABASE_URL`).
+2. TCP socket reachability check (exits with code `2` before running Prisma if unreachable).
+3. `prisma migrate deploy`, `prisma migrate status`, live `current_database()` identity verification, and `_prisma_migrations` integrity validation against all 17 repository migration directories.
+4. Read-only PostgreSQL catalog verification for unique indexes (`Company_code_key`, `User_companyId_email_key`, `Attendance_companyId_employeeId_workDate_key`), schema-backed `Decimal` precision (`CurrencyConfig.exchangeRate` `(18, 6)` and `JournalEntry`/`JournalLine` `(18, 4)`), and `AttendanceSource` enum values (`MANUAL`, `BIOMETRIC`, `SYSTEM_GENERATED`). No application rows are seeded, truncated, deleted, reset, or modified.
+5. Isolated staging server startup on an ephemeral loopback port to validate `GET /api/health` (`200`, `status="ok"`) and `GET /api/ready` (`200`, `status="ready"`, `checks.postgres.status="connected"`).
+6. Graceful `SIGTERM` shutdown verification confirming HTTP server closure and `prisma.$disconnect()`.
 
 ### Step 2: Start Isolated Staging Database Container (User Authorized)
 ```bash
@@ -163,7 +176,7 @@ Apply all version-controlled migrations in exact historical sequence:
 DATABASE_URL="$STAGING_DATABASE_URL" npx prisma migrate deploy
 ```
 
-Verify that all 16 version-controlled migrations applied cleanly:
+Verify that all 17 version-controlled migrations applied cleanly:
 1. `20261011000000_init`
 2. `20261011120000_core_tenant_foundation`
 3. `20261011180000_auth_rbac_company_admin`
@@ -180,6 +193,7 @@ Verify that all 16 version-controlled migrations applied cleanly:
 14. `20261106000000_phase2_3_bank_account_encryption_capacity`
 15. `20261112000000_employee_expense_claims_reimbursement`
 16. `20261119000000_employee_work_policy_and_multi_pair_attendance`
+17. `20261126000000_attendance_auto_checkout_system_generated`
 
 Verify migration table records in PostgreSQL:
 ```bash
@@ -206,32 +220,27 @@ Probe the endpoints from another shell:
   ```
 
 ### Step 5: Relational Invariants & Constraint Verification
-Execute live database queries and API calls to confirm that PostgreSQL enforces all enterprise constraints:
+The automated runner (`npm run db:verify:staging -- --execute`) verifies schema constraints via read-only PostgreSQL catalog queries (`pg_indexes`, `information_schema.columns`, `pg_enum`) without mutating any application rows:
 
 1. **Unique Company Code Constraint (`Company_code_key`)**:
-   - Attempt to bootstrap two companies with the same code (e.g. `ACME`).
-   - Confirm PostgreSQL throws a `P2002` unique constraint violation and API returns `409 Conflict`.
+   - Verified in `pg_indexes` as a `UNIQUE` index on `Company`.
+   - During optional manual/integration functional verification, attempting to create two companies with the same code raises a PostgreSQL `P2002` violation (`409 Conflict`).
 
-2. **Composite Tenant-Scoped User Constraint (`User_companyId_email_key`)**:
-   - Confirm two different companies can both have a user with email `admin@example.com`.
-   - Confirm a single company cannot have two users with the same email.
+2. **Composite Tenant-Scoped User & Attendance Constraints (`User_companyId_email_key`, `Attendance_companyId_employeeId_workDate_key`)**:
+   - Verified in `pg_indexes` as `UNIQUE` indexes enforcing tenant-scoped uniqueness for users and daily employee attendance records.
 
-3. **Decimal Precision (18, 6)**:
-   - Create a journal line with 6 decimal places (e.g. `1250.550000`).
-   - Confirm PostgreSQL stores the exact decimal value without floating-point truncation.
+3. **Decimal Precision (18, 6) & Accounting Decimal Precision (18, 4)**:
+   - Verified in `information_schema.columns` against `prisma/schema.prisma`:
+     - `CurrencyConfig.exchangeRate`: `numeric(18, 6)` (`@db.Decimal(18, 6)`).
+     - `JournalEntry.totalDebit`, `JournalEntry.totalCredit`, `JournalLine.debit`, `JournalLine.credit`: `numeric(18, 4)` (`@db.Decimal(18, 4)`).
 
-4. **Double-Entry Balance Enforcement**:
-   - Attempt to post a journal entry where Total Debits ≠ Total Credits.
-   - Confirm the transaction is rejected and rolls back cleanly.
+4. **AttendanceSource Enum Completeness**:
+   - Verified in `pg_enum` that `AttendanceSource` contains `MANUAL`, `BIOMETRIC`, and `SYSTEM_GENERATED`.
 
-5. **Fiscal Period Locking**:
-   - Mark a fiscal period as `LOCKED`.
-   - Attempt to post a journal entry within that period.
-   - Confirm the operation is blocked with a 400 validation error.
-
-6. **Non-Overlapping Salary Revisions**:
-   - Create an initial salary revision for an employee.
-   - Create a subsequent revision and verify existing active revisions are superseded without date overlaps.
+5. **Double-Entry Balance Enforcement & Fiscal Period Locking** *(verified by dedicated integration suites; never mutated by the automated staging verifier)*:
+   - **Double-Entry Balance**: Posting a journal entry where Total Debits ≠ Total Credits is rejected and rolls back cleanly.
+   - **Fiscal Period Locking**: Attempting to post a journal entry within a `LOCKED` fiscal period is rejected with a 400 validation error.
+   - **Non-Overlapping Salary Revisions**: Creating a subsequent salary revision supersedes active revisions without date overlaps.
 
 ### Step 6: Graceful Shutdown & Connection Pool Drain
 Send `SIGTERM` to the server process:
