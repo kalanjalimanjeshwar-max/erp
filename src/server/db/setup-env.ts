@@ -198,7 +198,7 @@ export function matchCoreErpDockerVolumes(dockerVolumes: readonly string[]): Det
   return detected;
 }
 
-function isPlaceholderOrWeak(val: string | undefined): boolean {
+export function isPlaceholderOrWeak(val: string | undefined): boolean {
   if (!val || val.trim() === '') return true;
   const lower = val.trim().toLowerCase();
   if (PLACEHOLDER_SECRETS.has(lower)) return true;
@@ -206,7 +206,7 @@ function isPlaceholderOrWeak(val: string | undefined): boolean {
   return false;
 }
 
-function renderStagingEnvFile(params: {
+export function renderStagingEnvFile(params: {
   user: string;
   password: string;
   database: string;
@@ -226,7 +226,7 @@ function renderStagingEnvFile(params: {
   ].join('\n');
 }
 
-function renderIntegrationEnvFile(params: { password: string; testUrl: string }): string {
+export function renderIntegrationEnvFile(params: { password: string; testUrl: string }): string {
   return [
     '# ==============================================================================',
     '# CoreERP Dedicated PostgreSQL 16 Integration Test Environment (.env.integration-test)',
@@ -239,7 +239,7 @@ function renderIntegrationEnvFile(params: { password: string; testUrl: string })
   ].join('\n');
 }
 
-function renderMainDevEnvFile(params: {
+export function renderMainDevEnvFile(params: {
   devUser: string;
   devPassword: string;
   devDatabase: string;

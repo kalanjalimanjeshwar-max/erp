@@ -86,7 +86,10 @@ async function defaultRunPrisma(
   });
 }
 
-function resolveAndValidateTargetUrl(
+export const DEFAULT_UNIT_TEST_DATABASE_URL =
+  'postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public';
+
+export function resolveAndValidateTargetUrl(
   target: string,
   env: Record<string, string | undefined>
 ): { valid: true; url: string; host: string; port: number; database: string } | { valid: false; error: string } {
@@ -145,9 +148,7 @@ function resolveAndValidateTargetUrl(
   }
 
   if (normalizedTarget === 'test') {
-    const url =
-      env.UNIT_TEST_DATABASE_URL?.trim() ||
-      'postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public';
+    const url = env.UNIT_TEST_DATABASE_URL?.trim() || DEFAULT_UNIT_TEST_DATABASE_URL;
     const ep = normalizeDatabaseUrl(url);
     if (
       !ep ||
