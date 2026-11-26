@@ -71,7 +71,7 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
     });
 
     it('should fail closed if primary DATABASE_URL is malformed or ambiguous', () => {
-      const validTarget = 'postgresql://test_user:pass@localhost:5433/core_erp_staging?schema=public';
+      const validTarget = 'postgresql://erp_staging_user:pass@localhost:5435/core_erp_staging?schema=public';
       const malformedPrimary = 'not_a_valid_postgres_url';
 
       const result = validateStagingDatabaseUrl(validTarget, malformedPrimary);
@@ -165,21 +165,58 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
       expect(resultMysql.error).toContain('Invalid URL protocol');
     });
 
-    it('should accept valid, explicitly disposable test and staging databases differing from primary', () => {
+    it('should accept only dedicated core_erp_staging databases on non-reserved ports differing from primary', () => {
       const primaryUrl = 'postgresql://erp_user:pass@localhost:5432/core_erp?schema=public';
       const validUrls = [
-        'postgresql://erp_test_user:pass@localhost:5433/core_erp_test?schema=public',
+        'postgresql://erp_staging_user:pass@localhost:5435/core_erp_staging?schema=public',
+        'postgresql://erp_staging_user:pass@127.0.0.1:5435/core_erp_staging?schema=public',
         'postgresql://erp_staging_user:pass@staging.db.internal:5432/core_erp_staging?schema=public',
-        'postgresql://user:pass@localhost:5432/disposable_db_temp?schema=public',
-        'postgresql://user:pass@localhost:5432/sandbox_erp?schema=public',
       ];
 
       for (const url of validUrls) {
         const result = validateStagingDatabaseUrl(url, primaryUrl);
         expect(result.valid).toBe(true);
         expect(result.url).toBe(url);
-        expect(result.databaseName).toBeDefined();
+        expect(result.databaseName).toBe('core_erp_staging');
       }
+    });
+
+    it('should strictly reject non-staging database names and reserved local ports (5432/5433/5434/5436)', () => {
+      const primaryUrl = 'postgresql://erp_user:pass@localhost:5432/core_erp?schema=public';
+      const rejectedUrls = [
+        // Non-staging reserved database names
+        'postgresql://erp_test_user:pass@localhost:5433/core_erp_test?schema=public',
+        'postgresql://erp_integration_user:pass@localhost:5434/core_erp_integration_test?schema=public',
+        'postgresql://erp_shadow_user:pass@localhost:5436/core_erp_shadow?schema=public',
+        // Non-canonical disposable names are rejected for staging
+        'postgresql://user:pass@localhost:5435/disposable_db_temp?schema=public',
+        'postgresql://user:pass@localhost:5435/sandbox_erp?schema=public',
+        // Reserved localhost ports even with core_erp_staging DB name
+        'postgresql://erp_staging_user:pass@localhost:5432/core_erp_staging?schema=public',
+        'postgresql://erp_staging_user:pass@localhost:5433/core_erp_staging?schema=public',
+        'postgresql://erp_staging_user:pass@localhost:5434/core_erp_staging?schema=public',
+        'postgresql://erp_staging_user:pass@localhost:5436/core_erp_staging?schema=public',
+      ];
+
+      for (const url of rejectedUrls) {
+        const result = validateStagingDatabaseUrl(url, primaryUrl);
+        expect(result.valid, `Expected staging validator to reject: ${url}`).toBe(false);
+      }
+    });
+
+    it('should reject collisions against TEST_DATABASE_URL and SHADOW_DATABASE_URL', () => {
+      const stagingUrl = 'postgresql://erp_staging_user:pass@staging.internal:5435/core_erp_staging';
+      const testCollision = validateStagingDatabaseUrl(stagingUrl, undefined, {
+        testDatabaseUrl: stagingUrl,
+      });
+      expect(testCollision.valid).toBe(false);
+      expect(testCollision.error).toContain('TEST_DATABASE_URL');
+
+      const shadowCollision = validateStagingDatabaseUrl(stagingUrl, undefined, {
+        shadowDatabaseUrl: stagingUrl,
+      });
+      expect(shadowCollision.valid).toBe(false);
+      expect(shadowCollision.error).toContain('SHADOW_DATABASE_URL');
     });
 
     it('should return complete structured verification steps reflecting actual migration count', () => {
@@ -328,7 +365,7 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
   describe('Staging Verifier Runner (Isolated Mocked Execution)', () => {
     const STAGING_SECRET = 'StagingRunnerSecret_2026!';
     const PROD_SECRET = 'ProdRunnerSecret_2026!';
-    const STAGING_URL = `postgresql://erp_test_user:${STAGING_SECRET}@localhost:5433/core_erp_staging?schema=public`;
+    const STAGING_URL = `postgresql://erp_staging_user:${STAGING_SECRET}@localhost:5435/core_erp_staging?schema=public`;
     const PROD_URL = `postgresql://erp_prod_user:${PROD_SECRET}@localhost:5432/core_erp?schema=public`;
 
     function createSilentLogger(): { logger: StagingVerifierLogger; messages: string[] } {
@@ -605,13 +642,14 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
           runPrismaCommand: vi.fn().mockResolvedValue({
             exitCode: 1,
             stdout: '',
-            stderr: `Error applying migration with ${STAGING_URL}`,
+            stderr: `Error P1000: Authentication failed against ${STAGING_URL}`,
           }),
           startStagingServer,
         },
       });
       expect(deployFail.exitCode).toBe(1);
       expect(deployFail.error).toContain('prisma migrate deploy failed');
+      expect(deployFail.error).toContain('P1000 Auth Hint');
       expect(deployFail.error).not.toContain(STAGING_SECRET);
       expect(startStagingServer).not.toHaveBeenCalled();
 
@@ -635,6 +673,41 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
       expect(statusFail.exitCode).toBe(1);
       expect(statusFail.error).toContain('prisma migrate status did not confirm an up-to-date schema');
       expect(startStagingServer).not.toHaveBeenCalled();
+    });
+
+    it('should never fall back to TEST_DATABASE_URL or DATABASE_URL and should reject STAGING_POSTGRES_PASSWORD mismatch', async () => {
+      const { logger } = createSilentLogger();
+      const checkPortReachable = vi.fn();
+
+      const noFallback = await runStagingVerification({
+        execute: true,
+        env: {
+          STAGING_DATABASE_URL: '',
+          TEST_DATABASE_URL: 'postgresql://erp_integration_user:secret@localhost:5434/core_erp_integration_test',
+          DATABASE_URL: PROD_URL,
+        },
+        logger,
+        deps: { checkPortReachable },
+      });
+      expect(noFallback.exitCode).toBe(1);
+      expect(noFallback.error).toContain('No explicit staging database URL provided');
+      expect(checkPortReachable).not.toHaveBeenCalled();
+
+      const conflictRes = await runStagingVerification({
+        execute: true,
+        env: {
+          STAGING_DATABASE_URL: STAGING_URL,
+          STAGING_POSTGRES_PASSWORD: 'DifferentStagingPassword_999!',
+          DATABASE_URL: PROD_URL,
+        },
+        logger,
+        deps: { checkPortReachable },
+      });
+      expect(conflictRes.exitCode).toBe(1);
+      expect(conflictRes.error).toContain('Conflicting staging credentials');
+      expect(conflictRes.error).not.toContain('DifferentStagingPassword_999!');
+      expect(conflictRes.error).not.toContain(STAGING_SECRET);
+      expect(checkPortReachable).not.toHaveBeenCalled();
     });
 
     it('should fail on wrong migration count or failed migration in _prisma_migrations and disconnect inspector', async () => {
@@ -846,7 +919,7 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
       const result = spawnSync(process.execPath, [tsxPath, scriptPath], {
         env: {
           ...process.env,
-          STAGING_DATABASE_URL: `postgresql://test_user:${testSecret}@localhost:5433/core_erp_staging?schema=public`,
+          STAGING_DATABASE_URL: `postgresql://erp_staging_user:${testSecret}@localhost:5435/core_erp_staging?schema=public`,
           DATABASE_URL: `postgresql://prod_user:${prodSecret}@localhost:5432/core_erp?schema=public`,
         },
         encoding: 'utf-8',
@@ -869,7 +942,7 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
       const result = spawnSync(process.execPath, [tsxPath, scriptPath], {
         env: {
           ...process.env,
-          STAGING_DATABASE_URL: `postgresql://erp_user:${testSecret}@localhost:5433/core_erp`,
+          STAGING_DATABASE_URL: `postgresql://erp_user:${testSecret}@localhost:5435/core_erp`,
           DATABASE_URL: 'postgresql://erp_user:another_pass@localhost:5432/core_erp',
         },
         encoding: 'utf-8',

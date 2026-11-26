@@ -117,7 +117,7 @@ export function validateDevSyncPreconditions(
   if (port !== CANONICAL_DEV_PORT) {
     return {
       valid: false,
-      error: `[SECURITY VIOLATION] Port must be development port ${CANONICAL_DEV_PORT}. Ports 5433 (staging) and 5434 (integration) are strictly forbidden. Received port ${port}.`,
+      error: `[SECURITY VIOLATION] Port must be development port ${CANONICAL_DEV_PORT}. Ports 5433 (test), 5434 (integration), 5435 (staging), and 5436 (shadow) are strictly forbidden. Received port ${port}.`,
     };
   }
 
@@ -203,7 +203,7 @@ export function syncEnvFileDatabaseUrl(
       `POSTGRES_PASSWORD="${newPassword}"`,
       `POSTGRES_DB="${CANONICAL_DEV_DB}"`,
       `DATABASE_URL="postgresql://${CANONICAL_DEV_USER}:${newPassword}@localhost:${CANONICAL_DEV_PORT}/${CANONICAL_DEV_DB}?schema=public"`,
-      'STAGING_DATABASE_URL="postgresql://erp_test_user:dev_test_password@localhost:5433/core_erp_staging?schema=public"',
+      '# Run `npm run db:setup` to configure isolated staging (5435), shadow (5436), and integration (5434) databases.',
       'SESSION_SECRET="dev_insecure_fallback_session_secret_32_chars_long"',
       'BIOMETRIC_BRIDGE_TOKEN="dev_biometric_bridge_secret_token_123456"',
       '',

@@ -4,7 +4,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { execFile, spawn } from 'child_process';
 import { PrismaClient } from '@prisma/client';
-import { sanitizeDatabaseUrl } from '../config/env.js';
 import { isPostgresPortReachable } from './health.js';
 import {
   AppliedMigrationRecord,
@@ -14,6 +13,7 @@ import {
   SchemaIndexRecord,
   getExpectedPrismaMigrations,
   getStagingVerificationSteps,
+  sanitizeDatabaseUrl,
   validateAppliedMigrations,
   validateSchemaInvariants,
   validateStagingDatabaseUrl,
@@ -170,10 +170,17 @@ export function buildIsolatedPrismaEnv(
     'DATABASE_URL',
     'STAGING_DATABASE_URL',
     'TEST_DATABASE_URL',
+    'SHADOW_DATABASE_URL',
     'COREERP_INTEGRATION_TEST_MODE',
     'POSTGRES_USER',
     'POSTGRES_PASSWORD',
     'POSTGRES_DB',
+    'STAGING_POSTGRES_USER',
+    'STAGING_POSTGRES_PASSWORD',
+    'STAGING_POSTGRES_DB',
+    'SHADOW_POSTGRES_USER',
+    'SHADOW_POSTGRES_PASSWORD',
+    'SHADOW_POSTGRES_DB',
     'BOOTSTRAP_SUPER_ADMIN_PASSWORD',
   ]);
 
@@ -215,6 +222,8 @@ export function buildIsolatedServerEnv(
     PORT: String(port),
     DATABASE_URL: validatedStagingUrl,
     TEST_DATABASE_URL: '',
+    STAGING_DATABASE_URL: '',
+    SHADOW_DATABASE_URL: '',
     COREERP_INTEGRATION_TEST_MODE: '',
     SESSION_SECRET: sessionSecret,
     BANK_ENCRYPTION_KEY: bankEncryptionKey,
@@ -507,9 +516,20 @@ export async function runStagingVerification(
     platform: options.deps?.platform ?? process.platform,
   };
 
-  const targetUrl = env.STAGING_DATABASE_URL?.trim() || env.TEST_DATABASE_URL?.trim() || undefined;
+  // Strictly read STAGING_DATABASE_URL ONLY — NEVER fall back to TEST_DATABASE_URL or DATABASE_URL
+  const targetUrl = env.STAGING_DATABASE_URL?.trim() || undefined;
   const primaryDbUrl = env.DATABASE_URL?.trim() || undefined;
-  const sensitiveValues = collectSensitiveValues([targetUrl, primaryDbUrl]);
+  const testDbUrl = env.TEST_DATABASE_URL?.trim() || undefined;
+  const shadowDbUrl = env.SHADOW_DATABASE_URL?.trim() || undefined;
+  const sensitiveValues = collectSensitiveValues([
+    targetUrl,
+    primaryDbUrl,
+    testDbUrl,
+    shadowDbUrl,
+    env.STAGING_POSTGRES_PASSWORD,
+    env.POSTGRES_PASSWORD,
+    env.SHADOW_POSTGRES_PASSWORD,
+  ]);
   const redact = (msg: string) => redactSensitiveText(msg, sensitiveValues);
 
   const stepOutcomes: StagingStepOutcome[] = [];
@@ -526,10 +546,59 @@ export async function runStagingVerification(
   logger.log(
     `   - Primary DATABASE_URL: ${primaryDbUrl ? sanitizeDatabaseUrl(primaryDbUrl) : '[NOT SET]'}`
   );
+  if (testDbUrl) {
+    logger.log(
+      `   - Isolated TEST_DATABASE_URL: ${sanitizeDatabaseUrl(testDbUrl)} (protected; never used as fallback)`
+    );
+  }
 
-  const validation = validateStagingDatabaseUrl(targetUrl, primaryDbUrl);
-  if (!validation.valid || !validation.endpoint || !validation.url || !validation.databaseName) {
-    const safeError = redact(validation.error || 'Target staging database URL failed validation.');
+  const validation = validateStagingDatabaseUrl(targetUrl, primaryDbUrl, {
+    testDatabaseUrl: testDbUrl,
+    shadowDatabaseUrl: shadowDbUrl,
+  });
+
+  // Also detect conflicting STAGING_POSTGRES_* variables vs STAGING_DATABASE_URL before any network I/O
+  let stagingEnvConflict: string | null = null;
+  if (validation.valid && validation.url) {
+    try {
+      const parsedTarget = new URL(validation.url);
+      const urlUser = decodeURIComponent(parsedTarget.username || '');
+      const urlPass = decodeURIComponent(parsedTarget.password || '');
+      const urlDb = decodeURIComponent(
+        parsedTarget.pathname.replace(/^\/+/, '').replace(/\/+$/, '')
+      );
+
+      if (env.STAGING_POSTGRES_USER?.trim() && urlUser !== env.STAGING_POSTGRES_USER.trim()) {
+        stagingEnvConflict =
+          'Conflicting staging credentials: STAGING_DATABASE_URL username does not match STAGING_POSTGRES_USER.';
+      } else if (
+        env.STAGING_POSTGRES_PASSWORD?.trim() &&
+        urlPass !== env.STAGING_POSTGRES_PASSWORD.trim()
+      ) {
+        stagingEnvConflict =
+          'Conflicting staging credentials: STAGING_DATABASE_URL password does not match STAGING_POSTGRES_PASSWORD. Check .env.staging and .env consistency.';
+      } else if (
+        env.STAGING_POSTGRES_DB?.trim() &&
+        urlDb.toLowerCase() !== env.STAGING_POSTGRES_DB.trim().toLowerCase()
+      ) {
+        stagingEnvConflict =
+          'Conflicting staging configuration: STAGING_DATABASE_URL database does not match STAGING_POSTGRES_DB.';
+      }
+    } catch {
+      stagingEnvConflict = 'Failed to inspect STAGING_DATABASE_URL credentials safely.';
+    }
+  }
+
+  if (
+    !validation.valid ||
+    !validation.endpoint ||
+    !validation.url ||
+    !validation.databaseName ||
+    stagingEnvConflict
+  ) {
+    const safeError = redact(
+      stagingEnvConflict || validation.error || 'Target staging database URL failed validation.'
+    );
     stepOutcomes.push({
       step: 1,
       name: 'Safety & Environment Pre-Flight',
@@ -538,16 +607,11 @@ export async function runStagingVerification(
     });
     logger.error(`\n❌ [SAFETY CHECK FAILED]: ${safeError}\n`);
     logger.log('Guidance:');
-    logger.log('  1. Staging verification requires an isolated, disposable database.');
-    logger.log('  2. Configure STAGING_DATABASE_URL or TEST_DATABASE_URL with a database name');
-    logger.log(
-      '     containing "test", "staging", or "disposable" (e.g. core_erp_staging or core_erp_test).'
-    );
-    logger.log('  3. Example (Local Docker on port 5433 from docker-compose.dev.yml):');
-    logger.log(
-      '     export STAGING_DATABASE_URL="postgresql://erp_test_user:<auth_secret>@localhost:5433/core_erp_test?schema=public"'
-    );
-    logger.log('  4. Silent fallback to DATABASE_URL is strictly prohibited.\n');
+    logger.log('  1. Staging verification requires its own isolated PostgreSQL 16 service (`core_erp_staging` on port 5435).');
+    logger.log('  2. Run `npm run db:setup` to generate `.env.staging` with consistent staging credentials.');
+    logger.log('  3. Start the dedicated staging container:');
+    logger.log('     docker compose --env-file .env.staging -f docker-compose.staging.yml up -d');
+    logger.log('  4. Silent fallback to DATABASE_URL or TEST_DATABASE_URL is strictly prohibited.\n');
     return {
       exitCode: 1,
       mode: options.execute ? 'EXECUTE' : 'DRY_RUN',
@@ -624,7 +688,7 @@ export async function runStagingVerification(
     });
     logger.warn(`\n⚠️  ${msg}`);
     logger.warn(
-      '   Ensure your staging PostgreSQL container is running (e.g., docker compose -f docker-compose.dev.yml up -d postgres-test).'
+      '   Ensure your dedicated staging PostgreSQL container is running (e.g., docker compose --env-file .env.staging -f docker-compose.staging.yml up -d).'
     );
     return {
       exitCode: 2,
@@ -647,8 +711,13 @@ export async function runStagingVerification(
   const isolatedPrismaEnv = buildIsolatedPrismaEnv(validation.url, env);
   const deployResult = await deps.runPrismaCommand(['migrate', 'deploy'], isolatedPrismaEnv);
   if (deployResult.exitCode !== 0) {
+    const rawOutput = `${deployResult.stderr}\n${deployResult.stdout}`.trim();
+    const isAuthError = /P1000|28P01|authentication failed/i.test(rawOutput);
+    const authHint = isAuthError
+      ? ' [P1000 Auth Hint: PostgreSQL ignores changed POSTGRES_PASSWORD values when an existing Docker volume is reused. Verify .env.staging matches the role password inside coreerp-postgres-staging without deleting volumes; see README.md P1000 troubleshooting.]'
+      : '';
     const detail = redact(
-      `prisma migrate deploy failed with exit code ${deployResult.exitCode}: ${(deployResult.stderr || deployResult.stdout).trim()}`
+      `prisma migrate deploy failed with exit code ${deployResult.exitCode}: ${(deployResult.stderr || deployResult.stdout).trim()}${authHint}`
     );
     stepOutcomes.push({
       step: 3,

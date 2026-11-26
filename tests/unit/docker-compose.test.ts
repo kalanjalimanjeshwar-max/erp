@@ -8,6 +8,7 @@ describe('Docker Compose YAML Parsing & Fail-Closed Security Validation', () => 
   const prodComposePath = path.join(rootDir, 'docker-compose.yml');
   const devComposePath = path.join(rootDir, 'docker-compose.dev.yml');
   const integrationComposePath = path.join(rootDir, 'docker-compose.integration-test.yml');
+  const stagingComposePath = path.join(rootDir, 'docker-compose.staging.yml');
 
   it('should parse docker-compose.yml without any YAML scanner or mapping errors', () => {
     const rawYaml = fs.readFileSync(prodComposePath, 'utf8');
@@ -26,6 +27,8 @@ describe('Docker Compose YAML Parsing & Fail-Closed Security Validation', () => 
     const doc = YAML.parse(rawYaml);
     expect(doc.services.postgres).toBeDefined();
     expect(doc.services['postgres-test']).toBeDefined();
+    expect(doc.services['postgres-shadow']).toBeDefined();
+    expect(doc.services['postgres-shadow'].profiles).toEqual(['shadow']);
   });
 
   it('should parse docker-compose.integration-test.yml without any YAML scanner errors', () => {
@@ -35,8 +38,20 @@ describe('Docker Compose YAML Parsing & Fail-Closed Security Validation', () => 
     expect(doc.services['postgres-integration-test']).toBeDefined();
   });
 
+  it('should parse docker-compose.staging.yml without any YAML scanner errors', () => {
+    const rawYaml = fs.readFileSync(stagingComposePath, 'utf8');
+    expect(() => YAML.parse(rawYaml)).not.toThrow();
+    const doc = YAML.parse(rawYaml);
+    expect(doc.services['postgres-staging']).toBeDefined();
+    expect(doc.services['postgres-staging'].image).toBe('postgres:16-alpine');
+    expect(doc.services['postgres-staging'].container_name).toBe('coreerp-postgres-staging');
+    expect(doc.services['postgres-staging'].restart).toBe('unless-stopped');
+    expect(doc.services['postgres-staging'].healthcheck).toBeDefined();
+    expect(doc.volumes.postgres_staging_data).toBeDefined();
+  });
+
   it('should guarantee no unquoted ${...} expressions contain colons followed by spaces in any compose file', () => {
-    const files = [prodComposePath, devComposePath, integrationComposePath];
+    const files = [prodComposePath, devComposePath, integrationComposePath, stagingComposePath];
     for (const file of files) {
       const content = fs.readFileSync(file, 'utf8');
       const lines = content.split('\n');
@@ -131,10 +146,26 @@ describe('Docker Compose YAML Parsing & Fail-Closed Security Validation', () => 
       expect(rawLine).toMatch(/POSTGRES_PASSWORD:\s*"[^"]+"/);
     });
 
-    it('should verify isolated port allocations across all Compose files', () => {
+    it('should enforce fail-closed staging credentials in docker-compose.staging.yml', () => {
+      const rawYaml = fs.readFileSync(stagingComposePath, 'utf8');
+      const doc = YAML.parse(rawYaml);
+      const pgEnv = doc.services['postgres-staging'].environment;
+
+      expect(pgEnv.POSTGRES_USER).toContain('${STAGING_POSTGRES_USER:?');
+      expect(pgEnv.POSTGRES_PASSWORD).toContain('${STAGING_POSTGRES_PASSWORD:?');
+      expect(pgEnv.POSTGRES_DB).toContain('${STAGING_POSTGRES_DB:?');
+
+      for (const key of ['POSTGRES_USER:', 'POSTGRES_PASSWORD:', 'POSTGRES_DB:']) {
+        const rawLine = rawYaml.split('\n').find((l) => l.includes(key));
+        expect(rawLine).toMatch(/:\s*"[^"]+"/);
+      }
+    });
+
+    it('should verify isolated port and volume allocations across all five PostgreSQL environments', () => {
       const prodDoc = YAML.parse(fs.readFileSync(prodComposePath, 'utf8'));
       const devDoc = YAML.parse(fs.readFileSync(devComposePath, 'utf8'));
       const testDoc = YAML.parse(fs.readFileSync(integrationComposePath, 'utf8'));
+      const stagingDoc = YAML.parse(fs.readFileSync(stagingComposePath, 'utf8'));
 
       // Prod DB must not publish host ports and must attach only to the internal DB network
       expect(prodDoc.services.postgres.ports).toBeUndefined();
@@ -147,11 +178,30 @@ describe('Docker Compose YAML Parsing & Fail-Closed Security Validation', () => 
       expect(prodDoc.services.app.networks).toEqual(['coreerp-db-internal', 'coreerp-edge']);
       expect(prodDoc.services.app.ports).toEqual(['127.0.0.1:${APP_BIND_PORT:-3000}:3000']);
       expect(prodDoc.networks['coreerp-edge']).toMatchObject({ driver: 'bridge' });
-      // Dev DB ports: dev on 5432, unit test on 5433
+
+      // Five strictly distinct local host ports (5432, 5433, 5434, 5435, 5436)
       expect(devDoc.services.postgres.ports).toContain('5432:5432');
       expect(devDoc.services['postgres-test'].ports).toContain('5433:5432');
-      // Integration test DB port: 5434
       expect(testDoc.services['postgres-integration-test'].ports).toContain('5434:5432');
+      expect(stagingDoc.services['postgres-staging'].ports).toContain('5435:5432');
+      expect(devDoc.services['postgres-shadow'].ports).toContain('5436:5432');
+
+      // Five strictly distinct named volumes (never shared across environments)
+      const volumes = [
+        devDoc.services.postgres.volumes[0].split(':')[0],
+        devDoc.services['postgres-test'].volumes[0].split(':')[0],
+        testDoc.services['postgres-integration-test'].volumes[0].split(':')[0],
+        stagingDoc.services['postgres-staging'].volumes[0].split(':')[0],
+        devDoc.services['postgres-shadow'].volumes[0].split(':')[0],
+      ];
+      expect(volumes).toEqual([
+        'postgres_dev_data',
+        'postgres_test_data',
+        'postgres_integration_test_data',
+        'postgres_staging_data',
+        'postgres_shadow_data',
+      ]);
+      expect(new Set(volumes).size).toBe(5);
     });
   });
 

@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  # ============================================================================
+  # Dedicated Isolated PostgreSQL 16 Staging Verification Database (Port 5435)
+  # ============================================================================
+  # Completely separate from Development (5432 / core_erp), Automated Testing
+  # (5433 / core_erp_test), Integration Testing (5434 / core_erp_integration_test),
+  # and Prisma Shadow (5436 / core_erp_shadow).
+  #
+  # Setup:
+  #   npm run db:setup
+  #   docker compose --env-file .env.staging -f docker-compose.staging.yml up -d
+  # ============================================================================
+  postgres-staging:
+    image: postgres:16-alpine
+    container_name: coreerp-postgres-staging
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${STAGING_POSTGRES_USER:?STAGING_POSTGRES_USER must be set in .env.staging (run npm run db:setup)}"
+      POSTGRES_PASSWORD: "${STAGING_POSTGRES_PASSWORD:?STAGING_POSTGRES_PASSWORD must be set in .env.staging (run npm run db:setup)}"
+      POSTGRES_DB: "${STAGING_POSTGRES_DB:?STAGING_POSTGRES_DB must be set to core_erp_staging in .env.staging (run npm run db:setup)}"
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      - "5435:5432"
+    volumes:
+      - postgres_staging_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${STAGING_POSTGRES_USER:?STAGING_POSTGRES_USER must be set in .env.staging} -d ${STAGING_POSTGRES_DB:?STAGING_POSTGRES_DB must be set in .env.staging}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  # Dedicated persistent volume for staging verification (never shared with dev/test/prod)
+  postgres_staging_data:
+    driver: local

@@ -25,7 +25,7 @@ if (
         'POSTGRES_PASSWORD=erp_password_dev',
         'POSTGRES_DB=core_erp',
         'DATABASE_URL="postgresql://erp_user:erp_password_dev@localhost:5432/core_erp?schema=public"',
-        'STAGING_DATABASE_URL="postgresql://erp_test_user:dev_test_password@localhost:5433/core_erp_staging?schema=public"',
+        '# Run `npm run db:setup` to generate isolated staging (5435), shadow (5436), and integration (5434) credentials.',
         'SESSION_SECRET="dev_insecure_fallback_session_secret_32_chars_long"',
         'BIOMETRIC_BRIDGE_TOKEN="dev_biometric_bridge_secret_token_123456"',
         '',
@@ -118,6 +118,18 @@ export const envSchema = z
       .transform((val) =>
         val === undefined ? undefined : val.trim().replace(/^["']|["']$/g, '')
       ),
+    STAGING_DATABASE_URL: z
+      .string()
+      .optional()
+      .transform((val) =>
+        val === undefined ? undefined : val.trim().replace(/^["']|["']$/g, '')
+      ),
+    SHADOW_DATABASE_URL: z
+      .string()
+      .optional()
+      .transform((val) =>
+        val === undefined ? undefined : val.trim().replace(/^["']|["']$/g, '')
+      ),
     COREERP_INTEGRATION_TEST_MODE: z.string().optional(),
     SESSION_SECRET: z
       .string()
@@ -141,6 +153,12 @@ export const envSchema = z
     POSTGRES_USER: z.string().optional(),
     POSTGRES_PASSWORD: z.string().optional(),
     POSTGRES_DB: z.string().optional(),
+    STAGING_POSTGRES_USER: z.string().optional(),
+    STAGING_POSTGRES_PASSWORD: z.string().optional(),
+    STAGING_POSTGRES_DB: z.string().optional(),
+    SHADOW_POSTGRES_USER: z.string().optional(),
+    SHADOW_POSTGRES_PASSWORD: z.string().optional(),
+    SHADOW_POSTGRES_DB: z.string().optional(),
   })
   .superRefine((data, ctx) => {
     const isIntegrationFlagSet = data.COREERP_INTEGRATION_TEST_MODE === 'true';
@@ -194,11 +212,14 @@ export const envSchema = z
     }
 
     // 0. Development Docker Compose / DATABASE_URL consistency check
-    if (data.NODE_ENV === 'development' && data.POSTGRES_PASSWORD && data.DATABASE_URL) {
+    if (data.NODE_ENV === 'development' && data.DATABASE_URL) {
       try {
         const parsedUrl = new URL(data.DATABASE_URL);
         const urlPass = decodeURIComponent(parsedUrl.password || '');
-        if (urlPass && data.POSTGRES_PASSWORD && urlPass !== data.POSTGRES_PASSWORD) {
+        const urlUser = decodeURIComponent(parsedUrl.username || '');
+        const urlDb = decodeURIComponent(parsedUrl.pathname.replace(/^\//, '').split('?')[0]);
+
+        if (data.POSTGRES_PASSWORD && urlPass && urlPass !== data.POSTGRES_PASSWORD) {
           ctx.addIssue({
             code: z.ZodIssueCode.custom,
             path: ['DATABASE_URL'],
@@ -206,8 +227,169 @@ export const envSchema = z
               'DATABASE_URL password does not match POSTGRES_PASSWORD. In development, ensure Docker Compose and application DATABASE_URL use matching credentials.',
           });
         }
+        if (data.POSTGRES_USER && urlUser && urlUser !== data.POSTGRES_USER) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['DATABASE_URL'],
+            message:
+              'DATABASE_URL username does not match POSTGRES_USER. Ensure Docker Compose and application DATABASE_URL use matching credentials.',
+          });
+        }
+        if (data.POSTGRES_DB && urlDb && urlDb !== data.POSTGRES_DB) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['DATABASE_URL'],
+            message:
+              'DATABASE_URL database name does not match POSTGRES_DB. Ensure Docker Compose and application DATABASE_URL target the same database.',
+          });
+        }
       } catch {
         // Base validation handles unparseable URLs
+      }
+    }
+
+    // 0b. Cross-environment database URL isolation & consistency checks (never silent fallback)
+    const extractEndpointKey = (rawUrl: string | undefined): string | null => {
+      if (!rawUrl || rawUrl.trim() === '') return null;
+      try {
+        const p = new URL(rawUrl);
+        if (p.protocol !== 'postgresql:' && p.protocol !== 'postgres:') return null;
+        const host = p.hostname.toLowerCase();
+        const normHost = host === 'localhost' || host === '::1' || host === '[::1]' ? '127.0.0.1' : host;
+        const port = p.port || '5432';
+        const db = decodeURIComponent(p.pathname.replace(/^\/+/, '').replace(/\/+$/, '')).toLowerCase();
+        if (!db) return null;
+        return `${normHost}:${port}/${db}`;
+      } catch {
+        return null;
+      }
+    };
+
+    const primaryKey = extractEndpointKey(data.DATABASE_URL);
+    const testKey = extractEndpointKey(data.TEST_DATABASE_URL);
+    const stagingKey = extractEndpointKey(data.STAGING_DATABASE_URL);
+    const shadowKey = extractEndpointKey(data.SHADOW_DATABASE_URL);
+
+    if (data.STAGING_DATABASE_URL && data.STAGING_DATABASE_URL.length > 0) {
+      if (
+        !data.STAGING_DATABASE_URL.startsWith('postgresql://') &&
+        !data.STAGING_DATABASE_URL.startsWith('postgres://')
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['STAGING_DATABASE_URL'],
+          message:
+            'STAGING_DATABASE_URL must be a valid PostgreSQL connection string targeting core_erp_staging.',
+        });
+      } else {
+        try {
+          const parsedStaging = new URL(data.STAGING_DATABASE_URL);
+          const stagingDb = decodeURIComponent(
+            parsedStaging.pathname.replace(/^\/+/, '').replace(/\/+$/, '')
+          ).toLowerCase();
+          if (stagingDb !== 'core_erp_staging') {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['STAGING_DATABASE_URL'],
+              message:
+                'STAGING_DATABASE_URL must point exclusively to database "core_erp_staging" (never core_erp, core_erp_test, core_erp_integration_test, or core_erp_shadow).',
+            });
+          }
+          if (
+            data.STAGING_POSTGRES_PASSWORD &&
+            decodeURIComponent(parsedStaging.password || '') !== data.STAGING_POSTGRES_PASSWORD
+          ) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['STAGING_DATABASE_URL'],
+              message:
+                'STAGING_DATABASE_URL password does not match STAGING_POSTGRES_PASSWORD. Ensure Docker Compose and Prisma use matching staging credentials.',
+            });
+          }
+        } catch {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['STAGING_DATABASE_URL'],
+            message: 'STAGING_DATABASE_URL is malformed or unparseable.',
+          });
+        }
+      }
+
+      if (stagingKey && primaryKey && stagingKey === primaryKey) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['STAGING_DATABASE_URL'],
+          message:
+            'Conflicting database configuration: STAGING_DATABASE_URL must not target the same endpoint as DATABASE_URL.',
+        });
+      }
+      if (stagingKey && testKey && stagingKey === testKey) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['STAGING_DATABASE_URL'],
+          message:
+            'Conflicting database configuration: STAGING_DATABASE_URL must not target the same endpoint as TEST_DATABASE_URL.',
+        });
+      }
+    }
+
+    if (data.SHADOW_DATABASE_URL && data.SHADOW_DATABASE_URL.length > 0) {
+      if (
+        !data.SHADOW_DATABASE_URL.startsWith('postgresql://') &&
+        !data.SHADOW_DATABASE_URL.startsWith('postgres://')
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['SHADOW_DATABASE_URL'],
+          message:
+            'SHADOW_DATABASE_URL must be a valid PostgreSQL connection string targeting core_erp_shadow.',
+        });
+      } else {
+        try {
+          const parsedShadow = new URL(data.SHADOW_DATABASE_URL);
+          const shadowDb = decodeURIComponent(
+            parsedShadow.pathname.replace(/^\/+/, '').replace(/\/+$/, '')
+          ).toLowerCase();
+          if (shadowDb !== 'core_erp_shadow') {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['SHADOW_DATABASE_URL'],
+              message:
+                'SHADOW_DATABASE_URL must point exclusively to database "core_erp_shadow".',
+            });
+          }
+          if (
+            data.SHADOW_POSTGRES_PASSWORD &&
+            decodeURIComponent(parsedShadow.password || '') !== data.SHADOW_POSTGRES_PASSWORD
+          ) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['SHADOW_DATABASE_URL'],
+              message:
+                'SHADOW_DATABASE_URL password does not match SHADOW_POSTGRES_PASSWORD.',
+            });
+          }
+        } catch {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['SHADOW_DATABASE_URL'],
+            message: 'SHADOW_DATABASE_URL is malformed or unparseable.',
+          });
+        }
+      }
+
+      if (
+        shadowKey &&
+        ((primaryKey && shadowKey === primaryKey) ||
+          (stagingKey && shadowKey === stagingKey) ||
+          (testKey && shadowKey === testKey))
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['SHADOW_DATABASE_URL'],
+          message:
+            'Conflicting database configuration: SHADOW_DATABASE_URL must be isolated from DATABASE_URL, TEST_DATABASE_URL, and STAGING_DATABASE_URL.',
+        });
       }
     }
 
@@ -362,16 +544,7 @@ export type AppConfig = z.infer<typeof envSchema>;
 /**
  * Redacts sensitive credentials from database connection string for safe logging
  */
-export function sanitizeDatabaseUrl(url: string | undefined): string {
-  if (!url) return '[NOT_CONFIGURED]';
-  try {
-    const parsed = new URL(url);
-    const auth = parsed.username ? `${parsed.username}:*****@` : '';
-    return `${parsed.protocol}//${auth}${parsed.host}${parsed.pathname}`;
-  } catch {
-    return 'postgresql://*****:*****@***/***';
-  }
-}
+export { sanitizeDatabaseUrl } from '../db/staging-safety.js';
 
 /**
  * Validates environment variables and exits gracefully with actionable message if invalid

@@ -14,13 +14,13 @@ This guide outlines the **safe, isolated PostgreSQL staging verification procedu
 
 To prevent accidental data loss, schema corruption, or unintended modifications:
 
-1. **Dedicated Disposable Database Target Only**:
-   - Verification must run against an isolated disposable database instance (e.g. `core_erp_staging` or `core_erp_test`).
+1. **Dedicated Disposable Staging Database Target Only (`core_erp_staging`)**:
+   - Verification runs **exclusively** against the dedicated staging database (`core_erp_staging` on host port `5435` locally, or an isolated remote `core_erp_staging` instance).
    - The tooling (`npm run db:verify:staging`) **strictly refuses** to run if:
-     - No explicit staging database URL is provided (`STAGING_DATABASE_URL` or `TEST_DATABASE_URL`).
-     - The target database URL matches the production `DATABASE_URL`.
-     - The database name is a production name (`core_erp`, `prod`, `production`, `main`, `live`).
-     - The database name lacks a required test/staging indicator (`test`, `staging`, `disposable`, `sandbox`, `temp`).
+     - `STAGING_DATABASE_URL` is missing or empty (**never** falls back to `DATABASE_URL` or `TEST_DATABASE_URL`).
+     - The target database URL resolves to the same endpoint as `DATABASE_URL`, `TEST_DATABASE_URL`, or `SHADOW_DATABASE_URL`.
+     - The database name is a production, test, integration-test, or shadow name (`core_erp`, `core_erp_test`, `core_erp_integration_test`, `core_erp_shadow`, `prod`, `production`, `main`, `live`).
+     - A loopback target uses a port reserved for another environment (`5432` dev, `5433` automated test, `5434` integration test, `5436` shadow).
 
 2. **Prohibited Destructive Operations**:
    - `prisma migrate reset` is **strictly prohibited**.
@@ -28,41 +28,49 @@ To prevent accidental data loss, schema corruption, or unintended modifications:
    - Raw `DROP DATABASE`, `DROP TABLE`, or destructive SQL scripts are **strictly prohibited**.
 
 3. **Explicit User Approval Required**:
-   - During Phase 8.7A (Preparation), no live database connections, Docker containers, or migrations are executed.
-   - Live execution will occur only in Phase 8.7B upon explicit user authorization.
+   - Running `npm run db:verify:staging` without `--execute` performs dry-run pre-flight validation only (no live database connections, Docker mutations, or migrations).
+   - Live execution occurs only when explicitly invoked with `--execute` after user authorization.
 
 ---
 
 ## 3. Dedicated Staging Database Architecture Options
 
-### Option A: Local Disposable Docker Container (Recommended)
-`docker-compose.dev.yml` already defines a dedicated, isolated test database service (`postgres-test`) running on port `5433`:
+### Option A: Local Dedicated Staging Docker Container (`docker-compose.staging.yml` — Recommended)
+CoreERP defines a dedicated, isolated staging PostgreSQL 16 service (`postgres-staging`) in `docker-compose.staging.yml` on port `5435` with its own volume (`postgres_staging_data`) and fail-closed credentials in git-ignored `.env.staging`:
 
 ```yaml
-# From docker-compose.dev.yml
-postgres-test:
+# From docker-compose.staging.yml
+postgres-staging:
   image: postgres:16-alpine
-  container_name: coreerp-postgres-test
+  container_name: coreerp-postgres-staging
+  restart: unless-stopped
   environment:
-    POSTGRES_USER: erp_test_user
-    POSTGRES_PASSWORD: erp_test_password
-    POSTGRES_DB: core_erp_test
+    POSTGRES_USER: "${STAGING_POSTGRES_USER:?STAGING_POSTGRES_USER must be set in .env.staging}"
+    POSTGRES_PASSWORD: "${STAGING_POSTGRES_PASSWORD:?STAGING_POSTGRES_PASSWORD must be set in .env.staging}"
+    POSTGRES_DB: "${STAGING_POSTGRES_DB:?STAGING_POSTGRES_DB must be set in .env.staging (core_erp_staging)}"
     TZ: UTC
     PGTZ: UTC
   ports:
-    - "5433:5432"
+    - "5435:5432"
   volumes:
-    - postgres_test_data:/var/lib/postgresql/data
+    - postgres_staging_data:/var/lib/postgresql/data
 ```
 
-> **Host Port Distinction (Port 5433 vs. Port 5432)**:
-> - **Port 5433 (Host)**: Mapped strictly to the isolated `postgres-test` container (`5433:5432`). All staging/test database commands must connect via port 5433.
-> - **Port 5432 (Host)**: The default PostgreSQL port reserved for the primary development database (`postgres` service in `docker-compose.yml` or `docker-compose.dev.yml`).
-> - This explicit port distinction guarantees that running staging verification against `localhost:5433` cannot inadvertently connect to, query, or mutate the development database on `localhost:5432`.
+> **Five-Environment Host Port Separation**:
+> - **Port 5432**: Development database (`docker-compose.dev.yml` → `postgres` / `core_erp`)
+> - **Port 5433**: Automated test database (`docker-compose.dev.yml` → `postgres-test` / `core_erp_test`)
+> - **Port 5434**: Integration test database (`docker-compose.integration-test.yml` → `postgres-integration-test` / `core_erp_integration_test`)
+> - **Port 5435**: Dedicated staging verification database (`docker-compose.staging.yml` → `postgres-staging` / `core_erp_staging`)
+> - **Port 5436**: Optional Prisma shadow database (`docker-compose.dev.yml --profile shadow` → `postgres-shadow` / `core_erp_shadow`)
 
-**Target Connection String**:
+**Initialize `.env.staging` cleanly (idempotent — never overwrites existing files)**:
 ```bash
-export STAGING_DATABASE_URL="postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public"
+npm run db:setup
+```
+
+**Target Connection String** (auto-generated into `.env.staging` by `npm run db:setup`):
+```bash
+STAGING_DATABASE_URL="postgresql://erp_staging_user:<unique_staging_password>@localhost:5435/core_erp_staging?schema=public"
 ```
 
 ### Option B: Ephemeral Cloud Staging Branch
@@ -71,16 +79,16 @@ If verifying in cloud environments (e.g. Neon, Supabase, Cloud SQL):
 - Ensure SSL is configured (`?sslmode=require`).
 - **Never** point to the production database.
 
-### Distinction: Local Disposable Integration Testing (Port 5434) vs. Staging Verification (Port 5433 / Cloud Staging)
-CoreERP intentionally separates **local disposable PostgreSQL 16 integration testing** (`localhost:5434` / `core_erp_integration_test`) from both **local development** (`localhost:5432` / `core_erp`) and **staging verification** (`localhost:5433` / `core_erp_test` or an ephemeral `core_erp_staging` instance):
+### Distinction: Local Disposable Integration Testing (Port 5434) vs. Staging Verification (Port 5435 / Cloud Staging)
+CoreERP intentionally separates **local disposable PostgreSQL 16 integration testing** (`localhost:5434` / `core_erp_integration_test`) from **local development** (`localhost:5432` / `core_erp`), **automated unit test DB** (`localhost:5433` / `core_erp_test`), **Prisma shadow DB** (`localhost:5436` / `core_erp_shadow`), and **dedicated staging verification** (`localhost:5435` / `core_erp_staging` or an ephemeral remote `core_erp_staging` instance):
 
 | Dimension | Local Disposable Integration Testing | Staging Verification |
 | :--- | :--- | :--- |
 | **Purpose** | Automated real-PostgreSQL Vitest concurrency, constraint, trigger, HTTP authorization/payroll-lock, and rollback suites | End-to-end release pre-flight, migration deployment, health/readiness probes, and operational verification |
-| **Compose File / Target** | `docker-compose.integration-test.yml` (`postgres-integration-test`) | `docker-compose.dev.yml` (`postgres-test`) or dedicated ephemeral `core_erp_staging` instance |
-| **Host Port / DB Name** | `localhost:5434` / `core_erp_integration_test` (`erp_integration_user`) — distinct from dev port `5432` (`core_erp`) | `localhost:5433` / `core_erp_test` or remote `core_erp_staging` — distinct from dev port `5432` (`core_erp`) |
-| **Safety Guard Layer** | `tests/setup.ts` + `src/server/db/client.ts` + `src/server/config/env.ts` (`COREERP_INTEGRATION_TEST_MODE=true`, `TEST_DATABASE_URL` on `5434` only, `DATABASE_URL` unset) | `npm run db:verify:staging` (`src/server/db/staging-safety.ts` via `STAGING_DATABASE_URL`) |
-| **Secret File** | Git-ignored `.env.integration-test` (`POSTGRES_PASSWORD`) | Environment-scoped staging secret mechanism |
+| **Compose File / Target** | `docker-compose.integration-test.yml` (`postgres-integration-test`) | `docker-compose.staging.yml` (`postgres-staging`) or dedicated ephemeral `core_erp_staging` instance |
+| **Host Port / DB Name** | `localhost:5434` / `core_erp_integration_test` (`erp_integration_user`) — distinct from dev port `5432` (`core_erp`) | `localhost:5435` / `core_erp_staging` (`erp_staging_user`) or remote `core_erp_staging` — distinct from `5432`/`5433`/`5434`/`5436` |
+| **Safety Guard Layer** | `tests/setup.ts` + `src/server/db/client.ts` + `src/server/config/env.ts` (`COREERP_INTEGRATION_TEST_MODE=true`, `TEST_DATABASE_URL` on `5434` only, `DATABASE_URL` unset) | `npm run db:verify:staging` (`src/server/db/staging-safety.ts` via `STAGING_DATABASE_URL` exclusively) |
+| **Secret File** | Git-ignored `.env.integration-test` (`POSTGRES_PASSWORD`) | Git-ignored `.env.staging` (`STAGING_POSTGRES_*`, `STAGING_DATABASE_URL`) |
 
 > **Database Isolation Guard Responsibilities (Port 5434):**
 > - `tests/setup.ts` retains responsibility for enabling `COREERP_INTEGRATION_TEST_MODE=true`, unsetting `DATABASE_URL`, wrapping `dotenv.config()`, and validating `TEST_DATABASE_URL` before test execution.
@@ -139,17 +147,20 @@ npm run db:verify:staging
 
 Expected result:
 ```
-✔ Safety validation PASSED for database "core_erp_test" (or "core_erp_staging").
+✔ Safety validation PASSED for database "core_erp_staging".
 ✔ Target is confirmed isolated and disposable (non-production).
 ✔ Discovered 17 versioned migration directories.
 ```
 
-To execute all 6 automated staging verification checks end-to-end against an explicitly validated, running disposable PostgreSQL target (with zero application data mutation and `DISABLE_AUTO_CHECKOUT_SCHEDULER=true` on the temporary probe server):
+To execute all 6 automated staging verification checks end-to-end against an explicitly validated, running disposable PostgreSQL staging target (with zero application data mutation and `DISABLE_AUTO_CHECKOUT_SCHEDULER=true` on the temporary probe server):
 ```bash
-STAGING_DATABASE_URL="postgresql://erp_test_user:<password>@localhost:5433/core_erp_staging?schema=public" npm run db:verify:staging -- --execute
+# Automatically loads STAGING_* from .env.staging when STAGING_DATABASE_URL is not overridden in shell:
+npm run db:verify:staging -- --execute
+# Or with an explicit staging connection string:
+STAGING_DATABASE_URL="postgresql://erp_staging_user:<password>@localhost:5435/core_erp_staging?schema=public" npm run db:verify:staging -- --execute
 ```
 The automated runner executes:
-1. Target URL & primary `DATABASE_URL` isolation validation (fails closed on any ambiguity; never falls back to `DATABASE_URL`).
+1. Target URL & primary `DATABASE_URL`/`TEST_DATABASE_URL`/`SHADOW_DATABASE_URL` isolation validation (fails closed on any ambiguity; never falls back to `DATABASE_URL` or `TEST_DATABASE_URL`).
 2. TCP socket reachability check (exits with code `2` before running Prisma if unreachable).
 3. `prisma migrate deploy`, `prisma migrate status`, live `current_database()` identity verification, and `_prisma_migrations` integrity validation against all 17 repository migration directories.
 4. Read-only PostgreSQL catalog verification for unique indexes (`Company_code_key`, `User_companyId_email_key`, `Attendance_companyId_employeeId_workDate_key`), schema-backed `Decimal` precision (`CurrencyConfig.exchangeRate` `(18, 6)` and `JournalEntry`/`JournalLine` `(18, 4)`), and `AttendanceSource` enum values (`MANUAL`, `BIOMETRIC`, `SYSTEM_GENERATED`). No application rows are seeded, truncated, deleted, reset, or modified.
@@ -158,11 +169,11 @@ The automated runner executes:
 
 ### Step 2: Start Isolated Staging Database Container (User Authorized)
 ```bash
-docker compose -f docker-compose.dev.yml up -d postgres-test
+docker compose --env-file .env.staging -f docker-compose.staging.yml up -d
 ```
 Wait for healthy status:
 ```bash
-docker compose -f docker-compose.dev.yml ps postgres-test
+docker compose --env-file .env.staging -f docker-compose.staging.yml ps
 ```
 
 ### Step 3: Verify Ordered Migration Application
@@ -272,19 +283,29 @@ Confirm `prisma.$disconnect()` completes and no connections linger in PostgreSQL
 
 ## 6. Teardown Procedure
 
-Once staging verification is complete, tear down only the disposable staging container using the container-scoped cleanup sequence:
+Once staging verification is complete, stop only the isolated staging container using the container-scoped sequence (preserving volumes):
 
 ```bash
-docker compose -f docker-compose.dev.yml stop postgres-test
-docker compose -f docker-compose.dev.yml rm -f postgres-test
+docker compose --env-file .env.staging -f docker-compose.staging.yml stop postgres-staging
+docker compose --env-file .env.staging -f docker-compose.staging.yml rm -f postgres-staging
 ```
 
 ### Safety & Scope Guarantees:
 1. **Container-Scoped Cleanup vs. Compose-Wide Teardown**:
-   - `docker compose down` operates at the entire project level and cannot be scoped to a single service. Running `docker compose down` (and especially `docker compose down -v`) would shut down all services in `docker-compose.dev.yml` and destroy all project volumes, including `postgres_dev_data`.
-   - Running `stop` followed by `rm -f` strictly targets the `postgres-test` container (`coreerp-postgres-test`) without impacting any other development or auxiliary containers.
+   - `docker compose down -v` destroys named volumes and must **never** be used routinely.
+   - Running `stop` followed by `rm -f` against `docker-compose.staging.yml` strictly targets `postgres-staging` (`coreerp-postgres-staging`) without impacting `postgres` (`postgres_dev_data`), `postgres-test` (`postgres_test_data`), `postgres-integration-test` (`postgres_integration_test_data`), or `postgres-shadow` (`postgres_shadow_data`).
 
 2. **Named Volume Preservation**:
    - The container removal command (`rm -f`) removes only the stopped container instance and preserves named volumes.
-   - The dedicated test data volume (`postgres_test_data`) remains intact and must **not** be deleted unless the operator separately and explicitly approves deletion of disposable test data.
+   - The dedicated staging data volume (`postgres_staging_data`) remains intact and must **not** be deleted unless the operator separately and explicitly approves deletion of disposable staging data.
    - Volume deletion commands (such as `docker volume rm`) are **not** recommended as routine cleanup, eliminating the risk of accidental volume deletion.
+
+3. **Explicitly Authorized Local Clean-Reset Workflow**:
+   - When an operator explicitly authorizes resetting CoreERP's local Docker databases (`dev`, `test`, `integration`, `staging`, `shadow`) from scratch, use the dedicated allowlisted script instead of manual or global Docker cleanup commands:
+     ```bash
+     # Dry-run preview (zero changes):
+     npm run db:clean-reset -- --targets staging
+     # Explicitly confirmed scoped reset + recreate + ordered migrations + staging verification:
+     npm run db:clean-reset -- --targets staging --execute --confirm-coreerp-local-reset
+     ```
+   - Never run `docker system prune --volumes` or touch production volumes (`postgres_data`, `coreerp_storage`).

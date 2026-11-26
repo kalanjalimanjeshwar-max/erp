@@ -24,6 +24,75 @@ export interface StagingUrlValidationResult {
   endpoint?: NormalizedDatabaseEndpoint;
 }
 
+// Canonical five-environment PostgreSQL separation (single source of truth)
+export const COREERP_DB_ENVIRONMENTS = {
+  development: {
+    database: 'core_erp',
+    user: 'erp_user',
+    port: 5432,
+    container: 'coreerp-postgres-dev',
+    volume: 'postgres_dev_data',
+    composeFile: 'docker-compose.dev.yml',
+    service: 'postgres',
+  },
+  automatedTest: {
+    database: 'core_erp_test',
+    user: 'erp_test_user',
+    port: 5433,
+    container: 'coreerp-postgres-test',
+    volume: 'postgres_test_data',
+    composeFile: 'docker-compose.dev.yml',
+    service: 'postgres-test',
+  },
+  integrationTest: {
+    database: 'core_erp_integration_test',
+    user: 'erp_integration_user',
+    port: 5434,
+    container: 'coreerp-postgres-integration-test',
+    volume: 'postgres_integration_test_data',
+    composeFile: 'docker-compose.integration-test.yml',
+    service: 'postgres-integration-test',
+  },
+  staging: {
+    database: 'core_erp_staging',
+    user: 'erp_staging_user',
+    port: 5435,
+    container: 'coreerp-postgres-staging',
+    volume: 'postgres_staging_data',
+    composeFile: 'docker-compose.staging.yml',
+    service: 'postgres-staging',
+  },
+  shadow: {
+    database: 'core_erp_shadow',
+    user: 'erp_shadow_user',
+    port: 5436,
+    container: 'coreerp-postgres-shadow',
+    volume: 'postgres_shadow_data',
+    composeFile: 'docker-compose.dev.yml',
+    service: 'postgres-shadow',
+  },
+} as const;
+
+export const CANONICAL_STAGING_DB_NAME = COREERP_DB_ENVIRONMENTS.staging.database;
+export const CANONICAL_STAGING_DB_PORT = COREERP_DB_ENVIRONMENTS.staging.port;
+
+// Dedicated non-staging local database names that must NEVER be used as staging
+export const NON_STAGING_RESERVED_DB_NAMES = new Set([
+  'core_erp',
+  'core_erp_test',
+  'coreerp_test',
+  'core_erp_integration_test',
+  'core_erp_shadow',
+]);
+
+// Localhost ports reserved for non-staging environments (never allowed for staging verification)
+export const RESERVED_NON_STAGING_LOCAL_PORTS: ReadonlyMap<number, string> = new Map([
+  [5432, 'development (core_erp)'],
+  [5433, 'automated testing (core_erp_test)'],
+  [5434, 'integration testing (core_erp_integration_test)'],
+  [5436, 'Prisma shadow database (core_erp_shadow)'],
+]);
+
 // Explicitly approved standard test/staging database names
 export const APPROVED_STANDARD_NAMES = new Set([
   'core_erp_test',
@@ -86,6 +155,20 @@ export function normalizeHostname(rawHost: string): string {
     return '127.0.0.1';
   }
   return host;
+}
+
+/**
+ * Redacts sensitive credentials from database connection string for safe logging.
+ */
+export function sanitizeDatabaseUrl(url: string | undefined): string {
+  if (!url) return '[NOT_CONFIGURED]';
+  try {
+    const parsed = new URL(url);
+    const auth = parsed.username ? `${parsed.username}:*****@` : '';
+    return `${parsed.protocol}//${auth}${parsed.host}${parsed.pathname}`;
+  } catch {
+    return 'postgresql://*****:*****@***/***';
+  }
 }
 
 /**
@@ -253,9 +336,23 @@ export function validateDisposableDatabaseName(dbName: string): { valid: boolean
  * Validates whether a target connection string is safe and valid for staging verification.
  * Compares normalized endpoints against primary DATABASE_URL to prevent accidental production targeting.
  */
+export interface AdditionalProtectedUrls {
+  testDatabaseUrl?: string;
+  shadowDatabaseUrl?: string;
+}
+
+/**
+ * Validates whether a target connection string is safe and valid for staging verification.
+ * Enforces strict five-environment isolation:
+ * - Requires explicit STAGING_DATABASE_URL (never falls back to DATABASE_URL or TEST_DATABASE_URL).
+ * - Compares normalized endpoints against primary DATABASE_URL, TEST_DATABASE_URL, and SHADOW_DATABASE_URL.
+ * - Rejects test, integration, shadow, and production databases as well as reserved local non-staging ports.
+ * - Requires exclusive targeting of database "core_erp_staging".
+ */
 export function validateStagingDatabaseUrl(
   targetUrl?: string,
-  primaryDatabaseUrl?: string
+  primaryDatabaseUrl?: string,
+  additionalProtectedUrls?: AdditionalProtectedUrls
 ): StagingUrlValidationResult {
   // 1. Explicit target URL is strictly required
   if (!targetUrl || targetUrl.trim() === '') {
@@ -263,8 +360,8 @@ export function validateStagingDatabaseUrl(
       valid: false,
       error:
         'Refusing to run staging verification: No explicit staging database URL provided. ' +
-        'Set STAGING_DATABASE_URL or TEST_DATABASE_URL in environment or pass as argument. ' +
-        'Silent fallback to DATABASE_URL is strictly prohibited to prevent data loss.',
+        'Set STAGING_DATABASE_URL (targeting core_erp_staging on port 5435 via .env.staging). ' +
+        'Silent fallback to DATABASE_URL or TEST_DATABASE_URL is strictly prohibited to prevent cross-environment contamination.',
     };
   }
 
@@ -309,7 +406,34 @@ export function validateStagingDatabaseUrl(
     }
   }
 
-  // 5. Validate database name against disposable policy
+  // 4b. Compare against TEST_DATABASE_URL and SHADOW_DATABASE_URL when provided
+  if (additionalProtectedUrls?.testDatabaseUrl && additionalProtectedUrls.testDatabaseUrl.trim() !== '') {
+    const testEndpoint = normalizeDatabaseUrl(additionalProtectedUrls.testDatabaseUrl);
+    if (testEndpoint && areDatabaseEndpointsEqual(targetEndpoint, testEndpoint)) {
+      return {
+        valid: false,
+        error:
+          `Refusing to run staging verification: Target database resolves to the same endpoint as TEST_DATABASE_URL ` +
+          `(${targetEndpoint.hostname}:${targetEndpoint.port}/${targetEndpoint.database}). Never use the test database as the staging database.`,
+        databaseName: targetEndpoint.database,
+      };
+    }
+  }
+
+  if (additionalProtectedUrls?.shadowDatabaseUrl && additionalProtectedUrls.shadowDatabaseUrl.trim() !== '') {
+    const shadowEndpoint = normalizeDatabaseUrl(additionalProtectedUrls.shadowDatabaseUrl);
+    if (shadowEndpoint && areDatabaseEndpointsEqual(targetEndpoint, shadowEndpoint)) {
+      return {
+        valid: false,
+        error:
+          `Refusing to run staging verification: Target database resolves to the same endpoint as SHADOW_DATABASE_URL ` +
+          `(${targetEndpoint.hostname}:${targetEndpoint.port}/${targetEndpoint.database}). Never use the Prisma shadow database as the staging database.`,
+        databaseName: targetEndpoint.database,
+      };
+    }
+  }
+
+  // 5. Validate database name against disposable policy (blocks production, backups, clones, etc.)
   const nameValidation = validateDisposableDatabaseName(targetEndpoint.database);
   if (!nameValidation.valid) {
     return {
@@ -317,6 +441,42 @@ export function validateStagingDatabaseUrl(
       error: `Refusing to run staging verification: ${nameValidation.error}`,
       databaseName: targetEndpoint.database,
     };
+  }
+
+  // 6. Strictly reject test, integration, and shadow database names
+  if (NON_STAGING_RESERVED_DB_NAMES.has(targetEndpoint.database)) {
+    return {
+      valid: false,
+      error:
+        `Refusing to run staging verification: Database "${targetEndpoint.database}" is reserved for a non-staging environment. ` +
+        `Never use development, test, integration-test, or shadow databases as the staging database. Target "${CANONICAL_STAGING_DB_NAME}" exclusively.`,
+      databaseName: targetEndpoint.database,
+    };
+  }
+
+  // 7. Enforce exclusive staging database identity ("core_erp_staging")
+  if (targetEndpoint.database !== CANONICAL_STAGING_DB_NAME) {
+    return {
+      valid: false,
+      error:
+        `Refusing to run staging verification: STAGING_DATABASE_URL must target database "${CANONICAL_STAGING_DB_NAME}" exclusively ` +
+        `(received "${targetEndpoint.database}"). Run \`npm run db:setup\` to configure isolated staging on port ${CANONICAL_STAGING_DB_PORT}.`,
+      databaseName: targetEndpoint.database,
+    };
+  }
+
+  // 8. On loopback hosts, reject ports reserved for development (5432), test (5433), integration (5434), or shadow (5436)
+  if (targetEndpoint.hostname === '127.0.0.1') {
+    const reservedOwner = RESERVED_NON_STAGING_LOCAL_PORTS.get(targetEndpoint.port);
+    if (reservedOwner) {
+      return {
+        valid: false,
+        error:
+          `Refusing to run staging verification: Localhost port ${targetEndpoint.port} is reserved for ${reservedOwner}. ` +
+          `Staging PostgreSQL must use dedicated port ${CANONICAL_STAGING_DB_PORT} (docker-compose.staging.yml).`,
+        databaseName: targetEndpoint.database,
+      };
+    }
   }
 
   return {
@@ -613,7 +773,7 @@ export function getStagingVerificationSteps(
       step: 1,
       name: 'Safety & Environment Pre-Flight',
       description:
-        'Validate STAGING_DATABASE_URL or TEST_DATABASE_URL against disposable naming rules and primary DATABASE_URL without connecting or falling back to DATABASE_URL.',
+        'Validate STAGING_DATABASE_URL exclusively against core_erp_staging (port 5435 locally) and reject any collision or fallback to DATABASE_URL, TEST_DATABASE_URL, or SHADOW_DATABASE_URL without connecting.',
       critical: true,
     },
     {
