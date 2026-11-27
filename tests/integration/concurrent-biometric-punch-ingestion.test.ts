@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { PrismaClient } from '@prisma/client';
-import net from 'net';
 import crypto from 'crypto';
 import {
   configureIntegrationPrismaClient,
@@ -10,6 +9,14 @@ import {
   verifyDatabaseUrlConsistency,
 } from '../../src/server/db/client.js';
 import { BiometricService } from '../../src/server/services/biometric.service.js';
+import {
+  checkTcpPortReachable,
+  createIntegrationFixtureScope,
+  disconnectIntegrationClients,
+  IntegrationFixtureScope,
+  throwIfCleanupErrors,
+  validateIntegrationDatabaseTarget,
+} from '../helpers/integration-fixture-manager.js';
 
 /**
  * Real PostgreSQL 16 Concurrency Integration Test:
@@ -24,111 +31,43 @@ import { BiometricService } from '../../src/server/services/biometric.service.js
  *    with an explicit `[BLOCKED / NOT RUN]` diagnostic note — never falsely reporting PASS.
  * 4. Once localhost:5434 is reachable, never masks `$connect()`, authentication, missing database,
  *    missing migration/table, PostgreSQL version, or Prisma configuration errors.
+ * 5. Creates uniquely generated, test-owned fixtures (never fixed IDs or pre-test destructive cleanup),
+ *    and deletes only tracked test-owned records while surfacing any cleanup or disconnect failures.
  */
 describe('PostgreSQL 16 Concurrency Integration Test: Biometric Raw Punch Ingestion', () => {
-  const testDbUrl = process.env.TEST_DATABASE_URL?.trim().replace(/^["']|["']$/g, '');
-  const isIntegrationMode = process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
+  let validatedTestDbUrl: string | null = null;
   let blockedReason: string | null = null;
   let isDbConnected = false;
   let testPrisma: PrismaClient | null = null;
-
-  const testCompanyId = '00000000-0000-4000-a000-000000000095';
-  const testUserId = '00000000-0000-4000-a000-000000000096';
-  const testTerminalId = '00000000-0000-4000-a000-000000000094';
-
-  const cleanupTestData = async (client: PrismaClient, tolerateCleanupErrors = false) => {
-    const deleteOps = [
-      () => client.auditLog.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.rawPunchLog.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.companySetting.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.biometricTerminal.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.user.deleteMany({ where: { companyId: testCompanyId } }),
-      () => client.company.deleteMany({ where: { id: testCompanyId } }),
-    ];
-
-    for (const op of deleteOps) {
-      if (tolerateCleanupErrors) {
-        try {
-          await op();
-        } catch (err) {
-          console.warn('[INTEGRATION CLEANUP WARNING]', err);
-        }
-      } else {
-        await op();
-      }
-    }
-  };
-
-  const checkPortReachable = (
-    host: string,
-    port: number,
-    timeoutMs = 1000
-  ): Promise<{ reachable: boolean; code?: string }> => {
-    return new Promise((resolve) => {
-      const socket = new net.Socket();
-      let settled = false;
-      const finish = (result: { reachable: boolean; code?: string }) => {
-        if (!settled) {
-          settled = true;
-          socket.destroy();
-          resolve(result);
-        }
-      };
-
-      socket.setTimeout(timeoutMs);
-      socket.once('connect', () => finish({ reachable: true }));
-      socket.once('timeout', () => finish({ reachable: false, code: 'TIMEOUT' }));
-      socket.once('error', (err: NodeJS.ErrnoException) =>
-        finish({ reachable: false, code: err.code || 'SOCKET_ERROR' })
-      );
-      socket.connect(port, host);
-    });
-  };
+  const activeScopes: IntegrationFixtureScope[] = [];
 
   beforeAll(async () => {
-    if (!isIntegrationMode || !testDbUrl || testDbUrl === '') {
-      blockedReason =
-        '[BLOCKED / NOT RUN] Biometric PostgreSQL 16 integration test requires ' +
-        'COREERP_INTEGRATION_TEST_MODE=true and TEST_DATABASE_URL targeting localhost:5434/core_erp_integration_test.';
+    const target = validateIntegrationDatabaseTarget({
+      integrationMode: process.env.COREERP_INTEGRATION_TEST_MODE,
+      testDatabaseUrl: process.env.TEST_DATABASE_URL,
+      databaseUrl: process.env.DATABASE_URL,
+      suiteLabel: 'Biometric PostgreSQL 16 integration test',
+    });
+
+    if (target.status === 'blocked') {
+      blockedReason = target.reason;
       console.warn(`\n${blockedReason}\n`);
       return;
     }
 
-    let parsed: URL;
-    try {
-      parsed = new URL(testDbUrl);
-    } catch {
-      throw new Error('[SECURITY FATAL] Invalid database URL format for TEST_DATABASE_URL.');
-    }
-
-    if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
-      throw new Error('[SECURITY FATAL] Forbidden database protocol in TEST_DATABASE_URL.');
-    }
-    const hostname = parsed.hostname.toLowerCase();
-    if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
-      throw new Error('[SECURITY FATAL] Integration test refused: unapproved host in TEST_DATABASE_URL.');
-    }
-    if (parsed.port !== '5434') {
-      throw new Error('[SECURITY FATAL] Integration test refused: port must be explicitly 5434.');
-    }
-    const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
-    if (dbName !== 'core_erp_integration_test') {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: database name must be core_erp_integration_test.'
-      );
-    }
-
-    const probe = await checkPortReachable(hostname, 5434);
+    const probe = await checkTcpPortReachable(target.host, target.port);
     if (!probe.reachable) {
       blockedReason =
-        `[BLOCKED / NOT RUN] PostgreSQL 16 integration endpoint is unreachable at ${hostname}:5434 ` +
+        `[BLOCKED / NOT RUN] PostgreSQL 16 integration endpoint is unreachable at ${target.host}:${target.port} ` +
         `(${probe.code || 'UNREACHABLE'}). No integration assertions were executed.`;
       console.warn(`\n${blockedReason}\n`);
       return;
     }
 
+    validatedTestDbUrl = target.cleanedUrl;
+
     // Endpoint is reachable: do NOT catch or downgrade $connect(), auth, missing DB, schema, or config errors.
-    testPrisma = configureIntegrationPrismaClient(testDbUrl);
+    testPrisma = configureIntegrationPrismaClient(target.cleanedUrl);
     await testPrisma.$connect();
 
     const versionRows = await testPrisma.$queryRaw<Array<{ version: string }>>`SELECT version() AS version`;
@@ -151,18 +90,25 @@ describe('PostgreSQL 16 Concurrency Integration Test: Biometric Raw Punch Ingest
   });
 
   afterAll(async () => {
+    const cleanupErrors: string[] = [];
     try {
       if (testPrisma && isDbConnected) {
-        await cleanupTestData(testPrisma, true);
+        for (const scope of activeScopes) {
+          if (scope.hasTrackedRecords()) {
+            const scopeErrors = await scope.cleanup(testPrisma, { returnErrors: true });
+            cleanupErrors.push(...scopeErrors);
+          }
+        }
       }
     } finally {
-      if (testPrisma) {
-        try {
-          await testPrisma.$disconnect();
-        } catch {}
-      }
+      const disconnectErrors = await disconnectIntegrationClients([
+        { label: 'testPrisma', client: testPrisma },
+      ]);
+      cleanupErrors.push(...disconnectErrors);
       resetPrismaClientForTesting();
     }
+
+    throwIfCleanupErrors(cleanupErrors, 'concurrent-biometric-punch-ingestion');
   });
 
   it('should deduplicate concurrent identical raw punch batches atomically on PostgreSQL 16', async (ctx) => {
@@ -172,7 +118,7 @@ describe('PostgreSQL 16 Concurrency Integration Test: Biometric Raw Punch Ingest
       ctx.skip(blockedReason);
     }
 
-    if (!isDbConnected || !testPrisma) {
+    if (!isDbConnected || !testPrisma || !validatedTestDbUrl) {
       throw new Error(
         '[INTEGRATION TEST INVARIANT ERROR] Database connection state inconsistent without blockedReason.'
       );
@@ -186,10 +132,10 @@ describe('PostgreSQL 16 Concurrency Integration Test: Biometric Raw Punch Ingest
 
     const configuredEngineUrl = (testPrisma as any)._engineConfig?.overrideDatasources?.db?.url;
     const proxiedEngineUrl = (prisma as any)._engineConfig?.overrideDatasources?.db?.url;
-    expect(configuredEngineUrl).toBe(testDbUrl);
-    expect(proxiedEngineUrl).toBe(testDbUrl);
+    expect(configuredEngineUrl).toBe(validatedTestDbUrl);
+    expect(proxiedEngineUrl).toBe(validatedTestDbUrl);
 
-    const urlConsistency = verifyDatabaseUrlConsistency(testDbUrl!, prisma);
+    const urlConsistency = verifyDatabaseUrlConsistency(validatedTestDbUrl, prisma);
     expect(urlConsistency.consistent).toBe(true);
     expect(urlConsistency.portMatch).toBe(true);
     expect(urlConsistency.databaseMatch).toBe(true);
@@ -208,95 +154,92 @@ describe('PostgreSQL 16 Concurrency Integration Test: Biometric Raw Punch Ingest
       expect([5432, 5434]).toContain(liveDbCheck[0].server_port);
     }
 
-    await cleanupTestData(testPrisma);
+    const fixtures = createIntegrationFixtureScope('BIOINT', 'biometric-punch-ingestion');
+    activeScopes.push(fixtures);
 
-    await testPrisma.company.create({
-      data: {
-        id: testCompanyId,
-        code: 'BIOINT95',
-        name: 'Biometric Integration Co',
+    try {
+      const company = await fixtures.createCompany(testPrisma, {
+        name: `Biometric Integration Co ${fixtures.tokens.runToken}`,
         currency: 'USD',
         timezone: 'UTC',
-      },
-    });
+      });
 
-    await testPrisma.user.create({
-      data: {
-        id: testUserId,
-        companyId: testCompanyId,
-        email: 'bio-int-admin@coreerp.local',
+      const user = await fixtures.createUser(testPrisma, {
+        companyId: company.id,
         fullName: 'Integration Admin',
         passwordHash: 'not-used-in-test',
         role: 'ADMIN',
         isActive: true,
-      },
-    });
+      });
 
-    const apiKeyHash = crypto.createHash('sha256').update('bio_int_test_key').digest('hex');
-    const terminal = await testPrisma.biometricTerminal.create({
-      data: {
-        id: testTerminalId,
-        companyId: testCompanyId,
-        deviceSerialNumber: 'INT-X2008-01',
+      const apiKeyHash = crypto
+        .createHash('sha256')
+        .update(`bio_int_test_key_${fixtures.tokens.terminalId}`)
+        .digest('hex');
+
+      const terminal = await fixtures.createBiometricTerminal(testPrisma, {
+        companyId: company.id,
         name: 'Integration Gate',
         terminalModel: 'eSSL X2008',
         apiKeyHash,
         apiKeyPrefix: 'bio_int_',
-        registeredByUserId: testUserId,
+        registeredByUserId: user.id,
         isActive: true,
-      },
-    });
+      });
 
-    const getCurrentUtcDayStart = (now = new Date()): Date =>
-      new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
-    const currentUtcDayStart = getCurrentUtcDayStart();
+      const getCurrentUtcDayStart = (now = new Date()): Date =>
+        new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+      const currentUtcDayStart = getCurrentUtcDayStart();
 
-    const batchPayload = {
-      punches: [
-        {
-          devicePunchId: 'int-concurrent-p1',
-          userEnrollmentId: '101',
-          punchTime: new Date(currentUtcDayStart.getTime() + 60_000).toISOString(),
-        },
-        {
-          devicePunchId: 'int-concurrent-p2',
-          userEnrollmentId: '102',
-          punchTime: new Date(currentUtcDayStart.getTime() + 120_000).toISOString(),
-        },
-      ],
-    };
+      const batchPayload = {
+        punches: [
+          {
+            devicePunchId: `int-concurrent-p1-${fixtures.tokens.runToken}`,
+            userEnrollmentId: '101',
+            punchTime: new Date(currentUtcDayStart.getTime() + 60_000).toISOString(),
+          },
+          {
+            devicePunchId: `int-concurrent-p2-${fixtures.tokens.runToken}`,
+            userEnrollmentId: '102',
+            punchTime: new Date(currentUtcDayStart.getTime() + 120_000).toISOString(),
+          },
+        ],
+      };
 
-    // Instrument the dedicated `testPrisma` instance with pass-through spies (no mocking)
-    // to prove BiometricService.ingestPunches() executes real queries directly against testPrisma.
-    const findManySpy = vi.spyOn(testPrisma.rawPunchLog, 'findMany');
-    const transactionSpy = vi.spyOn(testPrisma, '$transaction');
-    const settingFindUniqueSpy = vi.spyOn(testPrisma.companySetting, 'findUnique');
-    const settingUpsertSpy = vi.spyOn(testPrisma.companySetting, 'upsert');
+      // Instrument the dedicated `testPrisma` instance with pass-through spies (no mocking)
+      // to prove BiometricService.ingestPunches() executes real queries directly against testPrisma.
+      const findManySpy = vi.spyOn(testPrisma.rawPunchLog, 'findMany');
+      const transactionSpy = vi.spyOn(testPrisma, '$transaction');
+      const settingFindUniqueSpy = vi.spyOn(testPrisma.companySetting, 'findUnique');
+      const settingUpsertSpy = vi.spyOn(testPrisma.companySetting, 'upsert');
 
-    try {
-      const [resA, resB] = await Promise.all([
-        BiometricService.ingestPunches(terminal, batchPayload),
-        BiometricService.ingestPunches(terminal, batchPayload),
-      ]);
+      try {
+        const [resA, resB] = await Promise.all([
+          BiometricService.ingestPunches(terminal, batchPayload),
+          BiometricService.ingestPunches(terminal, batchPayload),
+        ]);
 
-      expect(resA.inserted + resB.inserted).toBe(2);
-      expect(resA.duplicates + resB.duplicates).toBe(2);
+        expect(resA.inserted + resB.inserted).toBe(2);
+        expect(resA.duplicates + resB.duplicates).toBe(2);
 
-      // Verify BiometricService routed its real Prisma operations through `testPrisma`
-      expect(findManySpy).toHaveBeenCalledTimes(2);
-      expect(transactionSpy.mock.calls.length).toBeGreaterThanOrEqual(1);
-      expect(settingFindUniqueSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
-      expect(settingUpsertSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+        // Verify BiometricService routed its real Prisma operations through `testPrisma`
+        expect(findManySpy).toHaveBeenCalledTimes(2);
+        expect(transactionSpy.mock.calls.length).toBeGreaterThanOrEqual(1);
+        expect(settingFindUniqueSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+        expect(settingUpsertSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+      } finally {
+        findManySpy.mockRestore();
+        transactionSpy.mockRestore();
+        settingFindUniqueSpy.mockRestore();
+        settingUpsertSpy.mockRestore();
+      }
+
+      const persistedCount = await testPrisma.rawPunchLog.count({
+        where: { companyId: company.id, terminalId: terminal.id },
+      });
+      expect(persistedCount).toBe(2);
     } finally {
-      findManySpy.mockRestore();
-      transactionSpy.mockRestore();
-      settingFindUniqueSpy.mockRestore();
-      settingUpsertSpy.mockRestore();
+      await fixtures.cleanup(testPrisma);
     }
-
-    const persistedCount = await testPrisma.rawPunchLog.count({
-      where: { companyId: testCompanyId, terminalId: testTerminalId },
-    });
-    expect(persistedCount).toBe(2);
   });
 });

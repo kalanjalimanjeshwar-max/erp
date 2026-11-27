@@ -7,7 +7,14 @@ import {
 import { CompanyBankAccountService } from '../../src/server/services/company-bank-account.service.js';
 import { EncryptionService } from '../../src/server/security/encryption.service.js';
 import { AuthUser } from '../../src/shared/types.js';
-import net from 'net';
+import {
+  checkTcpPortReachable,
+  createIntegrationFixtureScope,
+  disconnectIntegrationClients,
+  IntegrationFixtureScope,
+  throwIfCleanupErrors,
+  validateIntegrationDatabaseTarget,
+} from '../helpers/integration-fixture-manager.js';
 
 /**
  * Real PostgreSQL 16 Concurrency Integration Test:
@@ -22,166 +29,57 @@ import net from 'net';
  *    - "CompanyBankAccount_companyId_default_unique" index prevents duplicate active defaults.
  *    - Competing concurrent update maps constraint failure (23505 / P2002) to HTTP 409 Conflict.
  *    - Final committed state contains strictly one active default account per company.
+ * 5. Creates uniquely generated, test-owned fixtures (never fixed IDs or upsert reuse), never
+ *    performs destructive pre-test cleanup, and deletes only tracked test-owned records while
+ *    surfacing any cleanup or disconnect failures.
  */
 
 describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switching', () => {
-  const testDbUrl = process.env.TEST_DATABASE_URL?.trim().replace(/^["']|["']$/g, '');
-  const isIntegrationMode = process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
   let blockedReason: string | null = null;
   let isDbConnected = false;
   let testPrisma1: PrismaClient | null = null;
   let testPrisma2: PrismaClient | null = null;
-
-  const testCompanyId = '00000000-0000-4000-a000-000000000099';
-  const testUserId = '00000000-0000-4000-a000-000000000001';
-  const testActor: AuthUser = {
-    id: testUserId,
-    userId: testUserId,
-    companyId: testCompanyId,
-    email: 'integration-test-user@coreerp.local',
-    fullName: 'Integration Test Admin',
-    role: 'ADMIN',
-    isActive: true,
-    tokenVersion: 1,
-  };
-
-  const cleanupTestData = async (client: PrismaClient) => {
-    try {
-      await client.auditLog.deleteMany({ where: { companyId: testCompanyId } });
-    } catch {}
-    try {
-      await client.companyBankAccount.deleteMany({ where: { companyId: testCompanyId } });
-    } catch {}
-    try {
-      await client.user.deleteMany({ where: { companyId: testCompanyId } });
-    } catch {}
-    try {
-      await client.company.deleteMany({ where: { id: testCompanyId } });
-    } catch {}
-  };
-
-  // Helper to test if TCP port is reachable before attempting Prisma connection
-  const checkPortReachable = (
-    host: string,
-    port: number,
-    timeoutMs = 1000
-  ): Promise<{ reachable: boolean; code?: string }> => {
-    return new Promise((resolve) => {
-      const socket = new net.Socket();
-      let settled = false;
-      const finish = (result: { reachable: boolean; code?: string }) => {
-        if (!settled) {
-          settled = true;
-          socket.destroy();
-          resolve(result);
-        }
-      };
-
-      socket.setTimeout(timeoutMs);
-      socket.once('connect', () => finish({ reachable: true }));
-      socket.once('timeout', () => finish({ reachable: false, code: 'TIMEOUT' }));
-      socket.once('error', (err: NodeJS.ErrnoException) =>
-        finish({ reachable: false, code: err.code || 'SOCKET_ERROR' })
-      );
-      socket.connect(port, host);
-    });
-  };
+  const activeScopes: IntegrationFixtureScope[] = [];
 
   beforeAll(async () => {
-    // 1. Require explicit integration mode AND a configured TEST_DATABASE_URL
-    if (!isIntegrationMode || !testDbUrl) {
-      blockedReason =
-        '[BLOCKED / NOT RUN] PostgreSQL 16 concurrency integration test requires explicit ' +
-        'COREERP_INTEGRATION_TEST_MODE=true and TEST_DATABASE_URL targeting localhost:5434/core_erp_integration_test.';
+    // 1. Strictly validate integration mode, unset DATABASE_URL, and dedicated localhost:5434/core_erp_integration_test target
+    const target = validateIntegrationDatabaseTarget({
+      integrationMode: process.env.COREERP_INTEGRATION_TEST_MODE,
+      testDatabaseUrl: process.env.TEST_DATABASE_URL,
+      databaseUrl: process.env.DATABASE_URL,
+      suiteLabel: 'PostgreSQL 16 concurrency integration test',
+    });
+
+    if (target.status === 'blocked') {
+      blockedReason = target.reason;
       console.warn(
         `\n${blockedReason}` +
-        '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
-        '\n  1. Start container: docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d' +
-        '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
-        '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency\n'
+          '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
+          '\n  1. Start container: docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d' +
+          '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
+          '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency\n'
       );
       return;
     }
 
-    // 2. Reject ANY defined DATABASE_URL in integration mode to prevent split-brain routing
-    if (process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== '') {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: Conflicting DATABASE_URL detected in integration test mode. DATABASE_URL must remain unset.'
-      );
-    }
-
-    // 3. Parse URL and strictly enforce dedicated database endpoint
-    let parsed: URL;
-    try {
-      parsed = new URL(testDbUrl);
-    } catch {
-      throw new Error('[SECURITY FATAL] Invalid database URL format for TEST_DATABASE_URL.');
-    }
-
-    const protocol = parsed.protocol;
-    if (protocol !== 'postgresql:' && protocol !== 'postgres:') {
-      throw new Error(
-        '[SECURITY FATAL] Forbidden database protocol in TEST_DATABASE_URL. PostgreSQL is required.'
-      );
-    }
-
-    const host = parsed.hostname;
-    if (host !== 'localhost' && host !== '127.0.0.1') {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: Unapproved host in TEST_DATABASE_URL. Remote and production hosts are strictly forbidden. Expected localhost or 127.0.0.1.'
-      );
-    }
-
-    const port = parseInt(parsed.port, 10);
-    if (port !== 5434) {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: Dedicated integration test must run on port 5434.'
-      );
-    }
-
-    const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
-
-    // Reject protected, development, test, and production database names
-    const forbiddenNames = [
-      'core_erp',
-      'core_erp_dev',
-      'core_erp_prod',
-      'core_erp_test',
-      'postgres',
-      'production',
-      'development',
-    ];
-    if (forbiddenNames.includes(dbName.toLowerCase())) {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: Target database matches a protected development, test, or production database.'
-      );
-    }
-
-    // Strictly enforce dedicated database name: core_erp_integration_test
-    if (dbName !== 'core_erp_integration_test') {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: Dedicated database name must strictly be "core_erp_integration_test".'
-      );
-    }
-
-    const probe = await checkPortReachable(host, port);
+    const probe = await checkTcpPortReachable(target.host, target.port);
     if (!probe.reachable) {
       blockedReason =
-        `[BLOCKED / NOT RUN] PostgreSQL 16 integration database is unreachable at ${host}:${port} ` +
+        `[BLOCKED / NOT RUN] PostgreSQL 16 integration database is unreachable at ${target.host}:${target.port} ` +
         `(${probe.code || 'UNREACHABLE'}).`;
       console.warn(
         `\n${blockedReason}` +
-        '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
-        '\n  1. Start container: docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d' +
-        '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
-        '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency\n'
+          '\nTo run live concurrency tests against PostgreSQL 16 on Windows/Docker:' +
+          '\n  1. Start container: docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d' +
+          '\n  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy' +
+          '\n  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:concurrency\n'
       );
       return;
     }
 
     // Endpoint is reachable: do NOT catch or downgrade $connect(), auth, missing DB, PG version, identity, or Prisma errors.
-    testPrisma1 = configureIntegrationPrismaClient(testDbUrl);
-    testPrisma2 = new PrismaClient({ datasources: { db: { url: testDbUrl } } });
+    testPrisma1 = configureIntegrationPrismaClient(target.cleanedUrl);
+    testPrisma2 = new PrismaClient({ datasources: { db: { url: target.cleanedUrl } } });
     await testPrisma1.$connect();
     await testPrisma2.$connect();
     expect(process.env.DATABASE_URL).toBeUndefined();
@@ -223,23 +121,26 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
   });
 
   afterAll(async () => {
+    const cleanupErrors: string[] = [];
     try {
       if (testPrisma1 && isDbConnected) {
-        await cleanupTestData(testPrisma1);
+        for (const scope of activeScopes) {
+          if (scope.hasTrackedRecords()) {
+            const scopeErrors = await scope.cleanup(testPrisma1, { returnErrors: true });
+            cleanupErrors.push(...scopeErrors);
+          }
+        }
       }
     } finally {
-      if (testPrisma1) {
-        try {
-          await testPrisma1.$disconnect();
-        } catch {}
-      }
-      if (testPrisma2) {
-        try {
-          await testPrisma2.$disconnect();
-        } catch {}
-      }
+      const disconnectErrors = await disconnectIntegrationClients([
+        { label: 'testPrisma1', client: testPrisma1 },
+        { label: 'testPrisma2', client: testPrisma2 },
+      ]);
+      cleanupErrors.push(...disconnectErrors);
       resetPrismaClientForTesting();
     }
+
+    throwIfCleanupErrors(cleanupErrors, 'concurrent-bank-account-default');
   });
 
   it('should enforce exactly one active default bank account under real concurrent switching', async (ctx) => {
@@ -258,101 +159,99 @@ describe('PostgreSQL 16 Concurrency Integration Test: Default Bank Account Switc
     // Initialize encryption service for test session
     EncryptionService.init();
 
-    // Clean up any stale data from previous aborted test runs
-    await cleanupTestData(testPrisma1);
+    const fixtures = createIntegrationFixtureScope('CONC', 'bank-account-default-concurrency');
+    activeScopes.push(fixtures);
 
-    // Setup: Create test company, test user actor, and two active accounts
-    await testPrisma1.company.upsert({
-      where: { id: testCompanyId },
-      update: {},
-      create: {
-        id: testCompanyId,
-        name: 'Concurrency Test Corp',
-        code: 'CONC',
+    try {
+      // Setup: Create uniquely identified, test-owned company, user actor, and two active accounts
+      const company = await fixtures.createCompany(testPrisma1, {
+        name: `Concurrency Test Corp ${fixtures.tokens.runToken}`,
         currency: 'USD',
         timezone: 'UTC',
-      },
-    });
+      });
 
-    await testPrisma1.user.upsert({
-      where: { id: testUserId },
-      update: {},
-      create: {
-        id: testUserId,
-        companyId: testCompanyId,
-        email: 'integration-test-user@coreerp.local',
+      const user = await fixtures.createUser(testPrisma1, {
+        companyId: company.id,
         fullName: 'Integration Test Admin',
         role: 'ADMIN',
         isActive: true,
-        passwordHash: '$2a$10$abcdefghijklmnopqrstuuNOPASSWORDHASHFORTESTONLY123456',
-      },
-    });
+      });
 
-    const encAcc1 = EncryptionService.encrypt('1111222233334444')!;
-    const encAcc2 = EncryptionService.encrypt('5555666677778888')!;
+      const testActor: AuthUser = {
+        id: user.id,
+        userId: user.id,
+        companyId: company.id,
+        email: user.email,
+        fullName: 'Integration Test Admin',
+        role: 'ADMIN',
+        isActive: true,
+        tokenVersion: 1,
+      };
 
-    const acc1 = await testPrisma1.companyBankAccount.create({
-      data: {
-        companyId: testCompanyId,
+      const encAcc1 = EncryptionService.encrypt('1111222233334444')!;
+      const encAcc2 = EncryptionService.encrypt('5555666677778888')!;
+
+      const acc1 = await fixtures.createCompanyBankAccount(testPrisma1, {
+        companyId: company.id,
         bankName: 'Concurrent Bank Alpha',
-        accountHolderName: 'Concurrency Test Corp',
+        accountHolderName: company.name,
         accountNumber: encAcc1,
         isDefault: false,
         isActive: true,
-      },
-    });
+      });
 
-    const acc2 = await testPrisma1.companyBankAccount.create({
-      data: {
-        companyId: testCompanyId,
+      const acc2 = await fixtures.createCompanyBankAccount(testPrisma1, {
+        companyId: company.id,
         bankName: 'Concurrent Bank Beta',
-        accountHolderName: 'Concurrency Test Corp',
+        accountHolderName: company.name,
         accountNumber: encAcc2,
         isDefault: false,
         isActive: true,
-      },
-    });
+      });
 
-    // Fire two competing transactions concurrently to set both as default
-    const [res1, res2] = await Promise.allSettled([
-      CompanyBankAccountService.setDefaultAccount(testActor, acc1.id),
-      CompanyBankAccountService.setDefaultAccount(testActor, acc2.id),
-    ]);
+      // Fire two competing transactions concurrently to set both as default
+      const [res1, res2] = await Promise.allSettled([
+        CompanyBankAccountService.setDefaultAccount(testActor, acc1.id),
+        CompanyBankAccountService.setDefaultAccount(testActor, acc2.id),
+      ]);
 
-    // One must succeed, while the competing concurrent update encounters conflict (or handles gracefully)
-    const successCount = [res1, res2].filter((r) => r.status === 'fulfilled').length;
-    const rejectedCount = [res1, res2].filter((r) => r.status === 'rejected').length;
+      // One must succeed, while the competing concurrent update encounters conflict (or handles gracefully)
+      const successCount = [res1, res2].filter((r) => r.status === 'fulfilled').length;
+      const rejectedCount = [res1, res2].filter((r) => r.status === 'rejected').length;
 
-    if (successCount === 0) {
-      const formatRejection = (res: PromiseSettledResult<any>, idx: number) => {
-        if (res.status === 'rejected') {
-          const reason = res.reason;
-          return `Op ${idx}: code=${reason?.code || 'N/A'}, status=${reason?.statusCode || 'N/A'}, message=${reason?.message || reason}`;
-        }
-        return `Op ${idx}: fulfilled`;
-      };
-      console.error(
-        `[CONCURRENCY TEST FAILURE] Both competing operations rejected:\n  ${formatRejection(res1, 1)}\n  ${formatRejection(res2, 2)}`
-      );
+      if (successCount === 0) {
+        const formatRejection = (res: PromiseSettledResult<any>, idx: number) => {
+          if (res.status === 'rejected') {
+            const reason = res.reason;
+            return `Op ${idx}: code=${reason?.code || 'N/A'}, status=${reason?.statusCode || 'N/A'}, message=${reason?.message || reason}`;
+          }
+          return `Op ${idx}: fulfilled`;
+        };
+        console.error(
+          `[CONCURRENCY TEST FAILURE] Both competing operations rejected:\n  ${formatRejection(res1, 1)}\n  ${formatRejection(res2, 2)}`
+        );
+      }
+
+      expect(successCount).toBeGreaterThanOrEqual(1);
+
+      if (rejectedCount > 0) {
+        const rejected = [res1, res2].find((r) => r.status === 'rejected') as PromiseRejectedResult;
+        expect((rejected.reason as { statusCode?: number })?.statusCode).toBe(409);
+      }
+
+      // Verify database invariant: Exactly ONE default account can be active in the real PostgreSQL table
+      const defaultAccounts = await testPrisma1.companyBankAccount.findMany({
+        where: {
+          companyId: company.id,
+          isDefault: true,
+          isActive: true,
+        },
+      });
+
+      expect(defaultAccounts.length).toBe(1);
+      expect([acc1.id, acc2.id]).toContain(defaultAccounts[0].id);
+    } finally {
+      await fixtures.cleanup(testPrisma1);
     }
-
-    expect(successCount).toBeGreaterThanOrEqual(1);
-
-    if (rejectedCount > 0) {
-      const rejected = [res1, res2].find((r) => r.status === 'rejected') as PromiseRejectedResult;
-      expect((rejected.reason as { statusCode?: number })?.statusCode).toBe(409);
-    }
-
-    // Verify database invariant: Exactly ONE default account can be active in the real PostgreSQL table
-    const defaultAccounts = await testPrisma1.companyBankAccount.findMany({
-      where: {
-        companyId: testCompanyId,
-        isDefault: true,
-        isActive: true,
-      },
-    });
-
-    expect(defaultAccounts.length).toBe(1);
-    expect([acc1.id, acc2.id]).toContain(defaultAccounts[0].id);
   });
 });

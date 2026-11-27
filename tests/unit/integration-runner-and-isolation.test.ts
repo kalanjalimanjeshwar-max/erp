@@ -657,27 +657,32 @@ describe('Cross-Platform Integration Runner & Vitest DB-Free Isolation Safety (D
     ];
 
     it.each(legacySuites)(
-      '%s gates strictly on COREERP_INTEGRATION_TEST_MODE === true, skips with BLOCKED / NOT RUN, rejects any defined DATABASE_URL, and asserts DATABASE_URL remains undefined without silent post-hoc deletion',
+      '%s gates strictly on COREERP_INTEGRATION_TEST_MODE === true, skips with BLOCKED / NOT RUN, rejects any defined DATABASE_URL via shared target validation, and asserts DATABASE_URL remains undefined without silent post-hoc deletion',
       (relativePath) => {
         const source = fs.readFileSync(path.resolve(process.cwd(), relativePath), 'utf-8');
+        const helperSource = fs.readFileSync(
+          path.resolve(process.cwd(), 'tests/helpers/integration-fixture-manager.ts'),
+          'utf-8'
+        );
 
-        // Explicit opt-in gate & normalized TEST_DATABASE_URL
-        expect(source).toContain("process.env.COREERP_INTEGRATION_TEST_MODE === 'true'");
-        expect(source).toMatch(/if \(!isIntegrationMode \|\| !testDbUrl\)/);
+        // Delegates integration target validation to the shared safety helper with explicit env inputs
+        expect(source).toContain('validateIntegrationDatabaseTarget({');
+        expect(source).toContain('integrationMode: process.env.COREERP_INTEGRATION_TEST_MODE');
+        expect(source).toContain('testDatabaseUrl: process.env.TEST_DATABASE_URL');
+        expect(source).toContain('databaseUrl: process.env.DATABASE_URL');
 
         // Safe skip behavior using BLOCKED / NOT RUN and ctx.skip
         expect(source).toContain('[BLOCKED / NOT RUN]');
         expect(source).toContain('ctx.skip(blockedReason)');
 
-        // Rejects ANY defined DATABASE_URL in integration mode
-        expect(source).toMatch(
-          /if \(process\.env\.DATABASE_URL && process\.env\.DATABASE_URL\.trim\(\) !== ''\)/
-        );
+        // Shared validator enforces explicit opt-in, unset DATABASE_URL, protocol, localhost/127.0.0.1, port 5434, and database name
+        expect(helperSource).toContain("input.integrationMode === 'true'");
+        expect(helperSource).toContain("if (input.databaseUrl && input.databaseUrl.trim() !== '')");
+        expect(helperSource).toContain("APPROVED_INTEGRATION_HOSTS = new Set(['localhost', '127.0.0.1'])");
+        expect(helperSource).toContain('INTEGRATION_TEST_PORT = 5434');
+        expect(helperSource).toContain("INTEGRATION_TEST_DB_NAME = 'core_erp_integration_test'");
 
-        // Preserves strict protocol, localhost/127.0.0.1, port 5434, database name, PG 16, and current_database() guards
-        expect(source).toContain('port !== 5434');
-        expect(source).toContain("dbName !== 'core_erp_integration_test'");
-        expect(source).toContain("host !== 'localhost' && host !== '127.0.0.1'");
+        // Preserves strict PG 16 and current_database() runtime guards
         expect(source).toContain('/PostgreSQL\\s+16\\b/i');
         expect(source).toContain('SELECT current_database() AS db_name;');
 

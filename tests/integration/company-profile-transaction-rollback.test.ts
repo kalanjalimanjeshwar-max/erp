@@ -1,6 +1,5 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { PrismaClient } from '@prisma/client';
-import net from 'net';
 import crypto from 'crypto';
 import {
   configureIntegrationPrismaClient,
@@ -14,6 +13,13 @@ import {
   PERMITTED_MONTHLY_LEAVE_ALLOWANCES_SETTING_KEY,
 } from '../../src/server/services/company.service.js';
 import { AuthUser } from '../../src/shared/types.js';
+import {
+  checkTcpPortReachable,
+  disconnectIntegrationClients,
+  runOwnedCleanupSteps,
+  throwIfCleanupErrors,
+  validateIntegrationDatabaseTarget,
+} from '../helpers/integration-fixture-manager.js';
 
 /**
  * Real PostgreSQL 16 Integration Test Suite:
@@ -33,8 +39,7 @@ import { AuthUser } from '../../src/shared/types.js';
  *    foreign-key order.
  */
 describe('PostgreSQL 16 Integration Test: CompanyService.updateProfile Transaction Rollback', () => {
-  const testDbUrl = process.env.TEST_DATABASE_URL?.trim().replace(/^["']|["']$/g, '');
-  const isIntegrationMode = process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
+  let validatedTestDbUrl: string | null = null;
   let blockedReason: string | null = null;
   let isDbConnected = false;
   let testPrisma: PrismaClient | null = null;
@@ -43,29 +48,21 @@ describe('PostgreSQL 16 Integration Test: CompanyService.updateProfile Transacti
 
   const cleanupCompanyFixtures = async (
     client: PrismaClient,
-    companyId: string,
-    tolerateCleanupErrors = false
-  ) => {
-    const deleteOps = [
-      () => client.auditLog.deleteMany({ where: { companyId } }),
-      () => client.companySettingsChangeRequest.deleteMany({ where: { companyId } }),
-      () => client.companySetting.deleteMany({ where: { companyId } }),
-      () => client.user.deleteMany({ where: { companyId } }),
-      () => client.company.deleteMany({ where: { id: companyId } }),
-    ];
-
-    for (const op of deleteOps) {
-      if (tolerateCleanupErrors) {
-        try {
-          await op();
-        } catch (err) {
-          console.warn('[INTEGRATION CLEANUP WARNING]', err);
-        }
-      } else {
-        await op();
-      }
-    }
-  };
+    companyId: string
+  ): Promise<string[]> =>
+    runOwnedCleanupSteps(`companyId=${companyId}`, [
+      { label: 'auditLog', run: () => client.auditLog.deleteMany({ where: { companyId } }) },
+      {
+        label: 'companySettingsChangeRequest',
+        run: () => client.companySettingsChangeRequest.deleteMany({ where: { companyId } }),
+      },
+      {
+        label: 'companySetting',
+        run: () => client.companySetting.deleteMany({ where: { companyId } }),
+      },
+      { label: 'user', run: () => client.user.deleteMany({ where: { companyId } }) },
+      { label: 'company', run: () => client.company.deleteMany({ where: { id: companyId } }) },
+    ]);
 
   const seedCompanyFixture = async (client: PrismaClient, initialName: string) => {
     const companyId = crypto.randomUUID();
@@ -111,32 +108,6 @@ describe('PostgreSQL 16 Integration Test: CompanyService.updateProfile Transacti
     return { companyId, userId, actor };
   };
 
-  const checkPortReachable = (
-    host: string,
-    port: number,
-    timeoutMs = 1000
-  ): Promise<{ reachable: boolean; code?: string }> => {
-    return new Promise((resolve) => {
-      const socket = new net.Socket();
-      let settled = false;
-      const finish = (result: { reachable: boolean; code?: string }) => {
-        if (!settled) {
-          settled = true;
-          socket.destroy();
-          resolve(result);
-        }
-      };
-
-      socket.setTimeout(timeoutMs);
-      socket.once('connect', () => finish({ reachable: true }));
-      socket.once('timeout', () => finish({ reachable: false, code: 'TIMEOUT' }));
-      socket.once('error', (err: NodeJS.ErrnoException) =>
-        finish({ reachable: false, code: err.code || 'SOCKET_ERROR' })
-      );
-      socket.connect(port, host);
-    });
-  };
-
   const assertDatabaseSafety = async (ctx: {
     annotate: (message: string, type?: string) => Promise<unknown>;
     skip: (note?: string) => never;
@@ -147,7 +118,7 @@ describe('PostgreSQL 16 Integration Test: CompanyService.updateProfile Transacti
       ctx.skip(blockedReason);
     }
 
-    if (!isDbConnected || !testPrisma) {
+    if (!isDbConnected || !testPrisma || !validatedTestDbUrl) {
       throw new Error(
         '[INTEGRATION TEST INVARIANT ERROR] Database connection state inconsistent without blockedReason.'
       );
@@ -158,7 +129,7 @@ describe('PostgreSQL 16 Integration Test: CompanyService.updateProfile Transacti
     expect(getPrismaClient()).toBe(testPrisma);
     expect(global.__prismaClient).toBe(testPrisma);
 
-    const urlConsistency = verifyDatabaseUrlConsistency(testDbUrl!, prisma);
+    const urlConsistency = verifyDatabaseUrlConsistency(validatedTestDbUrl, prisma);
     expect(urlConsistency.consistent).toBe(true);
     expect(urlConsistency.portMatch).toBe(true);
     expect(urlConsistency.databaseMatch).toBe(true);
@@ -172,57 +143,30 @@ describe('PostgreSQL 16 Integration Test: CompanyService.updateProfile Transacti
   };
 
   beforeAll(async () => {
-    if (!isIntegrationMode || !testDbUrl || testDbUrl === '') {
-      blockedReason =
-        '[BLOCKED / NOT RUN] CompanySetting transaction rollback PostgreSQL 16 integration test requires ' +
-        'COREERP_INTEGRATION_TEST_MODE=true and TEST_DATABASE_URL targeting localhost:5434/core_erp_integration_test.';
+    const target = validateIntegrationDatabaseTarget({
+      integrationMode: process.env.COREERP_INTEGRATION_TEST_MODE,
+      testDatabaseUrl: process.env.TEST_DATABASE_URL,
+      databaseUrl: process.env.DATABASE_URL,
+      suiteLabel: 'CompanySetting transaction rollback PostgreSQL 16 integration test',
+    });
+
+    if (target.status === 'blocked') {
+      blockedReason = target.reason;
       console.warn(`\n${blockedReason}\n`);
       return;
     }
 
-    if (process.env.DATABASE_URL && testDbUrl === process.env.DATABASE_URL) {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: TEST_DATABASE_URL matches primary DATABASE_URL.'
-      );
-    }
-
-    let parsed: URL;
-    try {
-      parsed = new URL(testDbUrl);
-    } catch {
-      throw new Error('[SECURITY FATAL] Invalid database URL format for TEST_DATABASE_URL.');
-    }
-
-    if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
-      throw new Error('[SECURITY FATAL] Forbidden database protocol in TEST_DATABASE_URL.');
-    }
-
-    const hostname = parsed.hostname.toLowerCase();
-    if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
-      throw new Error('[SECURITY FATAL] Integration test refused: unapproved host in TEST_DATABASE_URL.');
-    }
-
-    if (parsed.port !== '5434') {
-      throw new Error('[SECURITY FATAL] Integration test refused: port must be explicitly 5434.');
-    }
-
-    const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
-    if (dbName !== 'core_erp_integration_test') {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: database name must be core_erp_integration_test.'
-      );
-    }
-
-    const probe = await checkPortReachable(hostname, 5434);
+    const probe = await checkTcpPortReachable(target.host, target.port);
     if (!probe.reachable) {
       blockedReason =
-        `[BLOCKED / NOT RUN] PostgreSQL 16 integration endpoint is unreachable at ${hostname}:5434 ` +
+        `[BLOCKED / NOT RUN] PostgreSQL 16 integration endpoint is unreachable at ${target.host}:${target.port} ` +
         `(${probe.code || 'UNREACHABLE'}). No integration assertions were executed.`;
       console.warn(`\n${blockedReason}\n`);
       return;
     }
 
-    testPrisma = configureIntegrationPrismaClient(testDbUrl);
+    validatedTestDbUrl = target.cleanedUrl;
+    testPrisma = configureIntegrationPrismaClient(target.cleanedUrl);
     await testPrisma.$connect();
 
     const versionRows = await testPrisma.$queryRaw<Array<{ version: string }>>`
@@ -248,20 +192,23 @@ describe('PostgreSQL 16 Integration Test: CompanyService.updateProfile Transacti
   });
 
   afterAll(async () => {
+    const cleanupErrors: string[] = [];
     try {
       if (testPrisma && isDbConnected) {
         for (const companyId of createdCompanyIds) {
-          await cleanupCompanyFixtures(testPrisma, companyId, true);
+          const tenantErrors = await cleanupCompanyFixtures(testPrisma, companyId);
+          cleanupErrors.push(...tenantErrors);
         }
       }
     } finally {
-      if (testPrisma) {
-        try {
-          await testPrisma.$disconnect();
-        } catch {}
-      }
+      const disconnectErrors = await disconnectIntegrationClients([
+        { label: 'testPrisma', client: testPrisma },
+      ]);
+      cleanupErrors.push(...disconnectErrors);
       resetPrismaClientForTesting();
     }
+
+    throwIfCleanupErrors(cleanupErrors, 'company-profile-transaction-rollback');
   });
 
   it('persists SALES_INVOICE_ENABLED-only updates atomically in PostgreSQL and records a single audit event', async (ctx) => {

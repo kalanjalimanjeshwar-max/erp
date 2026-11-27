@@ -6,7 +6,14 @@ import {
 } from '../../src/server/db/client.js';
 import { EncryptionService } from '../../src/server/security/encryption.service.js';
 import { BankAccountBackfillService } from '../../src/server/security/bank-account-backfill.service.js';
-import net from 'net';
+import {
+  checkTcpPortReachable,
+  createIntegrationFixtureScope,
+  disconnectIntegrationClients,
+  IntegrationFixtureScope,
+  throwIfCleanupErrors,
+  validateIntegrationDatabaseTarget,
+} from '../helpers/integration-fixture-manager.js';
 
 /**
  * Real PostgreSQL 16 Integration Test:
@@ -17,143 +24,52 @@ import net from 'net';
  * 2. Never connects to production, development, or standard unit-test databases.
  * 3. If TEST_DATABASE_URL is not set or PostgreSQL 16 is not reachable on localhost:5434, marks
  *    execution status as BLOCKED / NOT RUN without failing the suite.
- * 4. Strictly NON-MUTATING verification:
- *    - Creates an isolated, test-owned bank account record encrypted under test key k1.
- *    - Switches active key to k2 with k1 retained in the historical key ring.
- *    - Executes dry-run re-encryption.
- *    - Asserts dry-run reports 1 record requiring re-encryption to k2.
- *    - Asserts database record still contains the exact original k1 ciphertext (unmodified).
- *    - Asserts key inventory accurately reflects 1 record under k1 and 0 under k2.
- *    - Cleans up all test-owned records in safe foreign-key order.
+ * 4. Strictly isolated per-test owned fixtures:
+ *    - Creates uniquely identified, test-owned company, user, and bank account records encrypted under test key k1.
+ *    - Never uses fixed IDs, upsert reuse, or destructive pre-test cleanup.
+ *    - Cleans up only tracked test-owned records in explicit foreign-key order and surfaces any cleanup failures.
  */
 
 describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run', () => {
-  const testDbUrl = process.env.TEST_DATABASE_URL?.trim().replace(/^["']|["']$/g, '');
-  const isIntegrationMode = process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
   let blockedReason: string | null = null;
   let isDbConnected = false;
   let testPrisma: PrismaClient | null = null;
-
-  const testCompanyId = '00000000-0000-4000-a000-000000000097';
-  const testUserId = '00000000-0000-4000-a000-000000000007';
+  const activeScopes: IntegrationFixtureScope[] = [];
 
   const testK1Hex = '1111111111111111111111111111111111111111111111111111111111111111';
   const testK2Hex = '2222222222222222222222222222222222222222222222222222222222222222';
 
-  const cleanupTestData = async (client: PrismaClient) => {
-    const errors: string[] = [];
-    try {
-      await client.auditLog.deleteMany({ where: { companyId: testCompanyId } });
-    } catch (err: any) {
-      errors.push(`auditLog: ${err?.message || err}`);
-    }
-    try {
-      await client.companyBankAccount.deleteMany({ where: { companyId: testCompanyId } });
-    } catch (err: any) {
-      errors.push(`companyBankAccount: ${err?.message || err}`);
-    }
-    try {
-      await client.user.deleteMany({ where: { companyId: testCompanyId } });
-    } catch (err: any) {
-      errors.push(`user: ${err?.message || err}`);
-    }
-    try {
-      await client.company.deleteMany({ where: { id: testCompanyId } });
-    } catch (err: any) {
-      errors.push(`company: ${err?.message || err}`);
-    }
-
-    if (errors.length > 0) {
-      console.error(
-        `[TEST CLEANUP WARNING] Safe foreign-key cleanup encountered errors for company "${testCompanyId}":\n  ${errors.join('\n  ')}`
-      );
-    }
-  };
-
-  const checkPortReachable = (
-    host: string,
-    port: number,
-    timeoutMs = 1000
-  ): Promise<{ reachable: boolean; code?: string }> => {
-    return new Promise((resolve) => {
-      const socket = new net.Socket();
-      let settled = false;
-      const finish = (result: { reachable: boolean; code?: string }) => {
-        if (!settled) {
-          settled = true;
-          socket.destroy();
-          resolve(result);
-        }
-      };
-
-      socket.setTimeout(timeoutMs);
-      socket.once('connect', () => finish({ reachable: true }));
-      socket.once('timeout', () => finish({ reachable: false, code: 'TIMEOUT' }));
-      socket.once('error', (err: NodeJS.ErrnoException) =>
-        finish({ reachable: false, code: err.code || 'SOCKET_ERROR' })
-      );
-      socket.connect(port, host);
-    });
-  };
-
   beforeAll(async () => {
-    if (!isIntegrationMode || !testDbUrl) {
-      blockedReason =
-        '[BLOCKED / NOT RUN] PostgreSQL 16 key-rotation integration test requires explicit ' +
-        'COREERP_INTEGRATION_TEST_MODE=true and TEST_DATABASE_URL targeting localhost:5434/core_erp_integration_test.';
+    const target = validateIntegrationDatabaseTarget({
+      integrationMode: process.env.COREERP_INTEGRATION_TEST_MODE,
+      testDatabaseUrl: process.env.TEST_DATABASE_URL,
+      databaseUrl: process.env.DATABASE_URL,
+      suiteLabel: 'PostgreSQL 16 key-rotation integration test',
+    });
+
+    if (target.status === 'blocked') {
+      blockedReason = target.reason;
       console.warn(
         `\n${blockedReason}\n` +
-        'To run live key-rotation integration tests against PostgreSQL 16 on Docker:\n' +
-        '  1. Start container: docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d\n' +
-        '  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy\n' +
-        '  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:key-rotation\n'
+          'To run live key-rotation integration tests against PostgreSQL 16 on Docker:\n' +
+          '  1. Start container: docker compose --env-file .env.integration-test -f docker-compose.integration-test.yml up -d\n' +
+          '  2. Deploy migrations: DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npx prisma migrate deploy\n' +
+          '  3. Run test: TEST_DATABASE_URL="postgresql://erp_integration_user:<password>@localhost:5434/core_erp_integration_test?schema=public" npm run test:integration:key-rotation\n'
       );
       return;
     }
 
-    if (process.env.DATABASE_URL && process.env.DATABASE_URL.trim() !== '') {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: Conflicting DATABASE_URL detected in integration test mode. DATABASE_URL must remain unset.'
-      );
-    }
-
-    let parsed: URL;
-    try {
-      parsed = new URL(testDbUrl);
-    } catch {
-      throw new Error('[SECURITY FATAL] Invalid database URL format for TEST_DATABASE_URL.');
-    }
-
-    if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
-      throw new Error('[SECURITY FATAL] Forbidden database protocol in TEST_DATABASE_URL.');
-    }
-
-    const host = parsed.hostname;
-    if (host !== 'localhost' && host !== '127.0.0.1') {
-      throw new Error('[SECURITY FATAL] Unapproved host in TEST_DATABASE_URL.');
-    }
-
-    const port = parseInt(parsed.port, 10);
-    if (port !== 5434) {
-      throw new Error('[SECURITY FATAL] Dedicated integration test must run on port 5434.');
-    }
-
-    const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
-    if (dbName !== 'core_erp_integration_test') {
-      throw new Error('[SECURITY FATAL] Dedicated database name must strictly be "core_erp_integration_test".');
-    }
-
-    const probe = await checkPortReachable(host, port);
+    const probe = await checkTcpPortReachable(target.host, target.port);
     if (!probe.reachable) {
       blockedReason =
-        `[BLOCKED / NOT RUN] PostgreSQL 16 integration database is unreachable at ${host}:${port} ` +
+        `[BLOCKED / NOT RUN] PostgreSQL 16 integration database is unreachable at ${target.host}:${target.port} ` +
         `(${probe.code || 'UNREACHABLE'}).`;
       console.warn(`\n${blockedReason}\n`);
       return;
     }
 
     // Endpoint is reachable: do NOT catch or downgrade $connect(), auth, missing DB, PG version, identity, or Prisma errors.
-    testPrisma = configureIntegrationPrismaClient(testDbUrl);
+    testPrisma = configureIntegrationPrismaClient(target.cleanedUrl);
     await testPrisma.$connect();
     expect(process.env.DATABASE_URL).toBeUndefined();
     expect(process.env.COREERP_INTEGRATION_TEST_MODE).toBe('true');
@@ -179,19 +95,26 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
   });
 
   afterAll(async () => {
+    const cleanupErrors: string[] = [];
     try {
       if (testPrisma && isDbConnected) {
-        await cleanupTestData(testPrisma);
+        for (const scope of activeScopes) {
+          if (scope.hasTrackedRecords()) {
+            const scopeErrors = await scope.cleanup(testPrisma, { returnErrors: true });
+            cleanupErrors.push(...scopeErrors);
+          }
+        }
       }
     } finally {
-      if (testPrisma) {
-        try {
-          await testPrisma.$disconnect();
-        } catch {}
-      }
+      const disconnectErrors = await disconnectIntegrationClients([
+        { label: 'testPrisma', client: testPrisma },
+      ]);
+      cleanupErrors.push(...disconnectErrors);
       resetPrismaClientForTesting();
       EncryptionService.resetKeyRingForTesting();
     }
+
+    throwIfCleanupErrors(cleanupErrors, 'key-rotation-reencryption');
   });
 
   it('should identify historical-key record in dry run, verify inventory, and leave database unmutated', async (ctx) => {
@@ -207,8 +130,8 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       );
     }
 
-    // Clean up any stale data from previous aborted runs
-    await cleanupTestData(testPrisma);
+    const fixtures = createIntegrationFixtureScope('ROTC', 'key-rotation-dry-run');
+    activeScopes.push(fixtures);
 
     try {
       // 1. Setup initial cryptographic state: k1 is active
@@ -219,42 +142,27 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       const originalK1Ciphertext = EncryptionService.encrypt(testPlaintext)!;
       expect(originalK1Ciphertext.startsWith('enc:v1:k1:')).toBe(true);
 
-      // 2. Insert test fixtures: Company, User, and BankAccount encrypted with k1
-      await testPrisma.company.upsert({
-        where: { id: testCompanyId },
-        update: {},
-        create: {
-          id: testCompanyId,
-          name: 'Rotation Verification Corp',
-          code: 'ROTC',
-          currency: 'USD',
-          timezone: 'UTC',
-        },
+      // 2. Insert uniquely identified, test-owned fixtures: Company, User, and BankAccount encrypted with k1
+      const company = await fixtures.createCompany(testPrisma, {
+        name: `Rotation Verification Corp ${fixtures.tokens.runToken}`,
+        currency: 'USD',
+        timezone: 'UTC',
       });
 
-      await testPrisma.user.upsert({
-        where: { id: testUserId },
-        update: {},
-        create: {
-          id: testUserId,
-          companyId: testCompanyId,
-          email: 'rotation-test-user@coreerp.local',
-          fullName: 'Rotation Test User',
-          role: 'ADMIN',
-          isActive: true,
-          passwordHash: '$2a$10$abcdefghijklmnopqrstuuNOPASSWORDHASHFORTESTONLY123456',
-        },
+      await fixtures.createUser(testPrisma, {
+        companyId: company.id,
+        fullName: 'Rotation Test User',
+        role: 'ADMIN',
+        isActive: true,
       });
 
-      const testAccount = await testPrisma.companyBankAccount.create({
-        data: {
-          companyId: testCompanyId,
-          bankName: 'Historical Key Bank',
-          accountHolderName: 'Rotation Verification Corp',
-          accountNumber: originalK1Ciphertext,
-          isDefault: false,
-          isActive: true,
-        },
+      const testAccount = await fixtures.createCompanyBankAccount(testPrisma, {
+        companyId: company.id,
+        bankName: 'Historical Key Bank',
+        accountHolderName: company.name,
+        accountNumber: originalK1Ciphertext,
+        isDefault: false,
+        isActive: true,
       });
 
       // 3. Promote k2 to active key, retaining k1 as historical
@@ -266,7 +174,7 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       // 4. Execute Dry-Run Re-encryption
       const dryRunResult = await BankAccountBackfillService.runBackfill({
         dryRun: true,
-        companyId: testCompanyId,
+        companyId: company.id,
         mode: 'rotation-only',
       });
 
@@ -291,7 +199,7 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       expect(decrypted).toBe(testPlaintext);
 
       // 7. Verify Key Inventory Report reflects exactly 1 record under k1 and 0 under k2
-      const inventory = await BankAccountBackfillService.getKeyInventory(testCompanyId);
+      const inventory = await BankAccountBackfillService.getKeyInventory(company.id);
       expect(inventory.totalRecords).toBe(1);
       expect(inventory.activeKeyId).toBe('k2');
       expect(inventory.countsByKeyId['k1']).toBe(1);
@@ -299,8 +207,8 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       expect(inventory.needsRotationCount).toBe(1);
       expect(inventory.fullyActiveCount).toBe(0);
     } finally {
-      // 8. Clean up test data in guaranteed finally block
-      await cleanupTestData(testPrisma);
+      // 8. Clean up test-owned data in guaranteed finally block
+      await fixtures.cleanup(testPrisma);
     }
   });
 
@@ -317,8 +225,9 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       );
     }
 
-    // Clean up any stale data from previous runs
-    await cleanupTestData(testPrisma);
+    const fixtures = createIntegrationFixtureScope('LROTC', 'key-rotation-live');
+    activeScopes.push(fixtures);
+    let createdCompanyId: string | null = null;
 
     try {
       // 1. Setup initial cryptographic state: k1 is active
@@ -330,42 +239,28 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       expect(originalK1Ciphertext.startsWith('enc:v1:k1:')).toBe(true);
       expect(EncryptionService.decrypt(originalK1Ciphertext)).toBe(testPlaintext);
 
-      // 2. Insert test fixtures: Company, User, and BankAccount encrypted with k1
-      await testPrisma.company.upsert({
-        where: { id: testCompanyId },
-        update: {},
-        create: {
-          id: testCompanyId,
-          name: 'Live Rotation Corp',
-          code: 'LROTC',
-          currency: 'USD',
-          timezone: 'UTC',
-        },
+      // 2. Insert uniquely identified, test-owned fixtures: Company, User, and BankAccount encrypted with k1
+      const company = await fixtures.createCompany(testPrisma, {
+        name: `Live Rotation Corp ${fixtures.tokens.runToken}`,
+        currency: 'USD',
+        timezone: 'UTC',
+      });
+      createdCompanyId = company.id;
+
+      await fixtures.createUser(testPrisma, {
+        companyId: company.id,
+        fullName: 'Live Rotation User',
+        role: 'ADMIN',
+        isActive: true,
       });
 
-      await testPrisma.user.upsert({
-        where: { id: testUserId },
-        update: {},
-        create: {
-          id: testUserId,
-          companyId: testCompanyId,
-          email: 'live-rotation-user@coreerp.local',
-          fullName: 'Live Rotation User',
-          role: 'ADMIN',
-          isActive: true,
-          passwordHash: '$2a$10$abcdefghijklmnopqrstuuNOPASSWORDHASHFORTESTONLY123456',
-        },
-      });
-
-      const testAccount = await testPrisma.companyBankAccount.create({
-        data: {
-          companyId: testCompanyId,
-          bankName: 'Live Historical Key Bank',
-          accountHolderName: 'Live Rotation Corp',
-          accountNumber: originalK1Ciphertext,
-          isDefault: false,
-          isActive: true,
-        },
+      const testAccount = await fixtures.createCompanyBankAccount(testPrisma, {
+        companyId: company.id,
+        bankName: 'Live Historical Key Bank',
+        accountHolderName: company.name,
+        accountNumber: originalK1Ciphertext,
+        isDefault: false,
+        isActive: true,
       });
 
       // 3. Promote k2 to active key, retaining k1 as historical
@@ -377,7 +272,7 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       // 4. Step 8 of pre-flight: Dry-Run scoped strictly to test fixture
       const dryRunResult = await BankAccountBackfillService.runBackfill({
         dryRun: true,
-        companyId: testCompanyId,
+        companyId: company.id,
         accountId: testAccount.id,
         mode: 'rotation-only',
       });
@@ -397,7 +292,7 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       // 5. Authorized Live Re-encryption scoped strictly to test fixture
       const liveResult = await BankAccountBackfillService.runBackfill({
         dryRun: false,
-        companyId: testCompanyId,
+        companyId: company.id,
         accountId: testAccount.id,
         mode: 'rotation-only',
       });
@@ -425,7 +320,7 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       expect(decryptedLive).toBe(testPlaintext);
 
       // 6.4. Scoped key inventory reports expected counts (k1: 0, k2: 1)
-      const inventory = await BankAccountBackfillService.getKeyInventory(testCompanyId, testAccount.id);
+      const inventory = await BankAccountBackfillService.getKeyInventory(company.id, testAccount.id);
       expect(inventory.totalRecords).toBe(1);
       expect(inventory.activeKeyId).toBe('k2');
       expect(inventory.countsByKeyId['k1']).toBe(0);
@@ -436,7 +331,7 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       // 6.5. Idempotent re-run skips already active key record
       const rerunResult = await BankAccountBackfillService.runBackfill({
         dryRun: false,
-        companyId: testCompanyId,
+        companyId: company.id,
         accountId: testAccount.id,
         mode: 'rotation-only',
       });
@@ -444,11 +339,13 @@ describe('PostgreSQL 16 Non-Mutating Key-Aware Re-encryption & Inventory Dry-Run
       expect(rerunResult.totalAlreadyActiveKey).toBe(1);
     } finally {
       // 7. Safe cleanup of test-owned records in guaranteed finally block
-      await cleanupTestData(testPrisma);
-      const countRemaining = await testPrisma.companyBankAccount.count({
-        where: { companyId: testCompanyId },
-      });
-      expect(countRemaining).toBe(0);
+      await fixtures.cleanup(testPrisma);
+      if (createdCompanyId) {
+        const countRemaining = await testPrisma.companyBankAccount.count({
+          where: { companyId: createdCompanyId },
+        });
+        expect(countRemaining).toBe(0);
+      }
     }
   });
 });

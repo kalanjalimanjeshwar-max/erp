@@ -1,7 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import request from 'supertest';
 import { PrismaClient } from '@prisma/client';
-import net from 'net';
 import crypto from 'crypto';
 import { createApp } from '../../src/server/app.js';
 import { AuthService } from '../../src/server/services/auth.service.js';
@@ -13,6 +12,13 @@ import {
   resetPrismaClientForTesting,
   verifyDatabaseUrlConsistency,
 } from '../../src/server/db/client.js';
+import {
+  checkTcpPortReachable,
+  disconnectIntegrationClients,
+  runOwnedCleanupSteps,
+  throwIfCleanupErrors,
+  validateIntegrationDatabaseTarget,
+} from '../helpers/integration-fixture-manager.js';
 
 /**
  * Real PostgreSQL 16 HTTP Integration Test Suite:
@@ -33,8 +39,7 @@ import {
  */
 describe('PostgreSQL 16 HTTP Integration Test: Attendance Authorization & Payroll Lock', () => {
   const app = createApp();
-  const testDbUrl = process.env.TEST_DATABASE_URL?.trim().replace(/^["']|["']$/g, '');
-  const isIntegrationMode = process.env.COREERP_INTEGRATION_TEST_MODE === 'true';
+  let validatedTestDbUrl: string | null = null;
   let blockedReason: string | null = null;
   let isDbConnected = false;
   let testPrisma: PrismaClient | null = null;
@@ -43,62 +48,37 @@ describe('PostgreSQL 16 HTTP Integration Test: Attendance Authorization & Payrol
 
   const cleanupCompanyFixtures = async (
     client: PrismaClient,
-    companyId: string,
-    tolerateCleanupErrors = false
-  ) => {
-    const deleteOps = [
-      () => client.auditLog.deleteMany({ where: { companyId } }),
-      () => client.attendanceInterval.deleteMany({ where: { companyId } }),
-      () => client.attendancePunchEvent.deleteMany({ where: { companyId } }),
-      () => client.attendance.deleteMany({ where: { companyId } }),
-      () => client.payslip.deleteMany({ where: { companyId } }),
-      () => client.payrollPeriod.deleteMany({ where: { companyId } }),
-      () => client.rolePermission.deleteMany({ where: { companyId } }),
-      () => client.employeeWorkPolicyRevision.deleteMany({ where: { companyId } }),
-      () => client.employee.deleteMany({ where: { companyId } }),
-      () => client.shift.deleteMany({ where: { companyId } }),
-      () => client.user.deleteMany({ where: { companyId } }),
-      () => client.company.deleteMany({ where: { id: companyId } }),
-    ];
-
-    for (const op of deleteOps) {
-      if (tolerateCleanupErrors) {
-        try {
-          await op();
-        } catch (err) {
-          console.warn('[INTEGRATION CLEANUP WARNING]', err);
-        }
-      } else {
-        await op();
-      }
-    }
-  };
-
-  const checkPortReachable = (
-    host: string,
-    port: number,
-    timeoutMs = 1000
-  ): Promise<{ reachable: boolean; code?: string }> => {
-    return new Promise((resolve) => {
-      const socket = new net.Socket();
-      let settled = false;
-      const finish = (result: { reachable: boolean; code?: string }) => {
-        if (!settled) {
-          settled = true;
-          socket.destroy();
-          resolve(result);
-        }
-      };
-
-      socket.setTimeout(timeoutMs);
-      socket.once('connect', () => finish({ reachable: true }));
-      socket.once('timeout', () => finish({ reachable: false, code: 'TIMEOUT' }));
-      socket.once('error', (err: NodeJS.ErrnoException) =>
-        finish({ reachable: false, code: err.code || 'SOCKET_ERROR' })
-      );
-      socket.connect(port, host);
-    });
-  };
+    companyId: string
+  ): Promise<string[]> =>
+    runOwnedCleanupSteps(`companyId=${companyId}`, [
+      { label: 'auditLog', run: () => client.auditLog.deleteMany({ where: { companyId } }) },
+      {
+        label: 'attendanceInterval',
+        run: () => client.attendanceInterval.deleteMany({ where: { companyId } }),
+      },
+      {
+        label: 'attendancePunchEvent',
+        run: () => client.attendancePunchEvent.deleteMany({ where: { companyId } }),
+      },
+      { label: 'attendance', run: () => client.attendance.deleteMany({ where: { companyId } }) },
+      { label: 'payslip', run: () => client.payslip.deleteMany({ where: { companyId } }) },
+      {
+        label: 'payrollPeriod',
+        run: () => client.payrollPeriod.deleteMany({ where: { companyId } }),
+      },
+      {
+        label: 'rolePermission',
+        run: () => client.rolePermission.deleteMany({ where: { companyId } }),
+      },
+      {
+        label: 'employeeWorkPolicyRevision',
+        run: () => client.employeeWorkPolicyRevision.deleteMany({ where: { companyId } }),
+      },
+      { label: 'employee', run: () => client.employee.deleteMany({ where: { companyId } }) },
+      { label: 'shift', run: () => client.shift.deleteMany({ where: { companyId } }) },
+      { label: 'user', run: () => client.user.deleteMany({ where: { companyId } }) },
+      { label: 'company', run: () => client.company.deleteMany({ where: { id: companyId } }) },
+    ]);
 
   const assertDatabaseSafety = async (ctx: {
     annotate: (message: string, type?: string) => Promise<unknown>;
@@ -110,7 +90,7 @@ describe('PostgreSQL 16 HTTP Integration Test: Attendance Authorization & Payrol
       ctx.skip(blockedReason);
     }
 
-    if (!isDbConnected || !testPrisma) {
+    if (!isDbConnected || !testPrisma || !validatedTestDbUrl) {
       throw new Error(
         '[INTEGRATION TEST INVARIANT ERROR] Database connection state inconsistent without blockedReason.'
       );
@@ -121,7 +101,7 @@ describe('PostgreSQL 16 HTTP Integration Test: Attendance Authorization & Payrol
     expect(getPrismaClient()).toBe(testPrisma);
     expect(global.__prismaClient).toBe(testPrisma);
 
-    const urlConsistency = verifyDatabaseUrlConsistency(testDbUrl!, prisma);
+    const urlConsistency = verifyDatabaseUrlConsistency(validatedTestDbUrl, prisma);
     expect(urlConsistency.consistent).toBe(true);
     expect(urlConsistency.portMatch).toBe(true);
     expect(urlConsistency.databaseMatch).toBe(true);
@@ -255,59 +235,30 @@ describe('PostgreSQL 16 HTTP Integration Test: Attendance Authorization & Payrol
   };
 
   beforeAll(async () => {
-    if (!isIntegrationMode || !testDbUrl || testDbUrl === '') {
-      blockedReason =
-        '[BLOCKED / NOT RUN] Attendance HTTP authorization & payroll-lock PostgreSQL 16 integration test requires ' +
-        'COREERP_INTEGRATION_TEST_MODE=true and TEST_DATABASE_URL targeting localhost:5434/core_erp_integration_test.';
+    const target = validateIntegrationDatabaseTarget({
+      integrationMode: process.env.COREERP_INTEGRATION_TEST_MODE,
+      testDatabaseUrl: process.env.TEST_DATABASE_URL,
+      databaseUrl: process.env.DATABASE_URL,
+      suiteLabel: 'Attendance HTTP authorization & payroll-lock PostgreSQL 16 integration test',
+    });
+
+    if (target.status === 'blocked') {
+      blockedReason = target.reason;
       console.warn(`\n${blockedReason}\n`);
       return;
     }
 
-    if (process.env.DATABASE_URL && testDbUrl === process.env.DATABASE_URL) {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: TEST_DATABASE_URL matches primary DATABASE_URL.'
-      );
-    }
-
-    let parsed: URL;
-    try {
-      parsed = new URL(testDbUrl);
-    } catch {
-      throw new Error('[SECURITY FATAL] Invalid database URL format for TEST_DATABASE_URL.');
-    }
-
-    if (parsed.protocol !== 'postgresql:' && parsed.protocol !== 'postgres:') {
-      throw new Error('[SECURITY FATAL] Forbidden database protocol in TEST_DATABASE_URL.');
-    }
-
-    const hostname = parsed.hostname.toLowerCase();
-    if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: unapproved host in TEST_DATABASE_URL.'
-      );
-    }
-
-    if (parsed.port !== '5434') {
-      throw new Error('[SECURITY FATAL] Integration test refused: port must be explicitly 5434.');
-    }
-
-    const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
-    if (dbName !== 'core_erp_integration_test') {
-      throw new Error(
-        '[SECURITY FATAL] Integration test refused: database name must be core_erp_integration_test.'
-      );
-    }
-
-    const probe = await checkPortReachable(hostname, 5434);
+    const probe = await checkTcpPortReachable(target.host, target.port);
     if (!probe.reachable) {
       blockedReason =
-        `[BLOCKED / NOT RUN] PostgreSQL 16 integration endpoint is unreachable at ${hostname}:5434 ` +
+        `[BLOCKED / NOT RUN] PostgreSQL 16 integration endpoint is unreachable at ${target.host}:${target.port} ` +
         `(${probe.code || 'UNREACHABLE'}). No integration assertions were executed.`;
       console.warn(`\n${blockedReason}\n`);
       return;
     }
 
-    testPrisma = configureIntegrationPrismaClient(testDbUrl);
+    validatedTestDbUrl = target.cleanedUrl;
+    testPrisma = configureIntegrationPrismaClient(target.cleanedUrl);
     resetConfigForTesting();
     await testPrisma.$connect();
 
@@ -334,21 +285,24 @@ describe('PostgreSQL 16 HTTP Integration Test: Attendance Authorization & Payrol
   });
 
   afterAll(async () => {
+    const cleanupErrors: string[] = [];
     try {
       if (testPrisma && isDbConnected) {
         for (const companyId of createdCompanyIds) {
-          await cleanupCompanyFixtures(testPrisma, companyId, true);
+          const tenantErrors = await cleanupCompanyFixtures(testPrisma, companyId);
+          cleanupErrors.push(...tenantErrors);
         }
       }
     } finally {
-      if (testPrisma) {
-        try {
-          await testPrisma.$disconnect();
-        } catch {}
-      }
+      const disconnectErrors = await disconnectIntegrationClients([
+        { label: 'testPrisma', client: testPrisma },
+      ]);
+      cleanupErrors.push(...disconnectErrors);
       resetPrismaClientForTesting();
       resetConfigForTesting();
     }
+
+    throwIfCleanupErrors(cleanupErrors, 'attendance-authorization-and-payroll-lock');
   });
 
   it('denies EMPLOYEE with ATTENDANCE:EDIT override from updating another employee attendance record (HTTP 403) while permitting self update', async (ctx) => {
