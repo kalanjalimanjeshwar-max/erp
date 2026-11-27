@@ -11,16 +11,19 @@
  *   npm run db:setup:check    # Read-only audit without creating any files
  */
 
-import { runDatabaseEnvironmentSetup } from '../src/server/db/setup-env.js';
+// Capture genuine process environment BEFORE any module import can trigger Prisma/dotenv `.env` auto-loading.
+const initialShellEnv: Record<string, string | undefined> = { ...process.env };
 
 async function main() {
+  const { runDatabaseEnvironmentSetup } = await import('../src/server/db/setup-env.js');
+
   const args = process.argv.slice(2);
   const checkOnly = args.includes('--check') || args.includes('--dry-run');
 
   const result = await runDatabaseEnvironmentSetup({
     projectRoot: process.cwd(),
     checkOnly,
-    shellEnv: process.env,
+    shellEnv: initialShellEnv,
   });
 
   process.exit(result.exitCode);

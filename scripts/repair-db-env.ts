@@ -17,18 +17,20 @@
  * - Never touches eSSL X2008 biometric bridge files or USER_SYNC_ONLY configuration.
  */
 
-import {
-  REQUIRED_REPAIR_CONFIRMATION_FLAG,
-  runLocalDatabaseEnvRepair,
-  type RepairMode,
-} from '../src/server/db/repair-env.js';
+// Capture genuine process environment BEFORE any module import can trigger Prisma/dotenv `.env` auto-loading.
+const initialShellEnv: Record<string, string | undefined> = { ...process.env };
 
 async function main() {
+  const {
+    REQUIRED_REPAIR_CONFIRMATION_FLAG,
+    runLocalDatabaseEnvRepair,
+  } = await import('../src/server/db/repair-env.js');
+
   const args = process.argv.slice(2);
   const checkOnly = args.includes('--check');
   const confirmed = !checkOnly && args.includes(REQUIRED_REPAIR_CONFIRMATION_FLAG);
 
-  const mode: RepairMode = checkOnly ? 'CHECK' : confirmed ? 'REPAIR' : 'DRY_RUN';
+  const mode = checkOnly ? 'CHECK' : confirmed ? 'REPAIR' : 'DRY_RUN';
 
   if (checkOnly && args.includes(REQUIRED_REPAIR_CONFIRMATION_FLAG)) {
     console.warn(
@@ -40,7 +42,7 @@ async function main() {
     projectRoot: process.cwd(),
     mode,
     confirmed,
-    shellEnv: process.env,
+    shellEnv: initialShellEnv,
   });
 
   process.exit(result.exitCode);

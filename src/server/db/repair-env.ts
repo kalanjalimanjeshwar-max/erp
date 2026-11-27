@@ -926,7 +926,8 @@ export async function runLocalDatabaseEnvRepair(
     if (userVal) activeScopes.push('User');
     if (machineVal) activeScopes.push('Machine');
 
-    if (activeScopes.length === 0) continue;
+    const hasActiveOverride = activeScopes.length > 0;
+    if (!hasActiveOverride) continue;
 
     const effectiveValue = processVal || userVal || machineVal || '';
     const ep = normalizeDatabaseUrl(effectiveValue);
@@ -961,11 +962,13 @@ export async function runLocalDatabaseEnvRepair(
       }
     }
 
-    // For TEST_DATABASE_URL and STAGING_DATABASE_URL, shell overrides always shadow target env files
+    // For TEST_DATABASE_URL and STAGING_DATABASE_URL, an active shell/persistent override shadows target env files
     const isShadowingTargetFile =
-      varName === 'TEST_DATABASE_URL' || varName === 'STAGING_DATABASE_URL';
+      hasActiveOverride &&
+      (varName === 'TEST_DATABASE_URL' || varName === 'STAGING_DATABASE_URL');
     const isProblematic =
-      wrongEndpoint || persistentWrong || conflictsWithFile || isShadowingTargetFile;
+      hasActiveOverride &&
+      (wrongEndpoint || persistentWrong || conflictsWithFile || isShadowingTargetFile);
 
     if (isProblematic) {
       const scopeLabel = buildScopeLabel(activeScopes);

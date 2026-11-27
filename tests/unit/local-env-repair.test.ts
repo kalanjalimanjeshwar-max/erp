@@ -826,6 +826,8 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     expect(dryRunRes.status, `Dry-run CLI exited with ${dryRunRes.status}:\n${dryRunOut}`).toBe(0);
     expect(dryRunOut).toContain('DRY-RUN COMPLETE');
     expect(dryRunOut).toContain(REQUIRED_REPAIR_CONFIRMATION_FLAG);
+    // Clean process environment must never produce false-positive Process-scope shell overrides (even when .env exists)
+    expect(dryRunOut).not.toContain('[shell environment (Process)');
     expect(dryRunOut).not.toContain(seeded.devPass);
     expect(dryRunOut).not.toContain(seeded.integrationPass);
     expect(fs.readdirSync(dir).sort()).toEqual(['.env', '.env.integration-test']);
@@ -852,6 +854,7 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     expect(checkOut).toContain('Read-Only');
     expect(checkOut).toContain('STAGING_DATABASE_URL');
     expect(checkOut).toContain('TEST_DATABASE_URL');
+    expect(checkOut).not.toContain('[shell environment (Process)');
     expect(checkOut).not.toContain(seeded.devPass);
     expect(checkOut).not.toContain(seeded.integrationPass);
     expect(fs.readdirSync(dir).sort()).toEqual(['.env', '.env.integration-test']);
@@ -859,5 +862,240 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     expect(fs.readFileSync(path.join(dir, '.env.integration-test'), 'utf-8')).toBe(
       seeded.originalIntegration
     );
+  });
+
+  function seedCleanFiveEnvFiles(dir: string) {
+    const devPass = 'CleanDevSecret_1010!';
+    const shadowPass = 'CleanShadowSecret_2020!';
+    const intPass = 'CleanIntSecret_3030!';
+    const stagingPass = 'CleanStagingSecret_4040!';
+
+    fs.writeFileSync(
+      path.join(dir, '.env'),
+      [
+        'PORT=3000',
+        'NODE_ENV=development',
+        'POSTGRES_USER="erp_user"',
+        `POSTGRES_PASSWORD="${devPass}"`,
+        'POSTGRES_DB="core_erp"',
+        `DATABASE_URL="postgresql://erp_user:${encodeURIComponent(devPass)}@localhost:5432/core_erp?schema=public"`,
+        'SHADOW_POSTGRES_USER="erp_shadow_user"',
+        `SHADOW_POSTGRES_PASSWORD="${shadowPass}"`,
+        'SHADOW_POSTGRES_DB="core_erp_shadow"',
+        `SHADOW_DATABASE_URL="postgresql://erp_shadow_user:${encodeURIComponent(shadowPass)}@localhost:5436/core_erp_shadow?schema=public"`,
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(dir, '.env.integration-test'),
+      [
+        `POSTGRES_PASSWORD="${intPass}"`,
+        `TEST_DATABASE_URL="postgresql://erp_integration_user:${encodeURIComponent(intPass)}@localhost:5434/core_erp_integration_test?schema=public"`,
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(dir, '.env.staging'),
+      [
+        'STAGING_POSTGRES_USER="erp_staging_user"',
+        `STAGING_POSTGRES_PASSWORD="${stagingPass}"`,
+        'STAGING_POSTGRES_DB="core_erp_staging"',
+        `STAGING_DATABASE_URL="postgresql://erp_staging_user:${encodeURIComponent(stagingPass)}@localhost:5435/core_erp_staging?schema=public"`,
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    return { devPass, shadowPass, intPass, stagingPass };
+  }
+
+  it('12. [Test A] Reports zero shell override findings when TEST_DATABASE_URL and STAGING_DATABASE_URL are absent from Process, User, and Machine scopes', async () => {
+    // A1. Valid target-file configuration alone must pass CHECK with exitCode 0 and zero shell overrides
+    const cleanDir = makeTempProject();
+    seedCleanFiveEnvFiles(cleanDir);
+    const { logger: cleanLogger, logs: cleanLogs } = createSilentLogger();
+
+    const cleanRes = await runLocalDatabaseEnvRepair({
+      projectRoot: cleanDir,
+      mode: 'CHECK',
+      shellEnv: {},
+      logger: cleanLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(cleanRes.exitCode).toBe(0);
+    expect(cleanRes.shellOverrides).toEqual([]);
+    expect(cleanRes.findings.filter((f) => f.category === 'SHELL_OVERRIDE')).toEqual([]);
+    expect(cleanRes.manualRemediation).toEqual([]);
+    expect(cleanRes.actions.some((a) => a.operation === 'MANUAL_SHELL_CLEANUP')).toBe(false);
+    expect(cleanLogs.join('\n')).not.toContain('Shell / Persistent Environment Overrides');
+
+    // A2. Even when .env has misplaced STAGING_DATABASE_URL / TEST_DATABASE_URL, absent shell/persistent scopes must produce zero shell overrides
+    const misplacedDir = makeTempProject();
+    seedWindowsAuditScenario(misplacedDir);
+    const { logger: misplacedLogger, logs: misplacedLogs } = createSilentLogger();
+
+    const misplacedRes = await runLocalDatabaseEnvRepair({
+      projectRoot: misplacedDir,
+      mode: 'CHECK',
+      shellEnv: {},
+      logger: misplacedLogger,
+      inspectDocker: async () => DOCKER_UNAVAILABLE,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(misplacedRes.exitCode).toBe(1);
+    expect(misplacedRes.shellOverrides).toEqual([]);
+    expect(misplacedRes.findings.filter((f) => f.category === 'SHELL_OVERRIDE')).toEqual([]);
+    expect(misplacedRes.manualRemediation).toEqual([]);
+    expect(misplacedLogs.join('\n')).not.toContain('Shell / Persistent Environment Overrides');
+  });
+
+  it('13. [Test B] Detects genuine TEST_DATABASE_URL in Process scope as shadowing target file without falsely flagging STAGING_DATABASE_URL', async () => {
+    const dir = makeTempProject();
+    const { intPass } = seedCleanFiveEnvFiles(dir);
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {
+        TEST_DATABASE_URL: `postgresql://erp_integration_user:${encodeURIComponent(intPass)}@localhost:5434/core_erp_integration_test?schema=public`,
+      },
+      logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.shellOverrides).toHaveLength(1);
+    expect(res.shellOverrides[0].variable).toBe('TEST_DATABASE_URL');
+    expect(res.shellOverrides[0].scopes).toEqual(['Process']);
+    expect(res.shellOverrides[0].scopeLabel).toBe('Process');
+    expect(res.shellOverrides[0].status).toBe('MATCHES_TARGET');
+    expect(res.shellOverrides[0].remediationCommands).toContain(
+      'Remove-Item Env:TEST_DATABASE_URL -ErrorAction SilentlyContinue'
+    );
+    expect(res.findings.filter((f) => f.category === 'SHELL_OVERRIDE')).toHaveLength(1);
+    expect(res.shellOverrides.some((o) => o.variable === 'STAGING_DATABASE_URL')).toBe(false);
+    expect(logs.join('\n')).not.toContain(intPass);
+  });
+
+  it('14. [Test C] Detects genuine STAGING_DATABASE_URL in Process scope as shadowing target file without falsely flagging TEST_DATABASE_URL', async () => {
+    const dir = makeTempProject();
+    const { stagingPass } = seedCleanFiveEnvFiles(dir);
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {
+        STAGING_DATABASE_URL: `postgresql://erp_staging_user:${encodeURIComponent(stagingPass)}@localhost:5435/core_erp_staging?schema=public`,
+      },
+      logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.shellOverrides).toHaveLength(1);
+    expect(res.shellOverrides[0].variable).toBe('STAGING_DATABASE_URL');
+    expect(res.shellOverrides[0].scopes).toEqual(['Process']);
+    expect(res.shellOverrides[0].scopeLabel).toBe('Process');
+    expect(res.shellOverrides[0].status).toBe('MATCHES_TARGET');
+    expect(res.shellOverrides[0].remediationCommands).toContain(
+      'Remove-Item Env:STAGING_DATABASE_URL -ErrorAction SilentlyContinue'
+    );
+    expect(res.findings.filter((f) => f.category === 'SHELL_OVERRIDE')).toHaveLength(1);
+    expect(res.shellOverrides.some((o) => o.variable === 'TEST_DATABASE_URL')).toBe(false);
+    expect(logs.join('\n')).not.toContain(stagingPass);
+  });
+
+  it('15. [Test D] Flags wrong Process endpoint as CONFLICTING_OR_WRONG_TARGET with exact manual PowerShell remediation and secret redaction', async () => {
+    const dir = makeTempProject();
+    seedCleanFiveEnvFiles(dir);
+    const wrongProcessSecret = 'WrongProcessPort5433Secret_8899!';
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {
+        STAGING_DATABASE_URL: `postgresql://erp_test_user:${encodeURIComponent(wrongProcessSecret)}@localhost:5433/core_erp_test?schema=public`,
+      },
+      logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.shellOverrides).toHaveLength(1);
+    expect(res.shellOverrides[0].variable).toBe('STAGING_DATABASE_URL');
+    expect(res.shellOverrides[0].scopeLabel).toBe('Process');
+    expect(res.shellOverrides[0].status).toBe('CONFLICTING_OR_WRONG_TARGET');
+    expect(res.shellOverrides[0].resolvedEndpoint).toBe('127.0.0.1:5433/core_erp_test');
+    expect(res.manualRemediation).toContain(
+      'Remove-Item Env:STAGING_DATABASE_URL -ErrorAction SilentlyContinue'
+    );
+    expect(logs.join('\n')).not.toContain(wrongProcessSecret);
+  });
+
+  it('16. [Test E] Detects wrong User or Machine persistent overrides even when Process scope is empty and preserves manual remediation', async () => {
+    const dir = makeTempProject();
+    seedCleanFiveEnvFiles(dir);
+    const userWrongSecret = 'PersistentUserWrongSecret_6611!';
+    const machineWrongSecret = 'PersistentMachineWrongSecret_7722!';
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {}, // Empty Process scope — only persistent User/Machine entries exist
+      logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [
+        {
+          variable: 'TEST_DATABASE_URL',
+          userValue: `postgresql://erp_test_user:${encodeURIComponent(userWrongSecret)}@localhost:5433/core_erp_test?schema=public`,
+        },
+        {
+          variable: 'STAGING_DATABASE_URL',
+          machineValue: `postgresql://erp_test_user:${encodeURIComponent(machineWrongSecret)}@localhost:5432/core_erp?schema=public`,
+        },
+      ],
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.shellOverrides).toHaveLength(2);
+
+    const userOv = res.shellOverrides.find((o) => o.variable === 'TEST_DATABASE_URL');
+    const machineOv = res.shellOverrides.find((o) => o.variable === 'STAGING_DATABASE_URL');
+
+    expect(userOv?.scopes).toEqual(['User']);
+    expect(userOv?.scopeLabel).toBe('User');
+    expect(userOv?.status).toBe('CONFLICTING_OR_WRONG_TARGET');
+    expect(
+      userOv?.remediationCommands.some((c) =>
+        c.includes("[Environment]::SetEnvironmentVariable('TEST_DATABASE_URL', $null, 'User')")
+      )
+    ).toBe(true);
+
+    expect(machineOv?.scopes).toEqual(['Machine']);
+    expect(machineOv?.scopeLabel).toBe('Machine');
+    expect(machineOv?.status).toBe('CONFLICTING_OR_WRONG_TARGET');
+    expect(
+      machineOv?.remediationCommands.some((c) =>
+        c.includes(
+          "[Environment]::SetEnvironmentVariable('STAGING_DATABASE_URL', $null, 'Machine')"
+        )
+      )
+    ).toBe(true);
+
+    const combined = `${logs.join('\n')}\n${JSON.stringify(res.findings)}\n${JSON.stringify(res.shellOverrides)}`;
+    expect(combined).not.toContain(userWrongSecret);
+    expect(combined).not.toContain(machineWrongSecret);
   });
 });
