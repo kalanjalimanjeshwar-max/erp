@@ -17,6 +17,8 @@
     "postinstall": "prisma generate",
     "db:setup": "tsx scripts/setup-db-env.ts",
     "db:setup:check": "tsx scripts/setup-db-env.ts --check",
+    "db:repair:check": "tsx scripts/repair-db-env.ts --check",
+    "db:repair:local": "tsx scripts/repair-db-env.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
     "db:migrate:dev": "prisma migrate dev",
