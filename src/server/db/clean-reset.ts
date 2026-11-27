@@ -736,8 +736,162 @@ function collectSecrets(envMaps: Array<Record<string, string | undefined> | null
         // Not a URL
       }
     }
+    const historicalKeysRaw = map.BANK_HISTORICAL_KEYS?.trim();
+    if (historicalKeysRaw && historicalKeysRaw !== '{}') {
+      secrets.add(historicalKeysRaw);
+      try {
+        const parsedHistorical: unknown = JSON.parse(historicalKeysRaw);
+        if (parsedHistorical && typeof parsedHistorical === 'object' && !Array.isArray(parsedHistorical)) {
+          for (const keyVal of Object.values(parsedHistorical as Record<string, unknown>)) {
+            if (typeof keyVal === 'string' && keyVal.trim() !== '') {
+              secrets.add(keyVal.trim());
+            }
+          }
+        }
+      } catch {
+        // Non-JSON historical keys string already added verbatim above
+      }
+    }
   }
   return Array.from(secrets);
+}
+
+interface PreservedTargetCredentials {
+  user: string;
+  password: string;
+  database: string;
+  url: string;
+}
+
+export function generateDistinctSecret(
+  generateSecret: (bytes?: number) => string,
+  bytes: number,
+  forbidden: ReadonlySet<string>
+): string {
+  const maxAttempts = 8;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const candidate = generateSecret(bytes);
+    if (!forbidden.has(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error(
+    `Failed to generate a unique secret distinct from forbidden values after ${maxAttempts} attempts.`
+  );
+}
+
+function extractPreservableDevCredentials(
+  existingMainEnv: Record<string, string>
+): PreservedTargetCredentials {
+  const devUrl = existingMainEnv.DATABASE_URL?.trim() || '';
+  if (!devUrl) {
+    throw new Error(
+      'Cannot safely preserve unselected target "dev" credentials in .env because DATABASE_URL is missing. Restore valid "dev" credentials in .env or include "dev" in --targets.'
+    );
+  }
+  const ep = normalizeDatabaseUrl(devUrl);
+  if (
+    !ep ||
+    ep.hostname !== '127.0.0.1' ||
+    ep.port !== COREERP_DB_ENVIRONMENTS.development.port ||
+    ep.database !== COREERP_DB_ENVIRONMENTS.development.database
+  ) {
+    throw new Error(
+      `Cannot safely preserve unselected target "dev" credentials in .env because DATABASE_URL does not resolve strictly to localhost:${COREERP_DB_ENVIRONMENTS.development.port}/${COREERP_DB_ENVIRONMENTS.development.database}.`
+    );
+  }
+  const urlCreds = parseUrlCredentialsSafe(devUrl);
+  if (!urlCreds || !urlCreds.username || isPlaceholderOrWeak(urlCreds.password)) {
+    throw new Error(
+      'Cannot safely preserve unselected target "dev" credentials in .env because DATABASE_URL has missing or placeholder credentials.'
+    );
+  }
+  const envPassword = existingMainEnv.POSTGRES_PASSWORD?.trim() || '';
+  if (isPlaceholderOrWeak(envPassword)) {
+    throw new Error(
+      'Cannot safely preserve unselected target "dev" credentials in .env because POSTGRES_PASSWORD is missing or a placeholder.'
+    );
+  }
+  if (envPassword !== urlCreds.password) {
+    throw new Error(
+      'Cannot safely preserve unselected target "dev" credentials in .env because POSTGRES_PASSWORD does not match DATABASE_URL password.'
+    );
+  }
+  const envUser = existingMainEnv.POSTGRES_USER?.trim() || COREERP_DB_ENVIRONMENTS.development.user;
+  if (envUser !== urlCreds.username) {
+    throw new Error(
+      'Cannot safely preserve unselected target "dev" credentials in .env because POSTGRES_USER does not match DATABASE_URL username.'
+    );
+  }
+  const envDb = existingMainEnv.POSTGRES_DB?.trim() || COREERP_DB_ENVIRONMENTS.development.database;
+  if (envDb.toLowerCase() !== COREERP_DB_ENVIRONMENTS.development.database) {
+    throw new Error(
+      `Cannot safely preserve unselected target "dev" credentials in .env because POSTGRES_DB must be "${COREERP_DB_ENVIRONMENTS.development.database}".`
+    );
+  }
+  return {
+    user: envUser,
+    password: envPassword,
+    database: envDb,
+    url: devUrl,
+  };
+}
+
+function extractPreservableShadowCredentials(
+  existingMainEnv: Record<string, string>
+): PreservedTargetCredentials {
+  const shadowUrl = existingMainEnv.SHADOW_DATABASE_URL?.trim() || '';
+  if (!shadowUrl) {
+    throw new Error(
+      'Cannot safely preserve unselected target "shadow" credentials in .env because SHADOW_DATABASE_URL is missing. Restore valid "shadow" credentials in .env or include "shadow" in --targets.'
+    );
+  }
+  const ep = normalizeDatabaseUrl(shadowUrl);
+  if (
+    !ep ||
+    ep.hostname !== '127.0.0.1' ||
+    ep.port !== COREERP_DB_ENVIRONMENTS.shadow.port ||
+    ep.database !== COREERP_DB_ENVIRONMENTS.shadow.database
+  ) {
+    throw new Error(
+      `Cannot safely preserve unselected target "shadow" credentials in .env because SHADOW_DATABASE_URL does not resolve strictly to localhost:${COREERP_DB_ENVIRONMENTS.shadow.port}/${COREERP_DB_ENVIRONMENTS.shadow.database}.`
+    );
+  }
+  const urlCreds = parseUrlCredentialsSafe(shadowUrl);
+  if (!urlCreds || !urlCreds.username || isPlaceholderOrWeak(urlCreds.password)) {
+    throw new Error(
+      'Cannot safely preserve unselected target "shadow" credentials in .env because SHADOW_DATABASE_URL has missing or placeholder credentials.'
+    );
+  }
+  const envPassword = existingMainEnv.SHADOW_POSTGRES_PASSWORD?.trim() || '';
+  if (isPlaceholderOrWeak(envPassword)) {
+    throw new Error(
+      'Cannot safely preserve unselected target "shadow" credentials in .env because SHADOW_POSTGRES_PASSWORD is missing or a placeholder.'
+    );
+  }
+  if (envPassword !== urlCreds.password) {
+    throw new Error(
+      'Cannot safely preserve unselected target "shadow" credentials in .env because SHADOW_POSTGRES_PASSWORD does not match SHADOW_DATABASE_URL password.'
+    );
+  }
+  const envUser = existingMainEnv.SHADOW_POSTGRES_USER?.trim() || COREERP_DB_ENVIRONMENTS.shadow.user;
+  if (envUser !== urlCreds.username) {
+    throw new Error(
+      'Cannot safely preserve unselected target "shadow" credentials in .env because SHADOW_POSTGRES_USER does not match SHADOW_DATABASE_URL username.'
+    );
+  }
+  const envDb = existingMainEnv.SHADOW_POSTGRES_DB?.trim() || COREERP_DB_ENVIRONMENTS.shadow.database;
+  if (envDb.toLowerCase() !== COREERP_DB_ENVIRONMENTS.shadow.database) {
+    throw new Error(
+      `Cannot safely preserve unselected target "shadow" credentials in .env because SHADOW_POSTGRES_DB must be "${COREERP_DB_ENVIRONMENTS.shadow.database}".`
+    );
+  }
+  return {
+    user: envUser,
+    password: envPassword,
+    database: envDb,
+    url: shadowUrl,
+  };
 }
 
 interface InMemoryEnvironmentBundle {
@@ -745,32 +899,74 @@ interface InMemoryEnvironmentBundle {
   stagingEnv: Record<string, string>;
   integrationEnv: Record<string, string>;
   plannedFileActions: PlannedEnvFileAction[];
+  recreatedTargets: Set<CleanResetTarget>;
 }
 
 /**
  * STAGE 4 helper: Prepares all five database environments strictly in memory without creating,
  * renaming, or modifying any files on disk.
+ *
+ * Strict target-to-file isolation:
+ * - `.env` is modified/created ONLY when `dev` or `shadow` is selected (preserving the unselected
+ *   sibling's credentials and existing app secrets/encryption metadata).
+ * - `.env.staging` is modified/created ONLY when `staging` is selected.
+ * - `.env.integration-test` is modified/created ONLY when `integration` is selected.
+ * - `test` owns no env file (selecting only `test` leaves all env files PRESERVED byte-for-byte).
+ * - If credentials for any unselected target cannot be safely preserved, fails fast before Stage 8.
  */
 function prepareEnvironmentsInMemory(params: {
+  targets: readonly CleanResetTarget[];
   existingMainEnv: Record<string, string> | null;
   existingStagingEnv: Record<string, string> | null;
   existingIntegrationEnv: Record<string, string> | null;
   recreateEnv: boolean;
   generateSecret: (bytes?: number) => string;
 }): InMemoryEnvironmentBundle {
-  const { existingMainEnv, existingStagingEnv, existingIntegrationEnv, recreateEnv, generateSecret } =
-    params;
+  const {
+    targets,
+    existingMainEnv,
+    existingStagingEnv,
+    existingIntegrationEnv,
+    recreateEnv,
+    generateSecret,
+  } = params;
+
+  const selectsDev = targets.includes('dev');
+  const selectsShadow = targets.includes('shadow');
+  const selectsMainEnv = selectsDev || selectsShadow;
+  const selectsStaging = targets.includes('staging');
+  const selectsIntegration = targets.includes('integration');
 
   const plannedFileActions: PlannedEnvFileAction[] = [];
+  const recreatedTargets = new Set<CleanResetTarget>();
 
-  // 1. Staging environment (.env.staging)
+  // Gather existing non-staging passwords so freshly generated staging/integration secrets never collide
+  const existingDevPassword = existingMainEnv?.POSTGRES_PASSWORD?.trim() || 'erp_password_dev';
+  const existingIntegrationPassword = existingIntegrationEnv?.POSTGRES_PASSWORD?.trim() || '';
+
+  // 1. Staging environment (.env.staging — owned exclusively by `staging`)
   let stagingEnv: Record<string, string>;
-  if (existingStagingEnv && !recreateEnv) {
+  let plannedStagingPassword = existingStagingEnv?.STAGING_POSTGRES_PASSWORD?.trim() || '';
+  if (!selectsStaging) {
+    if (!existingStagingEnv) {
+      throw new Error(
+        'Cannot preserve unselected target "staging" because .env.staging does not exist. Create/repair .env.staging first or include "staging" in --targets.'
+      );
+    }
+    stagingEnv = { ...existingStagingEnv };
+    plannedFileActions.push({ file: '.env.staging', action: 'PRESERVE' });
+  } else if (existingStagingEnv && !recreateEnv) {
     stagingEnv = { ...existingStagingEnv };
     plannedFileActions.push({ file: '.env.staging', action: 'PRESERVE' });
   } else {
     const user = COREERP_DB_ENVIRONMENTS.staging.user;
-    const password = generateSecret(32);
+    const forbiddenStagingPasswords = new Set<string>([
+      existingDevPassword,
+      'erp_password_dev',
+      ...(existingIntegrationPassword ? [existingIntegrationPassword] : []),
+    ]);
+    const password = generateDistinctSecret(generateSecret, 32, forbiddenStagingPasswords);
+    plannedStagingPassword = password;
     const database = COREERP_DB_ENVIRONMENTS.staging.database;
     const stagingUrl = buildPostgresConnectionUrl({
       user,
@@ -781,6 +977,7 @@ function prepareEnvironmentsInMemory(params: {
     });
     const content = renderStagingEnvFile({ user, password, database, stagingUrl });
     stagingEnv = parseEnvFileContent(content);
+    recreatedTargets.add('staging');
     plannedFileActions.push({
       file: '.env.staging',
       action: existingStagingEnv ? 'BACKUP_AND_RECREATE' : 'CREATE',
@@ -788,13 +985,24 @@ function prepareEnvironmentsInMemory(params: {
     });
   }
 
-  // 2. Integration test environment (.env.integration-test)
+  // 2. Integration test environment (.env.integration-test — owned exclusively by `integration`)
   let integrationEnv: Record<string, string>;
-  if (existingIntegrationEnv && !recreateEnv) {
+  if (!selectsIntegration) {
+    if (!existingIntegrationEnv) {
+      throw new Error(
+        'Cannot preserve unselected target "integration" because .env.integration-test does not exist. Create/repair .env.integration-test first or include "integration" in --targets.'
+      );
+    }
+    integrationEnv = { ...existingIntegrationEnv };
+    plannedFileActions.push({ file: '.env.integration-test', action: 'PRESERVE' });
+  } else if (existingIntegrationEnv && !recreateEnv) {
     integrationEnv = { ...existingIntegrationEnv };
     plannedFileActions.push({ file: '.env.integration-test', action: 'PRESERVE' });
   } else {
-    const password = generateSecret(32);
+    const forbiddenIntegrationPasswords = new Set<string>(
+      plannedStagingPassword ? [plannedStagingPassword] : []
+    );
+    const password = generateDistinctSecret(generateSecret, 32, forbiddenIntegrationPasswords);
     const testUrl = buildPostgresConnectionUrl({
       user: COREERP_DB_ENVIRONMENTS.integrationTest.user,
       password,
@@ -804,6 +1012,7 @@ function prepareEnvironmentsInMemory(params: {
     });
     const content = renderIntegrationEnvFile({ password, testUrl });
     integrationEnv = parseEnvFileContent(content);
+    recreatedTargets.add('integration');
     plannedFileActions.push({
       file: '.env.integration-test',
       action: existingIntegrationEnv ? 'BACKUP_AND_RECREATE' : 'CREATE',
@@ -811,33 +1020,108 @@ function prepareEnvironmentsInMemory(params: {
     });
   }
 
-  // 3. Main development + shadow (.env — NEVER contains STAGING_DATABASE_URL or TEST_DATABASE_URL)
+  // 3. Main development + shadow (.env — owned exclusively by `dev` and `shadow`; NEVER contains STAGING_DATABASE_URL or TEST_DATABASE_URL)
   let mainEnv: Record<string, string>;
-  if (existingMainEnv && !recreateEnv) {
+  if (!selectsMainEnv) {
+    if (!existingMainEnv) {
+      throw new Error(
+        'Cannot preserve unselected targets "dev" and "shadow" because .env does not exist. Create/repair .env first or include "dev" and "shadow" in --targets.'
+      );
+    }
+    mainEnv = { ...existingMainEnv };
+    plannedFileActions.push({ file: '.env', action: 'PRESERVE' });
+  } else if (existingMainEnv && !recreateEnv) {
     mainEnv = { ...existingMainEnv };
     plannedFileActions.push({ file: '.env', action: 'PRESERVE' });
   } else {
-    const devUser = COREERP_DB_ENVIRONMENTS.development.user;
-    const devPassword = 'erp_password_dev';
-    const devDatabase = COREERP_DB_ENVIRONMENTS.development.database;
-    const devUrl = buildPostgresConnectionUrl({
-      user: devUser,
-      password: devPassword,
-      host: 'localhost',
-      port: COREERP_DB_ENVIRONMENTS.development.port,
-      database: devDatabase,
-    });
+    if (!existingMainEnv && selectsDev !== selectsShadow) {
+      const selectedName = selectsDev ? 'dev' : 'shadow';
+      const unselectedName = selectsDev ? 'shadow' : 'dev';
+      throw new Error(
+        `Cannot safely create .env for selected target "${selectedName}" because .env does not exist and credentials for unselected target "${unselectedName}" cannot be preserved. Create/repair .env first or select both "dev" and "shadow".`
+      );
+    }
 
-    const shadowUser = COREERP_DB_ENVIRONMENTS.shadow.user;
-    const shadowPassword = generateSecret(32);
-    const shadowDatabase = COREERP_DB_ENVIRONMENTS.shadow.database;
-    const shadowUrl = buildPostgresConnectionUrl({
-      user: shadowUser,
-      password: shadowPassword,
-      host: 'localhost',
-      port: COREERP_DB_ENVIRONMENTS.shadow.port,
-      database: shadowDatabase,
-    });
+    let devUser: string;
+    let devPassword: string;
+    let devDatabase: string;
+    let devUrl: string;
+    if (selectsDev) {
+      devUser = COREERP_DB_ENVIRONMENTS.development.user;
+      devPassword = 'erp_password_dev';
+      devDatabase = COREERP_DB_ENVIRONMENTS.development.database;
+      devUrl = buildPostgresConnectionUrl({
+        user: devUser,
+        password: devPassword,
+        host: 'localhost',
+        port: COREERP_DB_ENVIRONMENTS.development.port,
+        database: devDatabase,
+      });
+      recreatedTargets.add('dev');
+    } else {
+      const preservedDev = extractPreservableDevCredentials(existingMainEnv!);
+      devUser = preservedDev.user;
+      devPassword = preservedDev.password;
+      devDatabase = preservedDev.database;
+      devUrl = preservedDev.url;
+    }
+
+    let shadowUser: string;
+    let shadowPassword: string;
+    let shadowDatabase: string;
+    let shadowUrl: string;
+    if (selectsShadow) {
+      shadowUser = COREERP_DB_ENVIRONMENTS.shadow.user;
+      shadowPassword = generateDistinctSecret(
+        generateSecret,
+        32,
+        new Set<string>([devPassword, ...(plannedStagingPassword ? [plannedStagingPassword] : [])])
+      );
+      shadowDatabase = COREERP_DB_ENVIRONMENTS.shadow.database;
+      shadowUrl = buildPostgresConnectionUrl({
+        user: shadowUser,
+        password: shadowPassword,
+        host: 'localhost',
+        port: COREERP_DB_ENVIRONMENTS.shadow.port,
+        database: shadowDatabase,
+      });
+      recreatedTargets.add('shadow');
+    } else {
+      const preservedShadow = extractPreservableShadowCredentials(existingMainEnv!);
+      shadowUser = preservedShadow.user;
+      shadowPassword = preservedShadow.password;
+      shadowDatabase = preservedShadow.database;
+      shadowUrl = preservedShadow.url;
+    }
+
+    // Preserve existing application secrets and bank encryption metadata unless missing/placeholder
+    const sessionSecret =
+      existingMainEnv?.SESSION_SECRET && !isPlaceholderOrWeak(existingMainEnv.SESSION_SECRET)
+        ? existingMainEnv.SESSION_SECRET.trim()
+        : generateSecret(32);
+    const bankEncryptionKey =
+      existingMainEnv?.BANK_ENCRYPTION_KEY &&
+      !isPlaceholderOrWeak(existingMainEnv.BANK_ENCRYPTION_KEY)
+        ? existingMainEnv.BANK_ENCRYPTION_KEY.trim()
+        : generateSecret(32);
+    const bankActiveKeyId =
+      existingMainEnv?.BANK_ACTIVE_KEY_ID &&
+      !isPlaceholderOrWeak(existingMainEnv.BANK_ACTIVE_KEY_ID)
+        ? existingMainEnv.BANK_ACTIVE_KEY_ID.trim()
+        : 'k1';
+    const bankHistoricalKeys =
+      existingMainEnv?.BANK_HISTORICAL_KEYS &&
+      !isPlaceholderOrWeak(existingMainEnv.BANK_HISTORICAL_KEYS)
+        ? existingMainEnv.BANK_HISTORICAL_KEYS.trim()
+        : '{}';
+    const biometricBridgeToken =
+      existingMainEnv?.BIOMETRIC_BRIDGE_TOKEN &&
+      !isPlaceholderOrWeak(existingMainEnv.BIOMETRIC_BRIDGE_TOKEN)
+        ? existingMainEnv.BIOMETRIC_BRIDGE_TOKEN.trim()
+        : generateSecret(24);
+    const preservedPort = existingMainEnv?.PORT?.trim() || undefined;
+    const preservedNodeEnv = existingMainEnv?.NODE_ENV?.trim() || undefined;
+    const preservedUnitTestUrl = existingMainEnv?.UNIT_TEST_DATABASE_URL?.trim() || undefined;
 
     const content = renderMainDevEnvFile({
       devUser,
@@ -848,9 +1132,14 @@ function prepareEnvironmentsInMemory(params: {
       shadowPassword,
       shadowDatabase,
       shadowUrl,
-      sessionSecret: generateSecret(32),
-      bankEncryptionKey: generateSecret(32),
-      biometricBridgeToken: generateSecret(24),
+      port: preservedPort,
+      nodeEnv: preservedNodeEnv,
+      unitTestUrl: preservedUnitTestUrl,
+      sessionSecret,
+      bankEncryptionKey,
+      bankActiveKeyId,
+      bankHistoricalKeys,
+      biometricBridgeToken,
     });
     mainEnv = parseEnvFileContent(content);
     plannedFileActions.push({
@@ -860,7 +1149,7 @@ function prepareEnvironmentsInMemory(params: {
     });
   }
 
-  return { mainEnv, stagingEnv, integrationEnv, plannedFileActions };
+  return { mainEnv, stagingEnv, integrationEnv, plannedFileActions, recreatedTargets };
 }
 
 function parseUrlCredentialsSafe(
@@ -893,8 +1182,11 @@ export function validateAllFiveEnvironmentsPreflight(params: {
   stagingEnv: Record<string, string>;
   integrationEnv: Record<string, string>;
   recreateEnv: boolean;
+  recreatedTargets?: ReadonlySet<CleanResetTarget>;
 }): ValidatedFiveEnvironments {
-  const { shellEnv, mainEnv, stagingEnv, integrationEnv, recreateEnv } = params;
+  const { shellEnv, mainEnv, stagingEnv, integrationEnv, recreateEnv, recreatedTargets } = params;
+  const isTargetRecreated = (target: CleanResetTarget): boolean =>
+    recreatedTargets ? recreatedTargets.has(target) : recreateEnv;
   const issues: string[] = [];
   const resolvedUrls: Partial<Record<CleanResetTarget, string>> = {};
   const resolvedEndpoints: Partial<Record<CleanResetTarget, NormalizedDatabaseEndpoint>> = {};
@@ -956,6 +1248,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
 
   // Helper to verify shell URLs cannot silently override validated local targets with remote/wrong/conflicting endpoints
   const checkShellUrlOverride = (
+    target: CleanResetTarget,
     varName: string,
     fileLabel: string,
     shellVal: string | undefined,
@@ -983,7 +1276,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
       );
       return;
     }
-    if (!recreateEnv && fileVal?.trim()) {
+    if (!isTargetRecreated(target) && fileVal?.trim()) {
       const fileEp = normalizeDatabaseUrl(fileVal.trim());
       const shellCreds = parseUrlCredentialsSafe(trimmed);
       const fileCreds = parseUrlCredentialsSafe(fileVal.trim());
@@ -1004,6 +1297,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
 
   // Check shell overrides for all five targets BEFORE resolving effective target URLs
   checkShellUrlOverride(
+    'dev',
     'DATABASE_URL',
     '.env',
     shellEnv.DATABASE_URL,
@@ -1012,6 +1306,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
     COREERP_DB_ENVIRONMENTS.development.database
   );
   checkShellUrlOverride(
+    'test',
     'UNIT_TEST_DATABASE_URL',
     '.env',
     shellEnv.UNIT_TEST_DATABASE_URL,
@@ -1020,6 +1315,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
     COREERP_DB_ENVIRONMENTS.automatedTest.database
   );
   checkShellUrlOverride(
+    'integration',
     'TEST_DATABASE_URL',
     '.env.integration-test',
     shellEnv.TEST_DATABASE_URL,
@@ -1028,6 +1324,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
     COREERP_DB_ENVIRONMENTS.integrationTest.database
   );
   checkShellUrlOverride(
+    'staging',
     'STAGING_DATABASE_URL',
     '.env.staging',
     shellEnv.STAGING_DATABASE_URL,
@@ -1036,6 +1333,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
     COREERP_DB_ENVIRONMENTS.staging.database
   );
   checkShellUrlOverride(
+    'shadow',
     'SHADOW_DATABASE_URL',
     '.env',
     shellEnv.SHADOW_DATABASE_URL,
@@ -1128,7 +1426,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
       }
       if (
         shellEnv.POSTGRES_PASSWORD?.trim() &&
-        !recreateEnv &&
+        !isTargetRecreated('dev') &&
         creds.password !== shellEnv.POSTGRES_PASSWORD.trim()
       ) {
         issues.push(
@@ -1262,7 +1560,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
       }
       if (
         shellEnv.STAGING_POSTGRES_PASSWORD?.trim() &&
-        !recreateEnv &&
+        !isTargetRecreated('staging') &&
         creds.password !== shellEnv.STAGING_POSTGRES_PASSWORD.trim()
       ) {
         issues.push(
@@ -1494,6 +1792,7 @@ export async function runCoreErpCleanReset(
   let inMemoryBundle: InMemoryEnvironmentBundle;
   try {
     inMemoryBundle = prepareEnvironmentsInMemory({
+      targets,
       existingMainEnv,
       existingStagingEnv,
       existingIntegrationEnv,
@@ -1571,6 +1870,7 @@ export async function runCoreErpCleanReset(
     stagingEnv: inMemoryBundle.stagingEnv,
     integrationEnv: inMemoryBundle.integrationEnv,
     recreateEnv,
+    recreatedTargets: inMemoryBundle.recreatedTargets,
   });
 
   if (envValidation.issues.length > 0) {
