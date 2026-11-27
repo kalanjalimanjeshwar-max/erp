@@ -131,6 +131,7 @@ export interface LocalEnvRepairResult {
   executed: boolean;
   blocked: boolean;
   docker: DockerEnvironmentSnapshot;
+  persistentEnvScopesVerified: boolean;
   findings: RepairFinding[];
   shellOverrides: ShellOverrideFinding[];
   actions: RepairActionPlan[];
@@ -140,6 +141,7 @@ export interface LocalEnvRepairResult {
   blockers: string[];
   warnings: string[];
   manualRemediation: string[];
+  fileVerificationPassed: boolean | null;
   verificationPassed: boolean | null;
 }
 
@@ -605,6 +607,9 @@ export async function detectPersistentWindowsEnvOverrides(
 }
 
 function buildScopeLabel(scopes: Array<'Process' | 'User' | 'Machine'>): EnvOverrideScope {
+  if (scopes.length === 0) {
+    throw new Error('Cannot build scope label when no active environment override scopes exist.');
+  }
   const hasProcess = scopes.includes('Process');
   const hasUser = scopes.includes('User');
   const hasMachine = scopes.includes('Machine');
@@ -849,13 +854,23 @@ export async function runLocalDatabaseEnvRepair(
   if (stagingFile.error) blockers.push(stagingFile.error);
 
   // 3. Inspect shell & persistent Windows User/Machine environment overrides (strictly read-only)
-  const persistentEntries = await inspectPersistentEnvScopes(TRACKED_DB_ENV_VARS);
+  let persistentEntries: PersistentEnvScopeEntry[] | null;
+  try {
+    persistentEntries = await inspectPersistentEnvScopes(TRACKED_DB_ENV_VARS);
+  } catch {
+    persistentEntries = null;
+  }
+  const persistentEnvScopesVerified = Array.isArray(persistentEntries);
   const persistentMap = new Map<string, PersistentEnvScopeEntry>();
-  if (persistentEntries) {
+  if (persistentEntries !== null) {
     for (const entry of persistentEntries) {
       persistentMap.set(entry.variable, entry);
       trackSecrets([entry.userValue, entry.machineValue]);
     }
+  } else {
+    warnings.push(
+      'Windows User/Machine persistent environment scopes could not be verified (persistent scope inspection was unavailable or failed). Only Process-scope shell environment variables were checked; persistent User/Machine overrides remain unverified.'
+    );
   }
 
   const targetMetaByVar = new Map<
@@ -944,21 +959,28 @@ export async function runLocalDatabaseEnvRepair(
       return !pEp || pEp.hostname !== '127.0.0.1' || pEp.port !== meta.port || pEp.database !== meta.database;
     });
 
-    // Also flag conflict against file value when present
+    // Also flag conflict against file value when present across any active scope (endpoint or credentials)
     let conflictsWithFile = false;
-    if (meta.fileValue?.trim() && ep) {
+    if (meta.fileValue?.trim()) {
       const fileEp = normalizeDatabaseUrl(meta.fileValue.trim());
-      const envCreds = parseUrlCredentialsSafe(effectiveValue);
       const fileCreds = parseUrlCredentialsSafe(meta.fileValue.trim());
-      if (
-        fileEp &&
-        (!areDatabaseEndpointsEqual(ep, fileEp) ||
-          (envCreds &&
-            fileCreds &&
-            (envCreds.username !== fileCreds.username ||
-              envCreds.password !== fileCreds.password)))
-      ) {
-        conflictsWithFile = true;
+      if (fileEp) {
+        const activeValues = [processVal, userVal, machineVal].filter((v): v is string => Boolean(v));
+        for (const candidateVal of activeValues) {
+          const candidateEp = normalizeDatabaseUrl(candidateVal);
+          const candidateCreds = parseUrlCredentialsSafe(candidateVal);
+          if (
+            candidateEp &&
+            (!areDatabaseEndpointsEqual(candidateEp, fileEp) ||
+              (candidateCreds &&
+                fileCreds &&
+                (candidateCreds.username !== fileCreds.username ||
+                  candidateCreds.password !== fileCreds.password)))
+          ) {
+            conflictsWithFile = true;
+            break;
+          }
+        }
       }
     }
 
@@ -1774,7 +1796,11 @@ export async function runLocalDatabaseEnvRepair(
 
   logger.log('\n3. Audit Findings & Safety Classification:');
   if (findings.length === 0) {
-    logger.log('   - No configuration issues or shell overrides detected.');
+    logger.log(
+      persistentEnvScopesVerified
+        ? '   - No configuration issues or shell overrides detected.'
+        : '   - No configuration issues or Process-scope shell overrides detected (Windows User/Machine persistent environment scopes could not be verified).'
+    );
   } else {
     for (const f of findings) {
       logger.log(`   - [${f.safety}] ${redact(f.message)}`);
@@ -1808,6 +1834,7 @@ export async function runLocalDatabaseEnvRepair(
   const finalizeResult = (params: {
     exitCode: 0 | 1;
     executed: boolean;
+    fileVerificationPassed: boolean | null;
     verificationPassed: boolean | null;
   }): LocalEnvRepairResult => ({
     exitCode: params.exitCode,
@@ -1818,6 +1845,7 @@ export async function runLocalDatabaseEnvRepair(
       ...docker,
       error: docker.error ? redact(docker.error) : undefined,
     },
+    persistentEnvScopesVerified,
     findings: findings.map((f) => ({ ...f, message: redact(f.message) })),
     shellOverrides: shellOverrides.map((ov) => ({
       ...ov,
@@ -1834,7 +1862,12 @@ export async function runLocalDatabaseEnvRepair(
     blockers: blockers.map(redact),
     warnings: warnings.map(redact),
     manualRemediation: manualRemediation.map(redact),
-    verificationPassed: params.verificationPassed,
+    fileVerificationPassed: params.fileVerificationPassed,
+    // Complete environment verification can only be true when persistent scopes were also verified
+    verificationPassed:
+      params.verificationPassed === true && !persistentEnvScopesVerified
+        ? null
+        : params.verificationPassed,
   });
 
   // 9. Handle CHECK mode (strictly read-only)
@@ -1843,6 +1876,7 @@ export async function runLocalDatabaseEnvRepair(
       isBlocked ||
       hasFileMutationsPlanned ||
       shellOverrides.length > 0;
+    const filesVerifiedClean = !isBlocked && !hasFileMutationsPlanned;
 
     if (warnings.length > 0) {
       logger.log('\nWarnings:');
@@ -1858,21 +1892,52 @@ export async function runLocalDatabaseEnvRepair(
         );
       }
       logger.log('');
-      return finalizeResult({ exitCode: 1, executed: false, verificationPassed: null });
+      return finalizeResult({
+        exitCode: 1,
+        executed: false,
+        fileVerificationPassed: filesVerifiedClean,
+        verificationPassed: null,
+      });
+    }
+
+    if (!persistentEnvScopesVerified) {
+      logger.log(
+        '\n[AUDIT RESULT] File verification and Process-scope shell checks passed with warnings; Windows User/Machine persistent environment scopes could NOT be verified (zero changes needed).\n'
+      );
+      return finalizeResult({
+        exitCode: 0,
+        executed: false,
+        fileVerificationPassed: true,
+        verificationPassed: null,
+      });
     }
 
     logger.log('\n[AUDIT RESULT] All local database environment files and shell checks PASSED (zero changes needed).\n');
-    return finalizeResult({ exitCode: 0, executed: false, verificationPassed: true });
+    return finalizeResult({
+      exitCode: 0,
+      executed: false,
+      fileVerificationPassed: true,
+      verificationPassed: true,
+    });
   }
 
   // 10. Block BEFORE modifying any file if unsafe conditions were detected
   if (isBlocked) {
+    if (warnings.length > 0) {
+      logger.log('\nWarnings:');
+      for (const w of warnings) logger.warn(`   - ${redact(w)}`);
+    }
     logger.error('\n[REPAIR BLOCKED] Stopping before creating backups or modifying any files:');
     for (const b of blockers) {
       logger.error(`   - ${redact(b)}`);
     }
     logger.log('');
-    return finalizeResult({ exitCode: 1, executed: false, verificationPassed: null });
+    return finalizeResult({
+      exitCode: 1,
+      executed: false,
+      fileVerificationPassed: false,
+      verificationPassed: null,
+    });
   }
 
   // 11. Handle DRY_RUN mode (default — zero file mutations)
@@ -1886,21 +1951,67 @@ export async function runLocalDatabaseEnvRepair(
       if (shellOverrides.length > 0) {
         logger.log('   Clear the reported PowerShell overrides manually, then re-run `npm run db:setup:check`.');
       }
+      if (!persistentEnvScopesVerified) {
+        logger.warn(
+          '   Windows User/Machine persistent environment scopes could not be verified; check User/Machine scopes manually in PowerShell if running on Windows.'
+        );
+      }
       logger.log('');
-      return finalizeResult({ exitCode: 0, executed: false, verificationPassed: null });
+      return finalizeResult({
+        exitCode: 0,
+        executed: false,
+        fileVerificationPassed: true,
+        verificationPassed: null,
+      });
     }
 
     logger.log('\n[DRY-RUN COMPLETE] Zero files, backups, containers, or volumes were modified.');
     logger.log(
       `   To execute this repair safely with automatic backups, run:\n   npm run db:repair:local -- ${REQUIRED_REPAIR_CONFIRMATION_FLAG}\n`
     );
-    return finalizeResult({ exitCode: 0, executed: false, verificationPassed: null });
+    return finalizeResult({
+      exitCode: 0,
+      executed: false,
+      fileVerificationPassed: null,
+      verificationPassed: null,
+    });
   }
 
   // 12. CONFIRMED REPAIR EXECUTION (mode === 'REPAIR')
   if (!hasFileMutationsPlanned) {
-    logger.log('\n[REPAIR NO-OP] All local environment files are already valid and clean. Zero files modified; zero backups created.\n');
-    return finalizeResult({ exitCode: 0, executed: false, verificationPassed: true });
+    if (warnings.length > 0) {
+      logger.log('\nWarnings:');
+      for (const w of warnings) logger.warn(`   - ${redact(w)}`);
+    }
+    if (shellOverrides.length > 0 && !persistentEnvScopesVerified) {
+      logger.log(
+        '\n[REPAIR NO-OP — MANUAL SHELL CLEANUP REMAINING; PERSISTENT ENV SCOPES UNVERIFIED]'
+      );
+      logger.log(
+        '   Local environment files are already valid and clean (zero files modified; zero backups created), but manual shell cleanup remains required for the reported Process-scope override(s), and Windows User/Machine persistent environment scopes remain unverified.\n'
+      );
+    } else if (shellOverrides.length > 0) {
+      logger.log('\n[REPAIR NO-OP — MANUAL SHELL CLEANUP REMAINING]');
+      logger.log(
+        '   Local environment files are already valid and clean (zero files modified; zero backups created), but manual shell cleanup remains required for the reported environment override(s). Clear them manually, then run `npm run db:setup:check`.\n'
+      );
+    } else if (!persistentEnvScopesVerified) {
+      logger.log(
+        '\n[REPAIR NO-OP] File verification passed (all local environment files are already valid and clean; zero files modified; zero backups created), but Windows User/Machine persistent environment scopes could NOT be verified.\n'
+      );
+    } else {
+      logger.log(
+        '\n[REPAIR NO-OP] All local environment files are already valid and clean. Zero files modified; zero backups created.\n'
+      );
+    }
+    const completeVerificationPassed =
+      persistentEnvScopesVerified && shellOverrides.length === 0;
+    return finalizeResult({
+      exitCode: 0,
+      executed: false,
+      fileVerificationPassed: true,
+      verificationPassed: completeVerificationPassed ? true : null,
+    });
   }
 
   // Build ordered list of file writes
@@ -1963,7 +2074,12 @@ export async function runLocalDatabaseEnvRepair(
     const blockerMsg = `Backup creation failed before modifying any files: ${errMsg}. Aborting repair with zero changes to live environment files.`;
     blockers.push(blockerMsg);
     logger.error(`   - [ABORTED] ${blockerMsg}`);
-    return finalizeResult({ exitCode: 1, executed: false, verificationPassed: false });
+    return finalizeResult({
+      exitCode: 1,
+      executed: false,
+      fileVerificationPassed: false,
+      verificationPassed: false,
+    });
   }
 
   // Phase B: Atomic writes with rollback on mid-flight failure
@@ -2005,7 +2121,12 @@ export async function runLocalDatabaseEnvRepair(
     modifiedFiles.length = 0;
     createdFiles.length = 0;
     blockers.push(`Atomic write failed during repair: ${errMsg}`);
-    return finalizeResult({ exitCode: 1, executed: false, verificationPassed: false });
+    return finalizeResult({
+      exitCode: 1,
+      executed: false,
+      fileVerificationPassed: false,
+      verificationPassed: false,
+    });
   }
 
   // Phase C: Post-write file verification (re-read from disk and validate all 5 file targets)
@@ -2028,20 +2149,52 @@ export async function runLocalDatabaseEnvRepair(
     for (const issue of postVerify.issues) {
       logger.error(`       * ${redact(issue)}`);
     }
-    return finalizeResult({ exitCode: 1, executed: true, verificationPassed: false });
+    return finalizeResult({
+      exitCode: 1,
+      executed: true,
+      fileVerificationPassed: false,
+      verificationPassed: false,
+    });
   }
 
-  logger.log('   - Verified: .env, .env.integration-test, and .env.staging pass five-environment isolation checks.');
+  logger.log('   - File verification passed: .env, .env.integration-test, and .env.staging pass five-environment isolation checks.');
   logger.log('   - Verified: Zero containers, volumes, databases, or biometric bridge files were modified.');
+  if (!persistentEnvScopesVerified) {
+    logger.warn(
+      '   - Persistent scope verification: UNVERIFIED (Windows User/Machine persistent environment scopes could not be inspected).'
+    );
+  }
 
-  if (shellOverrides.length > 0) {
+  if (warnings.length > 0) {
+    logger.log('\nWarnings:');
+    for (const w of warnings) logger.warn(`   - ${redact(w)}`);
+  }
+
+  if (shellOverrides.length > 0 && !persistentEnvScopesVerified) {
+    logger.log('\n[REPAIR COMPLETE — FILES VERIFIED; MANUAL SHELL CLEANUP REMAINING; PERSISTENT ENV SCOPES UNVERIFIED]');
+    logger.log(
+      '   File verification passed for .env, .env.integration-test, and .env.staging. Clear the reported Process-scope PowerShell overrides manually, and verify Windows User/Machine persistent environment scopes manually.\n'
+    );
+  } else if (shellOverrides.length > 0) {
     logger.log('\n[REPAIR COMPLETE — MANUAL SHELL CLEANUP REMAINING]');
     logger.log(
       '   Local environment files are repaired and verified. Clear the reported PowerShell environment overrides manually, then run `npm run db:setup:check`.\n'
+    );
+  } else if (!persistentEnvScopesVerified) {
+    logger.log('\n[REPAIR COMPLETE — FILES VERIFIED; PERSISTENT ENV SCOPES UNVERIFIED]');
+    logger.log(
+      '   File verification passed for .env, .env.integration-test, and .env.staging, but Windows User/Machine persistent environment scopes could NOT be verified. Check User/Machine scopes manually in PowerShell if running on Windows.\n'
     );
   } else {
     logger.log('\n[REPAIR COMPLETE] Local database environment files repaired and verified successfully.\n');
   }
 
-  return finalizeResult({ exitCode: 0, executed: true, verificationPassed: true });
+  const completeVerificationPassed =
+    persistentEnvScopesVerified && shellOverrides.length === 0;
+  return finalizeResult({
+    exitCode: 0,
+    executed: true,
+    fileVerificationPassed: true,
+    verificationPassed: completeVerificationPassed ? true : null,
+  });
 }

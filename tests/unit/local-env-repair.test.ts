@@ -952,9 +952,29 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     expect(misplacedRes.findings.filter((f) => f.category === 'SHELL_OVERRIDE')).toEqual([]);
     expect(misplacedRes.manualRemediation).toEqual([]);
     expect(misplacedLogs.join('\n')).not.toContain('Shell / Persistent Environment Overrides');
+
+    // A3. Whitespace-only or empty-string values in Process/User/Machine must also be treated as absent
+    const wsRes = await runLocalDatabaseEnvRepair({
+      projectRoot: cleanDir,
+      mode: 'CHECK',
+      shellEnv: {
+        TEST_DATABASE_URL: '   ',
+        STAGING_DATABASE_URL: '',
+      },
+      logger: createSilentLogger().logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [
+        { variable: 'TEST_DATABASE_URL', userValue: '  ', machineValue: '' },
+        { variable: 'STAGING_DATABASE_URL', userValue: '', machineValue: '   ' },
+      ],
+    });
+    expect(wsRes.exitCode).toBe(0);
+    expect(wsRes.shellOverrides).toEqual([]);
+    expect(wsRes.findings.filter((f) => f.category === 'SHELL_OVERRIDE')).toEqual([]);
+    expect(wsRes.manualRemediation).toEqual([]);
   });
 
-  it('13. [Test B] Detects genuine TEST_DATABASE_URL in Process scope as shadowing target file without falsely flagging STAGING_DATABASE_URL', async () => {
+  it('13. [Test B] Detects genuine TEST_DATABASE_URL in Process scope (both matching-target shadowing and credential conflict) without falsely flagging STAGING_DATABASE_URL', async () => {
     const dir = makeTempProject();
     const { intPass } = seedCleanFiveEnvFiles(dir);
     const { logger, logs } = createSilentLogger();
@@ -982,9 +1002,30 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     expect(res.findings.filter((f) => f.category === 'SHELL_OVERRIDE')).toHaveLength(1);
     expect(res.shellOverrides.some((o) => o.variable === 'STAGING_DATABASE_URL')).toBe(false);
     expect(logs.join('\n')).not.toContain(intPass);
+
+    // B2. Same endpoint in Process scope with mismatched password must classify as CONFLICTING_OR_WRONG_TARGET
+    const wrongIntCredSecret = 'MismatchedProcessIntSecret_4411!';
+    const { logger: conflictLogger, logs: conflictLogs } = createSilentLogger();
+    const conflictRes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {
+        TEST_DATABASE_URL: `postgresql://erp_integration_user:${encodeURIComponent(wrongIntCredSecret)}@localhost:5434/core_erp_integration_test?schema=public`,
+      },
+      logger: conflictLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(conflictRes.exitCode).toBe(1);
+    expect(conflictRes.shellOverrides).toHaveLength(1);
+    expect(conflictRes.shellOverrides[0].variable).toBe('TEST_DATABASE_URL');
+    expect(conflictRes.shellOverrides[0].scopeLabel).toBe('Process');
+    expect(conflictRes.shellOverrides[0].status).toBe('CONFLICTING_OR_WRONG_TARGET');
+    expect(conflictLogs.join('\n')).not.toContain(wrongIntCredSecret);
   });
 
-  it('14. [Test C] Detects genuine STAGING_DATABASE_URL in Process scope as shadowing target file without falsely flagging TEST_DATABASE_URL', async () => {
+  it('14. [Test C] Detects genuine STAGING_DATABASE_URL in Process scope (both matching-target shadowing and credential conflict) without falsely flagging TEST_DATABASE_URL', async () => {
     const dir = makeTempProject();
     const { stagingPass } = seedCleanFiveEnvFiles(dir);
     const { logger, logs } = createSilentLogger();
@@ -1012,6 +1053,27 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     expect(res.findings.filter((f) => f.category === 'SHELL_OVERRIDE')).toHaveLength(1);
     expect(res.shellOverrides.some((o) => o.variable === 'TEST_DATABASE_URL')).toBe(false);
     expect(logs.join('\n')).not.toContain(stagingPass);
+
+    // C2. Same endpoint in Process scope with mismatched password must classify as CONFLICTING_OR_WRONG_TARGET
+    const wrongStagingCredSecret = 'MismatchedProcessStagingSecret_5522!';
+    const { logger: conflictLogger, logs: conflictLogs } = createSilentLogger();
+    const conflictRes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {
+        STAGING_DATABASE_URL: `postgresql://erp_staging_user:${encodeURIComponent(wrongStagingCredSecret)}@localhost:5435/core_erp_staging?schema=public`,
+      },
+      logger: conflictLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(conflictRes.exitCode).toBe(1);
+    expect(conflictRes.shellOverrides).toHaveLength(1);
+    expect(conflictRes.shellOverrides[0].variable).toBe('STAGING_DATABASE_URL');
+    expect(conflictRes.shellOverrides[0].scopeLabel).toBe('Process');
+    expect(conflictRes.shellOverrides[0].status).toBe('CONFLICTING_OR_WRONG_TARGET');
+    expect(conflictLogs.join('\n')).not.toContain(wrongStagingCredSecret);
   });
 
   it('15. [Test D] Flags wrong Process endpoint as CONFLICTING_OR_WRONG_TARGET with exact manual PowerShell remediation and secret redaction', async () => {
@@ -1043,7 +1105,7 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     expect(logs.join('\n')).not.toContain(wrongProcessSecret);
   });
 
-  it('16. [Test E] Detects wrong User or Machine persistent overrides even when Process scope is empty and preserves manual remediation', async () => {
+  it('16. [Test E] Detects wrong User or Machine persistent overrides when Process scope is empty without falsely claiming Process scope', async () => {
     const dir = makeTempProject();
     seedCleanFiveEnvFiles(dir);
     const userWrongSecret = 'PersistentUserWrongSecret_6611!';
@@ -1075,8 +1137,12 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     const machineOv = res.shellOverrides.find((o) => o.variable === 'STAGING_DATABASE_URL');
 
     expect(userOv?.scopes).toEqual(['User']);
+    expect(userOv?.scopes).not.toContain('Process');
     expect(userOv?.scopeLabel).toBe('User');
     expect(userOv?.status).toBe('CONFLICTING_OR_WRONG_TARGET');
+    expect(
+      userOv?.remediationCommands.some((c) => c.includes('Remove-Item Env:'))
+    ).toBe(false);
     expect(
       userOv?.remediationCommands.some((c) =>
         c.includes("[Environment]::SetEnvironmentVariable('TEST_DATABASE_URL', $null, 'User')")
@@ -1084,8 +1150,12 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     ).toBe(true);
 
     expect(machineOv?.scopes).toEqual(['Machine']);
+    expect(machineOv?.scopes).not.toContain('Process');
     expect(machineOv?.scopeLabel).toBe('Machine');
     expect(machineOv?.status).toBe('CONFLICTING_OR_WRONG_TARGET');
+    expect(
+      machineOv?.remediationCommands.some((c) => c.includes('Remove-Item Env:'))
+    ).toBe(false);
     expect(
       machineOv?.remediationCommands.some((c) =>
         c.includes(
@@ -1097,5 +1167,712 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     const combined = `${logs.join('\n')}\n${JSON.stringify(res.findings)}\n${JSON.stringify(res.shellOverrides)}`;
     expect(combined).not.toContain(userWrongSecret);
     expect(combined).not.toContain(machineWrongSecret);
+    expect(combined).not.toContain('[shell environment (Process)');
+  });
+
+  it('17. [Test F] Preserves existing repair safeguards, finding classifications, secret redaction, and eSSL X2008 USER_SYNC_ONLY biometric bridge files byte-for-byte', async () => {
+    const dir = makeTempProject();
+    const seeded = seedWindowsAuditScenario(dir);
+
+    // Seed isolated eSSL X2008 biometric bridge files in USER_SYNC_ONLY mode
+    const bridgeDir = path.join(dir, 'bridges', 'essl-x2008-bridge');
+    const bridgeDataDir = path.join(bridgeDir, 'data');
+    fs.mkdirSync(bridgeDataDir, { recursive: true });
+    const bridgeConfigPath = path.join(bridgeDir, 'bridge.config.json');
+    const checkpointPath = path.join(bridgeDataDir, 'checkpoints.json');
+    const originalBridgeConfig = JSON.stringify(
+      {
+        terminalSerial: 'X2008-PROD-001',
+        syncMode: 'USER_SYNC_ONLY',
+        pollIntervalMs: 30000,
+      },
+      null,
+      2
+    );
+    const originalCheckpoints = JSON.stringify(
+      { lastSyncedAt: '2026-11-27T00:00:00.000Z', watermark: 42 },
+      null,
+      2
+    );
+    fs.writeFileSync(bridgeConfigPath, originalBridgeConfig, 'utf-8');
+    fs.writeFileSync(checkpointPath, originalCheckpoints, 'utf-8');
+
+    // 1. DRY_RUN previews safely with zero mutations and zero false-positive shell overrides
+    const dryRes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'DRY_RUN',
+      confirmed: false,
+      shellEnv: {},
+      logger: createSilentLogger().logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+    expect(dryRes.exitCode).toBe(0);
+    expect(dryRes.executed).toBe(false);
+    expect(dryRes.shellOverrides).toEqual([]);
+    expect(dryRes.findings.some((f) => f.category === 'MISPLACED_VARIABLE')).toBe(true);
+    expect(dryRes.findings.some((f) => f.category === 'MISSING_VARIABLE')).toBe(true);
+    expect(dryRes.findings.some((f) => f.category === 'MISSING_FILE')).toBe(true);
+    expect(dryRes.findings.some((f) => f.category === 'SHELL_OVERRIDE')).toBe(false);
+
+    // 2. Confirmed REPAIR creates backups, writes atomically, verifies clean state, and never touches bridge files
+    const { logger, logs } = createSilentLogger();
+    const repairRes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+      now: () => new Date(2026, 10, 27, 9, 30, 0, 0),
+    });
+
+    expect(repairRes.exitCode).toBe(0);
+    expect(repairRes.executed).toBe(true);
+    expect(repairRes.verificationPassed).toBe(true);
+    expect(repairRes.backups).toHaveLength(2);
+    expect(repairRes.shellOverrides).toEqual([]);
+    expect(repairRes.manualRemediation).toEqual([]);
+
+    // Post-repair CHECK passes cleanly with zero shell overrides
+    const postCheck = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {},
+      logger: createSilentLogger().logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+    expect(postCheck.exitCode).toBe(0);
+    expect(postCheck.shellOverrides).toEqual([]);
+    expect(postCheck.findings).toEqual([]);
+
+    // Biometric bridge config (USER_SYNC_ONLY) and checkpoints remain byte-for-byte untouched
+    expect(fs.readFileSync(bridgeConfigPath, 'utf-8')).toBe(originalBridgeConfig);
+    expect(fs.readFileSync(checkpointPath, 'utf-8')).toBe(originalCheckpoints);
+    expect(JSON.parse(fs.readFileSync(bridgeConfigPath, 'utf-8')).syncMode).toBe('USER_SYNC_ONLY');
+
+    // Zero secret leakage
+    const allLogs = logs.join('\n');
+    expect(allLogs).not.toContain(seeded.devPass);
+    expect(allLogs).not.toContain(seeded.integrationPass);
+    expect(allLogs).not.toContain(seeded.shadowPass);
+  });
+
+  it('18. Distinguishes successful empty persistent scope inspection ([]) from unavailable inspection (null) without fabricating User/Machine findings', async () => {
+    const dir = makeTempProject();
+    seedCleanFiveEnvFiles(dir);
+
+    // 18a. Successful empty inspection ([]) -> verified, zero warnings, full CHECK pass
+    const { logger: okLogger, logs: okLogs } = createSilentLogger();
+    const okRes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {},
+      logger: okLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(okRes.exitCode).toBe(0);
+    expect(okRes.persistentEnvScopesVerified).toBe(true);
+    expect(okRes.verificationPassed).toBe(true);
+    expect(okRes.warnings).toEqual([]);
+    expect(okRes.shellOverrides).toEqual([]);
+    expect(okRes.findings).toEqual([]);
+    expect(okRes.manualRemediation).toEqual([]);
+    expect(okLogs.join('\n')).toContain(
+      'All local database environment files and shell checks PASSED (zero changes needed).'
+    );
+    expect(okLogs.join('\n')).toContain('No configuration issues or shell overrides detected.');
+
+    // 18b. Unavailable inspection (null) -> explicit warning, never claims persistent scopes verified, zero fabricated User/Machine findings
+    const { logger: nullLogger, logs: nullLogs } = createSilentLogger();
+    const nullRes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {},
+      logger: nullLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => null,
+    });
+
+    expect(nullRes.exitCode).toBe(0);
+    expect(nullRes.persistentEnvScopesVerified).toBe(false);
+    expect(nullRes.verificationPassed).toBeNull();
+    expect(nullRes.shellOverrides).toEqual([]);
+    expect(nullRes.findings).toEqual([]);
+    expect(nullRes.manualRemediation).toEqual([]);
+    expect(nullRes.warnings.length).toBeGreaterThanOrEqual(1);
+    expect(
+      nullRes.warnings.some((w) =>
+        /Windows User\/Machine persistent environment scopes could not be verified/i.test(w)
+      )
+    ).toBe(true);
+
+    const nullLogText = nullLogs.join('\n');
+    expect(nullLogText).toContain(
+      'Windows User/Machine persistent environment scopes could not be verified'
+    );
+    expect(nullLogText).not.toContain(
+      'All local database environment files and shell checks PASSED'
+    );
+    expect(nullLogText).not.toContain('No configuration issues or shell overrides detected.');
+    expect(nullLogText).not.toContain('[Environment]::SetEnvironmentVariable');
+
+    // 18c. DRY_RUN and REPAIR no-op also report persistentEnvScopesVerified=false and emit the warning
+    const { logger: dryLogger, logs: dryLogs } = createSilentLogger();
+    const dryNullRes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'DRY_RUN',
+      shellEnv: {},
+      logger: dryLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => null,
+    });
+    expect(dryNullRes.persistentEnvScopesVerified).toBe(false);
+    expect(dryNullRes.warnings.some((w) => /could not be verified/i.test(w))).toBe(true);
+    expect(dryLogs.join('\n')).toContain(
+      'Windows User/Machine persistent environment scopes could not be verified'
+    );
+
+    const { logger: repairLogger, logs: repairLogs } = createSilentLogger();
+    const repairNullRes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger: repairLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => null,
+    });
+    expect(repairNullRes.exitCode).toBe(0);
+    expect(repairNullRes.executed).toBe(false);
+    expect(repairNullRes.persistentEnvScopesVerified).toBe(false);
+    expect(repairNullRes.warnings.some((w) => /could not be verified/i.test(w))).toBe(true);
+    expect(repairLogs.join('\n')).toContain(
+      'Windows User/Machine persistent environment scopes could NOT be verified'
+    );
+  });
+
+  it('19. Still detects Process-scope overrides (matching target, wrong endpoint, credential conflict) when persistent inspection returns null without fabricating User/Machine findings', async () => {
+    const dir = makeTempProject();
+    const { intPass } = seedCleanFiveEnvFiles(dir);
+    const wrongStagingSecret = 'ProcessWrongEndpointSecret_9012!';
+    const mismatchedDevSecret = 'ProcessDevCredConflictSecret_3456!';
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {
+        // Matching-target shadowing Process override
+        TEST_DATABASE_URL: `postgresql://erp_integration_user:${encodeURIComponent(intPass)}@localhost:5434/core_erp_integration_test?schema=public`,
+        // Wrong-endpoint Process override
+        STAGING_DATABASE_URL: `postgresql://erp_test_user:${encodeURIComponent(wrongStagingSecret)}@localhost:5433/core_erp_test?schema=public`,
+        // Credential-conflict Process override on correct endpoint
+        DATABASE_URL: `postgresql://erp_user:${encodeURIComponent(mismatchedDevSecret)}@localhost:5432/core_erp?schema=public`,
+      },
+      logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => null,
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.persistentEnvScopesVerified).toBe(false);
+    expect(
+      res.warnings.some((w) =>
+        /Windows User\/Machine persistent environment scopes could not be verified/i.test(w)
+      )
+    ).toBe(true);
+
+    expect(res.shellOverrides).toHaveLength(3);
+
+    const testOv = res.shellOverrides.find((o) => o.variable === 'TEST_DATABASE_URL');
+    const stagingOv = res.shellOverrides.find((o) => o.variable === 'STAGING_DATABASE_URL');
+    const devOv = res.shellOverrides.find((o) => o.variable === 'DATABASE_URL');
+
+    expect(testOv?.scopes).toEqual(['Process']);
+    expect(testOv?.scopeLabel).toBe('Process');
+    expect(testOv?.status).toBe('MATCHES_TARGET');
+
+    expect(stagingOv?.scopes).toEqual(['Process']);
+    expect(stagingOv?.scopeLabel).toBe('Process');
+    expect(stagingOv?.status).toBe('CONFLICTING_OR_WRONG_TARGET');
+    expect(stagingOv?.resolvedEndpoint).toBe('127.0.0.1:5433/core_erp_test');
+
+    expect(devOv?.scopes).toEqual(['Process']);
+    expect(devOv?.scopeLabel).toBe('Process');
+    expect(devOv?.status).toBe('CONFLICTING_OR_WRONG_TARGET');
+
+    // Never fabricate User/Machine scopes or persistent remediation commands
+    for (const ov of res.shellOverrides) {
+      expect(ov.scopes).not.toContain('User');
+      expect(ov.scopes).not.toContain('Machine');
+      expect(
+        ov.remediationCommands.some((c) => c.includes('[Environment]::SetEnvironmentVariable'))
+      ).toBe(false);
+    }
+    expect(res.manualRemediation).toContain(
+      'Remove-Item Env:TEST_DATABASE_URL -ErrorAction SilentlyContinue'
+    );
+    expect(res.manualRemediation).toContain(
+      'Remove-Item Env:STAGING_DATABASE_URL -ErrorAction SilentlyContinue'
+    );
+    expect(res.manualRemediation).toContain(
+      'Remove-Item Env:DATABASE_URL -ErrorAction SilentlyContinue'
+    );
+
+    // Zero secret leakage in warnings, findings, shellOverrides, or logs
+    const combined = JSON.stringify({
+      logs,
+      warnings: res.warnings,
+      findings: res.findings,
+      shellOverrides: res.shellOverrides,
+      manualRemediation: res.manualRemediation,
+    });
+    expect(combined).not.toContain(intPass);
+    expect(combined).not.toContain(wrongStagingSecret);
+    expect(combined).not.toContain(mismatchedDevSecret);
+  });
+
+  it('20. Still detects genuine User and Machine persistent overrides (including credential conflict) when inspection succeeds without emitting unverified-scope warnings', async () => {
+    const dir = makeTempProject();
+    seedCleanFiveEnvFiles(dir);
+    const userCredConflictSecret = 'UserScopeCredMismatchSecret_7788!';
+    const machineWrongPortSecret = 'MachineScopeWrongPortSecret_8899!';
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [
+        {
+          variable: 'TEST_DATABASE_URL',
+          // Same endpoint as .env.integration-test but mismatched password -> CONFLICTING_OR_WRONG_TARGET
+          userValue: `postgresql://erp_integration_user:${encodeURIComponent(userCredConflictSecret)}@localhost:5434/core_erp_integration_test?schema=public`,
+        },
+        {
+          variable: 'STAGING_DATABASE_URL',
+          machineValue: `postgresql://erp_test_user:${encodeURIComponent(machineWrongPortSecret)}@localhost:5433/core_erp_test?schema=public`,
+        },
+      ],
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.persistentEnvScopesVerified).toBe(true);
+    expect(res.warnings).toEqual([]);
+    expect(res.shellOverrides).toHaveLength(2);
+
+    const userOv = res.shellOverrides.find((o) => o.variable === 'TEST_DATABASE_URL');
+    const machineOv = res.shellOverrides.find((o) => o.variable === 'STAGING_DATABASE_URL');
+
+    expect(userOv?.scopes).toEqual(['User']);
+    expect(userOv?.scopeLabel).toBe('User');
+    expect(userOv?.status).toBe('CONFLICTING_OR_WRONG_TARGET');
+
+    expect(machineOv?.scopes).toEqual(['Machine']);
+    expect(machineOv?.scopeLabel).toBe('Machine');
+    expect(machineOv?.status).toBe('CONFLICTING_OR_WRONG_TARGET');
+
+    const combined = JSON.stringify({
+      logs,
+      warnings: res.warnings,
+      findings: res.findings,
+      shellOverrides: res.shellOverrides,
+      manualRemediation: res.manualRemediation,
+    });
+    expect(combined).not.toContain(userCredConflictSecret);
+    expect(combined).not.toContain(machineWrongPortSecret);
+    expect(combined).not.toContain('could not be verified');
+  });
+
+  it('21. Handles persistent scope inspection exceptions safely with zero secret leakage in warnings and preserves USER_SYNC_ONLY biometric bridge files', async () => {
+    const dir = makeTempProject();
+    const seeded = seedCleanFiveEnvFiles(dir);
+    const leakedErrorSecret = 'ThrownInspectorSecret_5566!';
+
+    const bridgeDir = path.join(dir, 'bridges', 'essl-x2008-bridge');
+    fs.mkdirSync(bridgeDir, { recursive: true });
+    const bridgeConfigPath = path.join(bridgeDir, 'bridge.config.json');
+    const originalBridgeConfig = JSON.stringify(
+      { terminalSerial: 'X2008-01', syncMode: 'USER_SYNC_ONLY' },
+      null,
+      2
+    );
+    fs.writeFileSync(bridgeConfigPath, originalBridgeConfig, 'utf-8');
+
+    const { logger, logs } = createSilentLogger();
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'CHECK',
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => {
+        throw new Error(`PowerShell failed while reading ${leakedErrorSecret}`);
+      },
+    });
+
+    expect(res.exitCode).toBe(0);
+    expect(res.persistentEnvScopesVerified).toBe(false);
+    expect(res.verificationPassed).toBeNull();
+    expect(res.shellOverrides).toEqual([]);
+    expect(
+      res.warnings.some((w) =>
+        /Windows User\/Machine persistent environment scopes could not be verified/i.test(w)
+      )
+    ).toBe(true);
+
+    const combined = JSON.stringify({ logs, warnings: res.warnings, findings: res.findings });
+    expect(combined).not.toContain(leakedErrorSecret);
+    expect(combined).not.toContain(seeded.devPass);
+    expect(combined).not.toContain(seeded.intPass);
+    expect(combined).not.toContain(seeded.stagingPass);
+    expect(combined).not.toContain(seeded.shadowPass);
+    expect(fs.readFileSync(bridgeConfigPath, 'utf-8')).toBe(originalBridgeConfig);
+  });
+
+  it('22. REPAIR NO-OP distinguishes fileVerificationPassed from complete verificationPassed when persistent scope inspection returns null vs []', async () => {
+    const dir = makeTempProject();
+    const seeded = seedCleanFiveEnvFiles(dir);
+
+    // 22a. REPAIR NO-OP when persistent scope inspection returns null
+    const { logger: nullLogger, logs: nullLogs } = createSilentLogger();
+    const nullNoOp = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger: nullLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => null,
+    });
+
+    expect(nullNoOp.exitCode).toBe(0);
+    expect(nullNoOp.executed).toBe(false);
+    expect(nullNoOp.backups).toHaveLength(0);
+    expect(nullNoOp.modifiedFiles).toEqual([]);
+    expect(nullNoOp.createdFiles).toEqual([]);
+    expect(nullNoOp.fileVerificationPassed).toBe(true);
+    expect(nullNoOp.persistentEnvScopesVerified).toBe(false);
+    expect(nullNoOp.verificationPassed).toBeNull();
+    expect(nullNoOp.shellOverrides).toEqual([]);
+    expect(
+      nullNoOp.warnings.some((w) =>
+        /Windows User\/Machine persistent environment scopes could not be verified/i.test(w)
+      )
+    ).toBe(true);
+
+    const nullLogText = nullLogs.join('\n');
+    expect(nullLogText).toContain('File verification passed');
+    expect(nullLogText).toContain(
+      'Windows User/Machine persistent environment scopes could NOT be verified'
+    );
+    expect(nullLogText).not.toContain(seeded.devPass);
+    expect(nullLogText).not.toContain(seeded.intPass);
+    expect(nullLogText).not.toContain(seeded.stagingPass);
+
+    // 22b. REPAIR NO-OP when persistent scope inspection succeeds with []
+    const { logger: okLogger, logs: okLogs } = createSilentLogger();
+    const okNoOp = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger: okLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(okNoOp.exitCode).toBe(0);
+    expect(okNoOp.executed).toBe(false);
+    expect(okNoOp.fileVerificationPassed).toBe(true);
+    expect(okNoOp.persistentEnvScopesVerified).toBe(true);
+    expect(okNoOp.verificationPassed).toBe(true);
+    expect(okNoOp.warnings).toEqual([]);
+    expect(okLogs.join('\n')).toContain(
+      '[REPAIR NO-OP] All local environment files are already valid and clean. Zero files modified; zero backups created.'
+    );
+  });
+
+  it('23. Successful REPAIR returns fileVerificationPassed=true and verificationPassed=null when persistent scope inspection returns null (with and without Process overrides)', async () => {
+    // 23a. Successful REPAIR with null persistent inspection and no Process overrides
+    const dir = makeTempProject();
+    const seeded = seedWindowsAuditScenario(dir);
+
+    const bridgeDir = path.join(dir, 'bridges', 'essl-x2008-bridge');
+    fs.mkdirSync(bridgeDir, { recursive: true });
+    const bridgeConfigPath = path.join(bridgeDir, 'bridge.config.json');
+    const originalBridgeConfig = JSON.stringify(
+      { terminalSerial: 'X2008-REPAIR-01', syncMode: 'USER_SYNC_ONLY' },
+      null,
+      2
+    );
+    fs.writeFileSync(bridgeConfigPath, originalBridgeConfig, 'utf-8');
+
+    const { logger, logs } = createSilentLogger();
+    const repairRes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => null,
+      now: () => new Date(2026, 10, 27, 9, 45, 0, 0),
+    });
+
+    expect(repairRes.exitCode).toBe(0);
+    expect(repairRes.executed).toBe(true);
+    expect(repairRes.backups).toHaveLength(2);
+    expect(repairRes.modifiedFiles).toEqual(['.env', '.env.integration-test']);
+    expect(repairRes.createdFiles).toEqual(['.env.staging']);
+    expect(repairRes.fileVerificationPassed).toBe(true);
+    expect(repairRes.persistentEnvScopesVerified).toBe(false);
+    expect(repairRes.verificationPassed).toBeNull();
+    expect(repairRes.shellOverrides).toEqual([]);
+    expect(
+      repairRes.warnings.some((w) =>
+        /Windows User\/Machine persistent environment scopes could not be verified/i.test(w)
+      )
+    ).toBe(true);
+
+    const repairLogText = logs.join('\n');
+    expect(repairLogText).toContain('File verification passed:');
+    expect(repairLogText).toContain('Persistent scope verification: UNVERIFIED');
+    expect(repairLogText).toContain(
+      '[REPAIR COMPLETE — FILES VERIFIED; PERSISTENT ENV SCOPES UNVERIFIED]'
+    );
+    expect(repairLogText).not.toContain(
+      '[REPAIR COMPLETE] Local database environment files repaired and verified successfully.'
+    );
+    expect(repairLogText).not.toContain(seeded.devPass);
+    expect(repairLogText).not.toContain(seeded.integrationPass);
+    expect(repairLogText).not.toContain(seeded.shadowPass);
+    expect(fs.readFileSync(bridgeConfigPath, 'utf-8')).toBe(originalBridgeConfig);
+
+    // Repaired files on disk independently pass five-environment setup verification
+    const diskVerify = await runDatabaseEnvironmentSetup({
+      projectRoot: dir,
+      checkOnly: true,
+      shellEnv: {},
+      logger: createSilentLogger().logger,
+      inspectDockerVolumes: async () => null,
+    });
+    expect(diskVerify.exitCode).toBe(0);
+    expect(diskVerify.issues).toEqual([]);
+
+    // 23b. Successful REPAIR with null persistent inspection AND a genuine Process-scope override
+    const dirWithProc = makeTempProject();
+    seedWindowsAuditScenario(dirWithProc);
+    const procOverrideSecret = 'RepairNullProcOverrideSecret_4321!';
+    const { logger: procLogger, logs: procLogs } = createSilentLogger();
+
+    const procRepairRes = await runLocalDatabaseEnvRepair({
+      projectRoot: dirWithProc,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {
+        STAGING_DATABASE_URL: `postgresql://erp_test_user:${encodeURIComponent(procOverrideSecret)}@localhost:5433/core_erp_test?schema=public`,
+      },
+      logger: procLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => null,
+    });
+
+    expect(procRepairRes.exitCode).toBe(0);
+    expect(procRepairRes.executed).toBe(true);
+    expect(procRepairRes.fileVerificationPassed).toBe(true);
+    expect(procRepairRes.persistentEnvScopesVerified).toBe(false);
+    expect(procRepairRes.verificationPassed).toBeNull();
+    expect(procRepairRes.shellOverrides).toHaveLength(1);
+    expect(procRepairRes.shellOverrides[0].scopes).toEqual(['Process']);
+    expect(procRepairRes.shellOverrides[0].scopeLabel).toBe('Process');
+
+    const procCombined = JSON.stringify({
+      logs: procLogs,
+      warnings: procRepairRes.warnings,
+      shellOverrides: procRepairRes.shellOverrides,
+      findings: procRepairRes.findings,
+    });
+    expect(procLogs.join('\n')).toContain(
+      '[REPAIR COMPLETE — FILES VERIFIED; MANUAL SHELL CLEANUP REMAINING; PERSISTENT ENV SCOPES UNVERIFIED]'
+    );
+    expect(procCombined).not.toContain(procOverrideSecret);
+    expect(procCombined).not.toContain('[Environment]::SetEnvironmentVariable');
+  });
+
+  it('24. REPAIR NO-OP returns verificationPassed=null with explicit manual-cleanup status whenever shell overrides remain (for both [] and null persistent inspection), while no overrides + [] remains a complete pass', async () => {
+    const dir = makeTempProject();
+    const seeded = seedCleanFiveEnvFiles(dir);
+    const procOverrideSecret = 'NoOpProcessOverrideSecret_6543!';
+
+    // 24a. REPAIR NO-OP with Process override and successful persistent inspection ([])
+    const { logger: okScopeLogger, logs: okScopeLogs } = createSilentLogger();
+    const overrideWithVerifiedScopes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {
+        STAGING_DATABASE_URL: `postgresql://erp_test_user:${encodeURIComponent(procOverrideSecret)}@localhost:5433/core_erp_test?schema=public`,
+      },
+      logger: okScopeLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(overrideWithVerifiedScopes.exitCode).toBe(0);
+    expect(overrideWithVerifiedScopes.executed).toBe(false);
+    expect(overrideWithVerifiedScopes.backups).toHaveLength(0);
+    expect(overrideWithVerifiedScopes.fileVerificationPassed).toBe(true);
+    expect(overrideWithVerifiedScopes.persistentEnvScopesVerified).toBe(true);
+    expect(overrideWithVerifiedScopes.verificationPassed).toBeNull();
+    expect(overrideWithVerifiedScopes.shellOverrides).toHaveLength(1);
+    expect(overrideWithVerifiedScopes.shellOverrides[0].scopeLabel).toBe('Process');
+
+    const okScopeText = okScopeLogs.join('\n');
+    expect(okScopeText).toContain('[REPAIR NO-OP — MANUAL SHELL CLEANUP REMAINING]');
+    expect(okScopeText).toContain('manual shell cleanup remains required');
+    expect(okScopeText).not.toContain(
+      '[REPAIR NO-OP] All local environment files are already valid and clean.'
+    );
+    const okScopeCombined = JSON.stringify({
+      logs: okScopeLogs,
+      warnings: overrideWithVerifiedScopes.warnings,
+      findings: overrideWithVerifiedScopes.findings,
+      shellOverrides: overrideWithVerifiedScopes.shellOverrides,
+      manualRemediation: overrideWithVerifiedScopes.manualRemediation,
+    });
+    expect(okScopeCombined).not.toContain(procOverrideSecret);
+    expect(okScopeCombined).not.toContain(seeded.devPass);
+    expect(okScopeCombined).not.toContain(seeded.intPass);
+    expect(okScopeCombined).not.toContain(seeded.stagingPass);
+
+    // 24b. REPAIR NO-OP with Process override and unavailable persistent inspection (null)
+    const { logger: nullScopeLogger, logs: nullScopeLogs } = createSilentLogger();
+    const overrideWithNullScopes = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {
+        TEST_DATABASE_URL: `postgresql://erp_test_user:${encodeURIComponent(procOverrideSecret)}@localhost:5433/core_erp_test?schema=public`,
+      },
+      logger: nullScopeLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => null,
+    });
+
+    expect(overrideWithNullScopes.exitCode).toBe(0);
+    expect(overrideWithNullScopes.executed).toBe(false);
+    expect(overrideWithNullScopes.backups).toHaveLength(0);
+    expect(overrideWithNullScopes.fileVerificationPassed).toBe(true);
+    expect(overrideWithNullScopes.persistentEnvScopesVerified).toBe(false);
+    expect(overrideWithNullScopes.verificationPassed).toBeNull();
+    expect(overrideWithNullScopes.shellOverrides).toHaveLength(1);
+    expect(overrideWithNullScopes.shellOverrides[0].scopes).toEqual(['Process']);
+    expect(
+      overrideWithNullScopes.warnings.some((w) =>
+        /Windows User\/Machine persistent environment scopes could not be verified/i.test(w)
+      )
+    ).toBe(true);
+
+    const nullScopeText = nullScopeLogs.join('\n');
+    expect(nullScopeText).toContain(
+      '[REPAIR NO-OP — MANUAL SHELL CLEANUP REMAINING; PERSISTENT ENV SCOPES UNVERIFIED]'
+    );
+    expect(nullScopeText).toContain('manual shell cleanup remains required');
+    expect(nullScopeText).toContain('User/Machine persistent environment scopes remain unverified');
+    expect(nullScopeText).not.toContain(
+      '[REPAIR NO-OP] All local environment files are already valid and clean.'
+    );
+    const nullScopeCombined = JSON.stringify({
+      logs: nullScopeLogs,
+      warnings: overrideWithNullScopes.warnings,
+      findings: overrideWithNullScopes.findings,
+      shellOverrides: overrideWithNullScopes.shellOverrides,
+      manualRemediation: overrideWithNullScopes.manualRemediation,
+    });
+    expect(nullScopeCombined).not.toContain(procOverrideSecret);
+    expect(nullScopeCombined).not.toContain(seeded.devPass);
+    expect(nullScopeCombined).not.toContain(seeded.intPass);
+    expect(nullScopeCombined).not.toContain(seeded.stagingPass);
+    expect(nullScopeCombined).not.toContain('[Environment]::SetEnvironmentVariable');
+
+    // 24c. REPAIR NO-OP with zero shell overrides and successful persistent inspection ([]) remains a complete pass
+    const { logger: cleanLogger, logs: cleanLogs } = createSilentLogger();
+    const cleanNoOp = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger: cleanLogger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+    });
+
+    expect(cleanNoOp.exitCode).toBe(0);
+    expect(cleanNoOp.executed).toBe(false);
+    expect(cleanNoOp.fileVerificationPassed).toBe(true);
+    expect(cleanNoOp.persistentEnvScopesVerified).toBe(true);
+    expect(cleanNoOp.verificationPassed).toBe(true);
+    expect(cleanNoOp.shellOverrides).toEqual([]);
+    expect(cleanNoOp.warnings).toEqual([]);
+    expect(cleanLogs.join('\n')).toContain(
+      '[REPAIR NO-OP] All local environment files are already valid and clean. Zero files modified; zero backups created.'
+    );
+  });
+
+  it('25. Successful REPAIR that modifies files returns verificationPassed=null when a Process-scope override remains even if persistent scope inspection succeeds ([])', async () => {
+    const dir = makeTempProject();
+    const seeded = seedWindowsAuditScenario(dir);
+    const procOverrideSecret = 'RepairExecutedProcOverrideSecret_9876!';
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {
+        STAGING_DATABASE_URL: `postgresql://erp_test_user:${encodeURIComponent(procOverrideSecret)}@localhost:5433/core_erp_test?schema=public`,
+      },
+      logger,
+      inspectDocker: async () => DOCKER_AVAILABLE_MIXED,
+      inspectPersistentEnvScopes: async () => [],
+      now: () => new Date(2026, 10, 27, 9, 55, 0, 0),
+    });
+
+    expect(res.exitCode).toBe(0);
+    expect(res.executed).toBe(true);
+    expect(res.modifiedFiles).toEqual(['.env', '.env.integration-test']);
+    expect(res.createdFiles).toEqual(['.env.staging']);
+    expect(res.fileVerificationPassed).toBe(true);
+    expect(res.persistentEnvScopesVerified).toBe(true);
+    expect(res.verificationPassed).toBeNull();
+    expect(res.shellOverrides).toHaveLength(1);
+    expect(res.shellOverrides[0].scopes).toEqual(['Process']);
+    expect(res.shellOverrides[0].scopeLabel).toBe('Process');
+
+    const logText = logs.join('\n');
+    expect(logText).toContain('[REPAIR COMPLETE — MANUAL SHELL CLEANUP REMAINING]');
+    expect(logText).not.toContain(
+      '[REPAIR COMPLETE] Local database environment files repaired and verified successfully.'
+    );
+
+    const combined = JSON.stringify({
+      logs,
+      warnings: res.warnings,
+      findings: res.findings,
+      shellOverrides: res.shellOverrides,
+      manualRemediation: res.manualRemediation,
+    });
+    expect(combined).not.toContain(procOverrideSecret);
+    expect(combined).not.toContain(seeded.devPass);
+    expect(combined).not.toContain(seeded.integrationPass);
+    expect(combined).not.toContain(seeded.shadowPass);
   });
 });
