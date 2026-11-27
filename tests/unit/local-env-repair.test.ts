@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { execFileSync } from 'child_process';
+import { spawnSync } from 'node:child_process';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   REQUIRED_REPAIR_CONFIRMATION_FLAG,
@@ -776,8 +776,9 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
   });
 
   it('11. CLI scripts (db:repair:check & db:repair:local) and package.json wiring work safely in isolated directory without mutating files', () => {
+    const repoRoot = path.resolve(import.meta.dirname, '../..');
     const pkg = JSON.parse(
-      fs.readFileSync(path.join(process.cwd(), 'package.json'), 'utf-8')
+      fs.readFileSync(path.join(repoRoot, 'package.json'), 'utf-8')
     );
     expect(pkg.scripts['db:repair:check']).toBe('tsx scripts/repair-db-env.ts --check');
     expect(pkg.scripts['db:repair:local']).toBe('tsx scripts/repair-db-env.ts');
@@ -785,56 +786,78 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
 
     const dir = makeTempProject();
     const seeded = seedWindowsAuditScenario(dir);
-    const scriptPath = path.join(process.cwd(), 'scripts', 'repair-db-env.ts');
-    const tsxBin = path.join(
-      process.cwd(),
-      'node_modules',
-      '.bin',
-      process.platform === 'win32' ? 'tsx.cmd' : 'tsx'
-    );
+    const scriptPath = path.join(repoRoot, 'scripts', 'repair-db-env.ts');
+
+    // Resolve installed tsx JS CLI entrypoint from node_modules (never spawn Windows .cmd shims)
+    const tsxPkgPath = path.join(repoRoot, 'node_modules', 'tsx', 'package.json');
+    const tsxPkg = JSON.parse(fs.readFileSync(tsxPkgPath, 'utf-8')) as {
+      bin?: string | Record<string, string>;
+    };
+    const tsxBinRel =
+      typeof tsxPkg.bin === 'string'
+        ? tsxPkg.bin
+        : tsxPkg.bin?.tsx ?? './dist/cli.mjs';
+    const tsxCliPath = path.resolve(path.dirname(tsxPkgPath), tsxBinRel);
+    expect(fs.existsSync(tsxCliPath)).toBe(true);
 
     const cleanEnv: NodeJS.ProcessEnv = {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
       USERPROFILE: process.env.USERPROFILE,
       SYSTEMROOT: process.env.SYSTEMROOT,
+      COMSPEC: process.env.COMSPEC,
+      TEMP: process.env.TEMP,
+      TMP: process.env.TMP,
+      APPDATA: process.env.APPDATA,
+      LOCALAPPDATA: process.env.LOCALAPPDATA,
       NODE_ENV: 'development',
     };
 
     // Default dry-run (`db:repair:local` with no confirmation flag) exits 0 and mutates ZERO files
-    const dryRunOut = execFileSync(tsxBin, [scriptPath], {
+    const dryRunRes = spawnSync(process.execPath, [tsxCliPath, scriptPath], {
       cwd: dir,
       env: cleanEnv,
       encoding: 'utf-8',
       timeout: 15_000,
+      windowsHide: true,
     });
+    const dryRunOut = `${dryRunRes.stdout || ''}\n${dryRunRes.stderr || ''}`;
+    expect(dryRunRes.error).toBeUndefined();
+    expect(dryRunRes.status, `Dry-run CLI exited with ${dryRunRes.status}:\n${dryRunOut}`).toBe(0);
     expect(dryRunOut).toContain('DRY-RUN COMPLETE');
     expect(dryRunOut).toContain(REQUIRED_REPAIR_CONFIRMATION_FLAG);
     expect(dryRunOut).not.toContain(seeded.devPass);
     expect(dryRunOut).not.toContain(seeded.integrationPass);
     expect(fs.readdirSync(dir).sort()).toEqual(['.env', '.env.integration-test']);
+    expect(fs.readFileSync(path.join(dir, '.env'), 'utf-8')).toBe(seeded.originalEnv);
+    expect(fs.readFileSync(path.join(dir, '.env.integration-test'), 'utf-8')).toBe(
+      seeded.originalIntegration
+    );
 
     // `--check` exits 1 when issues exist, even if confirmation flag is also passed, and mutates ZERO files
-    let checkExitCode = 0;
-    let checkOut = '';
-    try {
-      execFileSync(tsxBin, [scriptPath, '--check', REQUIRED_REPAIR_CONFIRMATION_FLAG], {
+    const checkRes = spawnSync(
+      process.execPath,
+      [tsxCliPath, scriptPath, '--check', REQUIRED_REPAIR_CONFIRMATION_FLAG],
+      {
         cwd: dir,
         env: cleanEnv,
         encoding: 'utf-8',
         timeout: 15_000,
-      });
-    } catch (err: unknown) {
-      const e = err as { status?: number; stdout?: string; stderr?: string };
-      checkExitCode = e.status ?? 1;
-      checkOut = `${e.stdout || ''}\n${e.stderr || ''}`;
-    }
-    expect(checkExitCode).toBe(1);
+        windowsHide: true,
+      }
+    );
+    const checkOut = `${checkRes.stdout || ''}\n${checkRes.stderr || ''}`;
+    expect(checkRes.error).toBeUndefined();
+    expect(checkRes.status, `Check CLI exited with ${checkRes.status}:\n${checkOut}`).toBe(1);
     expect(checkOut).toContain('Read-Only');
     expect(checkOut).toContain('STAGING_DATABASE_URL');
     expect(checkOut).toContain('TEST_DATABASE_URL');
     expect(checkOut).not.toContain(seeded.devPass);
     expect(checkOut).not.toContain(seeded.integrationPass);
     expect(fs.readdirSync(dir).sort()).toEqual(['.env', '.env.integration-test']);
+    expect(fs.readFileSync(path.join(dir, '.env'), 'utf-8')).toBe(seeded.originalEnv);
+    expect(fs.readFileSync(path.join(dir, '.env.integration-test'), 'utf-8')).toBe(
+      seeded.originalIntegration
+    );
   });
 });
