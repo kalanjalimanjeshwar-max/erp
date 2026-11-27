@@ -322,10 +322,14 @@ function normalizeDatabaseUrl(urlValue: string | undefined): string | undefined 
 }
 
 /**
- * Validates that DATABASE_URL strictly points to the approved standard unit test database.
+ * Validates that a standard automated-test URL (UNIT_TEST_DATABASE_URL or DATABASE_URL)
+ * strictly points to the approved standard unit test database (localhost:5433 / core_erp_test).
  * Credentials and raw connection strings are NEVER logged in error messages.
  */
-function validateStandardDatabaseUrl(urlValue: string | undefined): void {
+function validateStandardDatabaseUrl(
+  urlValue: string | undefined,
+  envVarName: 'DATABASE_URL' | 'UNIT_TEST_DATABASE_URL' = 'DATABASE_URL'
+): void {
   const normalized = normalizeDatabaseUrl(urlValue);
   if (!normalized) {
     return;
@@ -336,35 +340,35 @@ function validateStandardDatabaseUrl(urlValue: string | undefined): void {
     parsed = new URL(normalized);
   } catch {
     throw new Error(
-      '[DATABASE SAFETY VIOLATION] Invalid or unparseable DATABASE_URL in test environment. Expected approved local test endpoint. Refusing to proceed.'
+      `[DATABASE SAFETY VIOLATION] Invalid or unparseable ${envVarName} in test environment. Expected approved local test endpoint. Refusing to proceed.`
     );
   }
 
   const protocol = parsed.protocol;
   if (protocol !== 'postgresql:' && protocol !== 'postgres:') {
     throw new Error(
-      '[DATABASE SAFETY VIOLATION] Forbidden database protocol in DATABASE_URL. PostgreSQL is required. Refusing to proceed.'
+      `[DATABASE SAFETY VIOLATION] Forbidden database protocol in ${envVarName}. PostgreSQL is required. Refusing to proceed.`
     );
   }
 
   const hostname = parsed.hostname;
   if (!APPROVED_TEST_DB_HOSTS.has(hostname)) {
     throw new Error(
-      '[DATABASE SAFETY VIOLATION] Unapproved database host in DATABASE_URL. Remote and production hosts are strictly forbidden in tests. Expected localhost or 127.0.0.1. Refusing to proceed.'
+      `[DATABASE SAFETY VIOLATION] Unapproved database host in ${envVarName}. Remote and production hosts are strictly forbidden in tests. Expected localhost or 127.0.0.1. Refusing to proceed.`
     );
   }
 
   const port = parsed.port;
   if (port !== STANDARD_TEST_DB_PORT) {
     throw new Error(
-      `[DATABASE SAFETY VIOLATION] Unapproved database port in DATABASE_URL. Primary port 5432 and non-test ports are strictly forbidden in tests. Expected port ${STANDARD_TEST_DB_PORT}. Refusing to proceed.`
+      `[DATABASE SAFETY VIOLATION] Unapproved database port in ${envVarName}. Primary port 5432 and non-test ports are strictly forbidden in tests. Expected port ${STANDARD_TEST_DB_PORT}. Refusing to proceed.`
     );
   }
 
   const dbName = parsed.pathname.replace(/^\//, '').split('?')[0];
   if (dbName !== STANDARD_TEST_DB_NAME) {
     throw new Error(
-      `[DATABASE SAFETY VIOLATION] Unapproved database name in DATABASE_URL. Expected database "${STANDARD_TEST_DB_NAME}". Refusing to proceed.`
+      `[DATABASE SAFETY VIOLATION] Unapproved database name in ${envVarName}. Expected database "${STANDARD_TEST_DB_NAME}". Refusing to proceed.`
     );
   }
 }
@@ -471,22 +475,28 @@ function configureTestEnvironment(
     }
     // In integration mode, DATABASE_URL is deliberately not populated with the port 5433 fallback.
   } else {
-    validateStandardDatabaseUrl(env.DATABASE_URL);
+    validateStandardDatabaseUrl(env.UNIT_TEST_DATABASE_URL, 'UNIT_TEST_DATABASE_URL');
+    validateStandardDatabaseUrl(env.DATABASE_URL, 'DATABASE_URL');
     validateIntegrationDatabaseUrl(env.TEST_DATABASE_URL);
 
     // In normal DB-free mode, remove any validated TEST_DATABASE_URL from the environment so
     // unit database guards and integration suites never mistake it for an active integration target.
     delete env.TEST_DATABASE_URL;
 
-    // 3. Populate approved local test database URL for standard unit tests if absent
-    if (!env.DATABASE_URL) {
-      env.DATABASE_URL = APPROVED_STANDARD_TEST_DB_URL;
-    } else {
-      const normalizedDbUrl = normalizeDatabaseUrl(env.DATABASE_URL);
-      if (normalizedDbUrl) {
-        env.DATABASE_URL = normalizedDbUrl;
-      }
+    const normalizedUnitTestUrl = normalizeDatabaseUrl(env.UNIT_TEST_DATABASE_URL);
+    const normalizedDbUrl = normalizeDatabaseUrl(env.DATABASE_URL);
+
+    if (normalizedUnitTestUrl && normalizedDbUrl && normalizedUnitTestUrl !== normalizedDbUrl) {
+      throw new Error(
+        '[DATABASE SAFETY VIOLATION] Conflicting UNIT_TEST_DATABASE_URL and DATABASE_URL detected in standard unit test mode. Unset DATABASE_URL or align both to the approved local unit-test database (localhost:5433/core_erp_test).'
+      );
     }
+
+    // 3. Automated tests resolve strictly via UNIT_TEST_DATABASE_URL (or approved local 5433 default)
+    const effectiveUnitTestUrl =
+      normalizedUnitTestUrl || normalizedDbUrl || APPROVED_STANDARD_TEST_DB_URL;
+    env.UNIT_TEST_DATABASE_URL = effectiveUnitTestUrl;
+    env.DATABASE_URL = effectiveUnitTestUrl;
     // Note: TEST_DATABASE_URL is NEVER automatically populated with default or placeholder credentials.
     // Missing TEST_DATABASE_URL remains missing so dedicated integration tests report BLOCKED / NOT RUN safely.
   }

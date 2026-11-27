@@ -533,4 +533,85 @@ describe('Environment Validation Unit Tests', () => {
       );
     });
   });
+
+  describe('Five-Environment Database URL Separation (UNIT_TEST, STAGING, SHADOW)', () => {
+    it('accepts valid isolated URLs across all five environments', () => {
+      const cfg = validateEnv({
+        NODE_ENV: 'development',
+        DATABASE_URL: 'postgresql://erp_user:dev_pass@localhost:5432/core_erp?schema=public',
+        UNIT_TEST_DATABASE_URL:
+          'postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public',
+        TEST_DATABASE_URL:
+          'postgresql://erp_integration_user:int_pass@localhost:5434/core_erp_integration_test?schema=public',
+        STAGING_DATABASE_URL:
+          'postgresql://erp_staging_user:staging_pass@localhost:5435/core_erp_staging?schema=public',
+        SHADOW_DATABASE_URL:
+          'postgresql://erp_shadow_user:shadow_pass@localhost:5436/core_erp_shadow?schema=public',
+      });
+
+      expect(cfg.UNIT_TEST_DATABASE_URL).toContain(':5433/core_erp_test');
+      expect(cfg.STAGING_DATABASE_URL).toContain(':5435/core_erp_staging');
+      expect(cfg.SHADOW_DATABASE_URL).toContain(':5436/core_erp_shadow');
+    });
+
+    it('rejects STAGING_DATABASE_URL targeting port 5433 (or any reserved non-staging localhost port)', () => {
+      expect(() =>
+        validateEnv({
+          NODE_ENV: 'development',
+          DATABASE_URL: 'postgresql://erp_user:dev_pass@localhost:5432/core_erp?schema=public',
+          STAGING_DATABASE_URL:
+            'postgresql://erp_staging_user:staging_pass@localhost:5433/core_erp_staging?schema=public',
+        })
+      ).toThrowError(/cannot target localhost port 5433/);
+
+      expect(() =>
+        validateEnv({
+          NODE_ENV: 'development',
+          DATABASE_URL: 'postgresql://erp_user:dev_pass@localhost:5432/core_erp?schema=public',
+          STAGING_DATABASE_URL:
+            'postgresql://erp_staging_user:staging_pass@127.0.0.1:5432/core_erp_staging?schema=public',
+        })
+      ).toThrowError(/cannot target localhost port 5432/);
+    });
+
+    it('rejects invalid UNIT_TEST_DATABASE_URL ports, hosts, database names, and cross-target collisions', () => {
+      expect(() =>
+        validateEnv({
+          NODE_ENV: 'development',
+          DATABASE_URL: 'postgresql://erp_user:dev_pass@localhost:5432/core_erp?schema=public',
+          UNIT_TEST_DATABASE_URL:
+            'postgresql://erp_test_user:erp_test_password@localhost:5434/core_erp_test?schema=public',
+        })
+      ).toThrowError(/UNIT_TEST_DATABASE_URL must target port 5433/);
+
+      expect(() =>
+        validateEnv({
+          NODE_ENV: 'development',
+          DATABASE_URL: 'postgresql://erp_user:dev_pass@localhost:5432/core_erp?schema=public',
+          UNIT_TEST_DATABASE_URL:
+            'postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp?schema=public',
+        })
+      ).toThrowError(/UNIT_TEST_DATABASE_URL must point exclusively to database "core_erp_test"/);
+
+      expect(() =>
+        validateEnv({
+          NODE_ENV: 'development',
+          DATABASE_URL: 'postgresql://erp_user:dev_pass@localhost:5432/core_erp?schema=public',
+          UNIT_TEST_DATABASE_URL:
+            'postgresql://erp_test_user:erp_test_password@remote.db.internal:5433/core_erp_test?schema=public',
+        })
+      ).toThrowError(/UNIT_TEST_DATABASE_URL must target localhost or 127\.0\.0\.1/);
+    });
+
+    it('rejects SHADOW_DATABASE_URL targeting reserved non-shadow localhost ports', () => {
+      expect(() =>
+        validateEnv({
+          NODE_ENV: 'development',
+          DATABASE_URL: 'postgresql://erp_user:dev_pass@localhost:5432/core_erp?schema=public',
+          SHADOW_DATABASE_URL:
+            'postgresql://erp_shadow_user:shadow_pass@localhost:5435/core_erp_shadow?schema=public',
+        })
+      ).toThrowError(/SHADOW_DATABASE_URL cannot target localhost port 5435/);
+    });
+  });
 });

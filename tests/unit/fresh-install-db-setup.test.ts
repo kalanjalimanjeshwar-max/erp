@@ -78,8 +78,12 @@ describe('Permanent Database Environment & Fresh Installation Reliability', () =
     // Generated .env passes strict Zod validateEnv() with zero errors
     expect(() => validateEnv({ ...mainEnv, NODE_ENV: 'development' })).not.toThrow();
 
-    // Staging URL in .env is synchronized with .env.staging
-    expect(mainEnv.STAGING_DATABASE_URL).toBe(stagingEnv.STAGING_DATABASE_URL);
+    // Strict file ownership: .env NEVER contains STAGING_DATABASE_URL or TEST_DATABASE_URL
+    expect(mainEnv.STAGING_DATABASE_URL).toBeUndefined();
+    expect(mainEnv.TEST_DATABASE_URL).toBeUndefined();
+
+    // Staging lives exclusively in .env.staging (port 5435 / core_erp_staging)
+    expect(stagingEnv.STAGING_DATABASE_URL).toContain(':5435/core_erp_staging');
     expect(stagingEnv.STAGING_POSTGRES_DB).toBe('core_erp_staging');
     expect(stagingEnv.STAGING_POSTGRES_USER).toBe('erp_staging_user');
     expect(stagingEnv.STAGING_POSTGRES_PASSWORD.length).toBeGreaterThanOrEqual(32);
@@ -134,7 +138,6 @@ describe('Permanent Database Environment & Fresh Installation Reliability', () =
       `POSTGRES_PASSWORD="${customDevPass}"`,
       'POSTGRES_DB="core_erp"',
       `DATABASE_URL="postgresql://erp_user:${customDevPass}@localhost:5432/core_erp?schema=public"`,
-      `STAGING_DATABASE_URL="postgresql://erp_staging_user:${customStagingPass}@localhost:5435/core_erp_staging?schema=public"`,
       'SHADOW_POSTGRES_USER="erp_shadow_user"',
       `SHADOW_POSTGRES_PASSWORD="${customShadowPass}"`,
       'SHADOW_POSTGRES_DB="core_erp_shadow"',
@@ -384,8 +387,8 @@ describe('Permanent Database Environment & Fresh Installation Reliability', () =
       mismatchRes.issues.some((i) => i.includes('DATABASE_URL password does not match POSTGRES_PASSWORD'))
     ).toBe(true);
     expect(
-      mismatchRes.issues.some((i) =>
-        i.includes('Staging credential mismatch between .env (STAGING_DATABASE_URL) and .env.staging')
+      mismatchRes.issues.some(
+        (i) => i.includes('[.env :: STAGING_DATABASE_URL]') && i.includes('Misplaced variable in .env')
       )
     ).toBe(true);
     expect(
@@ -632,5 +635,388 @@ describe('Permanent Database Environment & Fresh Installation Reliability', () =
           'postgresql://erp_staging_user:validpass@localhost:5435/core_erp_staging?schema=public',
       })
     );
+  });
+
+  it('13. Misplaced STAGING_DATABASE_URL (including port 5433) and TEST_DATABASE_URL in .env are rejected with exact [file :: VAR] reporting and zero secret leakage', async () => {
+    const projectRoot = createTempProjectDir();
+    const misplacedStagingSecret = 'MisplacedStaging5433Secret_9988!';
+    const misplacedTestSecret = 'MisplacedTestEnvSecret_7766!';
+    const validStagingSecret = 'ValidStagingSecret_554433221100!';
+    const validIntSecret = 'ValidIntSecret_112233445566!';
+
+    fs.writeFileSync(
+      path.join(projectRoot, '.env'),
+      [
+        'POSTGRES_USER="erp_user"',
+        'POSTGRES_PASSWORD="erp_password_dev"',
+        'POSTGRES_DB="core_erp"',
+        'DATABASE_URL="postgresql://erp_user:erp_password_dev@localhost:5432/core_erp?schema=public"',
+        `STAGING_DATABASE_URL="postgresql://erp_test_user:${misplacedStagingSecret}@localhost:5433/core_erp_test?schema=public"`,
+        `TEST_DATABASE_URL="postgresql://erp_integration_user:${misplacedTestSecret}@localhost:5434/core_erp_integration_test?schema=public"`,
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(projectRoot, '.env.staging'),
+      [
+        'STAGING_POSTGRES_USER="erp_staging_user"',
+        `STAGING_POSTGRES_PASSWORD="${validStagingSecret}"`,
+        'STAGING_POSTGRES_DB="core_erp_staging"',
+        `STAGING_DATABASE_URL="postgresql://erp_staging_user:${validStagingSecret}@localhost:5435/core_erp_staging?schema=public"`,
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(projectRoot, '.env.integration-test'),
+      [
+        `POSTGRES_PASSWORD="${validIntSecret}"`,
+        `TEST_DATABASE_URL="postgresql://erp_integration_user:${validIntSecret}@localhost:5434/core_erp_integration_test?schema=public"`,
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const { logger, logs } = createSilentLogger();
+    const res = await runDatabaseEnvironmentSetup({
+      projectRoot,
+      checkOnly: true,
+      logger,
+      inspectDockerVolumes: vi.fn().mockResolvedValue([]),
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(
+      res.issues.some(
+        (i) => i.includes('[.env :: STAGING_DATABASE_URL]') && i.includes('127.0.0.1:5433/core_erp_test')
+      )
+    ).toBe(true);
+    expect(
+      res.issues.some(
+        (i) => i.includes('[.env :: TEST_DATABASE_URL]') && i.includes('UNIT_TEST_DATABASE_URL')
+      )
+    ).toBe(true);
+
+    const combined = `${logs.join('\n')}\n${res.issues.join('\n')}`;
+    expect(combined).not.toContain(misplacedStagingSecret);
+    expect(combined).not.toContain(misplacedTestSecret);
+    expect(combined).not.toContain(validStagingSecret);
+    expect(combined).not.toContain(validIntSecret);
+  });
+
+  it('14. Backward-safe partial setup preserves existing .env and .env.integration-test byte-for-byte and creates ONLY missing .env.staging', async () => {
+    const projectRoot = createTempProjectDir();
+    const existingIntSecret = 'ExistingIntegrationPassword_KeepMe_2026!';
+    const existingMainContent = [
+      '# Preserved local dev .env',
+      'PORT=3000',
+      'NODE_ENV=development',
+      'POSTGRES_USER="erp_user"',
+      'POSTGRES_PASSWORD="erp_password_dev"',
+      'POSTGRES_DB="core_erp"',
+      'DATABASE_URL="postgresql://erp_user:erp_password_dev@localhost:5432/core_erp?schema=public"',
+      'SHADOW_POSTGRES_USER="erp_shadow_user"',
+      'SHADOW_POSTGRES_PASSWORD="ExistingShadowPassword_KeepMe_2026!"',
+      'SHADOW_POSTGRES_DB="core_erp_shadow"',
+      'SHADOW_DATABASE_URL="postgresql://erp_shadow_user:ExistingShadowPassword_KeepMe_2026!@localhost:5436/core_erp_shadow?schema=public"',
+      '',
+    ].join('\n');
+    const existingIntegrationContent = [
+      '# Preserved local .env.integration-test',
+      `POSTGRES_PASSWORD="${existingIntSecret}"`,
+      `TEST_DATABASE_URL="postgresql://erp_integration_user:${existingIntSecret}@localhost:5434/core_erp_integration_test?schema=public"`,
+      '',
+    ].join('\n');
+
+    fs.writeFileSync(path.join(projectRoot, '.env'), existingMainContent, 'utf-8');
+    fs.writeFileSync(
+      path.join(projectRoot, '.env.integration-test'),
+      existingIntegrationContent,
+      'utf-8'
+    );
+
+    // 1. db:setup:check is strictly read-only and reports missing .env.staging without creating it
+    const { logger: checkLogger } = createSilentLogger();
+    const preCheck = await runDatabaseEnvironmentSetup({
+      projectRoot,
+      checkOnly: true,
+      logger: checkLogger,
+      inspectDockerVolumes: vi.fn().mockResolvedValue([]),
+    });
+    expect(preCheck.exitCode).toBe(1);
+    expect(preCheck.files).toEqual([
+      { file: '.env.staging', action: 'MISSING' },
+      { file: '.env.integration-test', action: 'PRESERVED' },
+      { file: '.env', action: 'PRESERVED' },
+    ]);
+    expect(fs.existsSync(path.join(projectRoot, '.env.staging'))).toBe(false);
+
+    // 2. db:setup creates ONLY missing .env.staging and preserves existing .env and .env.integration-test byte-for-byte
+    const { logger: setupLogger } = createSilentLogger();
+    const setupRes = await runDatabaseEnvironmentSetup({
+      projectRoot,
+      logger: setupLogger,
+      inspectDockerVolumes: vi.fn().mockResolvedValue([]),
+    });
+    expect(setupRes.exitCode).toBe(0);
+    expect(setupRes.issues).toEqual([]);
+    expect(setupRes.files).toEqual([
+      { file: '.env.staging', action: 'CREATED' },
+      { file: '.env.integration-test', action: 'PRESERVED' },
+      { file: '.env', action: 'PRESERVED' },
+    ]);
+    expect(fs.readFileSync(path.join(projectRoot, '.env'), 'utf-8')).toBe(existingMainContent);
+    expect(fs.readFileSync(path.join(projectRoot, '.env.integration-test'), 'utf-8')).toBe(
+      existingIntegrationContent
+    );
+    expect(fs.existsSync(path.join(projectRoot, '.env.staging'))).toBe(true);
+
+    const createdStaging = parseEnvFileContent(
+      fs.readFileSync(path.join(projectRoot, '.env.staging'), 'utf-8')
+    );
+    expect(createdStaging.STAGING_DATABASE_URL).toContain('localhost:5435/core_erp_staging');
+
+    // 3. Subsequent db:setup:check succeeds cleanly and leaves all files untouched
+    const postCheck = await runDatabaseEnvironmentSetup({
+      projectRoot,
+      checkOnly: true,
+      logger: checkLogger,
+      inspectDockerVolumes: vi.fn().mockResolvedValue([]),
+    });
+    expect(postCheck.exitCode).toBe(0);
+    expect(postCheck.issues).toEqual([]);
+  });
+
+  it('15. Wrong ports across all five targets and duplicate endpoints fail with exact [source :: VAR] attribution', async () => {
+    const projectRoot = createTempProjectDir();
+    fs.writeFileSync(
+      path.join(projectRoot, '.env'),
+      [
+        'POSTGRES_USER="erp_user"',
+        'POSTGRES_PASSWORD="dev_pass_unique_123456"',
+        'POSTGRES_DB="core_erp"',
+        'DATABASE_URL="postgresql://erp_user:dev_pass_unique_123456@localhost:5439/core_erp?schema=public"',
+        'UNIT_TEST_DATABASE_URL="postgresql://erp_test_user:erp_test_password@localhost:5499/core_erp_test?schema=public"',
+        'SHADOW_POSTGRES_USER="erp_shadow_user"',
+        'SHADOW_POSTGRES_PASSWORD="shadow_pass_unique_123456"',
+        'SHADOW_POSTGRES_DB="core_erp_shadow"',
+        'SHADOW_DATABASE_URL="postgresql://erp_shadow_user:shadow_pass_unique_123456@localhost:5435/core_erp_shadow?schema=public"',
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(projectRoot, '.env.staging'),
+      [
+        'STAGING_POSTGRES_USER="erp_staging_user"',
+        'STAGING_POSTGRES_PASSWORD="staging_pass_unique_123456"',
+        'STAGING_POSTGRES_DB="core_erp_staging"',
+        'STAGING_DATABASE_URL="postgresql://erp_staging_user:staging_pass_unique_123456@localhost:5433/core_erp_staging?schema=public"',
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(projectRoot, '.env.integration-test'),
+      [
+        'POSTGRES_PASSWORD="int_pass_unique_123456"',
+        'TEST_DATABASE_URL="postgresql://erp_integration_user:int_pass_unique_123456@localhost:5432/core_erp_integration_test?schema=public"',
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const { logger } = createSilentLogger();
+    const wrongPortsRes = await runDatabaseEnvironmentSetup({
+      projectRoot,
+      checkOnly: true,
+      logger,
+      inspectDockerVolumes: vi.fn().mockResolvedValue([]),
+    });
+
+    expect(wrongPortsRes.exitCode).toBe(1);
+    expect(wrongPortsRes.issues.some((i) => i.includes('[.env :: DATABASE_URL]') && i.includes('5439'))).toBe(true);
+    expect(wrongPortsRes.issues.some((i) => i.includes('[.env :: UNIT_TEST_DATABASE_URL]') && i.includes('5499'))).toBe(true);
+    expect(wrongPortsRes.issues.some((i) => i.includes('[.env.integration-test :: TEST_DATABASE_URL]') && i.includes('5432'))).toBe(true);
+    expect(wrongPortsRes.issues.some((i) => i.includes('[.env.staging :: STAGING_DATABASE_URL]') && i.includes('reserved for automated testing'))).toBe(true);
+    expect(wrongPortsRes.issues.some((i) => i.includes('[.env :: SHADOW_DATABASE_URL]') && i.includes('5435'))).toBe(true);
+
+    // Duplicate endpoints across targets (staging colliding with automated test on 5433/core_erp_test)
+    const dupRoot = createTempProjectDir();
+    fs.writeFileSync(
+      path.join(dupRoot, '.env'),
+      [
+        'POSTGRES_USER="erp_user"',
+        'POSTGRES_PASSWORD="dev_pass_unique_123456"',
+        'POSTGRES_DB="core_erp"',
+        'DATABASE_URL="postgresql://erp_user:dev_pass_unique_123456@localhost:5432/core_erp?schema=public"',
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(dupRoot, '.env.staging'),
+      [
+        'STAGING_POSTGRES_USER="erp_staging_user"',
+        'STAGING_POSTGRES_PASSWORD="staging_pass_unique_123456"',
+        'STAGING_POSTGRES_DB="core_erp_staging"',
+        'STAGING_DATABASE_URL="postgresql://erp_test_user:erp_test_password@localhost:5433/core_erp_test?schema=public"',
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+    fs.writeFileSync(
+      path.join(dupRoot, '.env.integration-test'),
+      [
+        'POSTGRES_PASSWORD="int_pass_unique_123456"',
+        'TEST_DATABASE_URL="postgresql://erp_integration_user:int_pass_unique_123456@localhost:5434/core_erp_integration_test?schema=public"',
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const dupRes = await runDatabaseEnvironmentSetup({
+      projectRoot: dupRoot,
+      checkOnly: true,
+      logger,
+      inspectDockerVolumes: vi.fn().mockResolvedValue([]),
+    });
+    expect(dupRes.exitCode).toBe(1);
+    expect(
+      dupRes.issues.some(
+        (i) =>
+          i.includes('Duplicate database endpoint detected') &&
+          i.includes('[.env.staging :: STAGING_DATABASE_URL]')
+      )
+    ).toBe(true);
+  });
+
+  it('16. Conflicting shell environment overrides are detected with exact [shell environment :: VAR] reporting and zero secret leakage', async () => {
+    const projectRoot = createTempProjectDir();
+    const { logger } = createSilentLogger();
+
+    const setup = await runDatabaseEnvironmentSetup({
+      projectRoot,
+      logger,
+      inspectDockerVolumes: vi.fn().mockResolvedValue([]),
+    });
+    expect(setup.exitCode).toBe(0);
+
+    const shellStagingSecret = 'ShellConflictStagingSecret_999111!';
+    const shellDevSecret = 'ShellConflictDevSecret_888222!';
+    const { logger: conflictLogger, logs } = createSilentLogger();
+
+    const conflictRes = await runDatabaseEnvironmentSetup({
+      projectRoot,
+      checkOnly: true,
+      shellEnv: {
+        DATABASE_URL: `postgresql://erp_user:${shellDevSecret}@localhost:5432/core_erp?schema=public`,
+        STAGING_DATABASE_URL: `postgresql://erp_staging_user:${shellStagingSecret}@localhost:5435/core_erp_staging?schema=public`,
+        UNIT_TEST_DATABASE_URL:
+          'postgresql://erp_test_user:erp_test_password@localhost:5434/core_erp_test?schema=public',
+      },
+      logger: conflictLogger,
+      inspectDockerVolumes: vi.fn().mockResolvedValue([]),
+    });
+
+    expect(conflictRes.exitCode).toBe(1);
+    expect(
+      conflictRes.issues.some(
+        (i) => i.includes('[shell environment :: DATABASE_URL]') && i.includes('[.env :: DATABASE_URL]')
+      )
+    ).toBe(true);
+    expect(
+      conflictRes.issues.some(
+        (i) =>
+          i.includes('[shell environment :: STAGING_DATABASE_URL]') &&
+          i.includes('[.env.staging :: STAGING_DATABASE_URL]')
+      )
+    ).toBe(true);
+    expect(
+      conflictRes.issues.some((i) => i.includes('[shell environment :: UNIT_TEST_DATABASE_URL]'))
+    ).toBe(true);
+
+    const output = `${logs.join('\n')}\n${conflictRes.issues.join('\n')}`;
+    expect(output).not.toContain(shellStagingSecret);
+    expect(output).not.toContain(shellDevSecret);
+  });
+
+  it('17. CLI verify-staging-db.ts and migrate-target-db.ts refuse misplaced .env variables and conflicting shell overrides without leaking secrets', async () => {
+    const projectRoot = createTempProjectDir();
+    const { logger } = createSilentLogger();
+    await runDatabaseEnvironmentSetup({
+      projectRoot,
+      logger,
+      inspectDockerVolumes: vi.fn().mockResolvedValue([]),
+    });
+
+    const tsxPath = path.resolve(import.meta.dirname, '../../node_modules/tsx/dist/cli.mjs');
+    const verifyScript = path.resolve(import.meta.dirname, '../../scripts/verify-staging-db.ts');
+    const migrateScript = path.resolve(import.meta.dirname, '../../scripts/migrate-target-db.ts');
+
+    const baseChildEnv: Record<string, string | undefined> = { ...process.env };
+    delete baseChildEnv.STAGING_DATABASE_URL;
+    delete baseChildEnv.STAGING_POSTGRES_USER;
+    delete baseChildEnv.STAGING_POSTGRES_PASSWORD;
+    delete baseChildEnv.STAGING_POSTGRES_DB;
+    delete baseChildEnv.TEST_DATABASE_URL;
+    delete baseChildEnv.DATABASE_URL;
+    delete baseChildEnv.UNIT_TEST_DATABASE_URL;
+    delete baseChildEnv.SHADOW_DATABASE_URL;
+    delete baseChildEnv.VITEST;
+    baseChildEnv.NODE_ENV = 'development';
+
+    // Case A: Conflicting shell STAGING_DATABASE_URL vs .env.staging fails closed without leaking secret
+    const conflictingShellSecret = 'ConflictingShellStagingSecret_4242!';
+    const conflictCli = spawnSync(process.execPath, [tsxPath, verifyScript], {
+      cwd: projectRoot,
+      env: {
+        ...baseChildEnv,
+        STAGING_DATABASE_URL: `postgresql://erp_staging_user:${conflictingShellSecret}@localhost:5435/core_erp_staging?schema=public`,
+      },
+      encoding: 'utf-8',
+    });
+    const conflictOut = `${conflictCli.stdout}\n${conflictCli.stderr}`;
+    expect(conflictCli.status).toBe(1);
+    expect(conflictOut).toContain('[shell environment :: STAGING_DATABASE_URL]');
+    expect(conflictOut).toContain('[.env.staging :: STAGING_DATABASE_URL]');
+    expect(conflictOut).not.toContain(conflictingShellSecret);
+
+    // Case B: Misplaced STAGING_DATABASE_URL (port 5433) and TEST_DATABASE_URL in .env fail both CLI runners
+    const misplacedPass = 'MisplacedDotEnvSecret_5353!';
+    fs.appendFileSync(
+      path.join(projectRoot, '.env'),
+      [
+        `STAGING_DATABASE_URL="postgresql://erp_test_user:${misplacedPass}@localhost:5433/core_erp_test?schema=public"`,
+        `TEST_DATABASE_URL="postgresql://erp_integration_user:${misplacedPass}@localhost:5434/core_erp_integration_test?schema=public"`,
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+
+    const misplacedVerify = spawnSync(process.execPath, [tsxPath, verifyScript], {
+      cwd: projectRoot,
+      env: baseChildEnv,
+      encoding: 'utf-8',
+    });
+    const misplacedVerifyOut = `${misplacedVerify.stdout}\n${misplacedVerify.stderr}`;
+    expect(misplacedVerify.status).toBe(1);
+    expect(misplacedVerifyOut).toContain('[.env :: STAGING_DATABASE_URL]');
+    expect(misplacedVerifyOut).not.toContain(misplacedPass);
+
+    const misplacedMigrateInt = spawnSync(
+      process.execPath,
+      [tsxPath, migrateScript, '--target', 'integration'],
+      {
+        cwd: projectRoot,
+        env: baseChildEnv,
+        encoding: 'utf-8',
+      }
+    );
+    const misplacedMigrateOut = `${misplacedMigrateInt.stdout}\n${misplacedMigrateInt.stderr}`;
+    expect(misplacedMigrateInt.status).toBe(1);
+    expect(misplacedMigrateOut).toContain('[.env :: TEST_DATABASE_URL]');
+    expect(misplacedMigrateOut).not.toContain(misplacedPass);
   });
 });

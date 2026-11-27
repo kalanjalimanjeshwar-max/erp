@@ -56,6 +56,7 @@ function writeValidLocalEnvFiles(
     shadowPassword?: string;
     shadowDb?: string;
     envStagingUrlRef?: string;
+    envTestUrlRef?: string;
     stagingUrl?: string;
     stagingUser?: string;
     stagingPassword?: string;
@@ -96,27 +97,26 @@ function writeValidLocalEnvFiles(
     overrides?.integrationUrl ??
     `postgresql://erp_integration_user:${integrationPassword}@localhost:5434/core_erp_integration_test?schema=public`;
 
-  const envStagingUrlRef = overrides?.envStagingUrlRef ?? stagingUrl;
+  const mainEnvLines = [
+    'NODE_ENV=development',
+    `POSTGRES_USER="${devUser}"`,
+    `POSTGRES_PASSWORD="${devPassword}"`,
+    `POSTGRES_DB="${devDb}"`,
+    `DATABASE_URL="${devUrl}"`,
+    `SHADOW_POSTGRES_USER="${shadowUser}"`,
+    `SHADOW_POSTGRES_PASSWORD="${shadowPassword}"`,
+    `SHADOW_POSTGRES_DB="${shadowDb}"`,
+    `SHADOW_DATABASE_URL="${shadowUrl}"`,
+    ...(overrides?.envStagingUrlRef
+      ? [`STAGING_DATABASE_URL="${overrides.envStagingUrlRef}"`]
+      : []),
+    ...(overrides?.envTestUrlRef ? [`TEST_DATABASE_URL="${overrides.envTestUrlRef}"`] : []),
+    'SESSION_SECRET="valid_session_secret_0123456789abcdef0123456789abcdef"',
+    'BANK_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"',
+    'BIOMETRIC_BRIDGE_TOKEN="valid_bridge_token_0123456789abcdef"',
+  ];
 
-  fs.writeFileSync(
-    path.join(projectRoot, '.env'),
-    [
-      'NODE_ENV=development',
-      `POSTGRES_USER="${devUser}"`,
-      `POSTGRES_PASSWORD="${devPassword}"`,
-      `POSTGRES_DB="${devDb}"`,
-      `DATABASE_URL="${devUrl}"`,
-      `SHADOW_POSTGRES_USER="${shadowUser}"`,
-      `SHADOW_POSTGRES_PASSWORD="${shadowPassword}"`,
-      `SHADOW_POSTGRES_DB="${shadowDb}"`,
-      `SHADOW_DATABASE_URL="${shadowUrl}"`,
-      `STAGING_DATABASE_URL="${envStagingUrlRef}"`,
-      'SESSION_SECRET="valid_session_secret_0123456789abcdef0123456789abcdef"',
-      'BANK_ENCRYPTION_KEY="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"',
-      'BIOMETRIC_BRIDGE_TOKEN="valid_bridge_token_0123456789abcdef"',
-    ].join('\n') + '\n',
-    'utf-8'
-  );
+  fs.writeFileSync(path.join(projectRoot, '.env'), mainEnvLines.join('\n') + '\n', 'utf-8');
 
   fs.writeFileSync(
     path.join(projectRoot, '.env.staging'),
@@ -282,7 +282,6 @@ describe('CoreERP Clean-Reset Pre-Deletion Safety & Scoped Fresh-Install Workflo
       'postgresql://erp_staging_user:staging_secret_valid_1234567890abcdef@staging-rds.example.com:5435/core_erp_staging';
     writeValidLocalEnvFiles(projectRoot, {
       stagingUrl: remoteStagingUrl,
-      envStagingUrlRef: remoteStagingUrl,
     });
     const runDocker = vi.fn();
     const { logger } = createSilentLogger();
@@ -451,8 +450,6 @@ describe('CoreERP Clean-Reset Pre-Deletion Safety & Scoped Fresh-Install Workflo
         overrides: {
           stagingUrl:
             'postgresql://erp_staging_user:staging_secret_valid_1234567890abcdef@localhost:5433/core_erp_staging',
-          envStagingUrlRef:
-            'postgresql://erp_staging_user:staging_secret_valid_1234567890abcdef@localhost:5433/core_erp_staging',
         },
       },
       {
@@ -500,8 +497,6 @@ describe('CoreERP Clean-Reset Pre-Deletion Safety & Scoped Fresh-Install Workflo
       {
         stagingDb: 'core_erp',
         stagingUrl:
-          'postgresql://erp_staging_user:staging_secret_valid_1234567890abcdef@localhost:5435/core_erp',
-        envStagingUrlRef:
           'postgresql://erp_staging_user:staging_secret_valid_1234567890abcdef@localhost:5435/core_erp',
       },
       {
@@ -566,8 +561,6 @@ describe('CoreERP Clean-Reset Pre-Deletion Safety & Scoped Fresh-Install Workflo
       stagingPassword: 'staging_compose_pass_1234567890',
       stagingUrl:
         'postgresql://erp_staging_user:staging_url_mismatch_9876543210@localhost:5435/core_erp_staging',
-      envStagingUrlRef:
-        'postgresql://erp_staging_user:staging_url_mismatch_9876543210@localhost:5435/core_erp_staging',
     });
     const runDockerB = vi.fn();
     const { logger: loggerB } = createSilentLogger();
@@ -603,23 +596,28 @@ describe('CoreERP Clean-Reset Pre-Deletion Safety & Scoped Fresh-Install Workflo
     expect(resC.error).toContain('isolated credentials');
     expect(runDockerC).not.toHaveBeenCalled();
 
-    // Case D: .env STAGING_DATABASE_URL drifts from .env.staging
+    // Case D: Misplaced STAGING_DATABASE_URL (port 5433) or TEST_DATABASE_URL inside .env blocks BEFORE any deletion without leaking secrets
     const rootD = createTempDir();
+    const misplacedPassD = 'misplaced_secret_never_leak_5433!';
     writeValidLocalEnvFiles(rootD, {
-      envStagingUrlRef:
-        'postgresql://erp_staging_user:drifted_other_password_123456789@localhost:5435/core_erp_staging',
+      envStagingUrlRef: `postgresql://erp_test_user:${misplacedPassD}@localhost:5433/core_erp_test`,
+      envTestUrlRef: `postgresql://erp_integration_user:${misplacedPassD}@localhost:5434/core_erp_integration_test`,
     });
     const runDockerD = vi.fn();
+    const { logger: loggerD, logs: logsD } = createSilentLogger();
     const resD = await runCoreErpCleanReset({
       projectRoot: rootD,
       execute: true,
       confirmed: true,
       env: { NODE_ENV: 'development' },
-      logger: loggerB,
+      logger: loggerD,
       deps: { runDockerCommand: runDockerD },
     });
     expect(resD.exitCode).toBe(1);
-    expect(resD.error).toContain('mismatch between .env');
+    expect(resD.error).toContain('[.env :: STAGING_DATABASE_URL]');
+    expect(resD.error).toContain('[.env :: TEST_DATABASE_URL]');
+    expect(resD.error).not.toContain(misplacedPassD);
+    expect(logsD.join('\n')).not.toContain(misplacedPassD);
     expect(runDockerD).not.toHaveBeenCalled();
   });
 
@@ -630,7 +628,6 @@ describe('CoreERP Clean-Reset Pre-Deletion Safety & Scoped Fresh-Install Workflo
     writeValidLocalEnvFiles(root, {
       devUrl: devEndpointUrl,
       stagingUrl: devEndpointUrl,
-      envStagingUrlRef: devEndpointUrl,
     });
     const runDocker = vi.fn();
     const { logger } = createSilentLogger();

@@ -20,6 +20,7 @@ async function main() {
   const result = await runDatabaseEnvironmentSetup({
     projectRoot: process.cwd(),
     checkOnly,
+    shellEnv: process.env,
   });
 
   process.exit(result.exitCode);

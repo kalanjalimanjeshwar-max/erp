@@ -112,6 +112,12 @@ export const envSchema = z
       .transform((val) =>
         val === undefined ? undefined : val.trim().replace(/^["']|["']$/g, '')
       ),
+    UNIT_TEST_DATABASE_URL: z
+      .string()
+      .optional()
+      .transform((val) =>
+        val === undefined ? undefined : val.trim().replace(/^["']|["']$/g, '')
+      ),
     TEST_DATABASE_URL: z
       .string()
       .optional()
@@ -266,9 +272,79 @@ export const envSchema = z
     };
 
     const primaryKey = extractEndpointKey(data.DATABASE_URL);
+    const unitTestKey = extractEndpointKey(data.UNIT_TEST_DATABASE_URL);
     const testKey = extractEndpointKey(data.TEST_DATABASE_URL);
     const stagingKey = extractEndpointKey(data.STAGING_DATABASE_URL);
     const shadowKey = extractEndpointKey(data.SHADOW_DATABASE_URL);
+
+    if (data.UNIT_TEST_DATABASE_URL && data.UNIT_TEST_DATABASE_URL.length > 0) {
+      if (
+        !data.UNIT_TEST_DATABASE_URL.startsWith('postgresql://') &&
+        !data.UNIT_TEST_DATABASE_URL.startsWith('postgres://')
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['UNIT_TEST_DATABASE_URL'],
+          message:
+            'UNIT_TEST_DATABASE_URL must be a valid PostgreSQL connection string targeting local port 5433 and database "core_erp_test".',
+        });
+      } else {
+        try {
+          const parsedUnit = new URL(data.UNIT_TEST_DATABASE_URL);
+          const unitHost = parsedUnit.hostname.toLowerCase();
+          const unitPort = parsedUnit.port || '5432';
+          const unitDb = decodeURIComponent(
+            parsedUnit.pathname.replace(/^\/+/, '').replace(/\/+$/, '')
+          ).toLowerCase();
+
+          if (!APPROVED_INTEGRATION_TEST_HOSTS.has(unitHost)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['UNIT_TEST_DATABASE_URL'],
+              message:
+                'UNIT_TEST_DATABASE_URL must target localhost or 127.0.0.1 (automated test database only).',
+            });
+          }
+          if (unitPort !== '5433') {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['UNIT_TEST_DATABASE_URL'],
+              message:
+                'UNIT_TEST_DATABASE_URL must target port 5433 (core_erp_test). Do not point automated tests to dev (5432), integration (5434), staging (5435), or shadow (5436).',
+            });
+          }
+          if (unitDb !== 'core_erp_test') {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['UNIT_TEST_DATABASE_URL'],
+              message:
+                'UNIT_TEST_DATABASE_URL must point exclusively to database "core_erp_test".',
+            });
+          }
+        } catch {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['UNIT_TEST_DATABASE_URL'],
+            message: 'UNIT_TEST_DATABASE_URL is malformed or unparseable.',
+          });
+        }
+      }
+
+      if (
+        unitTestKey &&
+        ((primaryKey && unitTestKey === primaryKey && data.NODE_ENV !== 'test') ||
+          (testKey && unitTestKey === testKey) ||
+          (stagingKey && unitTestKey === stagingKey) ||
+          (shadowKey && unitTestKey === shadowKey))
+      ) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['UNIT_TEST_DATABASE_URL'],
+          message:
+            'Conflicting database configuration: UNIT_TEST_DATABASE_URL must be isolated from DATABASE_URL, TEST_DATABASE_URL, STAGING_DATABASE_URL, and SHADOW_DATABASE_URL.',
+        });
+      }
+    }
 
     if (data.STAGING_DATABASE_URL && data.STAGING_DATABASE_URL.length > 0) {
       if (
@@ -284,6 +360,8 @@ export const envSchema = z
       } else {
         try {
           const parsedStaging = new URL(data.STAGING_DATABASE_URL);
+          const stagingHost = parsedStaging.hostname.toLowerCase();
+          const stagingPort = parsedStaging.port || '5432';
           const stagingDb = decodeURIComponent(
             parsedStaging.pathname.replace(/^\/+/, '').replace(/\/+$/, '')
           ).toLowerCase();
@@ -293,6 +371,24 @@ export const envSchema = z
               path: ['STAGING_DATABASE_URL'],
               message:
                 'STAGING_DATABASE_URL must point exclusively to database "core_erp_staging" (never core_erp, core_erp_test, core_erp_integration_test, or core_erp_shadow).',
+            });
+          }
+          const isStagingLoopback =
+            stagingHost === 'localhost' ||
+            stagingHost === '127.0.0.1' ||
+            stagingHost === '::1' ||
+            stagingHost === '[::1]';
+          if (
+            isStagingLoopback &&
+            (stagingPort === '5432' ||
+              stagingPort === '5433' ||
+              stagingPort === '5434' ||
+              stagingPort === '5436')
+          ) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['STAGING_DATABASE_URL'],
+              message: `STAGING_DATABASE_URL cannot target localhost port ${stagingPort} (reserved for another CoreERP environment). Local staging must use port 5435 via .env.staging.`,
             });
           }
           if (
@@ -323,6 +419,14 @@ export const envSchema = z
             'Conflicting database configuration: STAGING_DATABASE_URL must not target the same endpoint as DATABASE_URL.',
         });
       }
+      if (stagingKey && unitTestKey && stagingKey === unitTestKey) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['STAGING_DATABASE_URL'],
+          message:
+            'Conflicting database configuration: STAGING_DATABASE_URL must not target the same endpoint as UNIT_TEST_DATABASE_URL.',
+        });
+      }
       if (stagingKey && testKey && stagingKey === testKey) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
@@ -347,6 +451,8 @@ export const envSchema = z
       } else {
         try {
           const parsedShadow = new URL(data.SHADOW_DATABASE_URL);
+          const shadowHost = parsedShadow.hostname.toLowerCase();
+          const shadowPort = parsedShadow.port || '5432';
           const shadowDb = decodeURIComponent(
             parsedShadow.pathname.replace(/^\/+/, '').replace(/\/+$/, '')
           ).toLowerCase();
@@ -356,6 +462,24 @@ export const envSchema = z
               path: ['SHADOW_DATABASE_URL'],
               message:
                 'SHADOW_DATABASE_URL must point exclusively to database "core_erp_shadow".',
+            });
+          }
+          const isShadowLoopback =
+            shadowHost === 'localhost' ||
+            shadowHost === '127.0.0.1' ||
+            shadowHost === '::1' ||
+            shadowHost === '[::1]';
+          if (
+            isShadowLoopback &&
+            (shadowPort === '5432' ||
+              shadowPort === '5433' ||
+              shadowPort === '5434' ||
+              shadowPort === '5435')
+          ) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: ['SHADOW_DATABASE_URL'],
+              message: `SHADOW_DATABASE_URL cannot target localhost port ${shadowPort} (reserved for another CoreERP environment). Local Prisma shadow must use port 5436.`,
             });
           }
           if (
@@ -381,6 +505,7 @@ export const envSchema = z
       if (
         shadowKey &&
         ((primaryKey && shadowKey === primaryKey) ||
+          (unitTestKey && shadowKey === unitTestKey) ||
           (stagingKey && shadowKey === stagingKey) ||
           (testKey && shadowKey === testKey))
       ) {
@@ -388,7 +513,7 @@ export const envSchema = z
           code: z.ZodIssueCode.custom,
           path: ['SHADOW_DATABASE_URL'],
           message:
-            'Conflicting database configuration: SHADOW_DATABASE_URL must be isolated from DATABASE_URL, TEST_DATABASE_URL, and STAGING_DATABASE_URL.',
+            'Conflicting database configuration: SHADOW_DATABASE_URL must be isolated from DATABASE_URL, UNIT_TEST_DATABASE_URL, TEST_DATABASE_URL, and STAGING_DATABASE_URL.',
         });
       }
     }

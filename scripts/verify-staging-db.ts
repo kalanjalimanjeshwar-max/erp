@@ -38,52 +38,147 @@ function parseDotEnvMinimal(content: string): Record<string, string> {
   return parsed;
 }
 
-function captureInitialStagingEnv(): Record<string, string | undefined> {
-  // Capture explicit shell environment BEFORE any module import triggers dotenv.config() or Prisma env loading.
-  const effectiveEnv: Record<string, string | undefined> = { ...process.env };
+function readEnvFileMinimal(filePath: string): Record<string, string> | null {
+  if (!fs.existsSync(filePath)) return null;
+  return parseDotEnvMinimal(fs.readFileSync(filePath, 'utf-8'));
+}
 
-  // Only consult local .env.staging when STAGING_DATABASE_URL was not explicitly provided in shell env.
-  // Never overwrite explicit values (including explicit empty string '') and never touch DATABASE_URL or TEST_DATABASE_URL.
-  if (effectiveEnv.STAGING_DATABASE_URL === undefined) {
-    const stagingEnvPath = path.resolve(process.cwd(), '.env.staging');
-    if (fs.existsSync(stagingEnvPath)) {
-      const parsed = parseDotEnvMinimal(fs.readFileSync(stagingEnvPath, 'utf-8'));
+function urlsConflict(urlA: string, urlB: string): boolean {
+  try {
+    const a = new URL(urlA.trim());
+    const b = new URL(urlB.trim());
+    const normHost = (h: string) => {
+      const lower = h.toLowerCase().replace(/^\[|\]$/g, '');
+      return lower === 'localhost' || lower === '127.0.0.1' || lower === '::1' ? '127.0.0.1' : lower;
+    };
+    const normDb = (p: string) => decodeURIComponent(p.replace(/^\/+/, '').replace(/\/+$/, '')).toLowerCase();
+    return (
+      normHost(a.hostname) !== normHost(b.hostname) ||
+      (a.port || '5432') !== (b.port || '5432') ||
+      normDb(a.pathname) !== normDb(b.pathname) ||
+      decodeURIComponent(a.username || '') !== decodeURIComponent(b.username || '') ||
+      decodeURIComponent(a.password || '') !== decodeURIComponent(b.password || '')
+    );
+  } catch {
+    return urlA.trim() !== urlB.trim();
+  }
+}
+
+function captureInitialStagingEnv(): {
+  effectiveEnv: Record<string, string | undefined>;
+  configErrors: string[];
+  secrets: string[];
+} {
+  // Capture explicit shell environment BEFORE any module import triggers dotenv.config() or Prisma env loading.
+  const shellEnv: Record<string, string | undefined> = { ...process.env };
+  const effectiveEnv: Record<string, string | undefined> = { ...shellEnv };
+  const configErrors: string[] = [];
+  const secrets: string[] = [];
+
+  const trackUrlAndPassword = (val: string | undefined) => {
+    const trimmed = val?.trim();
+    if (!trimmed) return;
+    secrets.push(trimmed);
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.password) {
+        secrets.push(parsed.password);
+        const decoded = decodeURIComponent(parsed.password);
+        if (decoded) secrets.push(decoded);
+      }
+    } catch {
+      // Not a URL
+    }
+  };
+
+  trackUrlAndPassword(shellEnv.STAGING_DATABASE_URL);
+  trackUrlAndPassword(shellEnv.DATABASE_URL);
+  trackUrlAndPassword(shellEnv.TEST_DATABASE_URL);
+  if (shellEnv.STAGING_POSTGRES_PASSWORD) secrets.push(shellEnv.STAGING_POSTGRES_PASSWORD);
+
+  const mainEnv = readEnvFileMinimal(path.resolve(process.cwd(), '.env'));
+  const stagingEnv = readEnvFileMinimal(path.resolve(process.cwd(), '.env.staging'));
+
+  if (mainEnv) {
+    trackUrlAndPassword(mainEnv.STAGING_DATABASE_URL);
+    trackUrlAndPassword(mainEnv.DATABASE_URL);
+    if (mainEnv.STAGING_POSTGRES_PASSWORD) secrets.push(mainEnv.STAGING_POSTGRES_PASSWORD);
+
+    // Reject misplaced staging variables inside .env (staging MUST live exclusively in .env.staging)
+    if (mainEnv.STAGING_DATABASE_URL?.trim()) {
+      configErrors.push(
+        '[.env :: STAGING_DATABASE_URL] Misplaced STAGING_DATABASE_URL found in .env. Staging must use STAGING_DATABASE_URL exclusively from .env.staging (localhost:5435/core_erp_staging). Remove STAGING_DATABASE_URL from .env.'
+      );
+    }
+    for (const stagingKey of [
+      'STAGING_POSTGRES_USER',
+      'STAGING_POSTGRES_PASSWORD',
+      'STAGING_POSTGRES_DB',
+    ]) {
+      if (mainEnv[stagingKey]?.trim()) {
+        configErrors.push(
+          `[.env :: ${stagingKey}] Staging Compose variable must live exclusively in .env.staging, not in .env. Remove ${stagingKey} from .env.`
+        );
+      }
+    }
+
+    // Load DATABASE_URL strictly as a protected comparison reference (never as a staging target)
+    if (effectiveEnv.DATABASE_URL === undefined && mainEnv.DATABASE_URL !== undefined) {
+      effectiveEnv.DATABASE_URL = mainEnv.DATABASE_URL;
+    }
+  }
+
+  if (stagingEnv) {
+    trackUrlAndPassword(stagingEnv.STAGING_DATABASE_URL);
+    if (stagingEnv.STAGING_POSTGRES_PASSWORD) secrets.push(stagingEnv.STAGING_POSTGRES_PASSWORD);
+
+    // Detect conflicting shell override vs .env.staging
+    if (
+      shellEnv.STAGING_DATABASE_URL !== undefined &&
+      shellEnv.STAGING_DATABASE_URL.trim() !== '' &&
+      stagingEnv.STAGING_DATABASE_URL?.trim() &&
+      urlsConflict(shellEnv.STAGING_DATABASE_URL, stagingEnv.STAGING_DATABASE_URL)
+    ) {
+      configErrors.push(
+        '[shell environment :: STAGING_DATABASE_URL] Conflicts with [.env.staging :: STAGING_DATABASE_URL]. Unset the conflicting shell override or align both.'
+      );
+    }
+
+    // Load exclusively from .env.staging when shell STAGING_DATABASE_URL is unset
+    if (effectiveEnv.STAGING_DATABASE_URL === undefined) {
       for (const key of [
         'STAGING_DATABASE_URL',
         'STAGING_POSTGRES_USER',
         'STAGING_POSTGRES_PASSWORD',
         'STAGING_POSTGRES_DB',
       ]) {
-        if (effectiveEnv[key] === undefined && parsed[key] !== undefined) {
-          effectiveEnv[key] = parsed[key];
+        if (effectiveEnv[key] === undefined && stagingEnv[key] !== undefined) {
+          effectiveEnv[key] = stagingEnv[key];
         }
       }
     }
   }
 
-  return effectiveEnv;
+  return { effectiveEnv, configErrors, secrets };
 }
 
 async function main() {
   const args = process.argv.slice(2);
   const isExecuteRequested = args.includes('--execute');
-  const effectiveEnv = captureInitialStagingEnv();
+  const { effectiveEnv, configErrors, secrets } = captureInitialStagingEnv();
 
-  // Dynamically import after capturing shell + .env.staging so repo .env cannot shadow .env.staging.
+  // Dynamically import after capturing shell + .env.staging so repo .env cannot shadow or populate STAGING_DATABASE_URL.
   const { runStagingVerification, redactSensitiveText } = await import(
     '../src/server/db/staging-verifier.js'
   );
 
-  // If neither shell nor .env.staging provided STAGING_DATABASE_URL, allow .env-loaded value (if present)
-  // while still strictly never falling back to DATABASE_URL or TEST_DATABASE_URL.
-  if (
-    effectiveEnv.STAGING_DATABASE_URL === undefined &&
-    process.env.STAGING_DATABASE_URL !== undefined
-  ) {
-    effectiveEnv.STAGING_DATABASE_URL = process.env.STAGING_DATABASE_URL;
-  }
-  if (effectiveEnv.DATABASE_URL === undefined && process.env.DATABASE_URL !== undefined) {
-    effectiveEnv.DATABASE_URL = process.env.DATABASE_URL;
+  if (configErrors.length > 0) {
+    console.error('\n❌ [STAGING CONFIGURATION SAFETY CHECK FAILED]:');
+    for (const err of configErrors) {
+      console.error(`   - ${redactSensitiveText(err, secrets)}`);
+    }
+    console.error('');
+    process.exit(1);
   }
 
   try {
@@ -95,6 +190,7 @@ async function main() {
   } catch (err: unknown) {
     const rawMessage = err instanceof Error ? err.message : String(err);
     const safeMessage = redactSensitiveText(rawMessage, [
+      ...secrets,
       effectiveEnv.STAGING_DATABASE_URL || '',
       effectiveEnv.TEST_DATABASE_URL || '',
       effectiveEnv.DATABASE_URL || '',

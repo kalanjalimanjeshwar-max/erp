@@ -811,7 +811,7 @@ function prepareEnvironmentsInMemory(params: {
     });
   }
 
-  // 3. Main development + shadow + staging ref (.env)
+  // 3. Main development + shadow (.env — NEVER contains STAGING_DATABASE_URL or TEST_DATABASE_URL)
   let mainEnv: Record<string, string>;
   if (existingMainEnv && !recreateEnv) {
     mainEnv = { ...existingMainEnv };
@@ -848,7 +848,6 @@ function prepareEnvironmentsInMemory(params: {
       shadowPassword,
       shadowDatabase,
       shadowUrl,
-      stagingUrl: stagingEnv.STAGING_DATABASE_URL || '',
       sessionSecret: generateSecret(32),
       bankEncryptionKey: generateSecret(32),
       biometricBridgeToken: generateSecret(24),
@@ -900,9 +899,65 @@ export function validateAllFiveEnvironmentsPreflight(params: {
   const resolvedUrls: Partial<Record<CleanResetTarget, string>> = {};
   const resolvedEndpoints: Partial<Record<CleanResetTarget, NormalizedDatabaseEndpoint>> = {};
 
-  // Helper to verify shell URLs cannot silently override validated local targets with remote/wrong endpoints
+  // 0. Reject strictly prohibited misplaced cross-environment variables (exact [file :: VAR] attribution)
+  if (mainEnv.STAGING_DATABASE_URL?.trim()) {
+    const misplacedEp = normalizeDatabaseUrl(mainEnv.STAGING_DATABASE_URL.trim());
+    const epNote = misplacedEp
+      ? ` (currently targets ${misplacedEp.hostname}:${misplacedEp.port}/${misplacedEp.database})`
+      : ' (unparseable URL)';
+    issues.push(
+      `[.env :: STAGING_DATABASE_URL] Misplaced variable in .env${epNote}. Staging must use STAGING_DATABASE_URL exclusively from .env.staging (localhost:5435/core_erp_staging). Remove STAGING_DATABASE_URL from .env.`
+    );
+  }
+  for (const stagingKey of [
+    'STAGING_POSTGRES_USER',
+    'STAGING_POSTGRES_PASSWORD',
+    'STAGING_POSTGRES_DB',
+  ]) {
+    if (mainEnv[stagingKey]?.trim()) {
+      issues.push(
+        `[.env :: ${stagingKey}] Staging Compose variable must be defined exclusively in .env.staging, not in .env. Remove ${stagingKey} from .env.`
+      );
+    }
+  }
+  if (mainEnv.TEST_DATABASE_URL?.trim()) {
+    const misplacedEp = normalizeDatabaseUrl(mainEnv.TEST_DATABASE_URL.trim());
+    const epNote = misplacedEp
+      ? ` (currently targets ${misplacedEp.hostname}:${misplacedEp.port}/${misplacedEp.database})`
+      : ' (unparseable URL)';
+    issues.push(
+      `[.env :: TEST_DATABASE_URL] Misplaced variable in .env${epNote}. Integration tests use TEST_DATABASE_URL exclusively from .env.integration-test (localhost:5434/core_erp_integration_test); automated unit tests use UNIT_TEST_DATABASE_URL (localhost:5433/core_erp_test). Remove TEST_DATABASE_URL from .env.`
+    );
+  }
+  for (const forbiddenKey of [
+    'DATABASE_URL',
+    'TEST_DATABASE_URL',
+    'UNIT_TEST_DATABASE_URL',
+    'SHADOW_DATABASE_URL',
+  ]) {
+    if (stagingEnv[forbiddenKey]?.trim()) {
+      issues.push(
+        `[.env.staging :: ${forbiddenKey}] Non-staging variable must not be defined in .env.staging. Remove ${forbiddenKey} from .env.staging.`
+      );
+    }
+  }
+  for (const forbiddenKey of [
+    'DATABASE_URL',
+    'STAGING_DATABASE_URL',
+    'UNIT_TEST_DATABASE_URL',
+    'SHADOW_DATABASE_URL',
+  ]) {
+    if (integrationEnv[forbiddenKey]?.trim()) {
+      issues.push(
+        `[.env.integration-test :: ${forbiddenKey}] Non-integration variable must not be defined in .env.integration-test. Remove ${forbiddenKey} from .env.integration-test.`
+      );
+    }
+  }
+
+  // Helper to verify shell URLs cannot silently override validated local targets with remote/wrong/conflicting endpoints
   const checkShellUrlOverride = (
     varName: string,
+    fileLabel: string,
     shellVal: string | undefined,
     fileVal: string | undefined,
     expectedPort: number,
@@ -913,18 +968,18 @@ export function validateAllFiveEnvironmentsPreflight(params: {
 
     const ep = normalizeDatabaseUrl(trimmed);
     if (!ep) {
-      issues.push(`Shell ${varName} is malformed or unparseable.`);
+      issues.push(`[shell environment :: ${varName}] Shell ${varName} is malformed or unparseable.`);
       return;
     }
     if (ep.hostname !== '127.0.0.1') {
       issues.push(
-        `Shell ${varName} points to remote host "${ep.hostname}". Local Docker clean-reset strictly requires localhost/127.0.0.1.`
+        `[shell environment :: ${varName}] Shell ${varName} points to remote host "${ep.hostname}". Local Docker clean-reset strictly requires localhost/127.0.0.1.`
       );
       return;
     }
     if (ep.port !== expectedPort || ep.database !== expectedDb) {
       issues.push(
-        `Shell ${varName} targets ${ep.hostname}:${ep.port}/${ep.database}, but expected localhost:${expectedPort}/${expectedDb}.`
+        `[shell environment :: ${varName}] Shell ${varName} targets ${ep.hostname}:${ep.port}/${ep.database}, but expected localhost:${expectedPort}/${expectedDb}.`
       );
       return;
     }
@@ -941,7 +996,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
               shellCreds.password !== fileCreds.password)))
       ) {
         issues.push(
-          `Shell ${varName} conflicts with the local environment file configuration. Unset conflicting shell overrides or align both.`
+          `[shell environment :: ${varName}] Conflicts with [${fileLabel} :: ${varName}]. Unset the conflicting shell override or align both.`
         );
       }
     }
@@ -950,6 +1005,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
   // Check shell overrides for all five targets BEFORE resolving effective target URLs
   checkShellUrlOverride(
     'DATABASE_URL',
+    '.env',
     shellEnv.DATABASE_URL,
     mainEnv.DATABASE_URL,
     COREERP_DB_ENVIRONMENTS.development.port,
@@ -957,13 +1013,15 @@ export function validateAllFiveEnvironmentsPreflight(params: {
   );
   checkShellUrlOverride(
     'UNIT_TEST_DATABASE_URL',
+    '.env',
     shellEnv.UNIT_TEST_DATABASE_URL,
-    undefined,
+    mainEnv.UNIT_TEST_DATABASE_URL,
     COREERP_DB_ENVIRONMENTS.automatedTest.port,
     COREERP_DB_ENVIRONMENTS.automatedTest.database
   );
   checkShellUrlOverride(
     'TEST_DATABASE_URL',
+    '.env.integration-test',
     shellEnv.TEST_DATABASE_URL,
     integrationEnv.TEST_DATABASE_URL,
     COREERP_DB_ENVIRONMENTS.integrationTest.port,
@@ -971,6 +1029,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
   );
   checkShellUrlOverride(
     'STAGING_DATABASE_URL',
+    '.env.staging',
     shellEnv.STAGING_DATABASE_URL,
     stagingEnv.STAGING_DATABASE_URL,
     COREERP_DB_ENVIRONMENTS.staging.port,
@@ -978,25 +1037,48 @@ export function validateAllFiveEnvironmentsPreflight(params: {
   );
   checkShellUrlOverride(
     'SHADOW_DATABASE_URL',
+    '.env',
     shellEnv.SHADOW_DATABASE_URL,
     mainEnv.SHADOW_DATABASE_URL,
     COREERP_DB_ENVIRONMENTS.shadow.port,
     COREERP_DB_ENVIRONMENTS.shadow.database
   );
 
-  // Resolve effective URLs for all five targets
+  // Resolve effective URLs strictly from their designated source files (staging NEVER falls back to .env)
+  const devSource = mainEnv.DATABASE_URL?.trim()
+    ? '[.env :: DATABASE_URL]'
+    : '[shell environment :: DATABASE_URL]';
   const devUrl = mainEnv.DATABASE_URL?.trim() || shellEnv.DATABASE_URL?.trim() || '';
+
+  const unitTestSource = shellEnv.UNIT_TEST_DATABASE_URL?.trim()
+    ? '[shell environment :: UNIT_TEST_DATABASE_URL]'
+    : mainEnv.UNIT_TEST_DATABASE_URL?.trim()
+      ? '[.env :: UNIT_TEST_DATABASE_URL]'
+      : '[default :: UNIT_TEST_DATABASE_URL]';
   const unitTestUrl =
     shellEnv.UNIT_TEST_DATABASE_URL?.trim() ||
     mainEnv.UNIT_TEST_DATABASE_URL?.trim() ||
     DEFAULT_UNIT_TEST_DATABASE_URL;
+
+  const integrationSource = integrationEnv.TEST_DATABASE_URL?.trim()
+    ? '[.env.integration-test :: TEST_DATABASE_URL]'
+    : '[shell environment :: TEST_DATABASE_URL]';
   const integrationUrl =
     integrationEnv.TEST_DATABASE_URL?.trim() || shellEnv.TEST_DATABASE_URL?.trim() || '';
+
+  const stagingSource = stagingEnv.STAGING_DATABASE_URL?.trim()
+    ? '[.env.staging :: STAGING_DATABASE_URL]'
+    : '[shell environment :: STAGING_DATABASE_URL]';
   const stagingUrl =
     stagingEnv.STAGING_DATABASE_URL?.trim() || shellEnv.STAGING_DATABASE_URL?.trim() || '';
 
   const explicitShadowUrl =
     mainEnv.SHADOW_DATABASE_URL?.trim() || shellEnv.SHADOW_DATABASE_URL?.trim();
+  const shadowSource = mainEnv.SHADOW_DATABASE_URL?.trim()
+    ? '[.env :: SHADOW_DATABASE_URL]'
+    : shellEnv.SHADOW_DATABASE_URL?.trim()
+      ? '[shell environment :: SHADOW_DATABASE_URL]'
+      : '[default :: SHADOW_DATABASE_URL]';
   const shadowFallbackUser =
     mainEnv.SHADOW_POSTGRES_USER?.trim() || COREERP_DB_ENVIRONMENTS.shadow.user;
   const shadowFallbackPass =
@@ -1021,25 +1103,27 @@ export function validateAllFiveEnvironmentsPreflight(params: {
     DATABASE_URL: devUrl,
   });
   if (devCheck.valid === false) {
-    issues.push(`Target "dev" validation failed: ${devCheck.error}`);
+    issues.push(`${devSource} Target "dev" validation failed: ${devCheck.error}`);
   } else {
     resolvedUrls.dev = devCheck.url;
     const devEp = normalizeDatabaseUrl(devCheck.url);
     if (devEp) resolvedEndpoints.dev = devEp;
     const creds = parseUrlCredentialsSafe(devCheck.url);
     if (!creds) {
-      issues.push('Target "dev" DATABASE_URL credentials could not be parsed.');
+      issues.push(`${devSource} Target "dev" DATABASE_URL credentials could not be parsed.`);
     } else {
       devPassword = creds.password;
       if (isPlaceholderOrWeak(creds.password)) {
-        issues.push('Target "dev" DATABASE_URL uses an empty or placeholder password.');
+        issues.push(`${devSource} Target "dev" DATABASE_URL uses an empty or placeholder password.`);
       }
       if (mainEnv.POSTGRES_USER?.trim() && creds.username !== mainEnv.POSTGRES_USER.trim()) {
-        issues.push('Target "dev" DATABASE_URL username does not match POSTGRES_USER in .env.');
+        issues.push(
+          `[.env :: DATABASE_URL vs POSTGRES_USER] Target "dev" DATABASE_URL username does not match POSTGRES_USER in .env.`
+        );
       }
       if (mainEnv.POSTGRES_PASSWORD?.trim() && creds.password !== mainEnv.POSTGRES_PASSWORD.trim()) {
         issues.push(
-          'Target "dev" DATABASE_URL password does not match POSTGRES_PASSWORD in .env (would cause P1000).'
+          `[.env :: DATABASE_URL vs POSTGRES_PASSWORD] Target "dev" DATABASE_URL password does not match POSTGRES_PASSWORD in .env (would cause P1000).`
         );
       }
       if (
@@ -1047,14 +1131,16 @@ export function validateAllFiveEnvironmentsPreflight(params: {
         !recreateEnv &&
         creds.password !== shellEnv.POSTGRES_PASSWORD.trim()
       ) {
-        issues.push('Shell POSTGRES_PASSWORD conflicts with target "dev" DATABASE_URL password.');
+        issues.push(
+          `[shell environment :: POSTGRES_PASSWORD] Conflicts with target "dev" DATABASE_URL password.`
+        );
       }
       if (
         mainEnv.POSTGRES_DB?.trim() &&
         mainEnv.POSTGRES_DB.trim().toLowerCase() !== COREERP_DB_ENVIRONMENTS.development.database
       ) {
         issues.push(
-          `Target "dev" POSTGRES_DB in .env must be "${COREERP_DB_ENVIRONMENTS.development.database}".`
+          `[.env :: POSTGRES_DB] Target "dev" POSTGRES_DB in .env must be "${COREERP_DB_ENVIRONMENTS.development.database}".`
         );
       }
     }
@@ -1065,7 +1151,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
     UNIT_TEST_DATABASE_URL: unitTestUrl,
   });
   if (testCheck.valid === false) {
-    issues.push(`Target "test" validation failed: ${testCheck.error}`);
+    issues.push(`${unitTestSource} Target "test" validation failed: ${testCheck.error}`);
   } else {
     resolvedUrls.test = testCheck.url;
     const testEp = normalizeDatabaseUrl(testCheck.url);
@@ -1078,7 +1164,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
     TEST_DATABASE_URL: integrationUrl,
   });
   if (intCheck.valid === false) {
-    issues.push(`Target "integration" validation failed: ${intCheck.error}`);
+    issues.push(`${integrationSource} Target "integration" validation failed: ${intCheck.error}`);
   } else {
     resolvedUrls.integration = intCheck.url;
     const intEp = normalizeDatabaseUrl(intCheck.url);
@@ -1087,44 +1173,48 @@ export function validateAllFiveEnvironmentsPreflight(params: {
     const composeIntPass = integrationEnv.POSTGRES_PASSWORD?.trim() || '';
     if (isPlaceholderOrWeak(composeIntPass)) {
       issues.push(
-        'Target "integration" .env.integration-test has a missing or placeholder POSTGRES_PASSWORD.'
+        `[.env.integration-test :: POSTGRES_PASSWORD] Target "integration" .env.integration-test has a missing or placeholder POSTGRES_PASSWORD.`
       );
     }
     if (!creds) {
-      issues.push('Target "integration" TEST_DATABASE_URL credentials could not be parsed.');
+      issues.push(
+        `${integrationSource} Target "integration" TEST_DATABASE_URL credentials could not be parsed.`
+      );
     } else {
       integrationPassword = creds.password;
       if (creds.username !== COREERP_DB_ENVIRONMENTS.integrationTest.user) {
         issues.push(
-          `Target "integration" TEST_DATABASE_URL username must be "${COREERP_DB_ENVIRONMENTS.integrationTest.user}".`
+          `${integrationSource} Target "integration" TEST_DATABASE_URL username must be "${COREERP_DB_ENVIRONMENTS.integrationTest.user}".`
         );
       }
       if (isPlaceholderOrWeak(creds.password)) {
-        issues.push('Target "integration" TEST_DATABASE_URL uses an empty or placeholder password.');
+        issues.push(
+          `${integrationSource} Target "integration" TEST_DATABASE_URL uses an empty or placeholder password.`
+        );
       }
       if (composeIntPass && creds.password !== composeIntPass) {
         issues.push(
-          'Target "integration" TEST_DATABASE_URL password does not match POSTGRES_PASSWORD in .env.integration-test (would cause P1000).'
+          `[.env.integration-test :: TEST_DATABASE_URL vs POSTGRES_PASSWORD] Target "integration" TEST_DATABASE_URL password does not match POSTGRES_PASSWORD in .env.integration-test (would cause P1000).`
         );
       }
     }
   }
 
-  // 4. Validate STAGING (port 5435 / core_erp_staging) — reusing validateStagingDatabaseUrl + strict local host/port check
+  // 4. Validate STAGING (port 5435 / core_erp_staging) — strictly from .env.staging (never .env)
   let stagingPassword = '';
   const stagingSafety = validateStagingDatabaseUrl(stagingUrl, devUrl || undefined, {
     testDatabaseUrl: integrationUrl || undefined,
     shadowDatabaseUrl: shadowUrl || undefined,
   });
   if (!stagingSafety.valid || !stagingSafety.endpoint || !stagingSafety.url) {
-    issues.push(`Target "staging" validation failed: ${stagingSafety.error}`);
+    issues.push(`${stagingSource} Target "staging" validation failed: ${stagingSafety.error}`);
   } else if (
     stagingSafety.endpoint.hostname !== '127.0.0.1' ||
     stagingSafety.endpoint.port !== COREERP_DB_ENVIRONMENTS.staging.port ||
     stagingSafety.endpoint.database !== COREERP_DB_ENVIRONMENTS.staging.database
   ) {
     issues.push(
-      `Target "staging" must resolve strictly to localhost:${COREERP_DB_ENVIRONMENTS.staging.port}/${COREERP_DB_ENVIRONMENTS.staging.database} for local Docker clean-reset (found ${stagingSafety.endpoint.hostname}:${stagingSafety.endpoint.port}/${stagingSafety.endpoint.database}).`
+      `${stagingSource} Target "staging" must resolve strictly to localhost:${COREERP_DB_ENVIRONMENTS.staging.port}/${COREERP_DB_ENVIRONMENTS.staging.database} for local Docker clean-reset (found ${stagingSafety.endpoint.hostname}:${stagingSafety.endpoint.port}/${stagingSafety.endpoint.database}).`
     );
   } else {
     resolvedUrls.staging = stagingSafety.url;
@@ -1135,31 +1225,39 @@ export function validateAllFiveEnvironmentsPreflight(params: {
     const sDb = stagingEnv.STAGING_POSTGRES_DB?.trim() || '';
 
     if (!sUser) {
-      issues.push('Target "staging" .env.staging is missing STAGING_POSTGRES_USER.');
+      issues.push(
+        `[.env.staging :: STAGING_POSTGRES_USER] Target "staging" .env.staging is missing STAGING_POSTGRES_USER.`
+      );
     }
     if (isPlaceholderOrWeak(sPass)) {
-      issues.push('Target "staging" .env.staging has a missing or placeholder STAGING_POSTGRES_PASSWORD.');
+      issues.push(
+        `[.env.staging :: STAGING_POSTGRES_PASSWORD] Target "staging" .env.staging has a missing or placeholder STAGING_POSTGRES_PASSWORD.`
+      );
     }
     if (sDb.toLowerCase() !== COREERP_DB_ENVIRONMENTS.staging.database) {
       issues.push(
-        `Target "staging" .env.staging STAGING_POSTGRES_DB must be "${COREERP_DB_ENVIRONMENTS.staging.database}".`
+        `[.env.staging :: STAGING_POSTGRES_DB] Target "staging" .env.staging STAGING_POSTGRES_DB must be "${COREERP_DB_ENVIRONMENTS.staging.database}".`
       );
     }
     if (!creds) {
-      issues.push('Target "staging" STAGING_DATABASE_URL credentials could not be parsed.');
+      issues.push(
+        `${stagingSource} Target "staging" STAGING_DATABASE_URL credentials could not be parsed.`
+      );
     } else {
       stagingPassword = creds.password;
       if (isPlaceholderOrWeak(creds.password)) {
-        issues.push('Target "staging" STAGING_DATABASE_URL uses an empty or placeholder password.');
+        issues.push(
+          `${stagingSource} Target "staging" STAGING_DATABASE_URL uses an empty or placeholder password.`
+        );
       }
       if (sUser && creds.username !== sUser) {
         issues.push(
-          'Target "staging" STAGING_DATABASE_URL username does not match STAGING_POSTGRES_USER in .env.staging.'
+          `[.env.staging :: STAGING_DATABASE_URL vs STAGING_POSTGRES_USER] Target "staging" STAGING_DATABASE_URL username does not match STAGING_POSTGRES_USER in .env.staging.`
         );
       }
       if (sPass && creds.password !== sPass) {
         issues.push(
-          'Target "staging" STAGING_DATABASE_URL password does not match STAGING_POSTGRES_PASSWORD in .env.staging (would cause P1000).'
+          `[.env.staging :: STAGING_DATABASE_URL vs STAGING_POSTGRES_PASSWORD] Target "staging" STAGING_DATABASE_URL password does not match STAGING_POSTGRES_PASSWORD in .env.staging (would cause P1000).`
         );
       }
       if (
@@ -1168,25 +1266,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
         creds.password !== shellEnv.STAGING_POSTGRES_PASSWORD.trim()
       ) {
         issues.push(
-          'Shell STAGING_POSTGRES_PASSWORD conflicts with target "staging" STAGING_DATABASE_URL password.'
-        );
-      }
-    }
-
-    // If .env also specifies STAGING_DATABASE_URL, ensure full parity with .env.staging
-    if (mainEnv.STAGING_DATABASE_URL?.trim()) {
-      const envStagingEp = normalizeDatabaseUrl(mainEnv.STAGING_DATABASE_URL.trim());
-      const envStagingCreds = parseUrlCredentialsSafe(mainEnv.STAGING_DATABASE_URL.trim());
-      if (
-        !envStagingEp ||
-        !areDatabaseEndpointsEqual(envStagingEp, stagingSafety.endpoint) ||
-        !envStagingCreds ||
-        !creds ||
-        envStagingCreds.username !== creds.username ||
-        envStagingCreds.password !== creds.password
-      ) {
-        issues.push(
-          'Staging configuration mismatch between .env (STAGING_DATABASE_URL) and .env.staging.'
+          `[shell environment :: STAGING_POSTGRES_PASSWORD] Conflicts with target "staging" STAGING_DATABASE_URL password.`
         );
       }
     }
@@ -1195,31 +1275,35 @@ export function validateAllFiveEnvironmentsPreflight(params: {
   // 5. Validate SHADOW (port 5436 / core_erp_shadow)
   const shadowEp = normalizeDatabaseUrl(shadowUrl);
   if (!shadowEp) {
-    issues.push('Target "shadow" SHADOW_DATABASE_URL is malformed or unparseable.');
+    issues.push(`${shadowSource} Target "shadow" SHADOW_DATABASE_URL is malformed or unparseable.`);
   } else if (
     shadowEp.hostname !== '127.0.0.1' ||
     shadowEp.port !== COREERP_DB_ENVIRONMENTS.shadow.port ||
     shadowEp.database !== COREERP_DB_ENVIRONMENTS.shadow.database
   ) {
     issues.push(
-      `Target "shadow" SHADOW_DATABASE_URL must resolve strictly to localhost:${COREERP_DB_ENVIRONMENTS.shadow.port}/${COREERP_DB_ENVIRONMENTS.shadow.database} (found ${shadowEp.hostname}:${shadowEp.port}/${shadowEp.database}).`
+      `${shadowSource} Target "shadow" SHADOW_DATABASE_URL must resolve strictly to localhost:${COREERP_DB_ENVIRONMENTS.shadow.port}/${COREERP_DB_ENVIRONMENTS.shadow.database} (found ${shadowEp.hostname}:${shadowEp.port}/${shadowEp.database}).`
     );
   } else {
     resolvedUrls.shadow = shadowUrl;
     resolvedEndpoints.shadow = shadowEp;
     const creds = parseUrlCredentialsSafe(shadowUrl);
     if (!creds) {
-      issues.push('Target "shadow" SHADOW_DATABASE_URL credentials could not be parsed.');
+      issues.push(
+        `${shadowSource} Target "shadow" SHADOW_DATABASE_URL credentials could not be parsed.`
+      );
     } else {
       if (isPlaceholderOrWeak(creds.password)) {
-        issues.push('Target "shadow" SHADOW_DATABASE_URL uses an empty or placeholder password.');
+        issues.push(
+          `${shadowSource} Target "shadow" SHADOW_DATABASE_URL uses an empty or placeholder password.`
+        );
       }
       if (
         mainEnv.SHADOW_POSTGRES_USER?.trim() &&
         creds.username !== mainEnv.SHADOW_POSTGRES_USER.trim()
       ) {
         issues.push(
-          'Target "shadow" SHADOW_DATABASE_URL username does not match SHADOW_POSTGRES_USER in .env.'
+          `[.env :: SHADOW_DATABASE_URL vs SHADOW_POSTGRES_USER] Target "shadow" SHADOW_DATABASE_URL username does not match SHADOW_POSTGRES_USER in .env.`
         );
       }
       if (
@@ -1227,7 +1311,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
         creds.password !== mainEnv.SHADOW_POSTGRES_PASSWORD.trim()
       ) {
         issues.push(
-          'Target "shadow" SHADOW_DATABASE_URL password does not match SHADOW_POSTGRES_PASSWORD in .env (would cause P1000).'
+          `[.env :: SHADOW_DATABASE_URL vs SHADOW_POSTGRES_PASSWORD] Target "shadow" SHADOW_DATABASE_URL password does not match SHADOW_POSTGRES_PASSWORD in .env (would cause P1000).`
         );
       }
       if (
@@ -1235,7 +1319,7 @@ export function validateAllFiveEnvironmentsPreflight(params: {
         mainEnv.SHADOW_POSTGRES_DB.trim().toLowerCase() !== COREERP_DB_ENVIRONMENTS.shadow.database
       ) {
         issues.push(
-          `Target "shadow" SHADOW_POSTGRES_DB in .env must be "${COREERP_DB_ENVIRONMENTS.shadow.database}".`
+          `[.env :: SHADOW_POSTGRES_DB] Target "shadow" SHADOW_POSTGRES_DB in .env must be "${COREERP_DB_ENVIRONMENTS.shadow.database}".`
         );
       }
     }
@@ -1244,35 +1328,35 @@ export function validateAllFiveEnvironmentsPreflight(params: {
   // 6. Cross-environment credential isolation (staging never shares password with dev or integration)
   if (stagingPassword && devPassword && stagingPassword === devPassword) {
     issues.push(
-      'Staging password matches development password. Staging must use dedicated isolated credentials.'
+      '[.env.staging :: STAGING_POSTGRES_PASSWORD vs .env :: POSTGRES_PASSWORD] Staging password matches development password. Staging must use dedicated isolated credentials.'
     );
   }
   if (stagingPassword && integrationPassword && stagingPassword === integrationPassword) {
     issues.push(
-      'Staging password matches integration-test password. Staging must use dedicated isolated credentials.'
+      '[.env.staging :: STAGING_POSTGRES_PASSWORD vs .env.integration-test :: POSTGRES_PASSWORD] Staging password matches integration-test password. Staging must use dedicated isolated credentials.'
     );
   }
 
   // 7. Cross-target physical endpoint uniqueness across all five environments (including raw parsed URLs)
-  const rawCandidateEndpoints: Array<[CleanResetTarget, NormalizedDatabaseEndpoint]> = [];
-  const rawPairs: Array<[CleanResetTarget, string]> = [
-    ['dev', devUrl],
-    ['test', unitTestUrl],
-    ['integration', integrationUrl],
-    ['staging', stagingUrl],
-    ['shadow', shadowUrl],
+  const rawCandidateEndpoints: Array<[CleanResetTarget, string, NormalizedDatabaseEndpoint]> = [];
+  const rawPairs: Array<[CleanResetTarget, string, string]> = [
+    ['dev', devSource, devUrl],
+    ['test', unitTestSource, unitTestUrl],
+    ['integration', integrationSource, integrationUrl],
+    ['staging', stagingSource, stagingUrl],
+    ['shadow', shadowSource, shadowUrl],
   ];
-  for (const [targetName, rawUrl] of rawPairs) {
+  for (const [targetName, sourceLabel, rawUrl] of rawPairs) {
     const ep = normalizeDatabaseUrl(rawUrl);
-    if (ep) rawCandidateEndpoints.push([targetName, ep]);
+    if (ep) rawCandidateEndpoints.push([targetName, sourceLabel, ep]);
   }
   for (let i = 0; i < rawCandidateEndpoints.length; i += 1) {
     for (let j = i + 1; j < rawCandidateEndpoints.length; j += 1) {
-      const [targetA, epA] = rawCandidateEndpoints[i];
-      const [targetB, epB] = rawCandidateEndpoints[j];
+      const [targetA, sourceA, epA] = rawCandidateEndpoints[i];
+      const [targetB, sourceB, epB] = rawCandidateEndpoints[j];
       if (areDatabaseEndpointsEqual(epA, epB)) {
         issues.push(
-          `Duplicate database endpoint detected: targets "${targetA}" and "${targetB}" both resolve to ${epA.hostname}:${epA.port}/${epA.database}.`
+          `Duplicate database endpoint detected: targets "${targetA}" ${sourceA} and "${targetB}" ${sourceB} both resolve to ${epA.hostname}:${epA.port}/${epA.database}.`
         );
       }
     }

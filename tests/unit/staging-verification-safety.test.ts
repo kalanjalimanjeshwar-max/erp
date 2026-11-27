@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { spawnSync } from 'node:child_process';
 import {
@@ -894,9 +895,26 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
   describe('CLI Subprocess Safety & Exit Code Tests', () => {
     const tsxPath = path.resolve(import.meta.dirname, '../../node_modules/tsx/dist/cli.mjs');
     const scriptPath = path.resolve(import.meta.dirname, '../../scripts/verify-staging-db.ts');
+    const cliTempDirs: string[] = [];
+
+    const makeIsolatedCwd = (): string => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'coreerp-staging-cli-'));
+      cliTempDirs.push(dir);
+      return dir;
+    };
+
+    afterEach(() => {
+      while (cliTempDirs.length > 0) {
+        const dir = cliTempDirs.pop()!;
+        if (fs.existsSync(dir)) {
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
+      }
+    });
 
     it('Case 1: Missing target URL fails safely with exit code 1 and safe error message', () => {
       const result = spawnSync(process.execPath, [tsxPath, scriptPath], {
+        cwd: makeIsolatedCwd(),
         env: {
           ...process.env,
           STAGING_DATABASE_URL: '',
@@ -917,6 +935,7 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
       const testSecret = 'SuperSecretTestPass123!';
       const prodSecret = 'SuperSecretProdPass456!';
       const result = spawnSync(process.execPath, [tsxPath, scriptPath], {
+        cwd: makeIsolatedCwd(),
         env: {
           ...process.env,
           STAGING_DATABASE_URL: `postgresql://erp_staging_user:${testSecret}@localhost:5435/core_erp_staging?schema=public`,
@@ -940,6 +959,7 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
     it('Case 3: Production database rejection fails with exit code 1 and redacts secrets', () => {
       const testSecret = 'SensitiveDbPass789!';
       const result = spawnSync(process.execPath, [tsxPath, scriptPath], {
+        cwd: makeIsolatedCwd(),
         env: {
           ...process.env,
           STAGING_DATABASE_URL: `postgresql://erp_user:${testSecret}@localhost:5435/core_erp`,
@@ -957,6 +977,7 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
 
     it('Case 4: Target resolving to same database endpoint as DATABASE_URL fails with exit code 1', () => {
       const result = spawnSync(process.execPath, [tsxPath, scriptPath], {
+        cwd: makeIsolatedCwd(),
         env: {
           ...process.env,
           // Target and primary point to same endpoint despite different query params, casing, and user
@@ -979,6 +1000,7 @@ describe('Staging Verification Safety & Isolation (Phase 8.7A)', () => {
       // Use loopback 127.0.0.1 on unused high port (59998)
       const secret = 'UnreachableProbeSecret99!';
       const result = spawnSync(process.execPath, [tsxPath, scriptPath, '--execute'], {
+        cwd: makeIsolatedCwd(),
         env: {
           ...process.env,
           STAGING_DATABASE_URL: `postgresql://test_user:${secret}@127.0.0.1:59998/core_erp_staging?schema=public`,
