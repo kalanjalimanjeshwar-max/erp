@@ -37,10 +37,9 @@ import { formatMoney, normalizeCurrencyCode } from '../../../shared/currency.ts'
 import { formatDateTimeInTimezone, getEffectiveTimeZone } from '../../../shared/timezone.ts';
 import {
   buildExportFileName,
-  DocumentExportBrandingImages,
-  generateDocxBlob,
+  type DocumentExportBrandingImages,
   resolveDocumentEffectiveBranding,
-} from '../../../shared/export/docx-builder.ts';
+} from '../../../shared/export/document-branding.ts';
 import { api, ApiError } from '../../services/api.ts';
 
 export type PrintableDocumentPayload =
@@ -364,6 +363,7 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
           seal: sealBytes,
           signature: signatureBytes,
         };
+        const { generateDocxBlob } = await import('../../../shared/export/docx-builder.ts');
         const blob = await generateDocxBlob({
           document,
           companyProfile: effectiveProfile,

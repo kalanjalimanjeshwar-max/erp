@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, lazy, Suspense } from 'react';
 import {
   Printer,
   Save,
@@ -46,8 +46,19 @@ import {
   normalizeDocumentVisualElements,
 } from '../../../shared/branding.ts';
 import { api, ApiError } from '../../services/api.ts';
-import { PrintableDocumentPayload, PrintableDocumentView } from '../print/PrintableDocumentView.tsx';
-import { VisualLayoutCanvas } from './VisualLayoutCanvas.tsx';
+import type { PrintableDocumentPayload } from '../print/PrintableDocumentView.tsx';
+import { LoadingSpinner } from '../common/LoadingSpinner.tsx';
+
+const PrintableDocumentView = lazy(() =>
+  import('../print/PrintableDocumentView.tsx').then((m) => ({
+    default: m.PrintableDocumentView,
+  }))
+);
+const VisualLayoutCanvas = lazy(() =>
+  import('./VisualLayoutCanvas.tsx').then((m) => ({
+    default: m.VisualLayoutCanvas,
+  }))
+);
 
 interface DocumentPrintSettingsSectionProps {
   companyProfile: CompanyProfile | null;
@@ -1206,43 +1217,53 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
             </div>
           </div>
 
-          {designerMode === 'CANVAS' ? (
-            <VisualLayoutCanvas
-              docType={activeDocType}
-              layout={currentLayout}
-              companyProfile={companyProfile}
-              selectedKey={selectedElementKey}
-              disabled={!canEdit}
-              onSelectElement={setSelectedElementKey}
-              onUpdateElement={handleUpdateVisualElement}
-            />
-          ) : (
-            <div className="bg-slate-800/50 rounded-lg p-3 max-h-[840px] overflow-auto">
-              <PrintableDocumentView
-                document={sampleDocument}
+          <Suspense fallback={<LoadingSpinner message="Loading layout designer..." size="md" />}>
+            {designerMode === 'CANVAS' ? (
+              <VisualLayoutCanvas
+                docType={activeDocType}
+                layout={currentLayout}
                 companyProfile={companyProfile}
-                layoutOverride={currentLayout}
-                bankAccount={defaultBank}
-                currentUser={currentUser}
-                isDraftPreview={hasUnsavedChanges}
-                embedded
+                selectedKey={selectedElementKey}
+                disabled={!canEdit}
+                onSelectElement={setSelectedElementKey}
+                onUpdateElement={handleUpdateVisualElement}
               />
-            </div>
-          )}
+            ) : (
+              <div className="bg-slate-800/50 rounded-lg p-3 max-h-[840px] overflow-auto">
+                <PrintableDocumentView
+                  document={sampleDocument}
+                  companyProfile={companyProfile}
+                  layoutOverride={currentLayout}
+                  bankAccount={defaultBank}
+                  currentUser={currentUser}
+                  isDraftPreview={hasUnsavedChanges}
+                  embedded
+                />
+              </div>
+            )}
+          </Suspense>
         </div>
       </div>
 
       {/* Full Modal Print / PDF / Word Preview */}
       {isFullPreviewOpen && (
-        <PrintableDocumentView
-          document={sampleDocument}
-          companyProfile={companyProfile}
-          layoutOverride={currentLayout}
-          bankAccount={defaultBank}
-          currentUser={currentUser}
-          isDraftPreview={hasUnsavedChanges}
-          onClose={() => setIsFullPreviewOpen(false)}
-        />
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center">
+              <LoadingSpinner message="Loading document preview..." size="md" />
+            </div>
+          }
+        >
+          <PrintableDocumentView
+            document={sampleDocument}
+            companyProfile={companyProfile}
+            layoutOverride={currentLayout}
+            bankAccount={defaultBank}
+            currentUser={currentUser}
+            isDraftPreview={hasUnsavedChanges}
+            onClose={() => setIsFullPreviewOpen(false)}
+          />
+        </Suspense>
       )}
     </div>
   );

@@ -1,8 +1,14 @@
-import React, { useState } from 'react';
+import React, { useState, lazy, Suspense } from 'react';
 import { Building2, Database, Shield, LogOut, User, LogIn } from 'lucide-react';
 import { DatabaseReadiness, AuthUser, CompanyProfile } from '../../../shared/types.ts';
 import { AdminNotificationsDropdown } from '../notifications/AdminNotificationsDropdown.tsx';
-import { WorkingHoursLogoutModal } from '../attendance/WorkingHoursLogoutModal.tsx';
+import { LoadingSpinner } from '../common/LoadingSpinner.tsx';
+
+const WorkingHoursLogoutModal = lazy(() =>
+  import('../attendance/WorkingHoursLogoutModal.tsx').then((m) => ({
+    default: m.WorkingHoursLogoutModal,
+  }))
+);
 
 interface HeaderProps {
   currentUser: AuthUser | null;
@@ -140,20 +146,28 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* Pre-Logout Shift Working Hours Modal for Employees */}
       {showLogoutModal && currentUser && (
-        <WorkingHoursLogoutModal
-          isOpen={showLogoutModal}
-          currentUser={currentUser}
-          companyProfile={companyProfile}
-          onClose={() => setShowLogoutModal(false)}
-          onConfirmLogout={() => {
-            setShowLogoutModal(false);
-            onLogout?.();
-          }}
-          onNavigateToAttendance={() => {
-            setShowLogoutModal(false);
-            onNavigate?.('attendance');
-          }}
-        />
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center">
+              <LoadingSpinner message="Loading shift summary..." size="md" />
+            </div>
+          }
+        >
+          <WorkingHoursLogoutModal
+            isOpen={showLogoutModal}
+            currentUser={currentUser}
+            companyProfile={companyProfile}
+            onClose={() => setShowLogoutModal(false)}
+            onConfirmLogout={() => {
+              setShowLogoutModal(false);
+              onLogout?.();
+            }}
+            onNavigateToAttendance={() => {
+              setShowLogoutModal(false);
+              onNavigate?.('attendance');
+            }}
+          />
+        </Suspense>
       )}
     </header>
   );

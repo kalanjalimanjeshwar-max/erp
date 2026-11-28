@@ -1,7 +1,6 @@
 import React, { useState } from 'react';
 import { Lock, Mail, Building2, ArrowRight, AlertCircle, RefreshCw, Eye, EyeOff } from 'lucide-react';
 import { api, ApiError } from '../services/api.ts';
-import { previewStore } from '../services/previewStore.ts';
 import { LoginResponse, DatabaseReadiness } from '../../shared/types.ts';
 
 interface LoginPageProps {
@@ -89,6 +88,7 @@ export const LoginPage: React.FC<LoginPageProps> = ({
     // Only allow sandbox preview login when PostgreSQL is offline.
     // Never intercept real database logins or bypass password checks for preview_admin.
     if (!isDbConnected) {
+      const { previewStore } = await import('../services/previewStore.ts');
       const isExactPreviewAdminCredentials =
         trimmedIdentifier === 'preview_admin' && password === 'PreviewOnly_2026!';
       const candidatePreviewUser = previewStore.findPreviewUser(trimmedIdentifier);

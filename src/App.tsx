@@ -1,33 +1,80 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useCallback, useRef, lazy, Suspense } from 'react';
 import { ErrorBoundary } from './client/components/common/ErrorBoundary.tsx';
 import { AppLayout } from './client/components/layout/AppLayout.tsx';
 import { LoginPage } from './client/pages/LoginPage.tsx';
 import { DashboardPage } from './client/pages/DashboardPage.tsx';
-import { SetupWizardPage } from './client/pages/SetupWizardPage.tsx';
 import { DatabaseUnavailablePage } from './client/pages/DatabaseUnavailablePage.tsx';
-import { SystemHealthPage } from './client/pages/SystemHealthPage.tsx';
-import { ModulesOverviewPage } from './client/pages/ModulesOverviewPage.tsx';
-import { UserAdminPage } from './client/pages/UserAdminPage.tsx';
-import { CompanyAdminPage } from './client/pages/CompanyAdminPage.tsx';
-import { PermissionMatrixPage } from './client/pages/PermissionMatrixPage.tsx';
-import { AuditLogPage } from './client/pages/AuditLogPage.tsx';
-import { ChartOfAccountsPage } from './client/pages/ChartOfAccountsPage.tsx';
-import { ContraEntriesPage } from './client/pages/ContraEntriesPage.tsx';
-import { JournalEntriesPage } from './client/pages/JournalEntriesPage.tsx';
-import { FinancialReportsPage } from './client/pages/FinancialReportsPage.tsx';
-import { CustomersPage } from './client/pages/CustomersPage.tsx';
-import { QuotationsPage } from './client/pages/QuotationsPage.tsx';
-import { InvoicesPage } from './client/pages/InvoicesPage.tsx';
-import { ReceiptsPage } from './client/pages/ReceiptsPage.tsx';
-import { EmployeesPage } from './client/pages/EmployeesPage.tsx';
-import { DepartmentsPage } from './client/pages/DepartmentsPage.tsx';
-import { AttendancePage } from './client/pages/AttendancePage.tsx';
-import { BiometricDevicesPage } from './client/pages/BiometricDevicesPage.tsx';
-import { LeavePage } from './client/pages/LeavePage.tsx';
-import { PayrollPage } from './client/pages/PayrollPage.tsx';
-import { EmployeeSelfServicePage } from './client/pages/EmployeeSelfServicePage.tsx';
-import { ExpenseModuleView } from './client/components/expenses/ExpenseModuleView.tsx';
 import { Receipt } from 'lucide-react';
+
+const SetupWizardPage = lazy(() =>
+  import('./client/pages/SetupWizardPage.tsx').then((m) => ({ default: m.SetupWizardPage }))
+);
+const SystemHealthPage = lazy(() =>
+  import('./client/pages/SystemHealthPage.tsx').then((m) => ({ default: m.SystemHealthPage }))
+);
+const ModulesOverviewPage = lazy(() =>
+  import('./client/pages/ModulesOverviewPage.tsx').then((m) => ({ default: m.ModulesOverviewPage }))
+);
+const UserAdminPage = lazy(() =>
+  import('./client/pages/UserAdminPage.tsx').then((m) => ({ default: m.UserAdminPage }))
+);
+const CompanyAdminPage = lazy(() =>
+  import('./client/pages/CompanyAdminPage.tsx').then((m) => ({ default: m.CompanyAdminPage }))
+);
+const PermissionMatrixPage = lazy(() =>
+  import('./client/pages/PermissionMatrixPage.tsx').then((m) => ({ default: m.PermissionMatrixPage }))
+);
+const AuditLogPage = lazy(() =>
+  import('./client/pages/AuditLogPage.tsx').then((m) => ({ default: m.AuditLogPage }))
+);
+const ChartOfAccountsPage = lazy(() =>
+  import('./client/pages/ChartOfAccountsPage.tsx').then((m) => ({ default: m.ChartOfAccountsPage }))
+);
+const ContraEntriesPage = lazy(() =>
+  import('./client/pages/ContraEntriesPage.tsx').then((m) => ({ default: m.ContraEntriesPage }))
+);
+const JournalEntriesPage = lazy(() =>
+  import('./client/pages/JournalEntriesPage.tsx').then((m) => ({ default: m.JournalEntriesPage }))
+);
+const FinancialReportsPage = lazy(() =>
+  import('./client/pages/FinancialReportsPage.tsx').then((m) => ({ default: m.FinancialReportsPage }))
+);
+const CustomersPage = lazy(() =>
+  import('./client/pages/CustomersPage.tsx').then((m) => ({ default: m.CustomersPage }))
+);
+const QuotationsPage = lazy(() =>
+  import('./client/pages/QuotationsPage.tsx').then((m) => ({ default: m.QuotationsPage }))
+);
+const InvoicesPage = lazy(() =>
+  import('./client/pages/InvoicesPage.tsx').then((m) => ({ default: m.InvoicesPage }))
+);
+const ReceiptsPage = lazy(() =>
+  import('./client/pages/ReceiptsPage.tsx').then((m) => ({ default: m.ReceiptsPage }))
+);
+const EmployeesPage = lazy(() =>
+  import('./client/pages/EmployeesPage.tsx').then((m) => ({ default: m.EmployeesPage }))
+);
+const DepartmentsPage = lazy(() =>
+  import('./client/pages/DepartmentsPage.tsx').then((m) => ({ default: m.DepartmentsPage }))
+);
+const AttendancePage = lazy(() =>
+  import('./client/pages/AttendancePage.tsx').then((m) => ({ default: m.AttendancePage }))
+);
+const BiometricDevicesPage = lazy(() =>
+  import('./client/pages/BiometricDevicesPage.tsx').then((m) => ({ default: m.BiometricDevicesPage }))
+);
+const LeavePage = lazy(() =>
+  import('./client/pages/LeavePage.tsx').then((m) => ({ default: m.LeavePage }))
+);
+const PayrollPage = lazy(() =>
+  import('./client/pages/PayrollPage.tsx').then((m) => ({ default: m.PayrollPage }))
+);
+const EmployeeSelfServicePage = lazy(() =>
+  import('./client/pages/EmployeeSelfServicePage.tsx').then((m) => ({ default: m.EmployeeSelfServicePage }))
+);
+const ExpenseModuleView = lazy(() =>
+  import('./client/components/expenses/ExpenseModuleView.tsx').then((m) => ({ default: m.ExpenseModuleView }))
+);
 import { AccessDenied } from './client/components/common/AccessDenied.tsx';
 import { DatabaseDisconnectedNotice } from './client/components/common/DatabaseDisconnectedNotice.tsx';
 import { LoadingSpinner } from './client/components/common/LoadingSpinner.tsx';
@@ -233,13 +280,21 @@ export default function App() {
     return (
       <ErrorBoundary>
         <div className="min-h-screen bg-slate-950 text-slate-100 p-6 md:p-12">
-          <SetupWizardPage
-            setupStatus={setupStatus}
-            readiness={dbReadiness}
-            onSetupSuccess={handleSetupSuccess}
-            onNavigateToLogin={() => setCurrentTab('login')}
-            onNavigateToDbStatus={() => setCurrentTab('db_status')}
-          />
+          <Suspense
+            fallback={
+              <div className="min-h-[60vh] flex items-center justify-center">
+                <LoadingSpinner message="Loading setup wizard..." size="lg" />
+              </div>
+            }
+          >
+            <SetupWizardPage
+              setupStatus={setupStatus}
+              readiness={dbReadiness}
+              onSetupSuccess={handleSetupSuccess}
+              onNavigateToLogin={() => setCurrentTab('login')}
+              onNavigateToDbStatus={() => setCurrentTab('db_status')}
+            />
+          </Suspense>
         </div>
       </ErrorBoundary>
     );
@@ -279,6 +334,13 @@ export default function App() {
         onLogout={handleLogout}
         onNavigateToLogin={() => setCurrentTab('login')}
       >
+        <Suspense
+          fallback={
+            <div className="min-h-[50vh] flex items-center justify-center">
+              <LoadingSpinner message="Loading module..." size="md" />
+            </div>
+          }
+        >
         {currentTab === 'dashboard' && (
           <DashboardPage
             setupStatus={setupStatus}
@@ -694,6 +756,7 @@ export default function App() {
         {currentTab === 'health' && <SystemHealthPage />}
 
         {currentTab === 'modules' && <ModulesOverviewPage />}
+        </Suspense>
       </AppLayout>
     </ErrorBoundary>
   );

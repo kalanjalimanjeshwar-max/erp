@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import {
   FileText,
   Plus,
@@ -33,8 +33,14 @@ import {
   UpdateInvoiceRequest,
 } from '../../shared/types.ts';
 import { formatMoney, getCurrencySymbol } from '../../shared/currency.ts';
-import { PrintableDocumentView } from '../components/print/PrintableDocumentView.tsx';
 import { CustomerSelectorWithCreate } from '../components/customers/CustomerSelectorWithCreate.tsx';
+import { LoadingSpinner } from '../components/common/LoadingSpinner.tsx';
+
+const PrintableDocumentView = lazy(() =>
+  import('../components/print/PrintableDocumentView.tsx').then((m) => ({
+    default: m.PrintableDocumentView,
+  }))
+);
 import {
   PREVIEW_INVOICES,
   PREVIEW_CUSTOMERS,
@@ -1167,16 +1173,24 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
 
       {/* View / Printable Invoice Modal */}
       {selectedInvoice && isPrintModalOpen && (
-        <PrintableDocumentView
-          document={{ type: 'INVOICE', data: selectedInvoice }}
-          companyProfile={companyProfile}
-          bankAccount={defaultBankAccount}
-          currentUser={currentUser}
-          onClose={() => {
-            setSelectedInvoice(null);
-            setIsPrintModalOpen(false);
-          }}
-        />
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center">
+              <LoadingSpinner message="Loading invoice preview..." size="md" />
+            </div>
+          }
+        >
+          <PrintableDocumentView
+            document={{ type: 'INVOICE', data: selectedInvoice }}
+            companyProfile={companyProfile}
+            bankAccount={defaultBankAccount}
+            currentUser={currentUser}
+            onClose={() => {
+              setSelectedInvoice(null);
+              setIsPrintModalOpen(false);
+            }}
+          />
+        </Suspense>
       )}
 
       {/* Create / Edit Invoice Modal */}
@@ -1535,15 +1549,23 @@ export const InvoicesPage: React.FC<InvoicesPageProps> = ({
 
       {/* Draft / Unsaved Invoice Preview (Stacked cleanly above edit modal) */}
       {draftPreviewInvoice && (
-        <PrintableDocumentView
-          document={{ type: 'INVOICE', data: draftPreviewInvoice }}
-          companyProfile={companyProfile}
-          bankAccount={defaultBankAccount}
-          currentUser={currentUser}
-          isDraftPreview={!editingInvoice}
-          onBackToEdit={() => setDraftPreviewInvoice(null)}
-          onClose={() => setDraftPreviewInvoice(null)}
-        />
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center">
+              <LoadingSpinner message="Loading invoice preview..." size="md" />
+            </div>
+          }
+        >
+          <PrintableDocumentView
+            document={{ type: 'INVOICE', data: draftPreviewInvoice }}
+            companyProfile={companyProfile}
+            bankAccount={defaultBankAccount}
+            currentUser={currentUser}
+            isDraftPreview={!editingInvoice}
+            onBackToEdit={() => setDraftPreviewInvoice(null)}
+            onClose={() => setDraftPreviewInvoice(null)}
+          />
+        </Suspense>
       )}
     </div>
   );

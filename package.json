@@ -8,7 +8,7 @@
     "predev": "prisma generate",
     "dev": "tsx server.ts",
     "prebuild": "prisma generate",
-    "build": "vite build",
+    "build": "node scripts/build-production.mjs",
     "start": "tsx server.ts",
     "pretest": "prisma generate",
     "test": "vitest run",

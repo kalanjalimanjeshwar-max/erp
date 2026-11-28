@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, lazy, Suspense } from 'react';
 import {
   DollarSign,
   Plus,
@@ -30,7 +30,13 @@ import {
   CreateCustomerReceiptRequest,
 } from '../../shared/types.ts';
 import { formatMoney, getCurrencySymbol } from '../../shared/currency.ts';
-import { PrintableDocumentView } from '../components/print/PrintableDocumentView.tsx';
+import { LoadingSpinner } from '../components/common/LoadingSpinner.tsx';
+
+const PrintableDocumentView = lazy(() =>
+  import('../components/print/PrintableDocumentView.tsx').then((m) => ({
+    default: m.PrintableDocumentView,
+  }))
+);
 
 interface ReceiptsPageProps {
   currentUser: AuthUser;
@@ -941,15 +947,23 @@ export const ReceiptsPage: React.FC<ReceiptsPageProps> = ({
 
       {/* View / Print Receipt Voucher Modal */}
       {selectedReceipt && isPrintModalOpen && (
-        <PrintableDocumentView
-          document={{ type: 'RECEIPT', data: selectedReceipt }}
-          companyProfile={companyProfile}
-          currentUser={currentUser}
-          onClose={() => {
-            setSelectedReceipt(null);
-            setIsPrintModalOpen(false);
-          }}
-        />
+        <Suspense
+          fallback={
+            <div className="fixed inset-0 z-50 bg-slate-950/75 backdrop-blur-sm flex items-center justify-center">
+              <LoadingSpinner message="Loading receipt preview..." size="md" />
+            </div>
+          }
+        >
+          <PrintableDocumentView
+            document={{ type: 'RECEIPT', data: selectedReceipt }}
+            companyProfile={companyProfile}
+            currentUser={currentUser}
+            onClose={() => {
+              setSelectedReceipt(null);
+              setIsPrintModalOpen(false);
+            }}
+          />
+        </Suspense>
       )}
     </div>
   );

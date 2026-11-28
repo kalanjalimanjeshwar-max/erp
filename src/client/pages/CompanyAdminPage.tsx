@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, lazy, Suspense } from 'react';
 import {
   Building2,
   Save,
@@ -26,8 +26,14 @@ import {
   CompanySettingsChangeRequestItem,
 } from '../../shared/types.ts';
 import { SUPPORTED_CURRENCIES, COMMON_TIMEZONES } from '../../shared/constants.ts';
-import { DocumentPrintSettingsSection } from '../components/company/DocumentPrintSettingsSection.tsx';
 import { BrandingAssetCard } from '../components/company/BrandingAssetCard.tsx';
+import { LoadingSpinner } from '../components/common/LoadingSpinner.tsx';
+
+const DocumentPrintSettingsSection = lazy(() =>
+  import('../components/company/DocumentPrintSettingsSection.tsx').then((m) => ({
+    default: m.DocumentPrintSettingsSection,
+  }))
+);
 
 export const STANDARD_MONTHLY_LEAVE_ALLOWANCE_OPTIONS = [4, 5, 6] as const;
 
@@ -507,14 +513,16 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
       </div>
 
       {activeTab === 'PRINT_SETTINGS' ? (
-        <DocumentPrintSettingsSection
-          companyProfile={profile}
-          currentUser={currentUser}
-          onProfileUpdated={(updated) => {
-            setProfile(updated);
-            if (onProfileUpdated) onProfileUpdated(updated);
-          }}
-        />
+        <Suspense fallback={<LoadingSpinner message="Loading document print settings..." size="md" />}>
+          <DocumentPrintSettingsSection
+            companyProfile={profile}
+            currentUser={currentUser}
+            onProfileUpdated={(updated) => {
+              setProfile(updated);
+              if (onProfileUpdated) onProfileUpdated(updated);
+            }}
+          />
+        </Suspense>
       ) : (
         <>
           {errorMessage && (
