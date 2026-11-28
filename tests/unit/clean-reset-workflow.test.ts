@@ -224,6 +224,7 @@ function buildVerifiedVolumes(
 }
 
 afterEach(() => {
+  vi.restoreAllMocks();
   while (tempDirs.length > 0) {
     const dir = tempDirs.pop()!;
     if (fs.existsSync(dir)) {
@@ -2129,5 +2130,1297 @@ describe('CoreERP Clean-Reset Pre-Deletion Safety & Scoped Fresh-Install Workflo
     expect(
       fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
     ).toBe(true);
+  });
+
+  it('27. [Stage 8.2 Test A] Volume ownership changing after Stage 8.1 returns structured failAfterDestruction result instead of throwing, with accurate completedSteps and zero volume deletion', async () => {
+    const projectRoot = createTempDir();
+    const otherWorkspace = createTempDir('foreign-after-stage81-');
+    writeValidLocalEnvFiles(projectRoot);
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const mockContainers = buildVerifiedContainers(projectRoot, ['staging']);
+    const mockVolumes = buildVerifiedVolumes(projectRoot, ['staging']);
+
+    const dockerInvocations: string[][] = [];
+    const runDockerCommand = vi.fn().mockImplementation(async (args: string[]) => {
+      dockerInvocations.push(args);
+      // Simulate container removal succeeding in Stage 8.1, then volume metadata changing before Stage 8.2 recheck
+      if (args[0] === 'rm' && args[1] === '-f' && args[2] === 'coreerp-postgres-staging') {
+        mockVolumes[0].labels = {
+          'com.docker.compose.project': 'foreignproj',
+          'com.docker.compose.volume': COREERP_LOCAL_RESET_SPECS.staging.volume,
+          'com.docker.compose.project.working_dir': otherWorkspace,
+        };
+      }
+      return { exitCode: 0, stdout: 'ok', stderr: '' };
+    });
+
+    const waitForPostgresReady = vi.fn().mockResolvedValue(true);
+    const runTargetMigration = vi.fn();
+    const runStagingVerify = vi.fn();
+    const { logger } = createSilentLogger();
+
+    const res = await runCoreErpCleanReset({
+      projectRoot,
+      targets: ['staging'],
+      execute: true,
+      confirmed: true,
+      recreateEnv: true,
+      verifyStaging: true,
+      env: { NODE_ENV: 'development' },
+      logger,
+      deps: {
+        runDockerCommand,
+        listDockerContainers: vi.fn().mockResolvedValue(mockContainers),
+        listDockerVolumes: vi.fn().mockResolvedValue(mockVolumes),
+        waitForPostgresReady,
+        runTargetMigration,
+        runStagingVerify,
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.removedContainers).toEqual(['coreerp-postgres-staging']);
+    expect(res.completedSteps).toContain('PREFLIGHT_STAGES_1_TO_7_PASSED');
+    expect(res.completedSteps).toContain('REMOVED_CONTAINER:coreerp-postgres-staging');
+    expect(res.completedSteps.some((s) => s.startsWith('REMOVED_VOLUME:'))).toBe(false);
+    expect(res.removedVolumes).toEqual([]);
+    expect(res.backedUpEnvFiles).toEqual([]);
+    expect(res.recreatedTargets).toEqual([]);
+    expect(res.migratedTargets).toEqual([]);
+    expect(res.stagingVerified).toBe(false);
+
+    // No `docker volume rm` or later compose recreation commands were issued
+    expect(dockerInvocations).toEqual([['rm', '-f', 'coreerp-postgres-staging']]);
+    expect(
+      dockerInvocations.some((args) => args[0] === 'volume' && args[1] === 'rm')
+    ).toBe(false);
+    expect(waitForPostgresReady).not.toHaveBeenCalled();
+    expect(runTargetMigration).not.toHaveBeenCalled();
+    expect(runStagingVerify).not.toHaveBeenCalled();
+
+    // No environment file writes or backups occurred
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+    expect(fs.readdirSync(projectRoot).filter((f) => f.includes('.backup.'))).toEqual([]);
+
+    // Structured error clearly reports safety violation and no automatic rollback
+    expect(res.error).toContain('[DOCKER SAFETY VIOLATION]');
+    expect(res.error).toContain(mockVolumes[0].name);
+    expect(res.error).toContain('No automatic rollback was performed');
+  });
+
+  it('28. [Stage 8.2 Test B] Unexpected exception during Stage 8.2 volume ownership recheck returns sanitized structured failAfterDestruction result with accurate completedSteps and zero volume deletion', async () => {
+    const projectRoot = createTempDir();
+    const seeded = writeValidLocalEnvFiles(projectRoot, {
+      stagingPassword: 'stage82_recheck_secret_never_leak_9876543210',
+    });
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const mockContainers = buildVerifiedContainers(projectRoot, ['staging']);
+    const verifiedVol = buildVerifiedVolumes(projectRoot, ['staging'])[0];
+    const verifiedLabels = { ...verifiedVol.labels };
+    let throwOnRecheck = false;
+
+    const throwingVolume: DockerVolumeMetadata = {
+      name: verifiedVol.name,
+      get labels(): Record<string, string> {
+        if (throwOnRecheck) {
+          throw new Error(
+            `Simulated volume metadata read failure (secret=${seeded.stagingPassword})`
+          );
+        }
+        return verifiedLabels;
+      },
+    };
+
+    const dockerInvocations: string[][] = [];
+    const runDockerCommand = vi.fn().mockImplementation(async (args: string[]) => {
+      dockerInvocations.push(args);
+      if (args[0] === 'rm' && args[1] === '-f' && args[2] === 'coreerp-postgres-staging') {
+        throwOnRecheck = true;
+      }
+      return { exitCode: 0, stdout: 'ok', stderr: '' };
+    });
+
+    const waitForPostgresReady = vi.fn().mockResolvedValue(true);
+    const runTargetMigration = vi.fn();
+    const runStagingVerify = vi.fn();
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runCoreErpCleanReset({
+      projectRoot,
+      targets: ['staging'],
+      execute: true,
+      confirmed: true,
+      recreateEnv: true,
+      verifyStaging: true,
+      env: { NODE_ENV: 'development' },
+      logger,
+      deps: {
+        runDockerCommand,
+        listDockerContainers: vi.fn().mockResolvedValue(mockContainers),
+        listDockerVolumes: vi.fn().mockResolvedValue([throwingVolume]),
+        waitForPostgresReady,
+        runTargetMigration,
+        runStagingVerify,
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.removedContainers).toEqual(['coreerp-postgres-staging']);
+    expect(res.completedSteps).toContain('PREFLIGHT_STAGES_1_TO_7_PASSED');
+    expect(res.completedSteps).toContain('REMOVED_CONTAINER:coreerp-postgres-staging');
+    expect(res.completedSteps.some((s) => s.startsWith('REMOVED_VOLUME:'))).toBe(false);
+    expect(res.removedVolumes).toEqual([]);
+    expect(res.backedUpEnvFiles).toEqual([]);
+    expect(res.recreatedTargets).toEqual([]);
+    expect(res.migratedTargets).toEqual([]);
+    expect(res.stagingVerified).toBe(false);
+
+    // No `docker volume rm` or later stages ran
+    expect(dockerInvocations).toEqual([['rm', '-f', 'coreerp-postgres-staging']]);
+    expect(
+      dockerInvocations.some((args) => args[0] === 'volume' && args[1] === 'rm')
+    ).toBe(false);
+    expect(waitForPostgresReady).not.toHaveBeenCalled();
+    expect(runTargetMigration).not.toHaveBeenCalled();
+    expect(runStagingVerify).not.toHaveBeenCalled();
+
+    // All environment files remain untouched byte-for-byte with zero backups
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+    expect(fs.readdirSync(projectRoot).filter((f) => f.includes('.backup.'))).toEqual([]);
+
+    // Structured error reports sanitized failure and no automatic rollback, leaking zero secrets
+    expect(res.error).toContain('[DOCKER SAFETY VIOLATION]');
+    expect(res.error).toContain('Simulated volume metadata read failure');
+    expect(res.error).toContain('No automatic rollback was performed');
+    expect(res.error).not.toContain(seeded.stagingPassword);
+    expect(logs.join('\n')).not.toContain(seeded.stagingPassword);
+  });
+
+  it('29. [Stage 8.1] Container removal rejection returns sanitized structured failure preserving previously removed containers and halting all later stages', async () => {
+    const projectRoot = createTempDir();
+    const seeded = writeValidLocalEnvFiles(projectRoot, {
+      stagingPassword: 'stage81_reject_secret_never_leak_11223344',
+    });
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const dockerInvocations: string[][] = [];
+    const runDockerCommand = vi.fn().mockImplementation(async (args: string[]) => {
+      dockerInvocations.push(args);
+      if (args[0] === 'rm' && args[1] === '-f' && args[2] === 'coreerp-postgres-staging') {
+        throw new Error(
+          `Docker daemon socket lost while removing container (secret=${seeded.stagingPassword})`
+        );
+      }
+      return { exitCode: 0, stdout: 'ok', stderr: '' };
+    });
+
+    const waitForPostgresReady = vi.fn().mockResolvedValue(true);
+    const runTargetMigration = vi.fn();
+    const runStagingVerify = vi.fn();
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runCoreErpCleanReset({
+      projectRoot,
+      targets: ['dev', 'staging'],
+      execute: true,
+      confirmed: true,
+      recreateEnv: true,
+      verifyStaging: true,
+      env: { NODE_ENV: 'development' },
+      logger,
+      deps: {
+        runDockerCommand,
+        listDockerContainers: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedContainers(projectRoot, ['dev', 'staging'])),
+        listDockerVolumes: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedVolumes(projectRoot, ['dev', 'staging'])),
+        waitForPostgresReady,
+        runTargetMigration,
+        runStagingVerify,
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.stagingVerified).toBe(false);
+    expect(res.removedContainers).toEqual(['coreerp-postgres-dev']);
+    expect(res.removedVolumes).toEqual([]);
+    expect(res.backedUpEnvFiles).toEqual([]);
+    expect(res.recreatedTargets).toEqual([]);
+    expect(res.migratedTargets).toEqual([]);
+    expect(res.completedSteps).toContain('PREFLIGHT_STAGES_1_TO_7_PASSED');
+    expect(res.completedSteps).toContain('REMOVED_CONTAINER:coreerp-postgres-dev');
+    expect(res.completedSteps).not.toContain('REMOVED_CONTAINER:coreerp-postgres-staging');
+    expect(res.completedSteps.some((s) => s.startsWith('REMOVED_VOLUME:'))).toBe(false);
+
+    expect(dockerInvocations).toEqual([
+      ['rm', '-f', 'coreerp-postgres-dev'],
+      ['rm', '-f', 'coreerp-postgres-staging'],
+    ]);
+    expect(waitForPostgresReady).not.toHaveBeenCalled();
+    expect(runTargetMigration).not.toHaveBeenCalled();
+    expect(runStagingVerify).not.toHaveBeenCalled();
+
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+    expect(fs.readdirSync(projectRoot).filter((f) => f.includes('.backup.'))).toEqual([]);
+
+    expect(res.error).toContain('Stage 8.1');
+    expect(res.error).toContain('Docker daemon socket lost');
+    expect(res.error).toContain('No automatic rollback was performed');
+    expect(res.error).not.toContain(seeded.stagingPassword);
+    expect(logs.join('\n')).not.toContain(seeded.stagingPassword);
+  });
+
+  it('30. [Stage 8.2] Volume removal rejection after container deletion returns sanitized structured failure with exact partial progress', async () => {
+    const projectRoot = createTempDir();
+    const seeded = writeValidLocalEnvFiles(projectRoot, {
+      stagingPassword: 'stage82_volrm_reject_secret_55667788',
+    });
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const dockerInvocations: string[][] = [];
+    const runDockerCommand = vi.fn().mockImplementation(async (args: string[]) => {
+      dockerInvocations.push(args);
+      if (args[0] === 'volume' && args[1] === 'rm' && args[2] === 'coreerp_postgres_staging_data') {
+        throw new Error(
+          `Docker daemon EIO during volume removal (secret=${seeded.stagingPassword})`
+        );
+      }
+      return { exitCode: 0, stdout: 'ok', stderr: '' };
+    });
+
+    const waitForPostgresReady = vi.fn().mockResolvedValue(true);
+    const runTargetMigration = vi.fn();
+    const runStagingVerify = vi.fn();
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runCoreErpCleanReset({
+      projectRoot,
+      targets: ['dev', 'staging'],
+      execute: true,
+      confirmed: true,
+      recreateEnv: true,
+      verifyStaging: true,
+      env: { NODE_ENV: 'development' },
+      logger,
+      deps: {
+        runDockerCommand,
+        listDockerContainers: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedContainers(projectRoot, ['dev', 'staging'])),
+        listDockerVolumes: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedVolumes(projectRoot, ['dev', 'staging'])),
+        waitForPostgresReady,
+        runTargetMigration,
+        runStagingVerify,
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.stagingVerified).toBe(false);
+    expect(res.removedContainers).toEqual([
+      'coreerp-postgres-dev',
+      'coreerp-postgres-staging',
+    ]);
+    expect(res.removedVolumes).toEqual(['coreerp_postgres_dev_data']);
+    expect(res.backedUpEnvFiles).toEqual([]);
+    expect(res.recreatedTargets).toEqual([]);
+    expect(res.migratedTargets).toEqual([]);
+    expect(res.completedSteps).toContain('REMOVED_CONTAINER:coreerp-postgres-dev');
+    expect(res.completedSteps).toContain('REMOVED_CONTAINER:coreerp-postgres-staging');
+    expect(res.completedSteps).toContain('REMOVED_VOLUME:coreerp_postgres_dev_data');
+    expect(res.completedSteps).not.toContain('REMOVED_VOLUME:coreerp_postgres_staging_data');
+
+    expect(dockerInvocations).toEqual([
+      ['rm', '-f', 'coreerp-postgres-dev'],
+      ['rm', '-f', 'coreerp-postgres-staging'],
+      ['volume', 'rm', 'coreerp_postgres_dev_data'],
+      ['volume', 'rm', 'coreerp_postgres_staging_data'],
+    ]);
+    expect(waitForPostgresReady).not.toHaveBeenCalled();
+    expect(runTargetMigration).not.toHaveBeenCalled();
+    expect(runStagingVerify).not.toHaveBeenCalled();
+
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+    expect(fs.readdirSync(projectRoot).filter((f) => f.includes('.backup.'))).toEqual([]);
+
+    expect(res.error).toContain('Stage 8.2');
+    expect(res.error).toContain('Docker daemon EIO during volume removal');
+    expect(res.error).toContain('No automatic rollback was performed');
+    expect(res.error).not.toContain(seeded.stagingPassword);
+    expect(logs.join('\n')).not.toContain(seeded.stagingPassword);
+  });
+
+  it('31. [Stage 8.2 Multi-Volume Partial Progress] First volume succeeds while second volume ownership re-check fails or throws, retaining exact partial volume progress and blocking later stages', async () => {
+    // Sub-case A: Second volume ownership mutates to foreign project after first volume is removed
+    {
+      const projectRoot = createTempDir();
+      const otherWorkspace = createTempDir('foreign-multi-vol-');
+      writeValidLocalEnvFiles(projectRoot);
+
+      const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+      const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+      const originalIntegrationBytes = fs.readFileSync(
+        path.join(projectRoot, '.env.integration-test')
+      );
+
+      const mockContainers = buildVerifiedContainers(projectRoot, ['dev', 'staging']);
+      const mockVolumes = buildVerifiedVolumes(projectRoot, ['dev', 'staging']);
+
+      const dockerInvocations: string[][] = [];
+      const runDockerCommand = vi.fn().mockImplementation(async (args: string[]) => {
+        dockerInvocations.push(args);
+        if (args[0] === 'volume' && args[1] === 'rm' && args[2] === 'coreerp_postgres_dev_data') {
+          mockVolumes[1].labels = {
+            'com.docker.compose.project': 'foreignproj',
+            'com.docker.compose.volume': COREERP_LOCAL_RESET_SPECS.staging.volume,
+            'com.docker.compose.project.working_dir': otherWorkspace,
+          };
+        }
+        return { exitCode: 0, stdout: 'ok', stderr: '' };
+      });
+
+      const waitForPostgresReady = vi.fn().mockResolvedValue(true);
+      const runTargetMigration = vi.fn();
+      const runStagingVerify = vi.fn();
+      const { logger } = createSilentLogger();
+
+      const res = await runCoreErpCleanReset({
+        projectRoot,
+        targets: ['dev', 'staging'],
+        execute: true,
+        confirmed: true,
+        recreateEnv: true,
+        verifyStaging: true,
+        env: { NODE_ENV: 'development' },
+        logger,
+        deps: {
+          runDockerCommand,
+          listDockerContainers: vi.fn().mockResolvedValue(mockContainers),
+          listDockerVolumes: vi.fn().mockResolvedValue(mockVolumes),
+          waitForPostgresReady,
+          runTargetMigration,
+          runStagingVerify,
+        },
+      });
+
+      expect(res.exitCode).toBe(1);
+      expect(res.mode).toBe('EXECUTE');
+      expect(res.stagingVerified).toBe(false);
+      expect(res.removedContainers).toEqual([
+        'coreerp-postgres-dev',
+        'coreerp-postgres-staging',
+      ]);
+      expect(res.removedVolumes).toEqual(['coreerp_postgres_dev_data']);
+      expect(res.completedSteps).toContain('REMOVED_VOLUME:coreerp_postgres_dev_data');
+      expect(res.completedSteps).not.toContain('REMOVED_VOLUME:coreerp_postgres_staging_data');
+      expect(res.backedUpEnvFiles).toEqual([]);
+      expect(res.recreatedTargets).toEqual([]);
+      expect(res.migratedTargets).toEqual([]);
+
+      expect(dockerInvocations).toEqual([
+        ['rm', '-f', 'coreerp-postgres-dev'],
+        ['rm', '-f', 'coreerp-postgres-staging'],
+        ['volume', 'rm', 'coreerp_postgres_dev_data'],
+      ]);
+      expect(waitForPostgresReady).not.toHaveBeenCalled();
+      expect(runTargetMigration).not.toHaveBeenCalled();
+      expect(runStagingVerify).not.toHaveBeenCalled();
+
+      expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+      expect(
+        fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+      ).toBe(true);
+      expect(
+        fs
+          .readFileSync(path.join(projectRoot, '.env.integration-test'))
+          .equals(originalIntegrationBytes)
+      ).toBe(true);
+      expect(fs.readdirSync(projectRoot).filter((f) => f.includes('.backup.'))).toEqual([]);
+
+      expect(res.error).toContain('[DOCKER SAFETY VIOLATION]');
+      expect(res.error).toContain('coreerp_postgres_staging_data');
+      expect(res.error).toContain('No automatic rollback was performed');
+    }
+
+    // Sub-case B: Second volume ownership re-check throws after first volume is removed
+    {
+      const projectRoot = createTempDir();
+      const seeded = writeValidLocalEnvFiles(projectRoot, {
+        stagingPassword: 'stage82_multivol_throw_secret_99001122',
+      });
+
+      const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+      const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+      const originalIntegrationBytes = fs.readFileSync(
+        path.join(projectRoot, '.env.integration-test')
+      );
+
+      const mockContainers = buildVerifiedContainers(projectRoot, ['dev', 'staging']);
+      const verifiedVols = buildVerifiedVolumes(projectRoot, ['dev', 'staging']);
+      const stagingLabels = { ...verifiedVols[1].labels };
+      let throwOnSecondVol = false;
+
+      const secondVol: DockerVolumeMetadata = {
+        name: verifiedVols[1].name,
+        get labels(): Record<string, string> {
+          if (throwOnSecondVol) {
+            throw new Error(
+              `Corrupt metadata on second volume (secret=${seeded.stagingPassword})`
+            );
+          }
+          return stagingLabels;
+        },
+      };
+
+      const dockerInvocations: string[][] = [];
+      const runDockerCommand = vi.fn().mockImplementation(async (args: string[]) => {
+        dockerInvocations.push(args);
+        if (args[0] === 'volume' && args[1] === 'rm' && args[2] === 'coreerp_postgres_dev_data') {
+          throwOnSecondVol = true;
+        }
+        return { exitCode: 0, stdout: 'ok', stderr: '' };
+      });
+
+      const waitForPostgresReady = vi.fn().mockResolvedValue(true);
+      const runTargetMigration = vi.fn();
+      const runStagingVerify = vi.fn();
+      const { logger, logs } = createSilentLogger();
+
+      const res = await runCoreErpCleanReset({
+        projectRoot,
+        targets: ['dev', 'staging'],
+        execute: true,
+        confirmed: true,
+        recreateEnv: true,
+        verifyStaging: true,
+        env: { NODE_ENV: 'development' },
+        logger,
+        deps: {
+          runDockerCommand,
+          listDockerContainers: vi.fn().mockResolvedValue(mockContainers),
+          listDockerVolumes: vi.fn().mockResolvedValue([verifiedVols[0], secondVol]),
+          waitForPostgresReady,
+          runTargetMigration,
+          runStagingVerify,
+        },
+      });
+
+      expect(res.exitCode).toBe(1);
+      expect(res.mode).toBe('EXECUTE');
+      expect(res.stagingVerified).toBe(false);
+      expect(res.removedContainers).toEqual([
+        'coreerp-postgres-dev',
+        'coreerp-postgres-staging',
+      ]);
+      expect(res.removedVolumes).toEqual(['coreerp_postgres_dev_data']);
+      expect(res.completedSteps).toContain('REMOVED_VOLUME:coreerp_postgres_dev_data');
+      expect(res.completedSteps).not.toContain('REMOVED_VOLUME:coreerp_postgres_staging_data');
+      expect(res.backedUpEnvFiles).toEqual([]);
+      expect(res.recreatedTargets).toEqual([]);
+      expect(res.migratedTargets).toEqual([]);
+
+      expect(dockerInvocations).toEqual([
+        ['rm', '-f', 'coreerp-postgres-dev'],
+        ['rm', '-f', 'coreerp-postgres-staging'],
+        ['volume', 'rm', 'coreerp_postgres_dev_data'],
+      ]);
+      expect(waitForPostgresReady).not.toHaveBeenCalled();
+      expect(runTargetMigration).not.toHaveBeenCalled();
+      expect(runStagingVerify).not.toHaveBeenCalled();
+
+      expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+      expect(
+        fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+      ).toBe(true);
+      expect(
+        fs
+          .readFileSync(path.join(projectRoot, '.env.integration-test'))
+          .equals(originalIntegrationBytes)
+      ).toBe(true);
+      expect(fs.readdirSync(projectRoot).filter((f) => f.includes('.backup.'))).toEqual([]);
+
+      expect(res.error).toContain('[DOCKER SAFETY VIOLATION]');
+      expect(res.error).toContain('Corrupt metadata on second volume');
+      expect(res.error).toContain('No automatic rollback was performed');
+      expect(res.error).not.toContain(seeded.stagingPassword);
+      expect(logs.join('\n')).not.toContain(seeded.stagingPassword);
+    }
+  });
+
+  it('32. [Stage 8.3] Environment backup/write failure returns sanitized structured failure with exact partial backup/write progress and halts later stages', async () => {
+    const projectRoot = createTempDir();
+    const seeded = writeValidLocalEnvFiles(projectRoot, {
+      devPassword: 'stage83_env_write_secret_never_leak_334455',
+    });
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const origOpenSync = fs.openSync;
+    const openSpy = vi.spyOn(fs, 'openSync').mockImplementation((filePath, flags, mode) => {
+      if (String(filePath).startsWith(path.join(projectRoot, '.env.backup.'))) {
+        throw new Error(
+          `EACCES: locked .env during backup (secret=${seeded.devPassword})`
+        );
+      }
+      return origOpenSync.call(fs, filePath, flags, mode);
+    });
+
+    const dockerInvocations: string[][] = [];
+    const runDockerCommand = vi.fn().mockImplementation(async (args: string[]) => {
+      dockerInvocations.push(args);
+      return { exitCode: 0, stdout: 'ok', stderr: '' };
+    });
+
+    const waitForPostgresReady = vi.fn().mockResolvedValue(true);
+    const runTargetMigration = vi.fn();
+    const runStagingVerify = vi.fn();
+    const { logger, logs } = createSilentLogger();
+
+    let res: Awaited<ReturnType<typeof runCoreErpCleanReset>>;
+    try {
+      res = await runCoreErpCleanReset({
+        projectRoot,
+        targets: ['dev', 'staging'],
+        execute: true,
+        confirmed: true,
+        recreateEnv: true,
+        verifyStaging: true,
+        env: { NODE_ENV: 'development' },
+        logger,
+        deps: {
+          runDockerCommand,
+          listDockerContainers: vi
+            .fn()
+            .mockResolvedValue(buildVerifiedContainers(projectRoot, ['dev', 'staging'])),
+          listDockerVolumes: vi
+            .fn()
+            .mockResolvedValue(buildVerifiedVolumes(projectRoot, ['dev', 'staging'])),
+          waitForPostgresReady,
+          runTargetMigration,
+          runStagingVerify,
+        },
+      });
+    } finally {
+      openSpy.mockRestore();
+    }
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.stagingVerified).toBe(false);
+    expect(res.removedContainers).toEqual([
+      'coreerp-postgres-dev',
+      'coreerp-postgres-staging',
+    ]);
+    expect(res.removedVolumes).toEqual([
+      'coreerp_postgres_dev_data',
+      'coreerp_postgres_staging_data',
+    ]);
+    // .env.staging backup & write succeeded before .env backup failed
+    expect(res.backedUpEnvFiles).toHaveLength(1);
+    expect(res.backedUpEnvFiles[0]).toMatch(/^\.env\.staging\.backup\./);
+    expect(res.completedSteps).toContain('WRITTEN_ENV:.env.staging');
+    expect(res.completedSteps).toContain('PRESERVED_ENV:.env.integration-test');
+    expect(res.completedSteps).not.toContain('WRITTEN_ENV:.env');
+    expect(res.recreatedTargets).toEqual([]);
+    expect(res.migratedTargets).toEqual([]);
+
+    // Unmodified files remain byte-for-byte intact and no .env backup was created
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+    expect(
+      fs.readdirSync(projectRoot).filter((f) => f.startsWith('.env.backup.'))
+    ).toEqual([]);
+
+    // No Stage 8.4+ calls ran
+    expect(dockerInvocations.some((args) => args[0] === 'compose')).toBe(false);
+    expect(waitForPostgresReady).not.toHaveBeenCalled();
+    expect(runTargetMigration).not.toHaveBeenCalled();
+    expect(runStagingVerify).not.toHaveBeenCalled();
+
+    expect(res.error).toContain('Stage 8.3');
+    expect(res.error).toContain('EACCES: locked .env during backup');
+    expect(res.error).toContain('No automatic rollback was performed');
+    expect(res.error).not.toContain(seeded.devPassword);
+    expect(logs.join('\n')).not.toContain(seeded.devPassword);
+  });
+
+  it('33. [Stage 8.4] Compose recreation rejection returns sanitized structured failure preserving already-recreated targets and stopping readiness/migrations/verification', async () => {
+    const projectRoot = createTempDir();
+    const seeded = writeValidLocalEnvFiles(projectRoot, {
+      stagingPassword: 'stage84_compose_reject_secret_66778899',
+    });
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const runDockerCommand = vi.fn().mockImplementation(async (args: string[]) => {
+      if (args.includes('docker-compose.staging.yml')) {
+        throw new Error(
+          `Compose daemon rejected staging up (secret=${seeded.stagingPassword})`
+        );
+      }
+      return { exitCode: 0, stdout: 'ok', stderr: '' };
+    });
+
+    const waitForPostgresReady = vi.fn().mockResolvedValue(true);
+    const runTargetMigration = vi.fn();
+    const runStagingVerify = vi.fn();
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runCoreErpCleanReset({
+      projectRoot,
+      targets: ['dev', 'staging'],
+      execute: true,
+      confirmed: true,
+      recreateEnv: false,
+      verifyStaging: true,
+      env: { NODE_ENV: 'development' },
+      logger,
+      deps: {
+        runDockerCommand,
+        listDockerContainers: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedContainers(projectRoot, ['dev', 'staging'])),
+        listDockerVolumes: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedVolumes(projectRoot, ['dev', 'staging'])),
+        waitForPostgresReady,
+        runTargetMigration,
+        runStagingVerify,
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.stagingVerified).toBe(false);
+    expect(res.removedContainers).toEqual([
+      'coreerp-postgres-dev',
+      'coreerp-postgres-staging',
+    ]);
+    expect(res.removedVolumes).toEqual([
+      'coreerp_postgres_dev_data',
+      'coreerp_postgres_staging_data',
+    ]);
+    expect(res.backedUpEnvFiles).toEqual([]);
+    expect(res.recreatedTargets).toEqual(['dev']);
+    expect(res.migratedTargets).toEqual([]);
+    expect(res.completedSteps).toContain('RECREATED_TARGET:dev');
+    expect(res.completedSteps).not.toContain('RECREATED_TARGET:staging');
+
+    expect(waitForPostgresReady).not.toHaveBeenCalled();
+    expect(runTargetMigration).not.toHaveBeenCalled();
+    expect(runStagingVerify).not.toHaveBeenCalled();
+
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+    expect(fs.readdirSync(projectRoot).filter((f) => f.includes('.backup.'))).toEqual([]);
+
+    expect(res.error).toContain('Stage 8.4');
+    expect(res.error).toContain('Compose daemon rejected staging up');
+    expect(res.error).toContain('No automatic rollback was performed');
+    expect(res.error).not.toContain(seeded.stagingPassword);
+    expect(logs.join('\n')).not.toContain(seeded.stagingPassword);
+  });
+
+  it('34. [Stage 8.5] Readiness check rejection returns sanitized structured failure preserving prior readiness progress and stopping migrations/verification', async () => {
+    const projectRoot = createTempDir();
+    const seeded = writeValidLocalEnvFiles(projectRoot, {
+      stagingPassword: 'stage85_ready_reject_secret_77889900',
+    });
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const waitForPostgresReady = vi.fn().mockImplementation(async ({ container }: { container: string }) => {
+      if (container === 'coreerp-postgres-staging') {
+        throw new Error(
+          `pg_isready probe crashed unexpectedly (secret=${seeded.stagingPassword})`
+        );
+      }
+      return true;
+    });
+    const runTargetMigration = vi.fn();
+    const runStagingVerify = vi.fn();
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runCoreErpCleanReset({
+      projectRoot,
+      targets: ['dev', 'staging'],
+      execute: true,
+      confirmed: true,
+      recreateEnv: false,
+      verifyStaging: true,
+      env: { NODE_ENV: 'development' },
+      logger,
+      deps: {
+        runDockerCommand: vi.fn().mockResolvedValue({ exitCode: 0, stdout: 'ok', stderr: '' }),
+        listDockerContainers: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedContainers(projectRoot, ['dev', 'staging'])),
+        listDockerVolumes: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedVolumes(projectRoot, ['dev', 'staging'])),
+        waitForPostgresReady,
+        runTargetMigration,
+        runStagingVerify,
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.stagingVerified).toBe(false);
+    expect(res.removedContainers).toEqual([
+      'coreerp-postgres-dev',
+      'coreerp-postgres-staging',
+    ]);
+    expect(res.removedVolumes).toEqual([
+      'coreerp_postgres_dev_data',
+      'coreerp_postgres_staging_data',
+    ]);
+    expect(res.backedUpEnvFiles).toEqual([]);
+    expect(res.recreatedTargets).toEqual(['dev', 'staging']);
+    expect(res.migratedTargets).toEqual([]);
+    expect(res.completedSteps).toContain('READY_CONTAINER:coreerp-postgres-dev');
+    expect(res.completedSteps).not.toContain('READY_CONTAINER:coreerp-postgres-staging');
+
+    expect(runTargetMigration).not.toHaveBeenCalled();
+    expect(runStagingVerify).not.toHaveBeenCalled();
+
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+    expect(fs.readdirSync(projectRoot).filter((f) => f.includes('.backup.'))).toEqual([]);
+
+    expect(res.error).toContain('Stage 8.5');
+    expect(res.error).toContain('pg_isready probe crashed unexpectedly');
+    expect(res.error).toContain('No automatic rollback was performed');
+    expect(res.error).not.toContain(seeded.stagingPassword);
+    expect(logs.join('\n')).not.toContain(seeded.stagingPassword);
+  });
+
+  it('35. [Stage 8.6] Migration dependency rejection returns sanitized structured failure preserving completed migrations and stopping staging verification', async () => {
+    const projectRoot = createTempDir();
+    const seeded = writeValidLocalEnvFiles(projectRoot, {
+      stagingPassword: 'stage86_migrate_reject_secret_88990011',
+    });
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const runTargetMigration = vi.fn().mockImplementation(async (opts: { target: string }) => {
+      if (opts.target === 'staging') {
+        throw new Error(
+          `Prisma runner crashed on staging target (secret=${seeded.stagingPassword})`
+        );
+      }
+      return {
+        exitCode: 0 as const,
+        target: opts.target,
+        mode: 'EXECUTE' as const,
+        expectedMigrationsCount: 17,
+        databaseName: opts.target,
+      };
+    });
+    const runStagingVerify = vi.fn();
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runCoreErpCleanReset({
+      projectRoot,
+      targets: ['dev', 'staging'],
+      execute: true,
+      confirmed: true,
+      recreateEnv: false,
+      verifyStaging: true,
+      env: { NODE_ENV: 'development' },
+      logger,
+      deps: {
+        runDockerCommand: vi.fn().mockResolvedValue({ exitCode: 0, stdout: 'ok', stderr: '' }),
+        listDockerContainers: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedContainers(projectRoot, ['dev', 'staging'])),
+        listDockerVolumes: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedVolumes(projectRoot, ['dev', 'staging'])),
+        waitForPostgresReady: vi.fn().mockResolvedValue(true),
+        runTargetMigration,
+        runStagingVerify,
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.stagingVerified).toBe(false);
+    expect(res.removedContainers).toEqual([
+      'coreerp-postgres-dev',
+      'coreerp-postgres-staging',
+    ]);
+    expect(res.removedVolumes).toEqual([
+      'coreerp_postgres_dev_data',
+      'coreerp_postgres_staging_data',
+    ]);
+    expect(res.backedUpEnvFiles).toEqual([]);
+    expect(res.recreatedTargets).toEqual(['dev', 'staging']);
+    expect(res.migratedTargets).toEqual(['dev']);
+    expect(res.completedSteps).toContain('MIGRATED_TARGET:dev');
+    expect(res.completedSteps).not.toContain('MIGRATED_TARGET:staging');
+    expect(res.completedSteps).not.toContain('STAGING_VERIFIED');
+
+    expect(runStagingVerify).not.toHaveBeenCalled();
+
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+    expect(fs.readdirSync(projectRoot).filter((f) => f.includes('.backup.'))).toEqual([]);
+
+    expect(res.error).toContain('Stage 8.6');
+    expect(res.error).toContain('Prisma runner crashed on staging target');
+    expect(res.error).toContain('No automatic rollback was performed');
+    expect(res.error).not.toContain(seeded.stagingPassword);
+    expect(logs.join('\n')).not.toContain(seeded.stagingPassword);
+  });
+
+  it('36. [Stage 8.7] Staging verification rejection returns sanitized structured failure preserving prior migration progress with stagingVerified=false', async () => {
+    const projectRoot = createTempDir();
+    const seeded = writeValidLocalEnvFiles(projectRoot, {
+      stagingPassword: 'stage87_verify_reject_secret_00112233',
+    });
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const runTargetMigration = vi.fn().mockResolvedValue({
+      exitCode: 0 as const,
+      target: 'staging',
+      mode: 'EXECUTE' as const,
+      expectedMigrationsCount: 17,
+      databaseName: 'core_erp_staging',
+    });
+    const runStagingVerify = vi
+      .fn()
+      .mockRejectedValue(
+        new Error(`Staging verifier threw unexpectedly (secret=${seeded.stagingPassword})`)
+      );
+    const { logger, logs } = createSilentLogger();
+
+    const res = await runCoreErpCleanReset({
+      projectRoot,
+      targets: ['staging'],
+      execute: true,
+      confirmed: true,
+      recreateEnv: false,
+      verifyStaging: true,
+      env: { NODE_ENV: 'development' },
+      logger,
+      deps: {
+        runDockerCommand: vi.fn().mockResolvedValue({ exitCode: 0, stdout: 'ok', stderr: '' }),
+        listDockerContainers: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedContainers(projectRoot, ['staging'])),
+        listDockerVolumes: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedVolumes(projectRoot, ['staging'])),
+        waitForPostgresReady: vi.fn().mockResolvedValue(true),
+        runTargetMigration,
+        runStagingVerify,
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.stagingVerified).toBe(false);
+    expect(res.removedContainers).toEqual(['coreerp-postgres-staging']);
+    expect(res.removedVolumes).toEqual(['coreerp_postgres_staging_data']);
+    expect(res.backedUpEnvFiles).toEqual([]);
+    expect(res.recreatedTargets).toEqual(['staging']);
+    expect(res.migratedTargets).toEqual(['staging']);
+    expect(res.completedSteps).toContain('MIGRATED_TARGET:staging');
+    expect(res.completedSteps).not.toContain('STAGING_VERIFIED');
+
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+    expect(fs.readdirSync(projectRoot).filter((f) => f.includes('.backup.'))).toEqual([]);
+
+    expect(res.error).toContain('Stage 8.7');
+    expect(res.error).toContain('Staging verifier threw unexpectedly');
+    expect(res.error).toContain('No automatic rollback was performed');
+    expect(res.error).not.toContain(seeded.stagingPassword);
+    expect(logs.join('\n')).not.toContain(seeded.stagingPassword);
+  });
+
+  it('37. [Stage 8.7 Post-Verification Consistency] Exception after STAGING_VERIFIED returns structured failure with stagingVerified=true, accurate completedSteps, sanitized error, and no rollback claim', async () => {
+    const projectRoot = createTempDir();
+    const seeded = writeValidLocalEnvFiles(projectRoot, {
+      stagingPassword: 'post_stage87_logger_secret_never_leak_998877',
+    });
+
+    const logs: string[] = [];
+    const logger: CleanResetLogger = {
+      log: (m) => {
+        logs.push(m);
+        if (m.includes('COMPLETED')) {
+          throw new Error(
+            `Logger stdout EPIPE after staging verification (secret=${seeded.stagingPassword})`
+          );
+        }
+      },
+      warn: (m) => logs.push(m),
+      error: (m) => logs.push(m),
+    };
+
+    const runTargetMigration = vi.fn().mockResolvedValue({
+      exitCode: 0 as const,
+      target: 'staging',
+      mode: 'EXECUTE' as const,
+      expectedMigrationsCount: 17,
+      databaseName: 'core_erp_staging',
+    });
+    const runStagingVerify = vi.fn().mockResolvedValue({
+      exitCode: 0 as const,
+      mode: 'EXECUTE' as const,
+      databaseName: 'core_erp_staging',
+      steps: [],
+    });
+
+    const res = await runCoreErpCleanReset({
+      projectRoot,
+      targets: ['staging'],
+      execute: true,
+      confirmed: true,
+      recreateEnv: false,
+      verifyStaging: true,
+      env: { NODE_ENV: 'development' },
+      logger,
+      deps: {
+        runDockerCommand: vi.fn().mockResolvedValue({ exitCode: 0, stdout: 'ok', stderr: '' }),
+        listDockerContainers: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedContainers(projectRoot, ['staging'])),
+        listDockerVolumes: vi
+          .fn()
+          .mockResolvedValue(buildVerifiedVolumes(projectRoot, ['staging'])),
+        waitForPostgresReady: vi.fn().mockResolvedValue(true),
+        runTargetMigration,
+        runStagingVerify,
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.stagingVerified).toBe(true);
+    expect(res.removedContainers).toEqual(['coreerp-postgres-staging']);
+    expect(res.removedVolumes).toEqual(['coreerp_postgres_staging_data']);
+    expect(res.recreatedTargets).toEqual(['staging']);
+    expect(res.migratedTargets).toEqual(['staging']);
+    expect(res.completedSteps).toContain('PREFLIGHT_STAGES_1_TO_7_PASSED');
+    expect(res.completedSteps).toContain('REMOVED_CONTAINER:coreerp-postgres-staging');
+    expect(res.completedSteps).toContain('REMOVED_VOLUME:coreerp_postgres_staging_data');
+    expect(res.completedSteps).toContain('RECREATED_TARGET:staging');
+    expect(res.completedSteps).toContain('READY_CONTAINER:coreerp-postgres-staging');
+    expect(res.completedSteps).toContain('MIGRATED_TARGET:staging');
+    expect(res.completedSteps).toContain('STAGING_VERIFIED');
+
+    expect(res.error).toContain('Logger stdout EPIPE after staging verification');
+    expect(res.error).toContain('No automatic rollback was performed');
+    expect(res.error).not.toContain(seeded.stagingPassword);
+    expect(logs.join('\n')).not.toContain(seeded.stagingPassword);
+  });
+
+  it('38. [Stage 8.3 Pre-Existing Backup Collision] Existing backup file at destination aborts Stage 8.3 cleanly without overwriting backup, modifying .env, or running later stages', async () => {
+    const projectRoot = createTempDir();
+    writeValidLocalEnvFiles(projectRoot);
+
+    const fixedIso = '2026-11-28T10:50:00.000Z';
+    const expectedBackupName = '.env.backup.2026-11-28T10-50-00-000Z';
+    const expectedBackupPath = path.join(projectRoot, expectedBackupName);
+    const existingBackupBytes = Buffer.from(
+      '# PRE-EXISTING BACKUP - MUST REMAIN BYTE-FOR-BYTE INTACT\r\nOLD_KEY="keep_exact_value"\r\n',
+      'utf-8'
+    );
+    fs.writeFileSync(expectedBackupPath, existingBackupBytes);
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const dockerInvocations: string[][] = [];
+    const runDockerCommand = vi.fn().mockImplementation(async (args: string[]) => {
+      dockerInvocations.push(args);
+      return { exitCode: 0, stdout: 'ok', stderr: '' };
+    });
+    const waitForPostgresReady = vi.fn().mockResolvedValue(true);
+    const runTargetMigration = vi.fn();
+    const runStagingVerify = vi.fn();
+    const { logger } = createSilentLogger();
+
+    const dateSpy = vi.spyOn(Date.prototype, 'toISOString').mockReturnValue(fixedIso);
+    const unlinkSpy = vi.spyOn(fs, 'unlinkSync');
+
+    let res: Awaited<ReturnType<typeof runCoreErpCleanReset>>;
+    try {
+      res = await runCoreErpCleanReset({
+        projectRoot,
+        targets: ['dev'],
+        execute: true,
+        confirmed: true,
+        recreateEnv: true,
+        verifyStaging: true,
+        env: { NODE_ENV: 'development' },
+        logger,
+        deps: {
+          runDockerCommand,
+          listDockerContainers: vi
+            .fn()
+            .mockResolvedValue(buildVerifiedContainers(projectRoot, ['dev'])),
+          listDockerVolumes: vi
+            .fn()
+            .mockResolvedValue(buildVerifiedVolumes(projectRoot, ['dev'])),
+          waitForPostgresReady,
+          runTargetMigration,
+          runStagingVerify,
+        },
+      });
+    } finally {
+      unlinkSpy.mockRestore();
+      dateSpy.mockRestore();
+    }
+
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.stagingVerified).toBe(false);
+    expect(res.removedContainers).toEqual(['coreerp-postgres-dev']);
+    expect(res.removedVolumes).toEqual(['coreerp_postgres_dev_data']);
+    expect(res.backedUpEnvFiles).toEqual([]);
+    expect(res.recreatedTargets).toEqual([]);
+    expect(res.migratedTargets).toEqual([]);
+    expect(res.completedSteps).not.toContain(`BACKED_UP_ENV:${expectedBackupName}`);
+    expect(res.completedSteps).not.toContain('WRITTEN_ENV:.env');
+
+    // Pre-existing backup and original env files remain completely unchanged byte-for-byte
+    expect(fs.existsSync(expectedBackupPath)).toBe(true);
+    expect(fs.readFileSync(expectedBackupPath).equals(existingBackupBytes)).toBe(true);
+    expect(
+      unlinkSpy.mock.calls.some(([targetPath]) => String(targetPath) === expectedBackupPath)
+    ).toBe(false);
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+
+    // Later Stage 8.4–8.7 operations never ran
+    expect(dockerInvocations.some((args) => args[0] === 'compose')).toBe(false);
+    expect(waitForPostgresReady).not.toHaveBeenCalled();
+    expect(runTargetMigration).not.toHaveBeenCalled();
+    expect(runStagingVerify).not.toHaveBeenCalled();
+
+    expect(res.error).toContain('Stage 8.3');
+    expect(res.error).toContain(expectedBackupName);
+    expect(res.error).toContain('already exists');
+    expect(res.error).toContain('No automatic rollback was performed');
+  });
+
+  it('39. [Stage 8.3 Backup-Path Race] Concurrent backup creation between initial existsSync check and exclusive open fails safely via EEXIST without touching racing backup or .env', async () => {
+    const projectRoot = createTempDir();
+    writeValidLocalEnvFiles(projectRoot);
+
+    const fixedIso = '2026-11-28T10:55:00.000Z';
+    const expectedBackupName = '.env.backup.2026-11-28T10-55-00-000Z';
+    const expectedBackupPath = path.join(projectRoot, expectedBackupName);
+    const racingBackupBytes = Buffer.from(
+      '# CONCURRENT PROCESS BACKUP WINNER - NEVER OVERWRITE OR DELETE\r\nOWNER="other_process"\r\n',
+      'utf-8'
+    );
+
+    const originalMainBytes = fs.readFileSync(path.join(projectRoot, '.env'));
+    const originalStagingBytes = fs.readFileSync(path.join(projectRoot, '.env.staging'));
+    const originalIntegrationBytes = fs.readFileSync(
+      path.join(projectRoot, '.env.integration-test')
+    );
+
+    const dockerInvocations: string[][] = [];
+    const runDockerCommand = vi.fn().mockImplementation(async (args: string[]) => {
+      dockerInvocations.push(args);
+      return { exitCode: 0, stdout: 'ok', stderr: '' };
+    });
+    const waitForPostgresReady = vi.fn().mockResolvedValue(true);
+    const runTargetMigration = vi.fn();
+    const runStagingVerify = vi.fn();
+    const { logger } = createSilentLogger();
+
+    let raceInjected = false;
+    const origExistsSync = fs.existsSync;
+    const dateSpy = vi.spyOn(Date.prototype, 'toISOString').mockReturnValue(fixedIso);
+    const unlinkSpy = vi.spyOn(fs, 'unlinkSync');
+    const existsSpy = vi.spyOn(fs, 'existsSync').mockImplementation((targetPath) => {
+      const existed = origExistsSync.call(fs, targetPath);
+      if (!raceInjected && String(targetPath) === expectedBackupPath && !existed) {
+        // Simulate another process creating the backup file right after the initial check returns false
+        raceInjected = true;
+        fs.writeFileSync(expectedBackupPath, racingBackupBytes);
+      }
+      return existed;
+    });
+
+    let res: Awaited<ReturnType<typeof runCoreErpCleanReset>>;
+    try {
+      res = await runCoreErpCleanReset({
+        projectRoot,
+        targets: ['dev'],
+        execute: true,
+        confirmed: true,
+        recreateEnv: true,
+        verifyStaging: true,
+        env: { NODE_ENV: 'development' },
+        logger,
+        deps: {
+          runDockerCommand,
+          listDockerContainers: vi
+            .fn()
+            .mockResolvedValue(buildVerifiedContainers(projectRoot, ['dev'])),
+          listDockerVolumes: vi
+            .fn()
+            .mockResolvedValue(buildVerifiedVolumes(projectRoot, ['dev'])),
+          waitForPostgresReady,
+          runTargetMigration,
+          runStagingVerify,
+        },
+      });
+    } finally {
+      existsSpy.mockRestore();
+      unlinkSpy.mockRestore();
+      dateSpy.mockRestore();
+    }
+
+    expect(raceInjected).toBe(true);
+    expect(res.exitCode).toBe(1);
+    expect(res.mode).toBe('EXECUTE');
+    expect(res.stagingVerified).toBe(false);
+    expect(res.removedContainers).toEqual(['coreerp-postgres-dev']);
+    expect(res.removedVolumes).toEqual(['coreerp_postgres_dev_data']);
+    expect(res.backedUpEnvFiles).toEqual([]);
+    expect(res.recreatedTargets).toEqual([]);
+    expect(res.migratedTargets).toEqual([]);
+    expect(res.completedSteps).not.toContain(`BACKED_UP_ENV:${expectedBackupName}`);
+    expect(res.completedSteps).not.toContain('WRITTEN_ENV:.env');
+
+    // Racing backup created by the other process must remain intact byte-for-byte and never be unlinked
+    expect(fs.existsSync(expectedBackupPath)).toBe(true);
+    expect(fs.readFileSync(expectedBackupPath).equals(racingBackupBytes)).toBe(true);
+    expect(
+      unlinkSpy.mock.calls.some(([targetPath]) => String(targetPath) === expectedBackupPath)
+    ).toBe(false);
+
+    // Original env files remain completely unchanged byte-for-byte
+    expect(fs.readFileSync(path.join(projectRoot, '.env')).equals(originalMainBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(projectRoot, '.env.integration-test')).equals(originalIntegrationBytes)
+    ).toBe(true);
+
+    // Later Stage 8.4–8.7 operations never ran
+    expect(dockerInvocations.some((args) => args[0] === 'compose')).toBe(false);
+    expect(waitForPostgresReady).not.toHaveBeenCalled();
+    expect(runTargetMigration).not.toHaveBeenCalled();
+    expect(runStagingVerify).not.toHaveBeenCalled();
+
+    expect(res.error).toContain('Stage 8.3');
+    expect(res.error).toContain(expectedBackupName);
+    expect(res.error).toContain('already exists');
+    expect(res.error).toContain('refusing to overwrite existing backup');
+    expect(res.error).toContain('No automatic rollback was performed');
   });
 });

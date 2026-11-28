@@ -704,6 +704,84 @@ function readEnvFileOrNull(filePath: string): Record<string, string> | null {
   return parseEnvFileContent(fs.readFileSync(filePath, 'utf-8'));
 }
 
+/**
+ * Creates a byte-for-byte backup strictly via exclusive file creation (`wx` / O_CREAT|O_EXCL)
+ * so an existing backup file is NEVER overwritten, even under a concurrent creation race.
+ * Preserves the original source file untouched on any failure and removes only a partial backup
+ * created by this call (never deleting or modifying a pre-existing backup).
+ */
+function createExclusiveEnvBackup(sourcePath: string, backupPath: string): void {
+  const rawContent = fs.readFileSync(sourcePath);
+  if (fs.existsSync(backupPath)) {
+    throw new Error(
+      `Backup file "${path.basename(backupPath)}" already exists; refusing to overwrite existing backup.`
+    );
+  }
+  let fd: number | null = null;
+  let createdByThisCall = false;
+  try {
+    fd = fs.openSync(backupPath, 'wx', 0o600);
+    createdByThisCall = true;
+    fs.writeFileSync(fd, rawContent);
+    fs.fsyncSync(fd);
+    const fdToClose = fd;
+    fd = null;
+    fs.closeSync(fdToClose);
+  } catch (err: unknown) {
+    let closeErr: unknown = null;
+    if (fd !== null) {
+      const fdToClose = fd;
+      fd = null;
+      try {
+        fs.closeSync(fdToClose);
+      } catch (cErr: unknown) {
+        closeErr = cErr;
+      }
+    }
+
+    if (!createdByThisCall) {
+      if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') {
+        throw new Error(
+          `Backup file "${path.basename(backupPath)}" already exists; refusing to overwrite existing backup.`
+        );
+      }
+      throw err;
+    }
+
+    let cleanupErr: unknown = null;
+    try {
+      fs.unlinkSync(backupPath);
+    } catch (uErr: unknown) {
+      if ((uErr as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        cleanupErr = uErr;
+      }
+    }
+
+    const originalMsg = err instanceof Error ? err.message : String(err);
+    const secondaryNotes: string[] = [];
+    if (closeErr !== null) {
+      secondaryNotes.push(
+        `file descriptor close failed: ${closeErr instanceof Error ? closeErr.message : String(closeErr)}`
+      );
+    }
+    if (cleanupErr !== null) {
+      secondaryNotes.push(
+        `partial backup cleanup failed for "${path.basename(backupPath)}": ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`
+      );
+    }
+    if (secondaryNotes.length > 0) {
+      const combinedErr = new Error(
+        `${originalMsg} (Additionally, ${secondaryNotes.join('; ')})`
+      );
+      if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code) {
+        (combinedErr as NodeJS.ErrnoException).code = (err as NodeJS.ErrnoException).code;
+      }
+      throw combinedErr;
+    }
+    throw err;
+  }
+}
+
 function collectSecrets(envMaps: Array<Record<string, string | undefined> | null>): string[] {
   const secrets = new Set<string>();
   const keys = [
@@ -2082,6 +2160,7 @@ export async function runCoreErpCleanReset(
   const backedUpEnvFiles: string[] = [];
   const recreatedTargets: CleanResetTarget[] = [];
   const migratedTargets: CleanResetTarget[] = [];
+  let stagingVerified = false;
 
   const failAfterDestruction = (rawReason: string): CleanResetResult => {
     const safeReason = redact(rawReason);
@@ -2097,247 +2176,279 @@ export async function runCoreErpCleanReset(
       backedUpEnvFiles,
       recreatedTargets,
       migratedTargets,
+      stagingVerified: stagingVerified || completedSteps.includes('STAGING_VERIFIED'),
       completedSteps,
       plan,
     });
   };
 
-  // 8.1 Remove ONLY verified allowlisted CoreERP local containers
-  for (const container of matchedContainers) {
-    assertSafeCoreErpContainerName(container, allowedContainerSet);
-    const rmRes = await runDocker(['rm', '-f', container], projectRoot, 30_000);
-    if (rmRes.exitCode !== 0) {
-      return failAfterDestruction(
-        `Failed to remove CoreERP container "${container}": ${(rmRes.stderr || rmRes.stdout).trim()}`
-      );
-    }
-    removedContainers.push(container);
-    completedSteps.push(`REMOVED_CONTAINER:${container}`);
-    logger.log(`   ✔ Removed verified CoreERP local container: ${container}`);
-  }
+  const formatStageError = (err: unknown): string =>
+    err instanceof Error ? err.message : String(err);
 
-  // 8.2 Remove ONLY verified allowlisted CoreERP local volumes
-  for (const volName of matchedVolumes) {
-    const volMeta = existingVolumes.find((v) => v.name === volName);
-    if (
-      !volMeta ||
-      classifyCoreErpLocalVolume({
-        volume: volMeta,
-        allowedVolumeNames: allowedVolumeSet,
-        projectRoot,
-        expectedComposeProject,
-        verifiedComposeProjects,
-      }) !== 'ALLOW'
-    ) {
-      throw new Error(`[DOCKER SAFETY VIOLATION] Refusing to delete unverified volume "${volName}".`);
-    }
-    const rmVolRes = await runDocker(['volume', 'rm', volName], projectRoot, 30_000);
-    if (rmVolRes.exitCode !== 0) {
-      return failAfterDestruction(
-        `Failed to remove CoreERP volume "${volName}": ${(rmVolRes.stderr || rmVolRes.stdout).trim()}`
-      );
-    }
-    removedVolumes.push(volName);
-    completedSteps.push(`REMOVED_VOLUME:${volName}`);
-    logger.log(`   ✔ Removed verified CoreERP local volume: ${volName}`);
-  }
-
-  // 8.3 Prepare / commit the pre-validated environment files (preserving existing files unless --recreate-env)
+  let activeStageContext = 'Stage 8 destructive execution';
   try {
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    for (const actionItem of inMemoryBundle.plannedFileActions) {
-      const fullPath = path.join(projectRoot, actionItem.file);
-      if (actionItem.action === 'PRESERVE') {
-        completedSteps.push(`PRESERVED_ENV:${actionItem.file}`);
+    // 8.1 Remove ONLY verified allowlisted CoreERP local containers
+    for (const container of matchedContainers) {
+      activeStageContext = `Stage 8.1 container removal for "${container}"`;
+      assertSafeCoreErpContainerName(container, allowedContainerSet);
+      const rmRes = await runDocker(['rm', '-f', container], projectRoot, 30_000);
+      if (rmRes.exitCode !== 0) {
+        return failAfterDestruction(
+          `Failed to remove CoreERP container "${container}": ${(rmRes.stderr || rmRes.stdout).trim()}`
+        );
+      }
+      removedContainers.push(container);
+      completedSteps.push(`REMOVED_CONTAINER:${container}`);
+      logger.log(`   ✔ Removed verified CoreERP local container: ${container}`);
+    }
+
+    // 8.2 Remove ONLY verified allowlisted CoreERP local volumes
+    for (const volName of matchedVolumes) {
+      activeStageContext = `Stage 8.2 volume ownership verification for "${volName}"`;
+      let ownershipDecision: ReturnType<typeof classifyCoreErpLocalVolume> | null = null;
+      try {
+        const volMeta = existingVolumes.find((v) => v.name === volName);
+        ownershipDecision = volMeta
+          ? classifyCoreErpLocalVolume({
+              volume: volMeta,
+              allowedVolumeNames: allowedVolumeSet,
+              projectRoot,
+              expectedComposeProject,
+              verifiedComposeProjects,
+            })
+          : null;
+      } catch (err: unknown) {
+        return failAfterDestruction(
+          `[DOCKER SAFETY VIOLATION] Failed to verify ownership of volume "${volName}" before deletion: ${formatStageError(err)}`
+        );
+      }
+      if (ownershipDecision !== 'ALLOW') {
+        return failAfterDestruction(
+          `[DOCKER SAFETY VIOLATION] Refusing to delete unverified volume "${volName}".`
+        );
+      }
+      activeStageContext = `Stage 8.2 volume removal for "${volName}"`;
+      const rmVolRes = await runDocker(['volume', 'rm', volName], projectRoot, 30_000);
+      if (rmVolRes.exitCode !== 0) {
+        return failAfterDestruction(
+          `Failed to remove CoreERP volume "${volName}": ${(rmVolRes.stderr || rmVolRes.stdout).trim()}`
+        );
+      }
+      removedVolumes.push(volName);
+      completedSteps.push(`REMOVED_VOLUME:${volName}`);
+      logger.log(`   ✔ Removed verified CoreERP local volume: ${volName}`);
+    }
+
+    // 8.3 Prepare / commit the pre-validated environment files (preserving existing files unless --recreate-env)
+    activeStageContext = 'Stage 8.3 environment-file backup and write';
+    try {
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      for (const actionItem of inMemoryBundle.plannedFileActions) {
+        activeStageContext = `Stage 8.3 environment-file processing for "${actionItem.file}"`;
+        const fullPath = path.join(projectRoot, actionItem.file);
+        if (actionItem.action === 'PRESERVE') {
+          completedSteps.push(`PRESERVED_ENV:${actionItem.file}`);
+          continue;
+        }
+        if (actionItem.action === 'BACKUP_AND_RECREATE' && fs.existsSync(fullPath)) {
+          const backupPath = `${fullPath}.backup.${stamp}`;
+          createExclusiveEnvBackup(fullPath, backupPath);
+          backedUpEnvFiles.push(path.basename(backupPath));
+          completedSteps.push(`BACKED_UP_ENV:${path.basename(backupPath)}`);
+          logger.log(`   ✔ Backed up existing ${actionItem.file} -> ${path.basename(backupPath)}`);
+        }
+        if (actionItem.content !== undefined) {
+          writeEnvFileAtomically(fullPath, actionItem.content);
+          completedSteps.push(`WRITTEN_ENV:${actionItem.file}`);
+          logger.log(`   ✔ Wrote validated ${actionItem.file}`);
+        }
+      }
+    } catch (err: unknown) {
+      return failAfterDestruction(
+        `Failed writing validated environment files (${activeStageContext}): ${formatStageError(err)}`
+      );
+    }
+
+    // 8.4 Recreate selected CoreERP local PostgreSQL containers via isolated Compose commands
+    const devBaseServices: CleanResetTarget[] = targets.filter((t) => t === 'dev' || t === 'test');
+    if (devBaseServices.length > 0) {
+      const serviceNames = devBaseServices.map((t) => COREERP_LOCAL_RESET_SPECS[t].service);
+      activeStageContext = `Stage 8.4 Compose recreation for docker-compose.dev.yml (${serviceNames.join(', ')})`;
+      const upRes = await runDocker(
+        ['compose', '-f', 'docker-compose.dev.yml', 'up', '-d', ...serviceNames],
+        projectRoot,
+        120_000
+      );
+      if (upRes.exitCode !== 0) {
+        return failAfterDestruction(
+          `Failed to start docker-compose.dev.yml (${serviceNames.join(', ')}): ${(upRes.stderr || upRes.stdout).trim()}`
+        );
+      }
+      recreatedTargets.push(...devBaseServices);
+      for (const t of devBaseServices) completedSteps.push(`RECREATED_TARGET:${t}`);
+    }
+
+    if (targets.includes('shadow')) {
+      activeStageContext = 'Stage 8.4 Compose recreation for postgres-shadow';
+      const upShadow = await runDocker(
+        ['compose', '-f', 'docker-compose.dev.yml', '--profile', 'shadow', 'up', '-d', 'postgres-shadow'],
+        projectRoot,
+        120_000
+      );
+      if (upShadow.exitCode !== 0) {
+        return failAfterDestruction(
+          `Failed to start postgres-shadow: ${(upShadow.stderr || upShadow.stdout).trim()}`
+        );
+      }
+      recreatedTargets.push('shadow');
+      completedSteps.push('RECREATED_TARGET:shadow');
+    }
+
+    if (targets.includes('integration')) {
+      activeStageContext = 'Stage 8.4 Compose recreation for docker-compose.integration-test.yml';
+      const upInt = await runDocker(
+        ['compose', '--env-file', '.env.integration-test', '-f', 'docker-compose.integration-test.yml', 'up', '-d'],
+        projectRoot,
+        120_000
+      );
+      if (upInt.exitCode !== 0) {
+        return failAfterDestruction(
+          `Failed to start docker-compose.integration-test.yml: ${(upInt.stderr || upInt.stdout).trim()}`
+        );
+      }
+      recreatedTargets.push('integration');
+      completedSteps.push('RECREATED_TARGET:integration');
+    }
+
+    if (targets.includes('staging')) {
+      activeStageContext = 'Stage 8.4 Compose recreation for docker-compose.staging.yml';
+      const upStaging = await runDocker(
+        ['compose', '--env-file', '.env.staging', '-f', 'docker-compose.staging.yml', 'up', '-d'],
+        projectRoot,
+        120_000
+      );
+      if (upStaging.exitCode !== 0) {
+        return failAfterDestruction(
+          `Failed to start docker-compose.staging.yml: ${(upStaging.stderr || upStaging.stdout).trim()}`
+        );
+      }
+      recreatedTargets.push('staging');
+      completedSteps.push('RECREATED_TARGET:staging');
+    }
+
+    // 8.5 Wait for PostgreSQL container readiness
+    for (const target of recreatedTargets) {
+      const spec = COREERP_LOCAL_RESET_SPECS[target];
+      activeStageContext = `Stage 8.5 readiness check for "${spec.container}" (${target})`;
+      const resolvedUser =
+        target === 'dev'
+          ? inMemoryBundle.mainEnv.POSTGRES_USER || spec.defaultUser
+          : target === 'staging'
+            ? inMemoryBundle.stagingEnv.STAGING_POSTGRES_USER || spec.defaultUser
+            : target === 'shadow'
+              ? inMemoryBundle.mainEnv.SHADOW_POSTGRES_USER || spec.defaultUser
+              : spec.defaultUser;
+      const resolvedDb =
+        target === 'dev'
+          ? inMemoryBundle.mainEnv.POSTGRES_DB || spec.database
+          : target === 'staging'
+            ? inMemoryBundle.stagingEnv.STAGING_POSTGRES_DB || spec.database
+            : target === 'shadow'
+              ? inMemoryBundle.mainEnv.SHADOW_POSTGRES_DB || spec.database
+              : spec.database;
+
+      const ready = await waitForReady({
+        container: spec.container,
+        user: resolvedUser,
+        database: resolvedDb,
+        cwd: projectRoot,
+        timeoutMs: options.readinessTimeoutMs,
+      });
+      if (!ready) {
+        return failAfterDestruction(
+          `Container "${spec.container}" (${target}) did not become PostgreSQL-ready before timeout.`
+        );
+      }
+      completedSteps.push(`READY_CONTAINER:${spec.container}`);
+      logger.log(`   ✔ Container "${spec.container}" is healthy and accepting connections.`);
+    }
+
+    // 8.6 Apply ordered Prisma migrations to the validated migratable targets (never shadow)
+    const mergedEnvForMigrations: Record<string, string | undefined> = {
+      ...env,
+      DATABASE_URL: envValidation.resolvedUrls.dev,
+      UNIT_TEST_DATABASE_URL: envValidation.resolvedUrls.test,
+      TEST_DATABASE_URL: envValidation.resolvedUrls.integration,
+      STAGING_DATABASE_URL: envValidation.resolvedUrls.staging,
+      STAGING_POSTGRES_USER: inMemoryBundle.stagingEnv.STAGING_POSTGRES_USER,
+      STAGING_POSTGRES_PASSWORD: inMemoryBundle.stagingEnv.STAGING_POSTGRES_PASSWORD,
+      STAGING_POSTGRES_DB: inMemoryBundle.stagingEnv.STAGING_POSTGRES_DB,
+      SHADOW_DATABASE_URL: envValidation.resolvedUrls.shadow,
+    };
+
+    for (const target of recreatedTargets) {
+      const spec = COREERP_LOCAL_RESET_SPECS[target];
+      if (!spec.applyMigrations) {
+        logger.log(
+          `   ℹ Skipping direct schema migration for "${target}" (${spec.database}): Prisma manages the shadow database automatically.`
+        );
         continue;
       }
-      if (actionItem.action === 'BACKUP_AND_RECREATE' && fs.existsSync(fullPath)) {
-        const backupPath = `${fullPath}.backup.${stamp}`;
-        fs.renameSync(fullPath, backupPath);
-        backedUpEnvFiles.push(path.basename(backupPath));
-        completedSteps.push(`BACKED_UP_ENV:${path.basename(backupPath)}`);
-        logger.log(`   ✔ Backed up existing ${actionItem.file} -> ${path.basename(backupPath)}`);
+
+      activeStageContext = `Stage 8.6 Prisma migration for target "${target}"`;
+      const migRes = await runTargetMigration({
+        target,
+        execute: true,
+        env: mergedEnvForMigrations,
+        logger,
+      });
+      if (migRes.exitCode !== 0) {
+        return failAfterDestruction(
+          `Migration failed for target "${target}": ${migRes.error || `exit code ${migRes.exitCode}`}`
+        );
       }
-      if (actionItem.content !== undefined) {
-        writeEnvFileAtomically(fullPath, actionItem.content);
-        completedSteps.push(`WRITTEN_ENV:${actionItem.file}`);
-        logger.log(`   ✔ Wrote validated ${actionItem.file}`);
-      }
+      migratedTargets.push(target);
+      completedSteps.push(`MIGRATED_TARGET:${target}`);
     }
+
+    // 8.7 Run full staging verification when staging is included
+    if (willVerifyStaging) {
+      activeStageContext = 'Stage 8.7 post-reset staging verification';
+      const verifyRes = await runStagingVerify({
+        execute: true,
+        env: mergedEnvForMigrations,
+        logger,
+      });
+      if (verifyRes.exitCode !== 0) {
+        return failAfterDestruction(
+          `Post-reset staging verification failed: ${verifyRes.error || `exit code ${verifyRes.exitCode}`}`
+        );
+      }
+      stagingVerified = true;
+      completedSteps.push('STAGING_VERIFIED');
+    }
+
+    activeStageContext = 'Stage 8 completion reporting';
+    logger.log('\n✅ CoreERP scoped local Docker clean-reset and fresh installation COMPLETED.\n');
+    return {
+      exitCode: 0,
+      mode: 'EXECUTE',
+      targets,
+      matchedContainers,
+      matchedVolumes,
+      skippedForeignVolumes,
+      removedContainers,
+      removedVolumes,
+      backedUpEnvFiles,
+      recreatedTargets,
+      migratedTargets,
+      stagingVerified,
+      completedSteps,
+      plan,
+    };
   } catch (err: unknown) {
     return failAfterDestruction(
-      `Failed writing validated environment files: ${err instanceof Error ? err.message : String(err)}`
+      `Unexpected error during ${activeStageContext}: ${formatStageError(err)}`
     );
   }
-
-  // 8.4 Recreate selected CoreERP local PostgreSQL containers via isolated Compose commands
-  const devBaseServices: CleanResetTarget[] = targets.filter((t) => t === 'dev' || t === 'test');
-  if (devBaseServices.length > 0) {
-    const serviceNames = devBaseServices.map((t) => COREERP_LOCAL_RESET_SPECS[t].service);
-    const upRes = await runDocker(
-      ['compose', '-f', 'docker-compose.dev.yml', 'up', '-d', ...serviceNames],
-      projectRoot,
-      120_000
-    );
-    if (upRes.exitCode !== 0) {
-      return failAfterDestruction(
-        `Failed to start docker-compose.dev.yml (${serviceNames.join(', ')}): ${(upRes.stderr || upRes.stdout).trim()}`
-      );
-    }
-    recreatedTargets.push(...devBaseServices);
-    for (const t of devBaseServices) completedSteps.push(`RECREATED_TARGET:${t}`);
-  }
-
-  if (targets.includes('shadow')) {
-    const upShadow = await runDocker(
-      ['compose', '-f', 'docker-compose.dev.yml', '--profile', 'shadow', 'up', '-d', 'postgres-shadow'],
-      projectRoot,
-      120_000
-    );
-    if (upShadow.exitCode !== 0) {
-      return failAfterDestruction(
-        `Failed to start postgres-shadow: ${(upShadow.stderr || upShadow.stdout).trim()}`
-      );
-    }
-    recreatedTargets.push('shadow');
-    completedSteps.push('RECREATED_TARGET:shadow');
-  }
-
-  if (targets.includes('integration')) {
-    const upInt = await runDocker(
-      ['compose', '--env-file', '.env.integration-test', '-f', 'docker-compose.integration-test.yml', 'up', '-d'],
-      projectRoot,
-      120_000
-    );
-    if (upInt.exitCode !== 0) {
-      return failAfterDestruction(
-        `Failed to start docker-compose.integration-test.yml: ${(upInt.stderr || upInt.stdout).trim()}`
-      );
-    }
-    recreatedTargets.push('integration');
-    completedSteps.push('RECREATED_TARGET:integration');
-  }
-
-  if (targets.includes('staging')) {
-    const upStaging = await runDocker(
-      ['compose', '--env-file', '.env.staging', '-f', 'docker-compose.staging.yml', 'up', '-d'],
-      projectRoot,
-      120_000
-    );
-    if (upStaging.exitCode !== 0) {
-      return failAfterDestruction(
-        `Failed to start docker-compose.staging.yml: ${(upStaging.stderr || upStaging.stdout).trim()}`
-      );
-    }
-    recreatedTargets.push('staging');
-    completedSteps.push('RECREATED_TARGET:staging');
-  }
-
-  // 8.5 Wait for PostgreSQL container readiness
-  for (const target of recreatedTargets) {
-    const spec = COREERP_LOCAL_RESET_SPECS[target];
-    const resolvedUser =
-      target === 'dev'
-        ? inMemoryBundle.mainEnv.POSTGRES_USER || spec.defaultUser
-        : target === 'staging'
-          ? inMemoryBundle.stagingEnv.STAGING_POSTGRES_USER || spec.defaultUser
-          : target === 'shadow'
-            ? inMemoryBundle.mainEnv.SHADOW_POSTGRES_USER || spec.defaultUser
-            : spec.defaultUser;
-    const resolvedDb =
-      target === 'dev'
-        ? inMemoryBundle.mainEnv.POSTGRES_DB || spec.database
-        : target === 'staging'
-          ? inMemoryBundle.stagingEnv.STAGING_POSTGRES_DB || spec.database
-          : target === 'shadow'
-            ? inMemoryBundle.mainEnv.SHADOW_POSTGRES_DB || spec.database
-            : spec.database;
-
-    const ready = await waitForReady({
-      container: spec.container,
-      user: resolvedUser,
-      database: resolvedDb,
-      cwd: projectRoot,
-      timeoutMs: options.readinessTimeoutMs,
-    });
-    if (!ready) {
-      return failAfterDestruction(
-        `Container "${spec.container}" (${target}) did not become PostgreSQL-ready before timeout.`
-      );
-    }
-    completedSteps.push(`READY_CONTAINER:${spec.container}`);
-    logger.log(`   ✔ Container "${spec.container}" is healthy and accepting connections.`);
-  }
-
-  // 8.6 Apply ordered Prisma migrations to the validated migratable targets (never shadow)
-  const mergedEnvForMigrations: Record<string, string | undefined> = {
-    ...env,
-    DATABASE_URL: envValidation.resolvedUrls.dev,
-    UNIT_TEST_DATABASE_URL: envValidation.resolvedUrls.test,
-    TEST_DATABASE_URL: envValidation.resolvedUrls.integration,
-    STAGING_DATABASE_URL: envValidation.resolvedUrls.staging,
-    STAGING_POSTGRES_USER: inMemoryBundle.stagingEnv.STAGING_POSTGRES_USER,
-    STAGING_POSTGRES_PASSWORD: inMemoryBundle.stagingEnv.STAGING_POSTGRES_PASSWORD,
-    STAGING_POSTGRES_DB: inMemoryBundle.stagingEnv.STAGING_POSTGRES_DB,
-    SHADOW_DATABASE_URL: envValidation.resolvedUrls.shadow,
-  };
-
-  for (const target of recreatedTargets) {
-    const spec = COREERP_LOCAL_RESET_SPECS[target];
-    if (!spec.applyMigrations) {
-      logger.log(
-        `   ℹ Skipping direct schema migration for "${target}" (${spec.database}): Prisma manages the shadow database automatically.`
-      );
-      continue;
-    }
-
-    const migRes = await runTargetMigration({
-      target,
-      execute: true,
-      env: mergedEnvForMigrations,
-      logger,
-    });
-    if (migRes.exitCode !== 0) {
-      return failAfterDestruction(
-        `Migration failed for target "${target}": ${migRes.error || `exit code ${migRes.exitCode}`}`
-      );
-    }
-    migratedTargets.push(target);
-    completedSteps.push(`MIGRATED_TARGET:${target}`);
-  }
-
-  // 8.7 Run full staging verification when staging is included
-  let stagingVerified = false;
-  if (willVerifyStaging) {
-    const verifyRes = await runStagingVerify({
-      execute: true,
-      env: mergedEnvForMigrations,
-      logger,
-    });
-    if (verifyRes.exitCode !== 0) {
-      return failAfterDestruction(
-        `Post-reset staging verification failed: ${verifyRes.error || `exit code ${verifyRes.exitCode}`}`
-      );
-    }
-    stagingVerified = true;
-    completedSteps.push('STAGING_VERIFIED');
-  }
-
-  logger.log('\n✅ CoreERP scoped local Docker clean-reset and fresh installation COMPLETED.\n');
-  return {
-    exitCode: 0,
-    mode: 'EXECUTE',
-    targets,
-    matchedContainers,
-    matchedVolumes,
-    skippedForeignVolumes,
-    removedContainers,
-    removedVolumes,
-    backedUpEnvFiles,
-    recreatedTargets,
-    migratedTargets,
-    stagingVerified,
-    completedSteps,
-    plan,
-  };
 }
