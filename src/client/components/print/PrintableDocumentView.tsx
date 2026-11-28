@@ -1,14 +1,18 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import {
   AlertCircle,
   ArrowLeft,
+  ChevronDown,
   Download,
   FileDown,
+  FileSpreadsheet,
   FileText,
   Globe,
+  Image as ImageIcon,
   Maximize2,
   Printer,
+  SlidersHorizontal,
   X,
 } from 'lucide-react';
 import {
@@ -16,10 +20,13 @@ import {
   CompanyBankAccountItem,
   CompanyProfile,
   CustomerReceiptItem,
+  DocumentCopyLabel,
   DocumentLanguage,
   DocumentPrintLayoutConfig,
   DocumentPrintType,
   InvoiceItem,
+  PageOrientation,
+  PaperSize,
   QuotationItem,
   VisualElementKey,
   VisualTextFontFamily,
@@ -27,6 +34,7 @@ import {
 import {
   getEffectivePaperDimensionsMm,
   getVisualElementTypography,
+  MAX_BRANDING_FILE_SIZE_BYTES,
   normalizeDocumentVisualElements,
 } from '../../../shared/branding.ts';
 import {
@@ -38,7 +46,13 @@ import { formatDateTimeInTimezone, getEffectiveTimeZone } from '../../../shared/
 import {
   buildExportFileName,
   type DocumentExportBrandingImages,
+  formatCompanyAddressLines,
+  formatCopyLabelText,
+  resolveCompanyContactParts,
+  resolveCompanyTaxId,
   resolveDocumentEffectiveBranding,
+  resolvePaymentQrDisplaySizeMm,
+  shouldDisplayPaymentQr,
 } from '../../../shared/export/document-branding.ts';
 import { api, ApiError } from '../../services/api.ts';
 
@@ -46,6 +60,65 @@ export type PrintableDocumentPayload =
   | { type: 'QUOTATION'; data: QuotationItem }
   | { type: 'INVOICE'; data: InvoiceItem }
   | { type: 'RECEIPT'; data: CustomerReceiptItem };
+
+/**
+ * Stable identity key used to reset per-document preview/export overrides
+ * whenever the user switches to a different document or document type.
+ */
+export function getDocumentPreviewResetKey(document: PrintableDocumentPayload): string {
+  const id = (document.data as { id?: string | null }).id || '';
+  return `${document.type}:${id}`;
+}
+
+/**
+ * Safely decodes a validated raster `data:image/(png|jpeg|jpg);base64,...` URI
+ * for Preview Mode DOCX export. Validates strict MIME allowlist, size limit,
+ * and actual PNG/JPEG magic bytes so SVG/HTML/arbitrary schemes are rejected.
+ */
+export function decodePreviewRasterDataUri(url: string): Uint8Array | null {
+  if (typeof url !== 'string') return null;
+  const trimmed = url.trim();
+  const match = /^data:image\/(png|jpeg|jpg);base64,([A-Za-z0-9+/=\s]+)$/i.exec(trimmed);
+  if (!match) return null;
+
+  const declaredKind = match[1].toLowerCase();
+  const base64Payload = match[2].replace(/\s+/g, '');
+  if (!base64Payload) return null;
+
+  // Quick pre-decode upper-bound guard against oversized payloads
+  const estimatedBytes = Math.ceil((base64Payload.length * 3) / 4);
+  if (estimatedBytes > MAX_BRANDING_FILE_SIZE_BYTES + 4) return null;
+
+  let bytes: Uint8Array;
+  try {
+    if (typeof atob === 'function') {
+      const binary = atob(base64Payload);
+      bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+    } else if (typeof Buffer !== 'undefined') {
+      const buf = Buffer.from(base64Payload, 'base64');
+      bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+    } else {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  if (bytes.length < 8 || bytes.length > MAX_BRANDING_FILE_SIZE_BYTES) return null;
+
+  const isPng =
+    bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47;
+  const isJpeg = bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+
+  if (declaredKind === 'png' && !isPng) return null;
+  if ((declaredKind === 'jpeg' || declaredKind === 'jpg') && !isJpeg) return null;
+  if (!isPng && !isJpeg) return null;
+
+  return bytes;
+}
 
 interface PrintableDocumentViewProps {
   document: PrintableDocumentPayload;
@@ -115,8 +188,14 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
   onClose,
 }) => {
   const docType: DocumentPrintType = document.type;
-  const [exportingFormat, setExportingFormat] = useState<'pdf' | 'docx' | null>(null);
+  const [exportingFormat, setExportingFormat] = useState<
+    'pdf' | 'docx' | 'xlsx' | 'jpg' | 'png' | null
+  >(null);
   const [exportError, setExportError] = useState<string | null>(null);
+  const [showDownloadMenu, setShowDownloadMenu] = useState(false);
+  const [showExportOptions, setShowExportOptions] = useState(false);
+  const downloadMenuRef = useRef<HTMLDivElement | null>(null);
+  const exportOptionsRef = useRef<HTMLDivElement | null>(null);
 
   const resolvedBranding = useMemo(
     () =>
@@ -132,15 +211,63 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
   const effectiveProfile = resolvedBranding.effectiveProfile;
   const resolvedSavedLayout = resolvedBranding.layout;
 
-  // Allow temporary interactive language toggle in modal preview without mutating saved DB config
+  // Temporary interactive preview & export overrides (never mutate saved DB config)
   const [previewLanguage, setPreviewLanguage] = useState<DocumentLanguage | null>(null);
+  const [previewPaperSize, setPreviewPaperSize] = useState<PaperSize | null>(null);
+  const [previewOrientation, setPreviewOrientation] = useState<PageOrientation | null>(null);
+  const [imageQuality, setImageQuality] = useState<'standard' | 'high'>('standard');
+  const [copyLabel, setCopyLabel] = useState<DocumentCopyLabel | ''>('');
+  const [includePaymentQrOverride, setIncludePaymentQrOverride] = useState<boolean | undefined>(
+    undefined
+  );
+
+  // Reset per-document temporary preview/export overrides whenever the active document changes
+  const documentResetKey = getDocumentPreviewResetKey(document);
+  useEffect(() => {
+    setPreviewLanguage(null);
+    setPreviewPaperSize(null);
+    setPreviewOrientation(null);
+    setImageQuality('standard');
+    setCopyLabel('');
+    setIncludePaymentQrOverride(undefined);
+    setExportError(null);
+  }, [documentResetKey]);
+
   const layout: DocumentPrintLayoutConfig = useMemo(
     () => ({
       ...resolvedSavedLayout,
       language: previewLanguage || resolvedSavedLayout.language,
+      paperSize: previewPaperSize || resolvedSavedLayout.paperSize,
+      orientation: previewOrientation || resolvedSavedLayout.orientation,
     }),
-    [resolvedSavedLayout, previewLanguage]
+    [resolvedSavedLayout, previewLanguage, previewPaperSize, previewOrientation]
   );
+
+  // Close dropdown menus when clicking outside
+  useEffect(() => {
+    if (!showDownloadMenu && !showExportOptions) return;
+    const handleOutside = (event: MouseEvent) => {
+      const target = event.target as Node | null;
+      if (
+        showDownloadMenu &&
+        downloadMenuRef.current &&
+        target &&
+        !downloadMenuRef.current.contains(target)
+      ) {
+        setShowDownloadMenu(false);
+      }
+      if (
+        showExportOptions &&
+        exportOptionsRef.current &&
+        target &&
+        !exportOptionsRef.current.contains(target)
+      ) {
+        setShowExportOptions(false);
+      }
+    };
+    window.document.addEventListener('mousedown', handleOutside);
+    return () => window.document.removeEventListener('mousedown', handleOutside);
+  }, [showDownloadMenu, showExportOptions]);
 
   const visualElements = useMemo(
     () =>
@@ -285,10 +412,39 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
     effectiveProfile?.sealUrl ||
     effectiveProfile?.brandingAssets?.seal?.url ||
     '';
+  const resolvedPaymentQrUrl =
+    layout.paymentQrUrl ||
+    effectiveProfile?.documentBranding?.paymentQrUrl ||
+    effectiveProfile?.paymentQrUrl ||
+    effectiveProfile?.brandingAssets?.paymentQr?.url ||
+    '';
   const resolvedSignatoryName =
     layout.signatoryName || effectiveProfile?.documentBranding?.signatoryName || '';
   const resolvedSignatoryTitle =
     layout.signatoryTitle || effectiveProfile?.documentBranding?.signatureTitle || '';
+
+  const companyAddressLines = useMemo(
+    () => formatCompanyAddressLines(effectiveProfile),
+    [effectiveProfile]
+  );
+  const companyContactParts = useMemo(
+    () => resolveCompanyContactParts(effectiveProfile),
+    [effectiveProfile]
+  );
+  const resolvedCompanyTaxId = useMemo(
+    () => resolveCompanyTaxId(effectiveProfile),
+    [effectiveProfile]
+  );
+  const copyLabelBadgeText = formatCopyLabelText(copyLabel || undefined);
+  const showPaymentQrOnSheet = shouldDisplayPaymentQr({
+    layout,
+    document,
+    qrSource: resolvedPaymentQrUrl,
+    includePaymentQrOverride,
+  });
+  const paymentQrSizeMm = resolvePaymentQrDisplaySizeMm(layout.paymentQrSize);
+  const paymentQrPosition = layout.paymentQrPosition || 'bottom-right';
+  const paymentQrLabel = (layout.paymentQrLabel || 'Scan to Pay').trim();
 
   const termsText =
     (document.type !== 'RECEIPT' ? document.data.terms : null) || layout.defaultTermsText;
@@ -308,8 +464,25 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
     window.setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
+  const fetchPreviewRasterBytes = async (url?: string | null): Promise<Uint8Array | null> => {
+    if (!url) return null;
+    if (url.startsWith('data:')) {
+      return decodePreviewRasterDataUri(url);
+    }
+    if (!url.startsWith('/')) return null;
+    try {
+      const resp = await fetch(url, { credentials: 'include' });
+      if (!resp.ok) return null;
+      const buf = new Uint8Array(await resp.arrayBuffer());
+      return buf;
+    } catch {
+      return null;
+    }
+  };
+
   const handleExportPdf = async () => {
     setExportError(null);
+    setShowDownloadMenu(false);
     if (currentUser?.isPreview) {
       window.print();
       return;
@@ -320,6 +493,8 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
         document,
         layoutOverride: layout,
         isDraftPreview,
+        copyLabel: copyLabel || undefined,
+        includePaymentQr: includePaymentQrOverride,
       });
       triggerBlobDownload(
         blob,
@@ -336,32 +511,23 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
     }
   };
 
-  const fetchPreviewRasterBytes = async (url?: string | null): Promise<Uint8Array | null> => {
-    if (!url || !url.startsWith('/')) return null;
-    try {
-      const resp = await fetch(url, { credentials: 'include' });
-      if (!resp.ok) return null;
-      const buf = new Uint8Array(await resp.arrayBuffer());
-      return buf;
-    } catch {
-      return null;
-    }
-  };
-
   const handleExportDocx = async () => {
     setExportError(null);
+    setShowDownloadMenu(false);
     try {
       setExportingFormat('docx');
       if (currentUser?.isPreview) {
-        const [logoBytes, sealBytes, signatureBytes] = await Promise.all([
+        const [logoBytes, sealBytes, signatureBytes, paymentQrBytes] = await Promise.all([
           fetchPreviewRasterBytes(resolvedLogoUrl),
           fetchPreviewRasterBytes(resolvedSealUrl),
           fetchPreviewRasterBytes(resolvedSignatureUrl),
+          showPaymentQrOnSheet ? fetchPreviewRasterBytes(resolvedPaymentQrUrl) : Promise.resolve(null),
         ]);
         const brandingImages: DocumentExportBrandingImages = {
           logo: logoBytes,
           seal: sealBytes,
           signature: signatureBytes,
+          paymentQr: paymentQrBytes,
         };
         const { generateDocxBlob } = await import('../../../shared/export/docx-builder.ts');
         const blob = await generateDocxBlob({
@@ -371,6 +537,8 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
           bankAccount: canDisplayBankDetails ? bankAccount : null,
           isDraftPreview,
           brandingImages,
+          copyLabel: copyLabel || undefined,
+          includePaymentQr: includePaymentQrOverride,
         });
         triggerBlobDownload(blob, buildExportFileName(document, 'docx', isDraftPreview));
         return;
@@ -380,6 +548,8 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
         document,
         layoutOverride: layout,
         isDraftPreview,
+        copyLabel: copyLabel || undefined,
+        includePaymentQr: includePaymentQrOverride,
       });
       triggerBlobDownload(
         blob,
@@ -391,6 +561,61 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
       } else {
         setExportError('Failed to export Word document.');
       }
+    } finally {
+      setExportingFormat(null);
+    }
+  };
+
+  const handleExportXlsx = async () => {
+    setExportError(null);
+    setShowDownloadMenu(false);
+    try {
+      setExportingFormat('xlsx');
+      const { generateXlsxBlob } = await import('../../../shared/export/xlsx-builder.ts');
+      const blob = generateXlsxBlob({
+        document,
+        companyProfile: effectiveProfile,
+        layoutOverride: layout,
+        bankAccount: canDisplayBankDetails ? bankAccount : null,
+        isDraftPreview,
+        copyLabel: copyLabel || undefined,
+        includePaymentQr: includePaymentQrOverride,
+      });
+      triggerBlobDownload(blob, buildExportFileName(document, 'xlsx', isDraftPreview));
+    } catch (err: unknown) {
+      setExportError(
+        err instanceof Error ? err.message : 'Failed to export Excel spreadsheet.'
+      );
+    } finally {
+      setExportingFormat(null);
+    }
+  };
+
+  const handleExportImage = async (format: 'jpg' | 'png') => {
+    setExportError(null);
+    setShowDownloadMenu(false);
+    try {
+      setExportingFormat(format);
+      const { generateDocumentImageExport } = await import('../../utils/invoice-image-export.ts');
+      const result = await generateDocumentImageExport(
+        {
+          document,
+          companyProfile: effectiveProfile,
+          layoutOverride: layout,
+          bankAccount: canDisplayBankDetails ? bankAccount : null,
+          isDraftPreview,
+          copyLabel: copyLabel || undefined,
+          includePaymentQr: includePaymentQrOverride,
+        },
+        { format, quality: imageQuality }
+      );
+      triggerBlobDownload(result.blob, result.fileName);
+    } catch (err: unknown) {
+      setExportError(
+        err instanceof Error
+          ? err.message
+          : `Failed to export ${format.toUpperCase()} image.`
+      );
     } finally {
       setExportingFormat(null);
     }
@@ -419,9 +644,11 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
       {layout.headerText && (
         <div className="text-[9.5px] text-slate-500 border-b border-slate-200 pb-1 mb-2.5 flex items-center justify-between">
           <span>{layout.headerText}</span>
-          <span className="uppercase tracking-wider font-medium">
-            {getDocumentLabel('originalForRecipient', layout.language).primary}
-          </span>
+          {!copyLabelBadgeText && (
+            <span className="uppercase tracking-wider font-medium">
+              {getDocumentLabel('originalForRecipient', layout.language).primary}
+            </span>
+          )}
         </div>
       )}
 
@@ -492,8 +719,10 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
             >
               {layout.showCompanyContact && (
                 <div className="space-y-0.5">
-                  {effectiveProfile?.address && <div>{effectiveProfile.address}</div>}
-                  {(effectiveProfile?.phone || effectiveProfile?.email || effectiveProfile?.website) && (
+                  {companyAddressLines.map((line, index) => (
+                    <div key={`${line}-${index}`}>{line}</div>
+                  ))}
+                  {companyContactParts.length > 0 && (
                     <div
                       className={`flex flex-wrap gap-x-2.5 gap-y-0.5 ${
                         visualElements.companyHeader.align === 'center'
@@ -503,18 +732,18 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
                           : 'justify-start'
                       }`}
                     >
-                      {effectiveProfile.phone && <span>{effectiveProfile.phone}</span>}
-                      {effectiveProfile.email && <span>{effectiveProfile.email}</span>}
-                      {effectiveProfile.website && <span>{effectiveProfile.website}</span>}
+                      {companyContactParts.map((part, idx) => (
+                        <span key={`${part}-${idx}`}>{part}</span>
+                      ))}
                     </div>
                   )}
                 </div>
               )}
 
-              {layout.showCompanyTaxId && effectiveProfile?.taxId && (
+              {layout.showCompanyTaxId && resolvedCompanyTaxId && (
                 <div className="text-slate-700 font-medium mt-0.5">
                   <BilingualText labelKey="taxId" language={layout.language} inline />:{' '}
-                  <span className="font-mono">{effectiveProfile.taxId}</span>
+                  <span className="font-mono">{resolvedCompanyTaxId}</span>
                 </div>
               )}
             </div>
@@ -527,6 +756,14 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
             maxWidth: useVisual ? `${visualElements.documentTitle.widthMm}mm` : undefined,
           }}
         >
+          {copyLabelBadgeText && (
+            <div className="mb-1 flex justify-end">
+              <span className="inline-block px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider border border-slate-400 text-slate-700 rounded bg-slate-50">
+                {copyLabelBadgeText}
+              </span>
+            </div>
+          )}
+
           {(!useVisual || visualElements.documentTitle.visible) && (
             <div
               style={{
@@ -1019,73 +1256,123 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
         </div>
       )}
 
-      {/* Authorized Signature & Seal */}
-      {layout.showSignatureSection && (
+      {/* Optional Uploaded UPI Payment QR + Authorized Signature & Seal */}
+      {(layout.showSignatureSection || showPaymentQrOnSheet) && (
         <div
-          className={`print-avoid-break flex items-end gap-5 pt-2 pb-2 ${
-            visualElements.signature.align === 'left'
+          className={`print-avoid-break flex flex-wrap items-end gap-5 pt-2 pb-2 ${
+            showPaymentQrOnSheet && layout.showSignatureSection
+              ? paymentQrPosition === 'bottom-left'
+                ? 'justify-between'
+                : 'justify-end'
+              : showPaymentQrOnSheet
+              ? paymentQrPosition === 'bottom-left'
+                ? 'justify-start'
+                : 'justify-end'
+              : visualElements.signature.align === 'left'
               ? 'justify-start'
               : visualElements.signature.align === 'center'
               ? 'justify-center'
               : 'justify-end'
           }`}
         >
-          {(!useVisual || visualElements.seal.visible) && resolvedSealUrl && (
-            <img
-              src={resolvedSealUrl}
-              alt="Company Seal"
-              className={useVisual ? 'object-contain opacity-90' : 'h-14 w-14 object-contain opacity-85'}
-              style={
-                useVisual
-                  ? {
-                      width: `${visualElements.seal.widthMm}mm`,
-                      height: `${visualElements.seal.heightMm}mm`,
-                    }
-                  : undefined
-              }
-            />
+          {showPaymentQrOnSheet && paymentQrPosition === 'bottom-left' && (
+            <div className="border border-slate-200 rounded-md p-2 bg-white text-center shrink-0">
+              <img
+                src={resolvedPaymentQrUrl}
+                alt={paymentQrLabel || 'UPI Payment QR Code'}
+                className="object-contain mx-auto"
+                style={{
+                  width: `${paymentQrSizeMm}mm`,
+                  height: `${paymentQrSizeMm}mm`,
+                }}
+              />
+              {paymentQrLabel && (
+                <div className="text-[9.5px] font-semibold text-slate-700 mt-1">
+                  {paymentQrLabel}
+                </div>
+              )}
+            </div>
           )}
-          {(!useVisual || visualElements.signature.visible || visualElements.signatoryLabels.visible) && (
-            <div className="text-center min-w-[165px]">
-              {(!useVisual || visualElements.signature.visible) &&
-                (resolvedSignatureUrl ? (
-                  <img
-                    src={resolvedSignatureUrl}
-                    alt="Authorized Signature"
-                    className={useVisual ? 'mx-auto object-contain mb-1' : 'h-11 mx-auto object-contain mb-1'}
-                    style={
-                      useVisual
-                        ? {
-                            width: `${visualElements.signature.widthMm}mm`,
-                            height: `${visualElements.signature.heightMm}mm`,
-                          }
-                        : undefined
-                    }
-                  />
-                ) : (
-                  <div className="h-8" />
-                ))}
-              {(!useVisual || visualElements.signatoryLabels.visible) && (
-                <div style={elStyle('signatoryLabels')}>
-                  <div className="border-t border-slate-400 pt-1 text-slate-800">
-                    {resolvedSignatoryName || (
-                      <span>
-                        {layout.signatureLabel ||
-                          getDocumentLabel('authorizedSignature', layout.language).primary}
-                      </span>
-                    )}
-                  </div>
-                  {layout.language !== 'EN' && (
-                    <div className="font-kannada text-[0.88em] font-normal text-slate-500">
-                      {getDocumentLabel('authorizedSignature', layout.language).secondary ||
-                        getDocumentLabel('authorizedSignature', layout.language).primary}
+
+          {layout.showSignatureSection && (
+            <div className="flex items-end gap-5">
+              {(!useVisual || visualElements.seal.visible) && resolvedSealUrl && (
+                <img
+                  src={resolvedSealUrl}
+                  alt="Company Seal"
+                  className={useVisual ? 'object-contain opacity-90' : 'h-14 w-14 object-contain opacity-85'}
+                  style={
+                    useVisual
+                      ? {
+                          width: `${visualElements.seal.widthMm}mm`,
+                          height: `${visualElements.seal.heightMm}mm`,
+                        }
+                      : undefined
+                  }
+                />
+              )}
+              {(!useVisual || visualElements.signature.visible || visualElements.signatoryLabels.visible) && (
+                <div className="text-center min-w-[165px]">
+                  {(!useVisual || visualElements.signature.visible) &&
+                    (resolvedSignatureUrl ? (
+                      <img
+                        src={resolvedSignatureUrl}
+                        alt="Authorized Signature"
+                        className={useVisual ? 'mx-auto object-contain mb-1' : 'h-11 mx-auto object-contain mb-1'}
+                        style={
+                          useVisual
+                            ? {
+                                width: `${visualElements.signature.widthMm}mm`,
+                                height: `${visualElements.signature.heightMm}mm`,
+                              }
+                            : undefined
+                        }
+                      />
+                    ) : (
+                      <div className="h-8" />
+                    ))}
+                  {(!useVisual || visualElements.signatoryLabels.visible) && (
+                    <div style={elStyle('signatoryLabels')}>
+                      <div className="border-t border-slate-400 pt-1 text-slate-800">
+                        {resolvedSignatoryName || (
+                          <span>
+                            {layout.signatureLabel ||
+                              getDocumentLabel('authorizedSignature', layout.language).primary}
+                          </span>
+                        )}
+                      </div>
+                      {layout.language !== 'EN' && (
+                        <div className="font-kannada text-[0.88em] font-normal text-slate-500">
+                          {getDocumentLabel('authorizedSignature', layout.language).secondary ||
+                            getDocumentLabel('authorizedSignature', layout.language).primary}
+                        </div>
+                      )}
+                      {resolvedSignatoryTitle && (
+                        <div className="text-[0.88em] font-normal text-slate-500">
+                          {resolvedSignatoryTitle}
+                        </div>
+                      )}
                     </div>
                   )}
-                  {resolvedSignatoryTitle && (
-                    <div className="text-[0.88em] font-normal text-slate-500">
-                      {resolvedSignatoryTitle}
-                    </div>
-                  )}
+                </div>
+              )}
+            </div>
+          )}
+
+          {showPaymentQrOnSheet && paymentQrPosition === 'bottom-right' && (
+            <div className="border border-slate-200 rounded-md p-2 bg-white text-center shrink-0">
+              <img
+                src={resolvedPaymentQrUrl}
+                alt={paymentQrLabel || 'UPI Payment QR Code'}
+                className="object-contain mx-auto"
+                style={{
+                  width: `${paymentQrSizeMm}mm`,
+                  height: `${paymentQrSizeMm}mm`,
+                }}
+              />
+              {paymentQrLabel && (
+                <div className="text-[9.5px] font-semibold text-slate-700 mt-1">
+                  {paymentQrLabel}
                 </div>
               )}
             </div>
@@ -1209,6 +1496,118 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
                 </button>
               )}
 
+              {/* Export Options Popover */}
+              <div className="relative" ref={exportOptionsRef}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowExportOptions((prev) => !prev);
+                    setShowDownloadMenu(false);
+                  }}
+                  className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition whitespace-nowrap shrink-0 cursor-pointer border ${
+                    showExportOptions
+                      ? 'bg-slate-800 border-indigo-500 text-white'
+                      : 'bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-200'
+                  }`}
+                >
+                  <SlidersHorizontal className="w-3.5 h-3.5" />
+                  <span>Options</span>
+                </button>
+
+                {showExportOptions && (
+                  <div className="absolute right-0 mt-2 w-72 bg-slate-950 border border-slate-700 rounded-xl shadow-2xl p-3.5 z-50 space-y-3 text-xs">
+                    <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                      <span className="font-bold text-slate-200 uppercase tracking-wider text-[11px]">
+                        Export &amp; Print Options
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPreviewPaperSize(null);
+                          setPreviewOrientation(null);
+                          setImageQuality('standard');
+                          setCopyLabel('');
+                          setIncludePaymentQrOverride(undefined);
+                        }}
+                        className="text-[11px] text-indigo-400 hover:text-indigo-300 cursor-pointer"
+                      >
+                        Reset
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-1">Paper Size</label>
+                        <select
+                          value={layout.paperSize}
+                          onChange={(e) => setPreviewPaperSize(e.target.value as PaperSize)}
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-100"
+                        >
+                          <option value="A4">A4</option>
+                          <option value="A5">A5</option>
+                          <option value="Letter">Letter</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-1">Orientation</label>
+                        <select
+                          value={layout.orientation}
+                          onChange={(e) =>
+                            setPreviewOrientation(e.target.value as PageOrientation)
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-100"
+                        >
+                          <option value="portrait">Portrait</option>
+                          <option value="landscape">Landscape</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-1">Image Quality</label>
+                        <select
+                          value={imageQuality}
+                          onChange={(e) =>
+                            setImageQuality(e.target.value as 'standard' | 'high')
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-100"
+                        >
+                          <option value="standard">Standard (150 DPI)</option>
+                          <option value="high">High (300 DPI)</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-[11px] text-slate-400 mb-1">Copy Label</label>
+                        <select
+                          value={copyLabel}
+                          onChange={(e) =>
+                            setCopyLabel(e.target.value as DocumentCopyLabel | '')
+                          }
+                          className="w-full bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs text-slate-100"
+                        >
+                          <option value="">None (Default)</option>
+                          <option value="ORIGINAL">Original</option>
+                          <option value="DUPLICATE">Duplicate</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    {resolvedPaymentQrUrl && (
+                      <label className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800 cursor-pointer">
+                        <span className="text-[11px] text-slate-300">Include Payment QR</span>
+                        <input
+                          type="checkbox"
+                          checked={showPaymentQrOnSheet}
+                          onChange={(e) => setIncludePaymentQrOverride(e.target.checked)}
+                          className="rounded border-slate-700 bg-slate-900 text-indigo-600"
+                        />
+                      </label>
+                    )}
+                  </div>
+                )}
+              </div>
+
               <button
                 type="button"
                 onClick={() => window.print()}
@@ -1233,15 +1632,83 @@ export const PrintableDocumentView: React.FC<PrintableDocumentViewProps> = ({
                 <span>{exportingFormat === 'pdf' ? 'Exporting PDF...' : 'Save as PDF'}</span>
               </button>
 
-              <button
-                type="button"
-                onClick={handleExportDocx}
-                disabled={exportingFormat !== null}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                <Download className="w-3.5 h-3.5" />
-                <span>{exportingFormat === 'docx' ? 'Exporting Word...' : 'Download Word (.docx)'}</span>
-              </button>
+              {/* Unified Download Menu (DOCX, JPG, PNG, XLSX, PDF, Browser Print) */}
+              <div className="relative" ref={downloadMenuRef}>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowDownloadMenu((prev) => !prev);
+                    setShowExportOptions(false);
+                  }}
+                  disabled={exportingFormat !== null}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold transition whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>
+                    {exportingFormat && exportingFormat !== 'pdf'
+                      ? `Exporting ${exportingFormat.toUpperCase()}...`
+                      : 'Download'}
+                  </span>
+                  <ChevronDown className="w-3.5 h-3.5" />
+                </button>
+
+                {showDownloadMenu && (
+                  <div className="absolute right-0 mt-2 w-56 bg-slate-950 border border-slate-700 rounded-xl shadow-2xl py-1.5 z-50 text-xs">
+                    <button
+                      type="button"
+                      onClick={handleExportPdf}
+                      className="w-full px-3.5 py-2 text-left text-slate-200 hover:bg-slate-800 flex items-center gap-2.5 cursor-pointer"
+                    >
+                      <FileDown className="w-3.5 h-3.5 text-indigo-400 shrink-0" />
+                      <span>PDF Document (.pdf)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleExportImage('jpg')}
+                      className="w-full px-3.5 py-2 text-left text-slate-200 hover:bg-slate-800 flex items-center gap-2.5 cursor-pointer"
+                    >
+                      <ImageIcon className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                      <span>JPG Image (.jpg)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleExportImage('png')}
+                      className="w-full px-3.5 py-2 text-left text-slate-200 hover:bg-slate-800 flex items-center gap-2.5 cursor-pointer"
+                    >
+                      <ImageIcon className="w-3.5 h-3.5 text-sky-400 shrink-0" />
+                      <span>PNG Image (.png)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleExportDocx}
+                      className="w-full px-3.5 py-2 text-left text-slate-200 hover:bg-slate-800 flex items-center gap-2.5 cursor-pointer"
+                    >
+                      <FileText className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      <span>Word Document (.docx)</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleExportXlsx}
+                      className="w-full px-3.5 py-2 text-left text-slate-200 hover:bg-slate-800 flex items-center gap-2.5 cursor-pointer"
+                    >
+                      <FileSpreadsheet className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                      <span>Excel Workbook (.xlsx)</span>
+                    </button>
+                    <div className="my-1 border-t border-slate-800" />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowDownloadMenu(false);
+                        window.print();
+                      }}
+                      className="w-full px-3.5 py-2 text-left text-slate-300 hover:bg-slate-800 flex items-center gap-2.5 cursor-pointer"
+                    >
+                      <Printer className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                      <span>Browser Print</span>
+                    </button>
+                  </div>
+                )}
+              </div>
 
               {onClose && !onBackToEdit && (
                 <button

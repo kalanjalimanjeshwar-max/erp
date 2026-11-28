@@ -35,6 +35,7 @@ export const BrandingAssetCard: React.FC<BrandingAssetCardProps> = ({
   const [localError, setLocalError] = useState<string | null>(null);
   const [previewNonce, setPreviewNonce] = useState(0);
 
+  const isPaymentQr = assetType === 'PAYMENT_QR';
   const previewUrl = asset?.url || fallbackUrl || '';
 
   const processFile = async (file: File | null | undefined) => {
@@ -42,7 +43,7 @@ export const BrandingAssetCard: React.FC<BrandingAssetCardProps> = ({
     setLocalError(null);
     setIsBusy(true);
     try {
-      const payload = await fileToBrandingUploadPayload(file);
+      const payload = await fileToBrandingUploadPayload(file, assetType);
       await onUpload(assetType, payload);
       setPreviewNonce((n) => n + 1);
     } catch (err: unknown) {
@@ -73,7 +74,9 @@ export const BrandingAssetCard: React.FC<BrandingAssetCardProps> = ({
       <div className="space-y-1">
         <div className="flex items-center justify-between gap-2">
           <h4 className="text-xs font-bold text-slate-100">{title}</h4>
-          <span className="text-[10px] font-mono text-slate-400">PNG / JPG / WebP · Max 2 MB</span>
+          <span className="text-[10px] font-mono text-slate-400">
+            {isPaymentQr ? 'PNG / JPG / JPEG · Max 2 MB' : 'PNG / JPG / WebP · Max 2 MB'}
+          </span>
         </div>
         <p className="text-[11px] text-slate-400 leading-relaxed">{description}</p>
       </div>
@@ -160,7 +163,11 @@ export const BrandingAssetCard: React.FC<BrandingAssetCardProps> = ({
         <input
           ref={inputRef}
           type="file"
-          accept=".png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"
+          accept={
+            isPaymentQr
+              ? '.png,.jpg,.jpeg,image/png,image/jpeg'
+              : '.png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp'
+          }
           className="hidden"
           onChange={(e) => processFile(e.target.files?.[0])}
         />

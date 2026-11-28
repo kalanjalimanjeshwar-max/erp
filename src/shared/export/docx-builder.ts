@@ -41,6 +41,12 @@ import {
   resolveEffectivePrintLayout,
   resolveDocumentEffectiveBranding,
   buildExportFileName,
+  formatCompanyAddressLines,
+  resolveCompanyContactParts,
+  resolveCompanyTaxId,
+  formatCopyLabelText,
+  shouldDisplayPaymentQr,
+  resolvePaymentQrDisplaySizeMm,
 } from './document-branding.ts';
 
 export {
@@ -50,6 +56,12 @@ export {
   resolveEffectivePrintLayout,
   resolveDocumentEffectiveBranding,
   buildExportFileName,
+  formatCompanyAddressLines,
+  resolveCompanyContactParts,
+  resolveCompanyTaxId,
+  formatCopyLabelText,
+  shouldDisplayPaymentQr,
+  resolvePaymentQrDisplaySizeMm,
 };
 
 const MM_TO_TWIPS = 56.6929133858;
@@ -182,8 +194,15 @@ function createRasterImageRun(
 }
 
 export function createWordDocument(context: DocumentExportContext): Document {
-  const { document: docPayload, layoutOverride, bankAccount, isDraftPreview, brandingImages } =
-    context;
+  const {
+    document: docPayload,
+    layoutOverride,
+    bankAccount,
+    isDraftPreview,
+    brandingImages,
+    copyLabel,
+    includePaymentQr,
+  } = context;
   const docType = docPayload.type;
   const { effectiveProfile: companyProfile, layout } = resolveDocumentEffectiveBranding(
     docPayload,
@@ -284,12 +303,17 @@ export function createWordDocument(context: DocumentExportContext): Document {
 
   const children: Array<Paragraph | Table> = [];
 
-  // Optional header text
-  if (layout.headerText || isDraftPreview) {
+  const resolvedCopyLabel = formatCopyLabelText(copyLabel);
+
+  // Optional header text or explicit copy label
+  if (layout.headerText || isDraftPreview || resolvedCopyLabel) {
     const parts = [
       layout.headerText,
       isDraftPreview ? 'DRAFT PREVIEW' : null,
-      getDocumentLabel('originalForRecipient', layout.language).primary,
+      resolvedCopyLabel ||
+        (layout.headerText || isDraftPreview
+          ? getDocumentLabel('originalForRecipient', layout.language).primary
+          : null),
     ].filter(Boolean);
     children.push(
       new Paragraph({
@@ -369,12 +393,13 @@ export function createWordDocument(context: DocumentExportContext): Document {
 
   if (companyHeaderVisible) {
     if (layout.showCompanyContact) {
-      if (companyProfile?.address) {
+      const addressLines = formatCompanyAddressLines(companyProfile);
+      for (const addrLine of addressLines) {
         companyLines.push(
           new Paragraph({
             alignment: headerAlign,
             spacing: { after: 20, line: headerTypo.lineTwips },
-            children: makeTextRuns(companyProfile.address, {
+            children: makeTextRuns(addrLine, {
               bold: headerTypo.bold,
               size: headerTypo.halfPt,
               color: '475569',
@@ -384,11 +409,7 @@ export function createWordDocument(context: DocumentExportContext): Document {
           })
         );
       }
-      const contactParts = [
-        companyProfile?.phone,
-        companyProfile?.email,
-        companyProfile?.website,
-      ].filter(Boolean);
+      const contactParts = resolveCompanyContactParts(companyProfile);
       if (contactParts.length > 0) {
         companyLines.push(
           new Paragraph({
@@ -405,13 +426,14 @@ export function createWordDocument(context: DocumentExportContext): Document {
         );
       }
     }
-    if (layout.showCompanyTaxId && companyProfile?.taxId) {
+    const resolvedTaxId = resolveCompanyTaxId(companyProfile);
+    if (layout.showCompanyTaxId && resolvedTaxId) {
       companyLines.push(
         new Paragraph({
           alignment: headerAlign,
           spacing: { after: 20, line: headerTypo.lineTwips },
           children: makeTextRuns(
-            `${formatLabelText('taxId', layout.language)}: ${companyProfile.taxId}`,
+            `${formatLabelText('taxId', layout.language)}: ${resolvedTaxId}`,
             {
               bold: true,
               size: headerTypo.halfPt,
@@ -1366,7 +1388,74 @@ export function createWordDocument(context: DocumentExportContext): Document {
     const sigLabelAlign = useVisual ? sigLabelsTypo.docxAlign : sigAlign;
     const sealAlign = toDocxAlignment(sealVisual.align || 'center');
 
-    if (sealImgRun || sigImgRun) {
+    const showQr = shouldDisplayPaymentQr({
+      document: docPayload,
+      layout,
+      qrSource: brandingImages?.paymentQr,
+      includePaymentQrOverride: includePaymentQr,
+    });
+    const qrSizeMm = resolvePaymentQrDisplaySizeMm(layout.paymentQrSize);
+    const qrLabel = (layout.paymentQrLabel || 'Scan to Pay').trim() || 'Scan to Pay';
+    const qrPosition = layout.paymentQrPosition === 'bottom-left' ? 'bottom-left' : 'bottom-right';
+    const qrImgRun = showQr
+      ? createRasterImageRun(brandingImages?.paymentQr, qrSizeMm, qrSizeMm, qrLabel)
+      : null;
+
+    const buildQrParagraphs = (align: (typeof AlignmentType)[keyof typeof AlignmentType]) =>
+      qrImgRun
+        ? [
+            new Paragraph({
+              alignment: align,
+              spacing: { before: 40, after: 40 },
+              children: [qrImgRun],
+            }),
+            new Paragraph({
+              alignment: align,
+              spacing: { after: 40 },
+              children: makeTextRuns(qrLabel, {
+                bold: true,
+                size: 16,
+                color: '334155',
+              }),
+            }),
+          ]
+        : [];
+
+    if (qrImgRun && qrPosition === 'bottom-right') {
+      children.push(
+        new Table({
+          width: { size: 100, type: WidthType.PERCENTAGE },
+          borders: noBorders(),
+          rows: [
+            new TableRow({
+              cantSplit: true,
+              children: [
+                new TableCell({
+                  width: { size: 62, type: WidthType.PERCENTAGE },
+                  borders: noBorders(),
+                  children: [new Paragraph({ children: [] })],
+                }),
+                new TableCell({
+                  width: { size: 38, type: WidthType.PERCENTAGE },
+                  borders: {
+                    top: { style: BorderStyle.SINGLE, size: 4, color: 'CBD5E1' },
+                    bottom: { style: BorderStyle.SINGLE, size: 4, color: 'CBD5E1' },
+                    left: { style: BorderStyle.SINGLE, size: 4, color: 'CBD5E1' },
+                    right: { style: BorderStyle.SINGLE, size: 4, color: 'CBD5E1' },
+                  },
+                  margins: { top: 80, bottom: 80, left: 100, right: 100 },
+                  children: buildQrParagraphs(AlignmentType.CENTER),
+                }),
+              ],
+            }),
+          ],
+        })
+      );
+    }
+
+    const embedQrOnLeft = Boolean(qrImgRun && qrPosition === 'bottom-left');
+
+    if (sealImgRun || sigImgRun || embedQrOnLeft) {
       children.push(
         new Table({
           width: { size: 100, type: WidthType.PERCENTAGE },
@@ -1378,7 +1467,10 @@ export function createWordDocument(context: DocumentExportContext): Document {
                 new TableCell({
                   width: { size: 50, type: WidthType.PERCENTAGE },
                   borders: noBorders(),
-                  children: [new Paragraph({ children: [] })],
+                  margins: embedQrOnLeft ? { top: 80, bottom: 40, right: 120 } : undefined,
+                  children: embedQrOnLeft
+                    ? buildQrParagraphs(AlignmentType.LEFT)
+                    : [new Paragraph({ children: [] })],
                 }),
                 new TableCell({
                   width: { size: 22, type: WidthType.PERCENTAGE },
@@ -1492,6 +1584,45 @@ export function createWordDocument(context: DocumentExportContext): Document {
               size: Math.max(13, sigLabelsTypo.halfPt - 2),
               color: '64748B',
               fontFamily: sigLabelsTypo.fontFamily,
+            }),
+          })
+        );
+      }
+    }
+  } else {
+    // Signature section hidden — still render Payment QR if explicitly enabled and available
+    const showQrOnly = shouldDisplayPaymentQr({
+      document: docPayload,
+      layout,
+      qrSource: brandingImages?.paymentQr,
+      includePaymentQrOverride: includePaymentQr,
+    });
+    if (showQrOnly) {
+      const qrSizeMm = resolvePaymentQrDisplaySizeMm(layout.paymentQrSize);
+      const qrLabel = (layout.paymentQrLabel || 'Scan to Pay').trim() || 'Scan to Pay';
+      const qrPosition = layout.paymentQrPosition === 'bottom-left' ? 'bottom-left' : 'bottom-right';
+      const qrImgRun = createRasterImageRun(
+        brandingImages?.paymentQr,
+        qrSizeMm,
+        qrSizeMm,
+        qrLabel
+      );
+      if (qrImgRun) {
+        const align =
+          qrPosition === 'bottom-left' ? AlignmentType.LEFT : AlignmentType.RIGHT;
+        children.push(
+          new Paragraph({
+            alignment: align,
+            spacing: { before: 120, after: 40 },
+            children: [qrImgRun],
+          }),
+          new Paragraph({
+            alignment: align,
+            spacing: { after: 60 },
+            children: makeTextRuns(qrLabel, {
+              bold: true,
+              size: 16,
+              color: '334155',
             }),
           })
         );

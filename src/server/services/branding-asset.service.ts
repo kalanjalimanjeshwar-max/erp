@@ -15,6 +15,7 @@ import {
 } from '../../shared/types.js';
 import {
   ALLOWED_BRANDING_EXTENSIONS,
+  ALLOWED_PAYMENT_QR_EXTENSIONS,
   BRANDING_ASSETS_SETTING_KEY,
   DOCUMENT_BRANDING_SNAPSHOT_PREFIX,
   MAX_BRANDING_FILE_SIZE_BYTES,
@@ -25,6 +26,7 @@ import {
   DOCUMENT_PRINT_SETTING_KEY,
   mergeDocumentPrintSettings,
 } from '../../shared/print-settings.js';
+import { mergeSnapshotIntoCompanyProfile } from '../../shared/export/document-branding.js';
 import { AuditService } from './audit.service.js';
 
 export interface ValidatedBrandingImage {
@@ -52,12 +54,12 @@ interface StoredAssetMetaFile {
   heightPx: number;
   aspectRatio: number;
   sha256Hash: string;
-  status: 'STAGED' | 'ACTIVE' | 'PENDING_APPROVAL' | 'ARCHIVED';
+  status: 'STAGED' | 'ACTIVE' | 'PENDING_APPROVAL' | 'ARCHIVED' | 'REJECTED';
   uploadedByUserId?: string | null;
   createdAt: string;
 }
 
-const VALID_ASSET_TYPES = new Set<BrandingAssetType>(['LOGO', 'SEAL', 'SIGNATURE']);
+const VALID_ASSET_TYPES = new Set<BrandingAssetType>(['LOGO', 'SEAL', 'SIGNATURE', 'PAYMENT_QR']);
 
 function normalizeMimeType(mime?: string | null): string {
   const clean = String(mime || '')
@@ -185,12 +187,16 @@ function defaultEmptyAssetsState(): CompanyBrandingAssetsState {
     logo: null,
     seal: null,
     signature: null,
+    paymentQr: null,
   };
 }
 
-function assetTypeToSlot(assetType: BrandingAssetType): 'logo' | 'seal' | 'signature' {
+function assetTypeToSlot(
+  assetType: BrandingAssetType
+): 'logo' | 'seal' | 'signature' | 'paymentQr' {
   if (assetType === 'LOGO') return 'logo';
   if (assetType === 'SEAL') return 'seal';
+  if (assetType === 'PAYMENT_QR') return 'paymentQr';
   return 'signature';
 }
 
@@ -236,7 +242,9 @@ export class BrandingAssetService {
   static normalizeAssetType(raw: unknown): BrandingAssetType {
     const upper = String(raw || '').trim().toUpperCase();
     if (!VALID_ASSET_TYPES.has(upper as BrandingAssetType)) {
-      const err = new Error('Invalid branding asset type. Allowed: LOGO, SEAL, SIGNATURE.');
+      const err = new Error(
+        'Invalid branding asset type. Allowed: LOGO, SEAL, SIGNATURE, PAYMENT_QR.'
+      );
       (err as { statusCode?: number }).statusCode = 400;
       throw err;
     }
@@ -245,12 +253,20 @@ export class BrandingAssetService {
 
   /**
    * Validates image binary magic bytes, extension, MIME consistency, size (<= 2MB), and pixel dimensions.
+   * For PAYMENT_QR, strictly permits PNG, JPG, and JPEG only (rejects WebP, SVG, HTML, scripts, and invalid binaries).
    */
   static validateImageBuffer(
     buffer: Buffer,
     declaredMimeType?: string | null,
-    fileName?: string | null
+    fileName?: string | null,
+    assetType?: BrandingAssetType
   ): ValidatedBrandingImage {
+    const isPaymentQr = assetType === 'PAYMENT_QR';
+    const allowedExtensions: readonly string[] = isPaymentQr
+      ? ALLOWED_PAYMENT_QR_EXTENSIONS
+      : ALLOWED_BRANDING_EXTENSIONS;
+    const allowedFormatsLabel = isPaymentQr ? 'PNG, JPG, and JPEG' : 'PNG, JPG, JPEG, and WebP';
+
     const rawName = String(fileName || 'branding.png').trim();
     if (rawName.includes('..') || rawName.includes('/') || rawName.includes('\\')) {
       return {
@@ -269,7 +285,7 @@ export class BrandingAssetService {
     const sanitizedFileName =
       path.basename(rawName).replace(/[^a-zA-Z0-9._-]/g, '_') || 'branding.png';
     const ext = getExtensionFromFileName(sanitizedFileName);
-    if (ext && !(ALLOWED_BRANDING_EXTENSIONS as readonly string[]).includes(ext)) {
+    if (ext && !allowedExtensions.includes(ext)) {
       return {
         valid: false,
         mimeType: 'image/png',
@@ -279,7 +295,7 @@ export class BrandingAssetService {
         aspectRatio: 1,
         sha256Hash: '',
         sanitizedFileName,
-        error: `Unsupported file extension "${ext}". Only PNG, JPG, JPEG, and WebP images are permitted.`,
+        error: `Unsupported file extension "${ext}". Only ${allowedFormatsLabel} images are permitted.`,
       };
     }
 
@@ -329,7 +345,7 @@ export class BrandingAssetService {
         aspectRatio: 1,
         sha256Hash: '',
         sanitizedFileName,
-        error: 'Security policy rejected executable or SVG/HTML file content. Only raster PNG, JPG, JPEG, or WebP images are allowed.',
+        error: `Security policy rejected executable or SVG/HTML file content. Only raster ${allowedFormatsLabel} images are allowed.`,
       };
     }
 
@@ -351,6 +367,19 @@ export class BrandingAssetService {
       } else {
         const webpDims = parseWebpDimensions(buffer);
         if (webpDims) {
+          if (isPaymentQr) {
+            return {
+              valid: false,
+              mimeType: 'image/webp',
+              extension: 'webp',
+              widthPx: webpDims.widthPx,
+              heightPx: webpDims.heightPx,
+              aspectRatio: 1,
+              sha256Hash: '',
+              sanitizedFileName,
+              error: 'Payment QR images must be PNG, JPG, or JPEG. WebP is not supported for Payment QR.',
+            };
+          }
           detectedMime = 'image/webp';
           extension = 'webp';
           dims = webpDims;
@@ -368,7 +397,7 @@ export class BrandingAssetService {
         aspectRatio: 1,
         sha256Hash: '',
         sanitizedFileName,
-        error: 'Image signature or dimensions could not be verified. Upload a valid PNG, JPG, JPEG, or WebP image.',
+        error: `Image signature or dimensions could not be verified. Upload a valid ${allowedFormatsLabel} image.`,
       };
     }
 
@@ -444,7 +473,7 @@ export class BrandingAssetService {
         urlPrefix === 'setup'
           ? `/api/setup/branding/assets/${meta.id}/file`
           : `/api/company/branding/assets/${meta.id}/file`,
-      status: meta.status,
+      status: meta.status === 'REJECTED' ? 'ARCHIVED' : meta.status,
       uploadedByUserId: meta.uploadedByUserId || null,
       createdAt: meta.createdAt,
     };
@@ -468,7 +497,12 @@ export class BrandingAssetService {
     buffer: Buffer;
     fallbackPngBuffer?: Buffer | null;
   }): Promise<CompanyBrandingAssetItem> {
-    const validated = this.validateImageBuffer(params.buffer, params.mimeType, params.fileName);
+    const validated = this.validateImageBuffer(
+      params.buffer,
+      params.mimeType,
+      params.fileName,
+      params.assetType
+    );
     if (!validated.valid) {
       const err = new Error(validated.error || 'Invalid branding image.');
       (err as { statusCode?: number }).statusCode = 400;
@@ -706,6 +740,7 @@ export class BrandingAssetService {
         logo: parsed.logo || null,
         seal: parsed.seal || null,
         signature: parsed.signature || null,
+        paymentQr: parsed.paymentQr || null,
       };
     } catch {
       return defaultEmptyAssetsState();
@@ -735,7 +770,12 @@ export class BrandingAssetService {
       throw err;
     }
 
-    const validated = this.validateImageBuffer(params.buffer, params.mimeType, params.fileName);
+    const validated = this.validateImageBuffer(
+      params.buffer,
+      params.mimeType,
+      params.fileName,
+      params.assetType
+    );
     if (!validated.valid) {
       const err = new Error(validated.error || 'Invalid branding asset image.');
       (err as { statusCode?: number }).statusCode = 400;
@@ -998,6 +1038,7 @@ export class BrandingAssetService {
           logo: parsed.logo || null,
           seal: parsed.seal || null,
           signature: parsed.signature || null,
+          paymentQr: parsed.paymentQr || null,
         };
       }
     } catch {
@@ -1080,6 +1121,8 @@ export class BrandingAssetService {
               (layout.elements.logo.widthMm / nextAsset.aspectRatio).toFixed(1)
             );
           }
+        } else if (payload.assetType === 'PAYMENT_QR') {
+          layout.paymentQrUrl = nextAsset ? nextAsset.url : '';
         }
       }
 
@@ -1117,7 +1160,16 @@ export class BrandingAssetService {
   }
 
   /**
+   * Marks a rejected pending branding asset as REJECTED on disk so it can never be retrieved or exported.
+   */
+  static async markAssetRejected(companyId: string, assetId: string): Promise<void> {
+    await this.updateStoredMetaStatus(companyId, assetId, 'REJECTED');
+  }
+
+  /**
    * Resolves stored asset file path and metadata strictly scoped to the actor's company.
+   * Rejects PENDING_APPROVAL, REJECTED, and STAGED assets so unapproved uploads cannot be
+   * retrieved or exported before SUPER_ADMIN approval.
    * Never exposes OS filesystem paths in API responses.
    */
   static async getCompanyAssetFile(
@@ -1146,6 +1198,12 @@ export class BrandingAssetService {
       throw err;
     }
 
+    if (meta.status !== 'ACTIVE' && meta.status !== 'ARCHIVED') {
+      const err = new Error('Branding asset is pending approval or inactive and cannot be retrieved.');
+      (err as { statusCode?: number }).statusCode = 403;
+      throw err;
+    }
+
     const filePath = this.ensureContainedFile(companyDir, meta.storageKey);
     if (!fs.existsSync(filePath)) {
       const err = new Error('Branding asset binary not found.');
@@ -1164,11 +1222,16 @@ export class BrandingAssetService {
 
   /**
    * Resolves a PDFKit / DOCX compatible raster Buffer (PNG or JPEG) from a branding asset URL or ID.
+   * Enforces tenant ownership, approval status (ACTIVE/ARCHIVED only), and optional assetType allowlist.
    * Never reads arbitrary OS paths outside storage/branding/<companyId> or public/.
    */
   static async resolveExportImageBuffer(
     companyId: string,
-    url?: string | null
+    url?: string | null,
+    options?: {
+      allowedAssetTypes?: BrandingAssetType[];
+      allowLocalFallback?: boolean;
+    }
   ): Promise<Buffer | null> {
     if (!url) return null;
     const trimmed = url.trim();
@@ -1181,16 +1244,35 @@ export class BrandingAssetService {
           companyId,
           apiMatch[1]
         );
+        if (meta.status !== 'ACTIVE' && meta.status !== 'ARCHIVED') {
+          return null;
+        }
+        if (
+          options?.allowedAssetTypes &&
+          options.allowedAssetTypes.length > 0 &&
+          !options.allowedAssetTypes.includes(meta.assetType)
+        ) {
+          return null;
+        }
         if ((meta.mimeType === 'image/png' || meta.mimeType === 'image/jpeg') && fs.existsSync(filePath)) {
           return await fs.promises.readFile(filePath);
         }
-        if (meta.mimeType === 'image/webp' && fallbackPngPath && fs.existsSync(fallbackPngPath)) {
+        if (
+          meta.assetType !== 'PAYMENT_QR' &&
+          meta.mimeType === 'image/webp' &&
+          fallbackPngPath &&
+          fs.existsSync(fallbackPngPath)
+        ) {
           return await fs.promises.readFile(fallbackPngPath);
         }
         return null;
       } catch {
         return null;
       }
+    }
+
+    if (options?.allowLocalFallback === false) {
+      return null;
     }
 
     // Fallback: safe local workspace static asset under /public
@@ -1263,6 +1345,7 @@ export class BrandingAssetService {
           logoAlignment: 'left',
           sealUrl: assets.seal?.url || null,
           signatureUrl: assets.signature?.url || null,
+          paymentQrUrl: assets.paymentQr?.url || null,
         },
       });
       const layout: DocumentPrintLayoutConfig = printSettings.layouts[docType];
@@ -1272,16 +1355,25 @@ export class BrandingAssetService {
         companyName: company.name,
         legalName: company.legalName || null,
         taxId: company.taxId || null,
+        taxRegistrationNumber: company.taxRegistrationNumber || null,
         address: company.address || null,
+        addressLine1: company.addressLine1 || null,
+        addressLine2: company.addressLine2 || null,
+        city: company.city || null,
+        state: company.state || null,
+        postalCode: company.postalCode || null,
+        country: company.country || null,
         phone: company.phone || null,
         email: company.email || null,
         website: company.website || null,
         logoUrl: assets.logo?.url || company.logoUrl || null,
         sealUrl: assets.seal?.url || layout.sealUrl || null,
         signatureUrl: assets.signature?.url || layout.signatureUrl || null,
+        paymentQrUrl: assets.paymentQr?.url || layout.paymentQrUrl || null,
         logoAssetId: assets.logo?.id || null,
         sealAssetId: assets.seal?.id || null,
         signatureAssetId: assets.signature?.id || null,
+        paymentQrAssetId: assets.paymentQr?.id || null,
         signatoryName: layout.signatoryName || null,
         signatoryTitle: layout.signatoryTitle || null,
         layout,
@@ -1338,46 +1430,19 @@ export class BrandingAssetService {
       return { effectiveProfile: profile };
     }
 
-    const baseProfile: CompanyProfile = profile || {
-      id: 'snapshot-company',
-      code: 'SNAPSHOT',
-      name: snapshot.companyName,
-      currency: 'INR',
-      timezone: 'Asia/Kolkata',
-    };
-
+    const mergedProfile = mergeSnapshotIntoCompanyProfile(profile, snapshot);
     const effectiveProfile: CompanyProfile = {
-      ...baseProfile,
-      name: snapshot.companyName || baseProfile.name,
-      legalName: snapshot.legalName !== undefined ? snapshot.legalName : baseProfile.legalName,
-      taxId: snapshot.taxId !== undefined ? snapshot.taxId : baseProfile.taxId,
-      address: snapshot.address !== undefined ? snapshot.address : baseProfile.address,
-      phone: snapshot.phone !== undefined ? snapshot.phone : baseProfile.phone,
-      email: snapshot.email !== undefined ? snapshot.email : baseProfile.email,
-      website: snapshot.website !== undefined ? snapshot.website : baseProfile.website,
-      logoUrl: snapshot.logoUrl !== undefined ? snapshot.logoUrl : baseProfile.logoUrl,
-      sealUrl: snapshot.sealUrl !== undefined ? snapshot.sealUrl : baseProfile.sealUrl,
-      signatureUrl:
-        snapshot.signatureUrl !== undefined ? snapshot.signatureUrl : baseProfile.signatureUrl,
-      documentBranding: {
-        logoSize: snapshot.layout?.logoSize || baseProfile.documentBranding?.logoSize || 'md',
-        logoAlignment:
-          snapshot.layout?.logoPosition || baseProfile.documentBranding?.logoAlignment || 'left',
-        sealUrl: snapshot.sealUrl ?? baseProfile.sealUrl ?? null,
-        signatureUrl: snapshot.signatureUrl ?? baseProfile.signatureUrl ?? null,
-        signatoryName: snapshot.signatoryName ?? baseProfile.documentBranding?.signatoryName ?? null,
-        signatureTitle: snapshot.signatoryTitle ?? baseProfile.documentBranding?.signatureTitle ?? null,
-      },
+      ...mergedProfile,
       printSettings:
-        snapshot.layout && baseProfile.printSettings
+        snapshot.layout && mergedProfile.printSettings
           ? {
-              ...baseProfile.printSettings,
+              ...mergedProfile.printSettings,
               layouts: {
-                ...baseProfile.printSettings.layouts,
+                ...mergedProfile.printSettings.layouts,
                 [docType]: snapshot.layout,
               },
             }
-          : baseProfile.printSettings,
+          : mergedProfile.printSettings,
     };
 
     return {

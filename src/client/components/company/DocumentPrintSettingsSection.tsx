@@ -15,6 +15,7 @@ import {
   FileEdit,
   LayoutGrid,
   FileText,
+  QrCode,
 } from 'lucide-react';
 import {
   AuthUser,
@@ -30,6 +31,8 @@ import {
   LogoPlacement,
   PageOrientation,
   PaperSize,
+  PaymentQrPosition,
+  PaymentQrSize,
   ServiceDescriptionLayout,
   TitlePlacement,
   VisualElementConfig,
@@ -1132,6 +1135,88 @@ export const DocumentPrintSettingsSection: React.FC<DocumentPrintSettingsSection
                 />
               </div>
             </div>
+          </div>
+
+          {/* 5. UPI Payment QR Code Display (Optional — Disabled by Default) */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+              <div className="flex items-center gap-2">
+                <QrCode className="w-3.5 h-3.5 text-indigo-400" />
+                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-300">
+                  UPI Payment QR Code
+                </h4>
+              </div>
+              <label className="flex items-center gap-2 text-[11px] text-slate-300 cursor-pointer">
+                <input
+                  type="checkbox"
+                  disabled={!canEdit}
+                  checked={Boolean(currentLayout.showPaymentQr)}
+                  onChange={(e) => updateLayout({ showPaymentQr: e.target.checked })}
+                  className="rounded border-slate-700 bg-slate-950 text-indigo-600"
+                />
+                <span>Show Payment QR on Print</span>
+              </label>
+            </div>
+
+            <div className="flex items-center justify-between gap-2 text-[11px] bg-slate-950/70 border border-slate-800 rounded-lg px-2.5 py-2">
+              <span className="text-slate-400">
+                Uses your uploaded UPI QR image from Company Profile (never auto-generated).
+              </span>
+              {companyProfile?.brandingAssets?.paymentQr?.url ||
+              companyProfile?.paymentQrUrl ||
+              currentLayout.paymentQrUrl ? (
+                <span className="text-emerald-400 font-semibold shrink-0">QR Uploaded</span>
+              ) : (
+                <span className="text-amber-300 font-semibold shrink-0">No QR Uploaded</span>
+              )}
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">QR Label</label>
+                <input
+                  type="text"
+                  disabled={!canEdit}
+                  maxLength={60}
+                  value={currentLayout.paymentQrLabel ?? 'Scan to Pay'}
+                  onChange={(e) => updateLayout({ paymentQrLabel: e.target.value })}
+                  placeholder="Scan to Pay"
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-100"
+                />
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">QR Size</label>
+                <select
+                  disabled={!canEdit}
+                  value={currentLayout.paymentQrSize || 'md'}
+                  onChange={(e) =>
+                    updateLayout({ paymentQrSize: e.target.value as PaymentQrSize })
+                  }
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-100"
+                >
+                  <option value="sm">Small (22 mm)</option>
+                  <option value="md">Medium (28 mm)</option>
+                  <option value="lg">Large (36 mm)</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-[11px] text-slate-400 mb-1">QR Position</label>
+                <select
+                  disabled={!canEdit}
+                  value={currentLayout.paymentQrPosition || 'bottom-right'}
+                  onChange={(e) =>
+                    updateLayout({ paymentQrPosition: e.target.value as PaymentQrPosition })
+                  }
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5 text-xs text-slate-100"
+                >
+                  <option value="bottom-left">Bottom Left</option>
+                  <option value="bottom-right">Bottom Right</option>
+                </select>
+              </div>
+            </div>
+            <p className="text-[11px] text-slate-500">
+              Hidden automatically on fully paid invoices by default; can be overridden per export in Print Preview.
+            </p>
           </div>
 
           {/* Action Buttons */}

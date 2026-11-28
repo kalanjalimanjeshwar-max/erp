@@ -4,7 +4,7 @@
  * drag/resize math for Logo, Seal, Signature, Header, Title, and Footer elements.
  */
 
-export type BrandingAssetType = 'LOGO' | 'SEAL' | 'SIGNATURE';
+export type BrandingAssetType = 'LOGO' | 'SEAL' | 'SIGNATURE' | 'PAYMENT_QR';
 
 export type VisualElementKey =
   | 'logo'
@@ -65,6 +65,10 @@ export const ALLOWED_BRANDING_MIME_TYPES = [
 ] as const;
 
 export const ALLOWED_BRANDING_EXTENSIONS = ['.png', '.jpg', '.jpeg', '.webp'] as const;
+
+export const ALLOWED_PAYMENT_QR_MIME_TYPES = ['image/png', 'image/jpeg'] as const;
+
+export const ALLOWED_PAYMENT_QR_EXTENSIONS = ['.png', '.jpg', '.jpeg'] as const;
 
 export const BRANDING_ASSETS_SETTING_KEY = 'BRANDING_ASSETS_V1';
 export const DOCUMENT_BRANDING_SNAPSHOT_PREFIX = 'DOC_BRANDING_SNAPSHOT:';
@@ -131,6 +135,7 @@ export interface CompanyBrandingAssetsState {
   logo: CompanyBrandingAssetItem | null;
   seal: CompanyBrandingAssetItem | null;
   signature: CompanyBrandingAssetItem | null;
+  paymentQr?: CompanyBrandingAssetItem | null;
 }
 
 export interface BrandingMarginsMm {

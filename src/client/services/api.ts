@@ -148,15 +148,24 @@ export interface BrandingUploadPayload {
   heightPx: number;
 }
 
-export async function fileToBrandingUploadPayload(file: File): Promise<BrandingUploadPayload> {
+export async function fileToBrandingUploadPayload(
+  file: File,
+  assetType?: BrandingAssetType
+): Promise<BrandingUploadPayload> {
+  const isPaymentQr = assetType === 'PAYMENT_QR';
   const lowerName = (file.name || '').toLowerCase();
-  const validExt =
-    lowerName.endsWith('.png') ||
-    lowerName.endsWith('.jpg') ||
-    lowerName.endsWith('.jpeg') ||
-    lowerName.endsWith('.webp');
+  const validExt = isPaymentQr
+    ? lowerName.endsWith('.png') || lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg')
+    : lowerName.endsWith('.png') ||
+      lowerName.endsWith('.jpg') ||
+      lowerName.endsWith('.jpeg') ||
+      lowerName.endsWith('.webp');
   if (!validExt) {
-    throw new Error('Unsupported file format. Please choose a PNG, JPG, JPEG, or WebP image.');
+    throw new Error(
+      isPaymentQr
+        ? 'Unsupported file format for Payment QR. Please choose a PNG, JPG, or JPEG image.'
+        : 'Unsupported file format. Please choose a PNG, JPG, JPEG, or WebP image.'
+    );
   }
   if (file.size <= 0) {
     throw new Error('Selected file is empty.');
@@ -199,7 +208,7 @@ export async function fileToBrandingUploadPayload(file: File): Promise<BrandingU
 
       let fallbackPngBase64: string | null = null;
       const isWebp =
-        file.type === 'image/webp' || lowerName.endsWith('.webp');
+        !isPaymentQr && (file.type === 'image/webp' || lowerName.endsWith('.webp'));
       if (isWebp && typeof document !== 'undefined') {
         try {
           const canvas = document.createElement('canvas');
@@ -1278,6 +1287,8 @@ export const api = {
     document: ExportableDocumentPayload;
     layoutOverride?: DocumentPrintLayoutConfig;
     isDraftPreview?: boolean;
+    copyLabel?: 'ORIGINAL' | 'DUPLICATE' | null;
+    includePaymentQr?: boolean;
   }) =>
     requestBlob('/api/documents/export/pdf', {
       method: 'POST',
@@ -1287,6 +1298,8 @@ export const api = {
     document: ExportableDocumentPayload;
     layoutOverride?: DocumentPrintLayoutConfig;
     isDraftPreview?: boolean;
+    copyLabel?: 'ORIGINAL' | 'DUPLICATE' | null;
+    includePaymentQr?: boolean;
   }) =>
     requestBlob('/api/documents/export/docx', {
       method: 'POST',

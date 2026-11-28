@@ -17,6 +17,9 @@ export type {
   LogoPlacement,
   LogoDisplaySize,
   ServiceDescriptionLayout,
+  PaymentQrSize,
+  PaymentQrPosition,
+  DocumentCopyLabel,
   DocumentPrintMargins,
   DocumentPrintLayoutConfig,
   DocumentPrintSettings,
@@ -198,6 +201,7 @@ export interface DocumentBrandingSettings {
   signatureTitle?: string | null;
   signatoryName?: string | null;
   sealUrl?: string | null;
+  paymentQrUrl?: string | null;
 }
 
 export interface DocumentBrandingSnapshot {
@@ -205,16 +209,25 @@ export interface DocumentBrandingSnapshot {
   companyName: string;
   legalName?: string | null;
   taxId?: string | null;
+  taxRegistrationNumber?: string | null;
   address?: string | null;
+  addressLine1?: string | null;
+  addressLine2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  postalCode?: string | null;
+  country?: string | null;
   phone?: string | null;
   email?: string | null;
   website?: string | null;
   logoUrl?: string | null;
   sealUrl?: string | null;
   signatureUrl?: string | null;
+  paymentQrUrl?: string | null;
   logoAssetId?: string | null;
   sealAssetId?: string | null;
   signatureAssetId?: string | null;
+  paymentQrAssetId?: string | null;
   signatoryName?: string | null;
   signatoryTitle?: string | null;
   layout?: import('./print-settings.js').DocumentPrintLayoutConfig;
@@ -230,7 +243,7 @@ export interface BrandingAssetMutationResponse {
 
 export interface BrandingAssetUploadResponse {
   assetUrl: string;
-  assetType: 'logo' | 'signature' | 'seal';
+  assetType: 'logo' | 'signature' | 'seal' | 'payment_qr';
   fileName: string;
   sizeBytes: number;
   mimeType: string;
@@ -242,10 +255,17 @@ export interface CompanyProfile {
   name: string;
   legalName?: string | null;
   taxId?: string | null;
+  taxRegistrationNumber?: string | null;
   currency: string;
   timezone: string;
   logoUrl?: string | null;
   address?: string | null;
+  addressLine1?: string | null;
+  addressLine2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  postalCode?: string | null;
+  country?: string | null;
   phone?: string | null;
   email?: string | null;
   website?: string | null;
@@ -255,6 +275,7 @@ export interface CompanyProfile {
   brandingAssets?: CompanyBrandingAssetsState | null;
   signatureUrl?: string | null;
   sealUrl?: string | null;
+  paymentQrUrl?: string | null;
   salesInvoiceEnabled?: boolean;
   roundingPrecision?: number;
   defaultDocumentLanguage?: string;
@@ -355,10 +376,17 @@ export interface UpdateCompanyProfileRequest {
   name: string;
   legalName?: string | null;
   taxId?: string | null;
+  taxRegistrationNumber?: string | null;
   timezone: string;
   currency: string;
   logoUrl?: string | null;
   address?: string | null;
+  addressLine1?: string | null;
+  addressLine2?: string | null;
+  city?: string | null;
+  state?: string | null;
+  postalCode?: string | null;
+  country?: string | null;
   phone?: string | null;
   email?: string | null;
   website?: string | null;

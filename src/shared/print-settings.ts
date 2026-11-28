@@ -33,6 +33,9 @@ export type TitlePlacement = 'left' | 'center' | 'right' | 'split';
 export type LogoPlacement = 'left' | 'center' | 'right';
 export type LogoDisplaySize = 'sm' | 'md' | 'lg';
 export type ServiceDescriptionLayout = 'detailed' | 'compact';
+export type PaymentQrSize = 'sm' | 'md' | 'lg';
+export type PaymentQrPosition = 'bottom-left' | 'bottom-right';
+export type DocumentCopyLabel = 'ORIGINAL' | 'DUPLICATE';
 
 export interface DocumentPrintMargins {
   topMm: number;
@@ -86,6 +89,13 @@ export interface DocumentPrintLayoutConfig {
   signatureUrl: string;
   sealUrl: string;
   showPrintedTimestamp: boolean;
+
+  // Optional Uploaded UPI Payment QR Display (disabled by default)
+  showPaymentQr?: boolean;
+  paymentQrLabel?: string;
+  paymentQrSize?: PaymentQrSize;
+  paymentQrPosition?: PaymentQrPosition;
+  paymentQrUrl?: string;
 
   // Visual Canvas Designer Elements
   visualLayoutEnabled: boolean;
@@ -142,6 +152,11 @@ const DEFAULT_BASE_LAYOUT: DocumentPrintLayoutConfig = {
   signatureUrl: '',
   sealUrl: '',
   showPrintedTimestamp: true,
+  showPaymentQr: false,
+  paymentQrLabel: 'Scan to Pay',
+  paymentQrSize: 'md',
+  paymentQrPosition: 'bottom-right',
+  paymentQrUrl: '',
   visualLayoutEnabled: true,
   elements: createDefaultVisualElements('A4', 'portrait', {
     topMm: 14,
@@ -165,6 +180,7 @@ export function createDefaultPrintSettings(company?: {
     signatureTitle?: string | null;
     signatoryName?: string | null;
     sealUrl?: string | null;
+    paymentQrUrl?: string | null;
   } | null;
 }): DocumentPrintSettings {
   const defaultLanguage = normalizeLanguage(company?.defaultDocumentLanguage);
@@ -178,6 +194,7 @@ export function createDefaultPrintSettings(company?: {
     signatoryTitle: branding?.signatureTitle || '',
     signatureUrl: branding?.signatureUrl || '',
     sealUrl: branding?.sealUrl || '',
+    paymentQrUrl: branding?.paymentQrUrl || '',
   };
 
   const makeElements = () =>
@@ -384,6 +401,26 @@ function mergeSingleLayout(
       incoming.signatureUrl !== undefined ? sanitizeBrandingUrl(incoming.signatureUrl) : base.signatureUrl,
     sealUrl: incoming.sealUrl !== undefined ? sanitizeBrandingUrl(incoming.sealUrl) : base.sealUrl,
     showPrintedTimestamp: incoming.showPrintedTimestamp ?? base.showPrintedTimestamp,
+    showPaymentQr: incoming.showPaymentQr ?? base.showPaymentQr ?? false,
+    paymentQrLabel:
+      typeof incoming.paymentQrLabel === 'string'
+        ? incoming.paymentQrLabel.slice(0, 80)
+        : base.paymentQrLabel ?? 'Scan to Pay',
+    paymentQrSize:
+      incoming.paymentQrSize === 'sm' ||
+      incoming.paymentQrSize === 'md' ||
+      incoming.paymentQrSize === 'lg'
+        ? incoming.paymentQrSize
+        : base.paymentQrSize ?? 'md',
+    paymentQrPosition:
+      incoming.paymentQrPosition === 'bottom-left' ||
+      incoming.paymentQrPosition === 'bottom-right'
+        ? incoming.paymentQrPosition
+        : base.paymentQrPosition ?? 'bottom-right',
+    paymentQrUrl:
+      incoming.paymentQrUrl !== undefined
+        ? sanitizeBrandingUrl(incoming.paymentQrUrl)
+        : base.paymentQrUrl ?? '',
     visualLayoutEnabled: incoming.visualLayoutEnabled ?? base.visualLayoutEnabled,
     elements,
   };
@@ -444,10 +481,22 @@ export function validatePrintSettingsPayload(payload: unknown): {
     if (layout.language && !['EN', 'KN', 'EN_KN'].includes(layout.language)) {
       return { valid: false, error: `Invalid language for ${docType}. Allowed: EN, KN, EN_KN.` };
     }
-    for (const urlField of [layout.signatureUrl, layout.sealUrl]) {
+    for (const urlField of [layout.signatureUrl, layout.sealUrl, layout.paymentQrUrl]) {
       if (urlField && !isValidBrandingUrl(urlField)) {
         return { valid: false, error: `Unsafe URL scheme detected in ${docType} branding.` };
       }
+    }
+    if (layout.paymentQrSize && !['sm', 'md', 'lg'].includes(layout.paymentQrSize)) {
+      return { valid: false, error: `Invalid paymentQrSize for ${docType}. Allowed: sm, md, lg.` };
+    }
+    if (
+      layout.paymentQrPosition &&
+      !['bottom-left', 'bottom-right'].includes(layout.paymentQrPosition)
+    ) {
+      return {
+        valid: false,
+        error: `Invalid paymentQrPosition for ${docType}. Allowed: bottom-left, bottom-right.`,
+      };
     }
     if (layout.margins) {
       for (const m of [

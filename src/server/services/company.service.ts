@@ -143,6 +143,7 @@ export class CompanyService {
       logo: null,
       seal: null,
       signature: null,
+      paymentQr: null,
     };
     try {
       const settings = await prisma.companySetting.findMany({
@@ -172,6 +173,7 @@ export class CompanyService {
           logo: parsedAssets.logo || null,
           seal: parsedAssets.seal || null,
           signature: parsedAssets.signature || null,
+          paymentQr: parsedAssets.paymentQr || null,
         };
       }
     } catch {
@@ -203,12 +205,14 @@ export class CompanyService {
       documentBranding: {
         sealUrl: brandingAssets.seal?.url || null,
         signatureUrl: brandingAssets.signature?.url || null,
+        paymentQrUrl: brandingAssets.paymentQr?.url || null,
       },
     });
 
     const activeLayout = printSettings.layouts.INVOICE;
     const sealUrl = brandingAssets.seal?.url || activeLayout.sealUrl || null;
     const signatureUrl = brandingAssets.signature?.url || activeLayout.signatureUrl || null;
+    const paymentQrUrl = brandingAssets.paymentQr?.url || activeLayout.paymentQrUrl || null;
 
     return {
       id: company.id,
@@ -216,21 +220,30 @@ export class CompanyService {
       name: company.name,
       legalName: company.legalName,
       taxId: company.taxId,
+      taxRegistrationNumber: company.taxRegistrationNumber ?? null,
       currency: company.currency,
       timezone: company.timezone,
       logoUrl: activeLogoUrl,
       sealUrl,
       signatureUrl,
+      paymentQrUrl,
       brandingAssets,
       documentBranding: {
         logoSize: activeLayout.logoSize || 'md',
         logoAlignment: activeLayout.logoPosition || 'left',
         sealUrl,
         signatureUrl,
+        paymentQrUrl,
         signatoryName: activeLayout.signatoryName || null,
         signatureTitle: activeLayout.signatoryTitle || null,
       },
       address: company.address,
+      addressLine1: company.addressLine1 ?? null,
+      addressLine2: company.addressLine2 ?? null,
+      city: company.city ?? null,
+      state: company.state ?? null,
+      postalCode: company.postalCode ?? null,
+      country: company.country ?? null,
       phone: company.phone,
       email: company.email,
       website: company.website,
@@ -315,6 +328,7 @@ export class CompanyService {
 
     let sealUrl: string | null = null;
     let signatureUrl: string | null = null;
+    let paymentQrUrl: string | null = null;
     try {
       const assetRows = await prisma.companySetting.findMany({
         where: { companyId, key: BRANDING_ASSETS_SETTING_KEY },
@@ -323,6 +337,7 @@ export class CompanyService {
         const parsed = JSON.parse(assetRows[0].value) as Partial<CompanyBrandingAssetsState>;
         sealUrl = parsed.seal?.url || null;
         signatureUrl = parsed.signature?.url || null;
+        paymentQrUrl = parsed.paymentQr?.url || null;
       }
     } catch {
       // ignore if mocked
@@ -333,6 +348,7 @@ export class CompanyService {
       documentBranding: {
         sealUrl,
         signatureUrl,
+        paymentQrUrl,
       },
     });
   }
@@ -538,10 +554,23 @@ export class CompanyService {
             ...(cf.name !== undefined ? { name: String(cf.name) } : {}),
             ...(cf.legalName !== undefined ? { legalName: cf.legalName as string | null } : {}),
             ...(cf.taxId !== undefined ? { taxId: cf.taxId as string | null } : {}),
+            ...(cf.taxRegistrationNumber !== undefined
+              ? { taxRegistrationNumber: cf.taxRegistrationNumber as string | null }
+              : {}),
             ...(cf.timezone !== undefined ? { timezone: String(cf.timezone) } : {}),
             ...(cf.currency !== undefined ? { currency: String(cf.currency) } : {}),
             ...(cf.logoUrl !== undefined ? { logoUrl: cf.logoUrl as string | null } : {}),
             ...(cf.address !== undefined ? { address: cf.address as string | null } : {}),
+            ...(cf.addressLine1 !== undefined
+              ? { addressLine1: cf.addressLine1 as string | null }
+              : {}),
+            ...(cf.addressLine2 !== undefined
+              ? { addressLine2: cf.addressLine2 as string | null }
+              : {}),
+            ...(cf.city !== undefined ? { city: cf.city as string | null } : {}),
+            ...(cf.state !== undefined ? { state: cf.state as string | null } : {}),
+            ...(cf.postalCode !== undefined ? { postalCode: cf.postalCode as string | null } : {}),
+            ...(cf.country !== undefined ? { country: cf.country as string | null } : {}),
             ...(cf.phone !== undefined ? { phone: cf.phone as string | null } : {}),
             ...(cf.email !== undefined ? { email: cf.email as string | null } : {}),
             ...(cf.website !== undefined ? { website: cf.website as string | null } : {}),
@@ -701,6 +730,22 @@ export class CompanyService {
       },
     });
 
+    const rejectedPayload = (existing.payload || {}) as {
+      type?: string;
+      operation?: string;
+      asset?: { id?: string } | null;
+    };
+    if (
+      rejectedPayload.type === 'COMPANY_BRANDING_ASSET' &&
+      rejectedPayload.operation === 'UPLOAD' &&
+      rejectedPayload.asset?.id
+    ) {
+      await BrandingAssetService.markAssetRejected(
+        actor.companyId,
+        String(rejectedPayload.asset.id)
+      ).catch(() => undefined);
+    }
+
     await AuditService.log({
       companyId: actor.companyId,
       userId: actor.userId,
@@ -782,6 +827,9 @@ export class CompanyService {
         current.name !== input.name.trim() ||
         (current.legalName || null) !== (input.legalName?.trim() || null) ||
         (current.taxId || null) !== (input.taxId?.trim() || null) ||
+        (input.taxRegistrationNumber !== undefined &&
+          (current.taxRegistrationNumber || null) !==
+            (input.taxRegistrationNumber?.trim() || null)) ||
         current.timezone !== input.timezone.trim() ||
         current.currency !== normalizedCurrency ||
         (input.salesInvoiceEnabled !== undefined &&
@@ -802,10 +850,25 @@ export class CompanyService {
                 name: input.name.trim(),
                 legalName: input.legalName?.trim() || null,
                 taxId: input.taxId?.trim() || null,
+                ...(input.taxRegistrationNumber !== undefined
+                  ? { taxRegistrationNumber: input.taxRegistrationNumber?.trim() || null }
+                  : {}),
                 timezone: input.timezone.trim(),
                 currency: normalizedCurrency,
                 logoUrl: input.logoUrl?.trim() || null,
                 address: input.address?.trim() || null,
+                ...(input.addressLine1 !== undefined
+                  ? { addressLine1: input.addressLine1?.trim() || null }
+                  : {}),
+                ...(input.addressLine2 !== undefined
+                  ? { addressLine2: input.addressLine2?.trim() || null }
+                  : {}),
+                ...(input.city !== undefined ? { city: input.city?.trim() || null } : {}),
+                ...(input.state !== undefined ? { state: input.state?.trim() || null } : {}),
+                ...(input.postalCode !== undefined
+                  ? { postalCode: input.postalCode?.trim() || null }
+                  : {}),
+                ...(input.country !== undefined ? { country: input.country?.trim() || null } : {}),
                 phone: input.phone?.trim() || null,
                 email: input.email?.trim().toLowerCase() || null,
                 website: input.website?.trim() || null,
@@ -856,10 +919,23 @@ export class CompanyService {
       name: input.name.trim(),
       legalName: input.legalName?.trim() || null,
       taxId: input.taxId?.trim() || null,
+      ...(input.taxRegistrationNumber !== undefined
+        ? { taxRegistrationNumber: input.taxRegistrationNumber?.trim() || null }
+        : {}),
       timezone: input.timezone.trim(),
       currency: normalizedCurrency,
       logoUrl: input.logoUrl?.trim() || null,
       address: input.address?.trim() || null,
+      ...(input.addressLine1 !== undefined
+        ? { addressLine1: input.addressLine1?.trim() || null }
+        : {}),
+      ...(input.addressLine2 !== undefined
+        ? { addressLine2: input.addressLine2?.trim() || null }
+        : {}),
+      ...(input.city !== undefined ? { city: input.city?.trim() || null } : {}),
+      ...(input.state !== undefined ? { state: input.state?.trim() || null } : {}),
+      ...(input.postalCode !== undefined ? { postalCode: input.postalCode?.trim() || null } : {}),
+      ...(input.country !== undefined ? { country: input.country?.trim() || null } : {}),
       phone: input.phone?.trim() || null,
       email: input.email?.trim().toLowerCase() || null,
       website: input.website?.trim() || null,

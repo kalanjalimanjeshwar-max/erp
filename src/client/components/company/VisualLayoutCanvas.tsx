@@ -31,6 +31,11 @@ import {
   resizeVisualElementFromHandle,
 } from '../../../shared/branding.ts';
 import { getDocumentLabel } from '../../../shared/print-translations.ts';
+import {
+  formatCompanyAddressLines,
+  resolveCompanyContactParts,
+  resolveCompanyTaxId,
+} from '../../../shared/export/document-branding.ts';
 
 interface VisualLayoutCanvasProps {
   docType: DocumentPrintType;
@@ -360,18 +365,28 @@ export const VisualLayoutCanvas: React.FC<VisualLayoutCanvasProps> = ({
     if (key === 'companyName') {
       return (
         <div className="pointer-events-none w-full text-slate-900" style={textStyle}>
-          {companyProfile?.name || 'NAMMA MEDIA'}
+          {companyProfile?.name || 'Company Name'}
         </div>
       );
     }
 
     if (key === 'companyHeader') {
+      const addressLines = formatCompanyAddressLines(companyProfile);
+      const contactLine = resolveCompanyContactParts(companyProfile).join(' • ');
+      const resolvedTaxId = resolveCompanyTaxId(companyProfile);
+      const hasAnyHeaderDetail =
+        addressLines.length > 0 || Boolean(contactLine) || Boolean(resolvedTaxId);
+
       return (
         <div className="pointer-events-none w-full text-slate-600" style={textStyle}>
-          <div>{companyProfile?.address || 'Bengaluru, Karnataka'}</div>
-          <div>{companyProfile?.email || 'billing@nammamedia.in'}</div>
-          {companyProfile?.taxId && (
-            <div className="font-mono text-slate-700">TAX: {companyProfile.taxId}</div>
+          {layout.showCompanyContact &&
+            addressLines.map((line, idx) => <div key={idx}>{line}</div>)}
+          {layout.showCompanyContact && contactLine && <div>{contactLine}</div>}
+          {layout.showCompanyTaxId && resolvedTaxId && (
+            <div className="font-mono text-slate-700">TAX: {resolvedTaxId}</div>
+          )}
+          {!hasAnyHeaderDetail && (
+            <div className="italic opacity-60">Company address not configured</div>
           )}
         </div>
       );

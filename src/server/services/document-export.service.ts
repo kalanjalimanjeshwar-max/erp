@@ -6,6 +6,7 @@ import {
   AuthUser,
   CompanyBankAccountItem,
   CompanyProfile,
+  DocumentCopyLabel,
   DocumentPrintLayoutConfig,
   DocumentPrintType,
   VisualElementKey,
@@ -24,8 +25,14 @@ import {
   DocumentExportBrandingImages,
   ExportableDocumentPayload,
   buildExportFileName,
+  formatCompanyAddressLines,
+  formatCopyLabelText,
   generateDocxBuffer,
+  resolveCompanyContactParts,
+  resolveCompanyTaxId,
   resolveEffectivePrintLayout,
+  resolvePaymentQrDisplaySizeMm,
+  shouldDisplayPaymentQr,
 } from '../../shared/export/docx-builder.js';
 import { BrandingAssetService } from './branding-asset.service.js';
 import { CompanyService } from './company.service.js';
@@ -38,6 +45,8 @@ export interface ExportDocumentRequest {
   document: ExportableDocumentPayload;
   layoutOverride?: DocumentPrintLayoutConfig;
   isDraftPreview?: boolean;
+  copyLabel?: DocumentCopyLabel | null;
+  includePaymentQr?: boolean;
 }
 
 export interface ExportDocumentResult {
@@ -325,14 +334,15 @@ export class DocumentExportService {
 
     const snapshot =
       !request.isDraftPreview && docPayload.data.status !== 'DRAFT'
-        ? docPayload.data.brandingSnapshot ||
-          (docPayload.data.id
+        ? (docPayload.data.id
             ? await BrandingAssetService.getDocumentSnapshot(
                 actor.companyId,
                 docPayload.type,
                 docPayload.data.id
               )
-            : null)
+            : null) ||
+          docPayload.data.brandingSnapshot ||
+          null
         : null;
 
     const { effectiveProfile: companyProfile, effectiveLayout: snapshotLayout } =
@@ -342,40 +352,80 @@ export class DocumentExportService {
         docPayload.type
       );
 
-    const layout =
+    const baseLayout =
       request.layoutOverride ||
       snapshotLayout ||
       resolveEffectivePrintLayout(docPayload.type, companyProfile, undefined);
 
-    const bankAccount = await this.resolveAuthorizedBankAccount(actor, docPayload.type, layout);
+    const bankAccount = await this.resolveAuthorizedBankAccount(actor, docPayload.type, baseLayout);
 
     const resolvedLogoUrl =
-      snapshot?.logoUrl ?? companyProfile?.brandingAssets?.logo?.url ?? companyProfile?.logoUrl ?? null;
+      snapshot && snapshot.logoUrl !== undefined
+        ? snapshot.logoUrl
+        : companyProfile?.brandingAssets?.logo?.url ?? companyProfile?.logoUrl ?? null;
     const resolvedSealUrl =
-      snapshot?.sealUrl ??
-      (layout.sealUrl ||
-        companyProfile?.documentBranding?.sealUrl ||
-        companyProfile?.sealUrl ||
-        companyProfile?.brandingAssets?.seal?.url ||
-        null);
+      snapshot && snapshot.sealUrl !== undefined
+        ? snapshot.sealUrl
+        : baseLayout.sealUrl ||
+          companyProfile?.documentBranding?.sealUrl ||
+          companyProfile?.sealUrl ||
+          companyProfile?.brandingAssets?.seal?.url ||
+          null;
     const resolvedSignatureUrl =
-      snapshot?.signatureUrl ??
-      (layout.signatureUrl ||
-        companyProfile?.documentBranding?.signatureUrl ||
-        companyProfile?.signatureUrl ||
-        companyProfile?.brandingAssets?.signature?.url ||
-        null);
+      snapshot && snapshot.signatureUrl !== undefined
+        ? snapshot.signatureUrl
+        : baseLayout.signatureUrl ||
+          companyProfile?.documentBranding?.signatureUrl ||
+          companyProfile?.signatureUrl ||
+          companyProfile?.brandingAssets?.signature?.url ||
+          null;
 
-    const [logoBuf, sealBuf, signatureBuf] = await Promise.all([
+    // Authoritative server-side Payment QR URL:
+    // - Historical snapshots that explicitly recorded paymentQrUrl (including null) are never overwritten by current assets.
+    // - Never trust arbitrary client-provided layoutOverride.paymentQrUrl; validate it against the tenant's approved asset.
+    const authoritativePaymentQrUrl =
+      snapshot && snapshot.paymentQrUrl !== undefined
+        ? snapshot.paymentQrUrl
+        : companyProfile?.brandingAssets?.paymentQr?.url ||
+          companyProfile?.paymentQrUrl ||
+          companyProfile?.documentBranding?.paymentQrUrl ||
+          null;
+
+    const requestedPaymentQrUrl =
+      typeof request.layoutOverride?.paymentQrUrl === 'string'
+        ? request.layoutOverride.paymentQrUrl.trim()
+        : '';
+    if (requestedPaymentQrUrl) {
+      const expectedQrUrl = (authoritativePaymentQrUrl || '').trim();
+      if (!expectedQrUrl || requestedPaymentQrUrl !== expectedQrUrl) {
+        const err = new Error(
+          'Payment QR URL is not an active, approved branding asset for this company.'
+        );
+        (err as { statusCode?: number }).statusCode = 403;
+        throw err;
+      }
+    }
+
+    const layout: DocumentPrintLayoutConfig = {
+      ...baseLayout,
+      paymentQrUrl: authoritativePaymentQrUrl || '',
+    };
+
+    const [logoBuf, sealBuf, signatureBuf, paymentQrBuf] = await Promise.all([
       BrandingAssetService.resolveExportImageBuffer(actor.companyId, resolvedLogoUrl),
       BrandingAssetService.resolveExportImageBuffer(actor.companyId, resolvedSealUrl),
       BrandingAssetService.resolveExportImageBuffer(actor.companyId, resolvedSignatureUrl),
+      BrandingAssetService.resolveExportImageBuffer(actor.companyId, authoritativePaymentQrUrl, {
+        allowedAssetTypes: ['PAYMENT_QR'],
+        allowLocalFallback: false,
+      }),
     ]);
 
     const brandingImages: DocumentExportBrandingImages = {
       logo: logoBuf,
       seal: sealBuf,
       signature: signatureBuf,
+      paymentQr: paymentQrBuf,
     };
 
     const fileName = buildExportFileName(docPayload, format, request.isDraftPreview);
@@ -391,6 +441,8 @@ export class DocumentExportService {
         bankAccount,
         isDraftPreview: request.isDraftPreview,
         brandingImages,
+        copyLabel: request.copyLabel,
+        includePaymentQr: request.includePaymentQr,
       });
       mimeType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
     } else {
@@ -401,6 +453,8 @@ export class DocumentExportService {
         bankAccount,
         isDraftPreview: request.isDraftPreview,
         brandingImages,
+        copyLabel: request.copyLabel,
+        includePaymentQr: request.includePaymentQr,
       });
       mimeType = 'application/pdf';
     }
@@ -445,6 +499,8 @@ export class DocumentExportService {
     bankAccount: CompanyBankAccountItem | null;
     isDraftPreview?: boolean;
     brandingImages?: DocumentExportBrandingImages;
+    copyLabel?: DocumentCopyLabel | null;
+    includePaymentQr?: boolean;
   }): Promise<Buffer> {
     const {
       document: docPayload,
@@ -453,6 +509,8 @@ export class DocumentExportService {
       bankAccount,
       isDraftPreview,
       brandingImages,
+      copyLabel,
+      includePaymentQr,
     } = params;
     const docType = docPayload.type;
     const fonts = loadFontAssets();
@@ -763,12 +821,17 @@ export class DocumentExportService {
 
     let cursorY = margins.top;
 
-    // Optional top header bar
-    if (layout.headerText || isDraftPreview) {
+    const resolvedCopyLabel = formatCopyLabelText(copyLabel);
+
+    // Optional top header bar (or explicit ORIGINAL / DUPLICATE copy label)
+    if (layout.headerText || isDraftPreview || resolvedCopyLabel) {
       const topParts = [
         layout.headerText || null,
         isDraftPreview ? 'DRAFT PREVIEW' : null,
-        getDocumentLabel('originalForRecipient', layout.language).primary,
+        resolvedCopyLabel ||
+          (layout.headerText || isDraftPreview
+            ? getDocumentLabel('originalForRecipient', layout.language).primary
+            : null),
       ].filter(Boolean);
       cursorY = writeMixedText(topParts.join('  |  '), contentLeft, cursorY, {
         width: contentWidth,
@@ -903,8 +966,9 @@ export class DocumentExportService {
 
     if (headerVisible) {
       if (layout.showCompanyContact) {
-        if (companyProfile?.address) {
-          leftY = writeMixedText(companyProfile.address, headerX, leftY, {
+        const addressLines = formatCompanyAddressLines(companyProfile);
+        for (const addrLine of addressLines) {
+          leftY = writeMixedText(addrLine, headerX, leftY, {
             width: headerW,
             align: headerAlign,
             fontSize: headerTypo.fontSizePt,
@@ -914,10 +978,9 @@ export class DocumentExportService {
             characterSpacing: headerTypo.letterSpacing,
             color: '#475569',
           });
+          leftY += 0.5;
         }
-        const contactLine = [companyProfile?.phone, companyProfile?.email, companyProfile?.website]
-          .filter(Boolean)
-          .join('  •  ');
+        const contactLine = resolveCompanyContactParts(companyProfile).join('  •  ');
         if (contactLine) {
           leftY = writeMixedText(contactLine, headerX, leftY + 1, {
             width: headerW,
@@ -932,9 +995,10 @@ export class DocumentExportService {
         }
       }
 
-      if (layout.showCompanyTaxId && companyProfile?.taxId) {
+      const resolvedTaxId = resolveCompanyTaxId(companyProfile);
+      if (layout.showCompanyTaxId && resolvedTaxId) {
         leftY = writeMixedText(
-          `${formatLabelText('taxId', layout.language)}: ${companyProfile.taxId}`,
+          `${formatLabelText('taxId', layout.language)}: ${resolvedTaxId}`,
           headerX,
           leftY + 1.5,
           {
@@ -1617,6 +1681,51 @@ export class DocumentExportService {
       doc.y = cursorY;
     }
 
+    // Optional Uploaded Payment QR Code (disabled by default; strictly uses server-validated buffer)
+    const qrImgSource = isSupportedPdfImageBuffer(
+      brandingImages?.paymentQr as Buffer | null | undefined
+    )
+      ? (brandingImages?.paymentQr as Buffer)
+      : null;
+    const showQr = shouldDisplayPaymentQr({
+      document: docPayload,
+      layout,
+      qrSource: qrImgSource,
+      includePaymentQrOverride: includePaymentQr,
+    });
+    const qrImgPt = mmToPt(resolvePaymentQrDisplaySizeMm(layout.paymentQrSize));
+    const qrBoxPad = 6;
+    const qrLabelText = (layout.paymentQrLabel || 'Scan to Pay').trim() || 'Scan to Pay';
+    const qrBoxW = Math.max(qrImgPt + qrBoxPad * 2, 76);
+    const qrBoxH = qrImgPt + qrBoxPad * 2 + 14;
+    const qrPos = layout.paymentQrPosition === 'bottom-left' ? 'bottom-left' : 'bottom-right';
+    let qrRenderedWithSignature = false;
+
+    const drawQrBoxAt = (x: number, y: number): number => {
+      if (!qrImgSource) return y;
+      doc
+        .roundedRect(x, y, qrBoxW, qrBoxH, 4)
+        .fillAndStroke('#ffffff', '#cbd5e1');
+      const imgX = x + (qrBoxW - qrImgPt) / 2;
+      try {
+        doc.image(qrImgSource, imgX, y + qrBoxPad, {
+          fit: [qrImgPt, qrImgPt],
+          align: 'center',
+          valign: 'center',
+        });
+      } catch {
+        // ignore unreadable image
+      }
+      writeMixedText(qrLabelText, x + 4, y + qrBoxPad + qrImgPt + 3, {
+        width: qrBoxW - 8,
+        align: 'center',
+        fontSize: 7.5,
+        bold: true,
+        color: '#334155',
+      });
+      return y + qrBoxH;
+    };
+
     // Authorized Signature & Seal
     if (layout.showSignatureSection) {
       const sealEl = visualElements.seal;
@@ -1633,10 +1742,8 @@ export class DocumentExportService {
       const sigImgW = useVisual ? Math.max(36, mmToPt(sigEl.widthMm)) : 112;
       const sigImgH = useVisual ? Math.max(16, Math.min(48, mmToPt(sigEl.heightMm))) : 28;
       const labelsNeeded = sigLabelsVisible ? 26 : 0;
-      const blockNeeded = Math.max(sealVisible ? sealH : 0, (sigVisible ? sigImgH : 0) + labelsNeeded) + 4;
-
-      cursorY = ensurePageSpace(blockNeeded + 4);
-      cursorY = Math.max(doc.y + 4, cursorY + 4);
+      const sigBlockNeeded =
+        Math.max(sealVisible ? sealH : 0, (sigVisible ? sigImgH : 0) + labelsNeeded) + 4;
 
       const sealX = useVisual
         ? Math.max(contentLeft, Math.min(contentRight - sealW, mmToPt(sealEl.xMm)))
@@ -1645,6 +1752,31 @@ export class DocumentExportService {
       const sigX = useVisual
         ? Math.max(contentLeft, Math.min(contentRight - sigW, mmToPt(sigEl.xMm)))
         : contentRight - 150;
+
+      const leftmostSigX = Math.min(sealVisible ? sealX : sigX, sigX);
+      const canPlaceQrBesideSignature =
+        showQr && qrPos === 'bottom-left' && contentLeft + qrBoxW + 10 < leftmostSigX;
+
+      if (showQr && !canPlaceQrBesideSignature) {
+        cursorY = ensurePageSpace(qrBoxH + 8);
+        const qrX = qrPos === 'bottom-left' ? contentLeft : contentRight - qrBoxW;
+        cursorY = drawQrBoxAt(qrX, cursorY) + 8;
+        doc.y = cursorY;
+        qrRenderedWithSignature = true;
+      }
+
+      const blockNeeded = canPlaceQrBesideSignature
+        ? Math.max(sigBlockNeeded, qrBoxH + 4)
+        : sigBlockNeeded;
+
+      cursorY = ensurePageSpace(blockNeeded + 4);
+      cursorY = Math.max(doc.y + 4, cursorY + 4);
+
+      let qrEndY = cursorY;
+      if (canPlaceQrBesideSignature) {
+        qrEndY = drawQrBoxAt(contentLeft, cursorY);
+        qrRenderedWithSignature = true;
+      }
 
       const sealImgSource = isSupportedPdfImageBuffer(brandingImages?.seal as Buffer | null | undefined)
         ? (brandingImages?.seal as Buffer)
@@ -1722,10 +1854,19 @@ export class DocumentExportService {
             color: '#64748b',
           });
         }
-        cursorY = Math.max(sy + 4, cursorY + (sealVisible ? sealH : 0) + 4);
+        cursorY = Math.max(sy + 4, cursorY + (sealVisible ? sealH : 0) + 4, qrEndY + 4);
       } else if (sealVisible && sealImgSource) {
-        cursorY += sealH + 4;
+        cursorY = Math.max(cursorY + sealH + 4, qrEndY + 4);
+      } else if (canPlaceQrBesideSignature) {
+        cursorY = qrEndY + 4;
       }
+      doc.y = cursorY;
+    }
+
+    if (showQr && !qrRenderedWithSignature) {
+      cursorY = ensurePageSpace(qrBoxH + 8);
+      const qrX = qrPos === 'bottom-left' ? contentLeft : contentRight - qrBoxW;
+      cursorY = drawQrBoxAt(qrX, cursorY) + 6;
       doc.y = cursorY;
     }
 

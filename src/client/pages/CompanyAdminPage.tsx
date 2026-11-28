@@ -152,10 +152,17 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
   const [name, setName] = useState('');
   const [legalName, setLegalName] = useState('');
   const [taxId, setTaxId] = useState('');
+  const [taxRegistrationNumber, setTaxRegistrationNumber] = useState('');
   const [currency, setCurrency] = useState('USD');
   const [timezone, setTimezone] = useState('UTC');
   const [logoUrl, setLogoUrl] = useState('');
   const [address, setAddress] = useState('');
+  const [addressLine1, setAddressLine1] = useState('');
+  const [addressLine2, setAddressLine2] = useState('');
+  const [city, setCity] = useState('');
+  const [stateRegion, setStateRegion] = useState('');
+  const [postalCode, setPostalCode] = useState('');
+  const [country, setCountry] = useState('');
   const [phone, setPhone] = useState('');
   const [email, setEmail] = useState('');
   const [website, setWebsite] = useState('');
@@ -174,10 +181,17 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
     setName(data.name || '');
     setLegalName(data.legalName || '');
     setTaxId(data.taxId || '');
+    setTaxRegistrationNumber(data.taxRegistrationNumber || '');
     setCurrency(data.currency || 'USD');
     setTimezone(data.timezone || 'UTC');
     setLogoUrl(data.logoUrl || '');
     setAddress(data.address || '');
+    setAddressLine1(data.addressLine1 || '');
+    setAddressLine2(data.addressLine2 || '');
+    setCity(data.city || '');
+    setStateRegion(data.state || '');
+    setPostalCode(data.postalCode || '');
+    setCountry(data.country || '');
     setPhone(data.phone || '');
     setEmail(data.email || '');
     setWebsite(data.website || '');
@@ -230,7 +244,14 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
     setPendingMessage(null);
 
     if (currentUser?.isPreview) {
-      const slot = assetType === 'LOGO' ? 'logo' : assetType === 'SEAL' ? 'seal' : 'signature';
+      const slot =
+        assetType === 'LOGO'
+          ? 'logo'
+          : assetType === 'SEAL'
+          ? 'seal'
+          : assetType === 'PAYMENT_QR'
+          ? 'paymentQr'
+          : 'signature';
       const previewAsset = {
         id: `preview-${slot}`,
         companyId: profile?.id || 'preview-company-id',
@@ -258,12 +279,15 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
         logoUrl: assetType === 'LOGO' ? payload.dataBase64 : base.logoUrl,
         sealUrl: assetType === 'SEAL' ? payload.dataBase64 : base.sealUrl,
         signatureUrl: assetType === 'SIGNATURE' ? payload.dataBase64 : base.signatureUrl,
+        paymentQrUrl: assetType === 'PAYMENT_QR' ? payload.dataBase64 : base.paymentQrUrl,
         brandingAssets: {
           version: 1,
           logo: assetType === 'LOGO' ? previewAsset : base.brandingAssets?.logo || null,
           seal: assetType === 'SEAL' ? previewAsset : base.brandingAssets?.seal || null,
           signature:
             assetType === 'SIGNATURE' ? previewAsset : base.brandingAssets?.signature || null,
+          paymentQr:
+            assetType === 'PAYMENT_QR' ? previewAsset : base.brandingAssets?.paymentQr || null,
         },
       };
       applyLoadedProfile(nextProfile);
@@ -298,7 +322,14 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
     setPendingMessage(null);
 
     if (currentUser?.isPreview) {
-      const slot = assetType === 'LOGO' ? 'logo' : assetType === 'SEAL' ? 'seal' : 'signature';
+      const slot =
+        assetType === 'LOGO'
+          ? 'logo'
+          : assetType === 'SEAL'
+          ? 'seal'
+          : assetType === 'PAYMENT_QR'
+          ? 'paymentQr'
+          : 'signature';
       const base = profile || {
         id: 'preview-company-id',
         code: 'PREVIEW',
@@ -311,11 +342,13 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
         logoUrl: assetType === 'LOGO' ? null : base.logoUrl,
         sealUrl: assetType === 'SEAL' ? null : base.sealUrl,
         signatureUrl: assetType === 'SIGNATURE' ? null : base.signatureUrl,
+        paymentQrUrl: assetType === 'PAYMENT_QR' ? null : base.paymentQrUrl,
         brandingAssets: {
           version: 1,
           logo: slot === 'logo' ? null : base.brandingAssets?.logo || null,
           seal: slot === 'seal' ? null : base.brandingAssets?.seal || null,
           signature: slot === 'signature' ? null : base.brandingAssets?.signature || null,
+          paymentQr: slot === 'paymentQr' ? null : base.brandingAssets?.paymentQr || null,
         },
       };
       applyLoadedProfile(nextProfile);
@@ -396,15 +429,23 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
 
     if (currentUser?.isPreview) {
       const mockUpdated: CompanyProfile = {
-        id: 'preview-company-id',
-        code: 'PREVIEW',
+        ...profile,
+        id: profile?.id || 'preview-company-id',
+        code: profile?.code || 'PREVIEW',
         name: name.trim(),
         legalName: legalName.trim() || null,
         taxId: taxId.trim() || null,
+        taxRegistrationNumber: taxRegistrationNumber.trim() || null,
         currency,
         timezone,
         logoUrl: logoUrl.trim() || null,
         address: address.trim() || null,
+        addressLine1: addressLine1.trim() || null,
+        addressLine2: addressLine2.trim() || null,
+        city: city.trim() || null,
+        state: stateRegion.trim() || null,
+        postalCode: postalCode.trim() || null,
+        country: country.trim() || null,
         phone: phone.trim() || null,
         email: email.trim() || null,
         website: website.trim() || null,
@@ -426,10 +467,17 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
         name: name.trim(),
         legalName: legalName.trim() || null,
         taxId: taxId.trim() || null,
+        taxRegistrationNumber: taxRegistrationNumber.trim() || null,
         currency,
         timezone,
         logoUrl: logoUrl.trim() || null,
         address: address.trim() || null,
+        addressLine1: addressLine1.trim() || null,
+        addressLine2: addressLine2.trim() || null,
+        city: city.trim() || null,
+        state: stateRegion.trim() || null,
+        postalCode: postalCode.trim() || null,
+        country: country.trim() || null,
         phone: phone.trim() || null,
         email: email.trim() || null,
         website: website.trim() || null,
@@ -672,8 +720,21 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
                 type="text"
                 value={taxId}
                 onChange={(e) => setTaxId(e.target.value)}
-                placeholder="e.g. US-TAX-1234567"
+                placeholder="e.g. 29AABCD1234E1Z5"
                 className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+
+            <div className="md:col-span-2">
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                GSTIN / Tax Registration Number (Optional)
+              </label>
+              <input
+                type="text"
+                value={taxRegistrationNumber}
+                onChange={(e) => setTaxRegistrationNumber(e.target.value)}
+                placeholder="e.g. 29AABCD1234E1Z5 (displayed on invoices if configured)"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-100 focus:outline-none focus:border-indigo-500"
               />
             </div>
           </div>
@@ -774,13 +835,87 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
             <div className="md:col-span-2">
               <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center gap-1.5">
                 <MapPin className="w-3.5 h-3.5 text-slate-400" />
-                Physical Headquarters Address
+                Physical Headquarters Address (Summary / Legacy Line)
               </label>
               <input
                 type="text"
                 value={address}
                 onChange={(e) => setAddress(e.target.value)}
-                placeholder="100 Main Street, Suite 400, New York, NY 10001"
+                placeholder="100 Main Street, Suite 400, Bengaluru, Karnataka 560001"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                Address Line 1
+              </label>
+              <input
+                type="text"
+                value={addressLine1}
+                onChange={(e) => setAddressLine1(e.target.value)}
+                placeholder="Building / Street / Floor"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                Address Line 2
+              </label>
+              <input
+                type="text"
+                value={addressLine2}
+                onChange={(e) => setAddressLine2(e.target.value)}
+                placeholder="Area / Landmark (Optional)"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">City</label>
+              <input
+                type="text"
+                value={city}
+                onChange={(e) => setCity(e.target.value)}
+                placeholder="e.g. Bengaluru"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                State / Province
+              </label>
+              <input
+                type="text"
+                value={stateRegion}
+                onChange={(e) => setStateRegion(e.target.value)}
+                placeholder="e.g. Karnataka"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                Postal / PIN Code
+              </label>
+              <input
+                type="text"
+                value={postalCode}
+                onChange={(e) => setPostalCode(e.target.value)}
+                placeholder="e.g. 560001"
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-100 focus:outline-none focus:border-indigo-500"
+              />
+            </div>
+
+            <div>
+              <label className="block text-xs font-medium text-slate-300 mb-1.5">Country</label>
+              <input
+                type="text"
+                value={country}
+                onChange={(e) => setCountry(e.target.value)}
+                placeholder="e.g. India"
                 className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-indigo-500"
               />
             </div>
@@ -831,7 +966,7 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
             </span>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
             <BrandingAssetCard
               assetType="LOGO"
               title="Company Logo"
@@ -891,6 +1026,28 @@ export const CompanyAdminPage: React.FC<CompanyAdminPageProps> = ({ currentUser,
                     (r.payload as { assetType?: string })?.assetType === 'SIGNATURE'
                 )
                   ? 'A signature update is currently awaiting Super Admin approval.'
+                  : null
+              }
+              disabled={!canEditBranding}
+              onUpload={handleUploadBrandingAsset}
+              onRemove={handleRemoveBrandingAsset}
+            />
+
+            <BrandingAssetCard
+              assetType="PAYMENT_QR"
+              title="UPI Payment QR Code"
+              description="Upload your existing UPI QR image (PNG/JPG). Displayed on invoices only when enabled in Print Settings."
+              recommendedHint="Square PNG, JPG, or JPEG · kept unmodified"
+              asset={profile?.brandingAssets?.paymentQr || null}
+              fallbackUrl={profile?.paymentQrUrl || profile?.documentBranding?.paymentQrUrl}
+              pendingNote={
+                changeRequests.some(
+                  (r) =>
+                    (r.payload as { type?: string; assetType?: string })?.type ===
+                      'COMPANY_BRANDING_ASSET' &&
+                    (r.payload as { assetType?: string })?.assetType === 'PAYMENT_QR'
+                )
+                  ? 'A Payment QR update is currently awaiting Super Admin approval.'
                   : null
               }
               disabled={!canEditBranding}
