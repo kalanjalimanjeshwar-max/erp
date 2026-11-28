@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   REQUIRED_REPAIR_CONFIRMATION_FLAG,
   appendEnvAssignmentPreservingContent,
+  defaultCreateFileBackup,
+  defaultRestoreFileFromBackup,
   runLocalDatabaseEnvRepair,
   stripMisplacedVarsFromEnvContent,
   writeFileAtomicallyStrict,
@@ -150,6 +152,7 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
   }
 
   afterEach(() => {
+    vi.restoreAllMocks();
     for (const dir of tempDirs.splice(0, tempDirs.length)) {
       fs.rmSync(dir, { recursive: true, force: true });
     }
@@ -1874,5 +1877,802 @@ describe('CoreERP Permanent Local Database Environment Repair', () => {
     expect(combined).not.toContain(seeded.devPass);
     expect(combined).not.toContain(seeded.integrationPass);
     expect(combined).not.toContain(seeded.shadowPass);
+  });
+
+  it('26. Post-write verification failure restores all previously existing files byte-for-byte (preserving UTF-8 BOM and CRLF) and keeps backups intact', async () => {
+    const dir = makeTempProject();
+    const seeded = seedWindowsAuditScenario(dir, { crlf: true });
+
+    // Prepend UTF-8 BOM to .env to verify exact byte-for-byte encoding preservation on rollback
+    const envWithBom = Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      fs.readFileSync(path.join(dir, '.env')),
+    ]);
+    fs.writeFileSync(path.join(dir, '.env'), envWithBom);
+
+    // Pre-seed a valid .env.staging so ONLY existing files (.env and .env.integration-test) are modified
+    const stagingPass = 'PreExistingStagingSecret_7766!';
+    fs.writeFileSync(
+      path.join(dir, '.env.staging'),
+      [
+        'STAGING_POSTGRES_USER="erp_staging_user"',
+        `STAGING_POSTGRES_PASSWORD="${stagingPass}"`,
+        'STAGING_POSTGRES_DB="core_erp_staging"',
+        `STAGING_DATABASE_URL="postgresql://erp_staging_user:${encodeURIComponent(stagingPass)}@localhost:5435/core_erp_staging?schema=public"`,
+        '',
+      ].join('\r\n'),
+      'utf-8'
+    );
+
+    const originalEnvBytes = fs.readFileSync(path.join(dir, '.env'));
+    const originalIntBytes = fs.readFileSync(path.join(dir, '.env.integration-test'));
+    const originalStagingBytes = fs.readFileSync(path.join(dir, '.env.staging'));
+
+    const { logger, logs } = createSilentLogger();
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_UNAVAILABLE,
+      inspectPersistentEnvScopes: async () => [],
+      now: () => new Date(2026, 10, 27, 10, 15, 0, 111),
+      verifyRepairedFiles: async () => ({
+        exitCode: 1,
+        mode: 'CHECK',
+        files: [],
+        detectedVolumes: [],
+        issues: ['Simulated post-write verification failure on disk'],
+        warnings: [],
+      }),
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.executed).toBe(false);
+    expect(res.fileVerificationPassed).toBe(false);
+    expect(res.verificationPassed).toBe(false);
+    expect(res.modifiedFiles).toEqual([]);
+    expect(res.createdFiles).toEqual([]);
+    expect(res.backups).toHaveLength(2);
+    expect(res.rollback?.attempted).toBe(true);
+    expect(res.rollback?.succeeded).toBe(true);
+    expect(res.rollback?.records).toHaveLength(2);
+    expect(
+      res.rollback?.records.find((r) => r.file === '.env')
+    ).toMatchObject({ action: 'RESTORE_FROM_BACKUP', success: true });
+    expect(
+      res.rollback?.records.find((r) => r.file === '.env.integration-test')
+    ).toMatchObject({ action: 'RESTORE_FROM_BACKUP', success: true });
+
+    // Original files restored byte-for-byte (including BOM and CRLF)
+    expect(fs.readFileSync(path.join(dir, '.env')).equals(originalEnvBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(dir, '.env.integration-test')).equals(originalIntBytes)
+    ).toBe(true);
+    expect(
+      fs.readFileSync(path.join(dir, '.env.staging')).equals(originalStagingBytes)
+    ).toBe(true);
+
+    // Backup files remain completely intact on disk after rollback
+    const envBackup = res.backups.find((b) => b.file === '.env')!;
+    const intBackup = res.backups.find((b) => b.file === '.env.integration-test')!;
+    expect(fs.existsSync(envBackup.backupPath)).toBe(true);
+    expect(fs.existsSync(intBackup.backupPath)).toBe(true);
+    expect(fs.readFileSync(envBackup.backupPath).equals(originalEnvBytes)).toBe(true);
+    expect(fs.readFileSync(intBackup.backupPath).equals(originalIntBytes)).toBe(true);
+
+    const logText = logs.join('\n');
+    expect(logText).toContain('[ROLLBACK COMPLETE]');
+    expect(logText).toContain('all original files were restored');
+    expect(
+      res.blockers.some((b) => /Post-repair verification failed.*all original files were restored/i.test(b))
+    ).toBe(true);
+    expect(logText).not.toContain(seeded.devPass);
+    expect(logText).not.toContain(seeded.integrationPass);
+  });
+
+  it('27. Post-write verification failure removes all newly created files (.env.integration-test and .env.staging) while leaving clean .env untouched', async () => {
+    const dir = makeTempProject();
+    const devPass = 'CleanOnlyDevPass_8822!';
+    const shadowPass = 'CleanOnlyShadowPass_9933!';
+    fs.writeFileSync(
+      path.join(dir, '.env'),
+      [
+        'PORT=3000',
+        'NODE_ENV=development',
+        'POSTGRES_USER="erp_user"',
+        `POSTGRES_PASSWORD="${devPass}"`,
+        'POSTGRES_DB="core_erp"',
+        `DATABASE_URL="postgresql://erp_user:${encodeURIComponent(devPass)}@localhost:5432/core_erp?schema=public"`,
+        'SHADOW_POSTGRES_USER="erp_shadow_user"',
+        `SHADOW_POSTGRES_PASSWORD="${shadowPass}"`,
+        'SHADOW_POSTGRES_DB="core_erp_shadow"',
+        `SHADOW_DATABASE_URL="postgresql://erp_shadow_user:${encodeURIComponent(shadowPass)}@localhost:5436/core_erp_shadow?schema=public"`,
+        '',
+      ].join('\n'),
+      'utf-8'
+    );
+    const originalEnvBytes = fs.readFileSync(path.join(dir, '.env'));
+
+    const { logger, logs } = createSilentLogger();
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_UNAVAILABLE,
+      inspectPersistentEnvScopes: async () => [],
+      verifyRepairedFiles: async () => ({
+        exitCode: 1,
+        mode: 'CHECK',
+        files: [],
+        detectedVolumes: [],
+        issues: ['Simulated verification failure after creating missing env files'],
+        warnings: [],
+      }),
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.executed).toBe(false);
+    expect(res.fileVerificationPassed).toBe(false);
+    expect(res.verificationPassed).toBe(false);
+    expect(res.backups).toHaveLength(0);
+    expect(res.modifiedFiles).toEqual([]);
+    expect(res.createdFiles).toEqual([]);
+    expect(res.rollback?.attempted).toBe(true);
+    expect(res.rollback?.succeeded).toBe(true);
+    expect(res.rollback?.records).toHaveLength(2);
+    expect(
+      res.rollback?.records.find((r) => r.file === '.env.integration-test')
+    ).toEqual({ file: '.env.integration-test', action: 'REMOVE_CREATED_FILE', success: true });
+    expect(
+      res.rollback?.records.find((r) => r.file === '.env.staging')
+    ).toEqual({ file: '.env.staging', action: 'REMOVE_CREATED_FILE', success: true });
+
+    // Both newly created files were removed; untouched .env remains byte-for-byte identical
+    expect(fs.existsSync(path.join(dir, '.env.integration-test'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, '.env.staging'))).toBe(false);
+    expect(fs.readFileSync(path.join(dir, '.env')).equals(originalEnvBytes)).toBe(true);
+    expect(logs.join('\n')).toContain('[ROLLBACK COMPLETE]');
+  });
+
+  it('28. Mixed scenario: post-write verification failure (and verification exception) restores existing .env and .env.integration-test byte-for-byte, removes newly created .env.staging, and keeps backups intact', async () => {
+    for (const mode of ['NON_ZERO_EXIT', 'THROWN_ERROR'] as const) {
+      const dir = makeTempProject();
+      seedWindowsAuditScenario(dir, { crlf: true });
+      const originalEnvBytes = fs.readFileSync(path.join(dir, '.env'));
+      const originalIntBytes = fs.readFileSync(path.join(dir, '.env.integration-test'));
+
+      const { logger, logs } = createSilentLogger();
+      const res = await runLocalDatabaseEnvRepair({
+        projectRoot: dir,
+        mode: 'REPAIR',
+        confirmed: true,
+        shellEnv: {},
+        logger,
+        inspectDocker: async () => DOCKER_UNAVAILABLE,
+        inspectPersistentEnvScopes: async () => [],
+        now: () => new Date(2026, 10, 27, 10, 20, 0, mode === 'NON_ZERO_EXIT' ? 1 : 2),
+        verifyRepairedFiles: async () => {
+          if (mode === 'THROWN_ERROR') {
+            throw new Error('Unexpected I/O failure during post-write verification');
+          }
+          return {
+            exitCode: 1,
+            mode: 'CHECK',
+            files: [],
+            detectedVolumes: [],
+            issues: ['Post-write check detected mismatch across repaired files'],
+            warnings: [],
+          };
+        },
+      });
+
+      expect(res.exitCode, mode).toBe(1);
+      expect(res.executed, mode).toBe(false);
+      expect(res.fileVerificationPassed, mode).toBe(false);
+      expect(res.verificationPassed, mode).toBe(false);
+      expect(res.modifiedFiles, mode).toEqual([]);
+      expect(res.createdFiles, mode).toEqual([]);
+      expect(res.backups, mode).toHaveLength(2);
+      expect(res.rollback?.attempted, mode).toBe(true);
+      expect(res.rollback?.succeeded, mode).toBe(true);
+      expect(res.rollback?.records, mode).toHaveLength(3);
+      expect(
+        res.rollback?.records.find((r) => r.file === '.env')
+      ).toMatchObject({ action: 'RESTORE_FROM_BACKUP', success: true });
+      expect(
+        res.rollback?.records.find((r) => r.file === '.env.integration-test')
+      ).toMatchObject({ action: 'RESTORE_FROM_BACKUP', success: true });
+      expect(
+        res.rollback?.records.find((r) => r.file === '.env.staging')
+      ).toEqual({ file: '.env.staging', action: 'REMOVE_CREATED_FILE', success: true });
+
+      // Existing files restored byte-for-byte; newly created .env.staging removed
+      expect(fs.readFileSync(path.join(dir, '.env')).equals(originalEnvBytes), mode).toBe(true);
+      expect(
+        fs.readFileSync(path.join(dir, '.env.integration-test')).equals(originalIntBytes),
+        mode
+      ).toBe(true);
+      expect(fs.existsSync(path.join(dir, '.env.staging')), mode).toBe(false);
+
+      // Both backups preserved byte-for-byte
+      for (const backup of res.backups) {
+        expect(fs.existsSync(backup.backupPath), `${mode}:${backup.file}`).toBe(true);
+      }
+      expect(
+        fs
+          .readFileSync(res.backups.find((b) => b.file === '.env')!.backupPath)
+          .equals(originalEnvBytes),
+        mode
+      ).toBe(true);
+      expect(
+        fs
+          .readFileSync(res.backups.find((b) => b.file === '.env.integration-test')!.backupPath)
+          .equals(originalIntBytes),
+        mode
+      ).toBe(true);
+
+      expect(logs.join('\n'), mode).toContain('[ROLLBACK COMPLETE]');
+      expect(logs.join('\n'), mode).toContain('all original files were restored');
+    }
+  });
+
+  it('29. Partial rollback failure is reported accurately, identifies the un-restored file, preserves all backups, and never claims complete restoration', async () => {
+    const dir = makeTempProject();
+    seedWindowsAuditScenario(dir);
+    const originalEnvBytes = fs.readFileSync(path.join(dir, '.env'));
+    const originalIntBytes = fs.readFileSync(path.join(dir, '.env.integration-test'));
+
+    const { logger, logs } = createSilentLogger();
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_UNAVAILABLE,
+      inspectPersistentEnvScopes: async () => [],
+      now: () => new Date(2026, 10, 27, 10, 25, 0, 500),
+      verifyRepairedFiles: async () => ({
+        exitCode: 1,
+        mode: 'CHECK',
+        files: [],
+        detectedVolumes: [],
+        issues: ['Simulated verification failure triggering partial rollback failure'],
+        warnings: [],
+      }),
+      restoreFileFromBackup: (filePath, backupPath) => {
+        if (path.basename(filePath) === '.env.integration-test') {
+          throw new Error('EACCES: simulated locked file during .env.integration-test restore');
+        }
+        defaultRestoreFileFromBackup(filePath, backupPath);
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.executed).toBe(false);
+    expect(res.blocked).toBe(true);
+    expect(res.fileVerificationPassed).toBe(false);
+    expect(res.verificationPassed).toBe(false);
+    expect(res.rollback?.attempted).toBe(true);
+    expect(res.rollback?.succeeded).toBe(false);
+    expect(res.rollback?.records).toHaveLength(3);
+
+    const envRecord = res.rollback?.records.find((r) => r.file === '.env');
+    const intRecord = res.rollback?.records.find((r) => r.file === '.env.integration-test');
+    const stagingRecord = res.rollback?.records.find((r) => r.file === '.env.staging');
+
+    expect(envRecord).toMatchObject({ action: 'RESTORE_FROM_BACKUP', success: true });
+    expect(stagingRecord).toEqual({
+      file: '.env.staging',
+      action: 'REMOVE_CREATED_FILE',
+      success: true,
+    });
+    expect(intRecord).toMatchObject({
+      file: '.env.integration-test',
+      action: 'RESTORE_FROM_BACKUP',
+      success: false,
+    });
+    expect(intRecord?.error).toContain('EACCES');
+
+    // Un-restored file remains accurately reflected in modifiedFiles
+    expect(res.modifiedFiles).toEqual(['.env.integration-test']);
+    expect(res.createdFiles).toEqual([]);
+
+    // .env was restored, .env.staging was removed, and ALL backups remain intact byte-for-byte
+    expect(fs.readFileSync(path.join(dir, '.env')).equals(originalEnvBytes)).toBe(true);
+    expect(fs.existsSync(path.join(dir, '.env.staging'))).toBe(false);
+    expect(res.backups).toHaveLength(2);
+    expect(
+      fs
+        .readFileSync(res.backups.find((b) => b.file === '.env')!.backupPath)
+        .equals(originalEnvBytes)
+    ).toBe(true);
+    expect(
+      fs
+        .readFileSync(res.backups.find((b) => b.file === '.env.integration-test')!.backupPath)
+        .equals(originalIntBytes)
+    ).toBe(true);
+
+    // Must clearly identify .env.integration-test and NEVER claim complete rollback
+    const logText = logs.join('\n');
+    expect(logText).toContain('[ROLLBACK INCOMPLETE]');
+    expect(logText).toContain('.env.integration-test');
+    expect(logText).not.toContain('[ROLLBACK COMPLETE]');
+    expect(logText).not.toContain('all original files were restored');
+    expect(
+      res.blockers.some((b) => b.includes('.env.integration-test') && /Rollback failed/i.test(b))
+    ).toBe(true);
+    expect(
+      res.blockers.some((b) => /rollback was INCOMPLETE/i.test(b))
+    ).toBe(true);
+    expect(
+      res.blockers.some((b) => /all original files were restored/i.test(b))
+    ).toBe(false);
+  });
+
+  it('30. Exclusive backup creation (wx) aborts on backup filename collision before modifying any live file and preserves existing backup contents', async () => {
+    // 30a. Direct unit test of defaultCreateFileBackup
+    const directDir = makeTempProject();
+    const srcFile = path.join(directDir, '.env');
+    const collidingBackup = path.join(directDir, '.env.backup.existing');
+    const sentinelBackupBytes = Buffer.from('# EXISTING BACKUP — MUST NOT BE OVERWRITTEN\r\nKEEP=1\r\n', 'utf-8');
+    fs.writeFileSync(srcFile, 'DATABASE_URL="postgresql://u:p@localhost:5432/core_erp"\n', 'utf-8');
+    fs.writeFileSync(collidingBackup, sentinelBackupBytes);
+
+    const unlinkSpy = vi.spyOn(fs, 'unlinkSync');
+    expect(() => defaultCreateFileBackup(srcFile, collidingBackup)).toThrow(
+      /Backup file already exists.*refusing to overwrite/i
+    );
+    expect(unlinkSpy).not.toHaveBeenCalled();
+    expect(fs.readFileSync(collidingBackup).equals(sentinelBackupBytes)).toBe(true);
+    unlinkSpy.mockRestore();
+
+    // 30b. Full REPAIR aborts before modifying ANY live file when second backup filename collides
+    const dir = makeTempProject();
+    seedWindowsAuditScenario(dir, { crlf: true });
+    const originalEnvBytes = fs.readFileSync(path.join(dir, '.env'));
+    const originalIntBytes = fs.readFileSync(path.join(dir, '.env.integration-test'));
+
+    // Deterministic timestamp: 2026-11-27 10:30:00.000 -> 20261127-103000-000
+    const fixedDate = new Date(2026, 10, 27, 10, 30, 0, 0);
+    const collidingIntBackupPath = path.join(dir, '.env.integration-test.backup.20261127-103000-000');
+    const existingIntBackupSentinel = Buffer.from('# PRIOR BACKUP CONTENTS — PRESERVE EXACTLY\r\n', 'utf-8');
+    fs.writeFileSync(collidingIntBackupPath, existingIntBackupSentinel);
+
+    const { logger, logs } = createSilentLogger();
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_UNAVAILABLE,
+      inspectPersistentEnvScopes: async () => [],
+      now: () => fixedDate,
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.executed).toBe(false);
+    expect(res.blocked).toBe(true);
+    expect(res.fileVerificationPassed).toBe(false);
+    expect(res.verificationPassed).toBe(false);
+    expect(res.modifiedFiles).toEqual([]);
+    expect(res.createdFiles).toEqual([]);
+    expect(
+      res.blockers.some((b) => /Backup creation failed.*already exists/i.test(b))
+    ).toBe(true);
+    expect(logs.join('\n')).toContain('[ABORTED]');
+
+    // ZERO live environment files modified or created
+    expect(fs.readFileSync(path.join(dir, '.env')).equals(originalEnvBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(dir, '.env.integration-test')).equals(originalIntBytes)
+    ).toBe(true);
+    expect(fs.existsSync(path.join(dir, '.env.staging'))).toBe(false);
+
+    // Pre-existing colliding backup preserved byte-for-byte
+    expect(fs.readFileSync(collidingIntBackupPath).equals(existingIntBackupSentinel)).toBe(true);
+  });
+
+  it('31. Never exposes passwords, encoded passwords, or raw connection URLs during post-write verification failure and rollback failure', async () => {
+    const dir = makeTempProject();
+    const seeded = seedWindowsAuditScenario(dir);
+    const generatedStagingSecret = 'GeneratedStagingSecret_RollbackLeakCheck_9988!';
+    const shellOverrideSecret = 'ShellOverrideSecret_RollbackLeakCheck_7766!';
+    const rawDevUrl = `postgresql://erp_user:${encodeURIComponent(seeded.devPass)}@localhost:5432/core_erp?schema=public`;
+    const rawStagingUrl = `postgresql://erp_staging_user:${encodeURIComponent(generatedStagingSecret)}@localhost:5435/core_erp_staging?schema=public`;
+
+    const { logger, logs } = createSilentLogger();
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {
+        TEST_DATABASE_URL: `postgresql://erp_test_user:${encodeURIComponent(shellOverrideSecret)}@localhost:5433/core_erp_test?schema=public`,
+      },
+      logger,
+      inspectDocker: async () => DOCKER_UNAVAILABLE,
+      inspectPersistentEnvScopes: async () => [],
+      generateSecret: () => generatedStagingSecret,
+      verifyRepairedFiles: async () => ({
+        exitCode: 1,
+        mode: 'CHECK',
+        files: [],
+        detectedVolumes: [],
+        issues: [
+          `Verification failed for ${rawDevUrl} and ${rawStagingUrl} using secret ${seeded.integrationPass}`,
+        ],
+        warnings: [],
+      }),
+      restoreFileFromBackup: (filePath, backupPath) => {
+        if (path.basename(filePath) === '.env') {
+          throw new Error(
+            `Restore error touching ${rawDevUrl} with ${seeded.devPass} and ${seeded.shadowPass}`
+          );
+        }
+        defaultRestoreFileFromBackup(filePath, backupPath);
+      },
+    });
+
+    expect(res.exitCode).toBe(1);
+    expect(res.executed).toBe(false);
+    expect(res.blocked).toBe(true);
+    expect(res.rollback?.attempted).toBe(true);
+    expect(res.rollback?.succeeded).toBe(false);
+
+    const combined = JSON.stringify({
+      logs,
+      blockers: res.blockers,
+      warnings: res.warnings,
+      findings: res.findings,
+      shellOverrides: res.shellOverrides,
+      manualRemediation: res.manualRemediation,
+      rollback: res.rollback,
+    });
+
+    for (const secret of [
+      seeded.devPass,
+      encodeURIComponent(seeded.devPass),
+      seeded.shadowPass,
+      encodeURIComponent(seeded.shadowPass),
+      seeded.integrationPass,
+      encodeURIComponent(seeded.integrationPass),
+      seeded.misplacedStagingPass,
+      seeded.misplacedTestPass,
+      generatedStagingSecret,
+      encodeURIComponent(generatedStagingSecret),
+      shellOverrideSecret,
+      encodeURIComponent(shellOverrideSecret),
+      rawDevUrl,
+      rawStagingUrl,
+      'session_secret_preserved_exactly_1234567890abcdef',
+      'bridge_token_preserved_exactly_1234567890',
+    ]) {
+      expect(combined).not.toContain(secret);
+    }
+  });
+
+  it('32. Backup write failure cleans up partial backup file, closes descriptor once, aborts repair before live writes, and redacts secrets', async () => {
+    // 32a. Direct defaultCreateFileBackup write failure cleans up partial backup and closes fd once
+    const directDir = makeTempProject();
+    const srcPath = path.join(directDir, '.env');
+    const backupPath = path.join(directDir, '.env.backup.writefail');
+    fs.writeFileSync(srcPath, 'DATABASE_URL="postgresql://u:p@localhost:5432/core_erp"\n', 'utf-8');
+
+    let backupFd: number | null = null;
+    let backupFdCloseCount = 0;
+    const origOpenSync = fs.openSync;
+    const origCloseSync = fs.closeSync;
+    const openSpy = vi.spyOn(fs, 'openSync').mockImplementation((p, flags, mode) => {
+      const fd = origOpenSync.call(fs, p, flags, mode);
+      if (p === backupPath) {
+        backupFd = fd;
+      }
+      return fd;
+    });
+    const closeSpy = vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+      if (backupFd !== null && fd === backupFd) {
+        backupFdCloseCount += 1;
+      }
+      return origCloseSync.call(fs, fd);
+    });
+    const origWriteFileSync = fs.writeFileSync;
+    const writeSpy = vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
+      if (typeof file === 'number') {
+        const err = new Error('ENOSPC: no space left on device while writing backup') as NodeJS.ErrnoException;
+        err.code = 'ENOSPC';
+        throw err;
+      }
+      return origWriteFileSync.call(fs, file, data, options);
+    });
+
+    expect(() => defaultCreateFileBackup(srcPath, backupPath)).toThrow(
+      /ENOSPC: no space left on device while writing backup/
+    );
+    expect(backupFd).not.toBeNull();
+    expect(backupFdCloseCount).toBe(1);
+    expect(fs.existsSync(backupPath)).toBe(false);
+
+    writeSpy.mockRestore();
+    closeSpy.mockRestore();
+    openSpy.mockRestore();
+
+    // 32b. End-to-end REPAIR aborts before modifying live files, cleans up partial backup, and redacts secrets
+    const dir = makeTempProject();
+    const seeded = seedWindowsAuditScenario(dir, { crlf: true });
+    const originalEnvBytes = fs.readFileSync(path.join(dir, '.env'));
+    const originalIntBytes = fs.readFileSync(path.join(dir, '.env.integration-test'));
+    const rawDevUrl = `postgresql://erp_user:${encodeURIComponent(seeded.devPass)}@localhost:5432/core_erp?schema=public`;
+    const fixedDate = new Date(2026, 10, 28, 1, 10, 0, 0);
+    const expectedEnvBackupPath = path.join(dir, '.env.backup.20261128-011000-000');
+
+    const repairWriteSpy = vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
+      if (typeof file === 'number') {
+        throw new Error(`ENOSPC writing backup for ${rawDevUrl} (${seeded.devPass})`);
+      }
+      return origWriteFileSync.call(fs, file, data, options);
+    });
+
+    const { logger, logs } = createSilentLogger();
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_UNAVAILABLE,
+      inspectPersistentEnvScopes: async () => [],
+      now: () => fixedDate,
+    });
+    repairWriteSpy.mockRestore();
+
+    expect(res.exitCode).toBe(1);
+    expect(res.executed).toBe(false);
+    expect(res.blocked).toBe(true);
+    expect(res.fileVerificationPassed).toBe(false);
+    expect(res.verificationPassed).toBe(false);
+    expect(res.modifiedFiles).toEqual([]);
+    expect(res.createdFiles).toEqual([]);
+
+    // Partial backup created by failed write was removed
+    expect(fs.existsSync(expectedEnvBackupPath)).toBe(false);
+
+    // Live files remain completely untouched byte-for-byte
+    expect(fs.readFileSync(path.join(dir, '.env')).equals(originalEnvBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(dir, '.env.integration-test')).equals(originalIntBytes)
+    ).toBe(true);
+    expect(fs.existsSync(path.join(dir, '.env.staging'))).toBe(false);
+
+    const combined = JSON.stringify({ logs, blockers: res.blockers, warnings: res.warnings });
+    expect(combined).toContain('ENOSPC');
+    expect(combined).not.toContain(seeded.devPass);
+    expect(combined).not.toContain(encodeURIComponent(seeded.devPass));
+    expect(combined).not.toContain(rawDevUrl);
+  });
+
+  it('33. Backup fsync and close failures clean up partial backup without double-closing fd and abort repair before modifying live files', async () => {
+    // 33a. Direct fsync failure removes partial backup and closes backup fd exactly once
+    const fsyncDir = makeTempProject();
+    const srcPath = path.join(fsyncDir, '.env');
+    const backupPath = path.join(fsyncDir, '.env.backup.fsyncfail');
+    fs.writeFileSync(srcPath, 'DATABASE_URL="postgresql://u:p@localhost:5432/core_erp"\n', 'utf-8');
+
+    let fsyncBackupFd: number | null = null;
+    let fsyncBackupFdCloseCount = 0;
+    const origOpenSync = fs.openSync;
+    const origCloseSync = fs.closeSync;
+    const openSpy1 = vi.spyOn(fs, 'openSync').mockImplementation((p, flags, mode) => {
+      const fd = origOpenSync.call(fs, p, flags, mode);
+      if (p === backupPath) {
+        fsyncBackupFd = fd;
+      }
+      return fd;
+    });
+    const closeSpy = vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+      if (fsyncBackupFd !== null && fd === fsyncBackupFd) {
+        fsyncBackupFdCloseCount += 1;
+      }
+      return origCloseSync.call(fs, fd);
+    });
+    const fsyncSpy = vi.spyOn(fs, 'fsyncSync').mockImplementation(() => {
+      const err = new Error('EIO: simulated fsync failure on backup') as NodeJS.ErrnoException;
+      err.code = 'EIO';
+      throw err;
+    });
+
+    expect(() => defaultCreateFileBackup(srcPath, backupPath)).toThrow(
+      /EIO: simulated fsync failure on backup/
+    );
+    expect(fsyncBackupFd).not.toBeNull();
+    expect(fsyncBackupFdCloseCount).toBe(1);
+    expect(fs.existsSync(backupPath)).toBe(false);
+
+    fsyncSpy.mockRestore();
+    closeSpy.mockRestore();
+    openSpy1.mockRestore();
+
+    // 33b. Direct close failure on backup fd does NOT double-close fd and still removes partial backup
+    const closeFailDir = makeTempProject();
+    const srcPath2 = path.join(closeFailDir, '.env');
+    const backupPath2 = path.join(closeFailDir, '.env.backup.closefail');
+    fs.writeFileSync(srcPath2, 'DATABASE_URL="postgresql://u:p@localhost:5432/core_erp"\n', 'utf-8');
+
+    let closeBackupFd: number | null = null;
+    let closeBackupFdCloseCount = 0;
+    let backupExistedBeforeClose = false;
+    const openSpy2 = vi.spyOn(fs, 'openSync').mockImplementation((p, flags, mode) => {
+      const fd = origOpenSync.call(fs, p, flags, mode);
+      if (p === backupPath2) {
+        closeBackupFd = fd;
+      }
+      return fd;
+    });
+    const closeFailSpy = vi.spyOn(fs, 'closeSync').mockImplementation((fd) => {
+      // Only fail when closing the newly created backup fd (not readFileSync's source fd)
+      if (closeBackupFd !== null && fd === closeBackupFd) {
+        closeBackupFdCloseCount += 1;
+        backupExistedBeforeClose = fs.existsSync(backupPath2);
+        // Close the real descriptor first so OS does not leak it, then simulate close failure
+        origCloseSync.call(fs, fd);
+        throw new Error('EIO: simulated closeSync failure');
+      }
+      return origCloseSync.call(fs, fd);
+    });
+
+    expect(() => defaultCreateFileBackup(srcPath2, backupPath2)).toThrow(
+      /EIO: simulated closeSync failure/
+    );
+    expect(closeBackupFd).not.toBeNull();
+    expect(backupExistedBeforeClose).toBe(true);
+    expect(closeBackupFdCloseCount).toBe(1);
+    expect(fs.existsSync(backupPath2)).toBe(false);
+    closeFailSpy.mockRestore();
+    openSpy2.mockRestore();
+
+    // 33c. End-to-end REPAIR aborts on fsync failure before modifying any live env file
+    const dir = makeTempProject();
+    seedWindowsAuditScenario(dir, { crlf: true });
+    const originalEnvBytes = fs.readFileSync(path.join(dir, '.env'));
+    const originalIntBytes = fs.readFileSync(path.join(dir, '.env.integration-test'));
+    const fixedDate = new Date(2026, 10, 28, 1, 15, 0, 0);
+    const expectedEnvBackupPath = path.join(dir, '.env.backup.20261128-011500-000');
+
+    const repairFsyncSpy = vi.spyOn(fs, 'fsyncSync').mockImplementation(() => {
+      throw new Error('EIO: disk flush error during backup');
+    });
+
+    const { logger } = createSilentLogger();
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_UNAVAILABLE,
+      inspectPersistentEnvScopes: async () => [],
+      now: () => fixedDate,
+    });
+    repairFsyncSpy.mockRestore();
+
+    expect(res.exitCode).toBe(1);
+    expect(res.executed).toBe(false);
+    expect(res.blocked).toBe(true);
+    expect(res.modifiedFiles).toEqual([]);
+    expect(res.createdFiles).toEqual([]);
+    expect(fs.existsSync(expectedEnvBackupPath)).toBe(false);
+    expect(fs.readFileSync(path.join(dir, '.env')).equals(originalEnvBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(dir, '.env.integration-test')).equals(originalIntBytes)
+    ).toBe(true);
+    expect(fs.existsSync(path.join(dir, '.env.staging'))).toBe(false);
+  });
+
+  it('34. Backup cleanup failure reports both original backup error and cleanup failure clearly without hiding original error or leaking secrets', async () => {
+    // 34a. Direct defaultCreateFileBackup reports both original fsync error and cleanup failure
+    const directDir = makeTempProject();
+    const srcPath = path.join(directDir, '.env');
+    const backupPath = path.join(directDir, '.env.backup.cleanupfail');
+    fs.writeFileSync(srcPath, 'DATABASE_URL="postgresql://u:p@localhost:5432/core_erp"\n', 'utf-8');
+
+    const fsyncSpy = vi.spyOn(fs, 'fsyncSync').mockImplementation(() => {
+      const err = new Error('ENOSPC: simulated flush failure') as NodeJS.ErrnoException;
+      err.code = 'ENOSPC';
+      throw err;
+    });
+    const unlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation(() => {
+      const err = new Error('EPERM: simulated unlink lock on partial backup') as NodeJS.ErrnoException;
+      err.code = 'EPERM';
+      throw err;
+    });
+
+    let caught: Error | null = null;
+    try {
+      defaultCreateFileBackup(srcPath, backupPath);
+    } catch (err) {
+      caught = err instanceof Error ? err : new Error(String(err));
+    }
+    fsyncSpy.mockRestore();
+    unlinkSpy.mockRestore();
+
+    expect(caught).not.toBeNull();
+    expect(caught!.message).toContain('ENOSPC: simulated flush failure');
+    expect(caught!.message).toContain('partial backup cleanup failed');
+    expect(caught!.message).toContain('EPERM: simulated unlink lock on partial backup');
+    expect(caught!.message).toContain('.env.backup.cleanupfail');
+
+    // 34b. End-to-end REPAIR reports both original error and cleanup failure, keeps live files untouched, and redacts secrets
+    const dir = makeTempProject();
+    const seeded = seedWindowsAuditScenario(dir);
+    const originalEnvBytes = fs.readFileSync(path.join(dir, '.env'));
+    const originalIntBytes = fs.readFileSync(path.join(dir, '.env.integration-test'));
+    const rawDevUrl = `postgresql://erp_user:${encodeURIComponent(seeded.devPass)}@localhost:5432/core_erp?schema=public`;
+    const rawIntUrl = `postgresql://erp_integration_user:${encodeURIComponent(seeded.integrationPass)}@localhost:5434/core_erp_integration_test?schema=public`;
+
+    const origWriteFileSync = fs.writeFileSync;
+    const repairWriteSpy = vi.spyOn(fs, 'writeFileSync').mockImplementation((file, data, options) => {
+      if (typeof file === 'number') {
+        throw new Error(`ENOSPC writing backup for ${rawDevUrl} with ${seeded.devPass}`);
+      }
+      return origWriteFileSync.call(fs, file, data, options);
+    });
+    const repairUnlinkSpy = vi.spyOn(fs, 'unlinkSync').mockImplementation(() => {
+      throw new Error(`EPERM cleaning partial backup for ${rawIntUrl} (${seeded.integrationPass})`);
+    });
+
+    const { logger, logs } = createSilentLogger();
+    const res = await runLocalDatabaseEnvRepair({
+      projectRoot: dir,
+      mode: 'REPAIR',
+      confirmed: true,
+      shellEnv: {},
+      logger,
+      inspectDocker: async () => DOCKER_UNAVAILABLE,
+      inspectPersistentEnvScopes: async () => [],
+      now: () => new Date(2026, 10, 28, 1, 20, 0, 0),
+    });
+    repairWriteSpy.mockRestore();
+    repairUnlinkSpy.mockRestore();
+
+    expect(res.exitCode).toBe(1);
+    expect(res.executed).toBe(false);
+    expect(res.blocked).toBe(true);
+    expect(res.modifiedFiles).toEqual([]);
+    expect(res.createdFiles).toEqual([]);
+
+    // Live environment files remain byte-for-byte unchanged
+    expect(fs.readFileSync(path.join(dir, '.env')).equals(originalEnvBytes)).toBe(true);
+    expect(
+      fs.readFileSync(path.join(dir, '.env.integration-test')).equals(originalIntBytes)
+    ).toBe(true);
+    expect(fs.existsSync(path.join(dir, '.env.staging'))).toBe(false);
+
+    const combined = JSON.stringify({
+      logs,
+      blockers: res.blockers,
+      warnings: res.warnings,
+      findings: res.findings,
+    });
+    // Both original failure and cleanup failure are reported clearly
+    expect(combined).toContain('ENOSPC writing backup');
+    expect(combined).toContain('partial backup cleanup failed');
+    expect(combined).toContain('EPERM cleaning partial backup');
+
+    // Zero secrets or raw connection URLs leaked anywhere
+    for (const secret of [
+      seeded.devPass,
+      encodeURIComponent(seeded.devPass),
+      seeded.integrationPass,
+      encodeURIComponent(seeded.integrationPass),
+      seeded.shadowPass,
+      rawDevUrl,
+      rawIntUrl,
+    ]) {
+      expect(combined).not.toContain(secret);
+    }
   });
 });

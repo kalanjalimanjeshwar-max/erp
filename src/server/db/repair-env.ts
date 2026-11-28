@@ -94,6 +94,20 @@ export interface FileBackupRecord {
   backupPath: string;
 }
 
+export interface FileRollbackRecord {
+  file: '.env' | '.env.integration-test' | '.env.staging';
+  action: 'RESTORE_FROM_BACKUP' | 'REMOVE_CREATED_FILE';
+  success: boolean;
+  backupPath?: string;
+  error?: string;
+}
+
+export interface RepairRollbackSummary {
+  attempted: boolean;
+  succeeded: boolean;
+  records: FileRollbackRecord[];
+}
+
 export interface RepairFinding {
   category:
     | 'MISPLACED_VARIABLE'
@@ -122,6 +136,9 @@ export interface LocalEnvRepairOptions {
   generateSecret?: (bytes?: number) => string;
   createBackup?: (filePath: string, backupPath: string) => void;
   writeFileAtomically?: (filePath: string, content: string) => void;
+  verifyRepairedFiles?: typeof runDatabaseEnvironmentSetup;
+  restoreFileFromBackup?: (filePath: string, backupPath: string) => void;
+  removeCreatedFile?: (filePath: string) => void;
   now?: () => Date;
 }
 
@@ -143,6 +160,7 @@ export interface LocalEnvRepairResult {
   manualRemediation: string[];
   fileVerificationPassed: boolean | null;
   verificationPassed: boolean | null;
+  rollback?: RepairRollbackSummary;
 }
 
 export const CANONICAL_REPAIR_TARGETS = [
@@ -275,6 +293,22 @@ function collectSecretsFromMap(map: Record<string, string | undefined> | null): 
       // Not a URL
     }
   }
+  const historicalKeysRaw = map.BANK_HISTORICAL_KEYS?.trim();
+  if (historicalKeysRaw && historicalKeysRaw !== '{}') {
+    secrets.push(historicalKeysRaw);
+    try {
+      const parsedHistorical: unknown = JSON.parse(historicalKeysRaw);
+      if (parsedHistorical && typeof parsedHistorical === 'object' && !Array.isArray(parsedHistorical)) {
+        for (const val of Object.values(parsedHistorical as Record<string, unknown>)) {
+          if (typeof val === 'string' && val.trim() !== '') {
+            secrets.push(val.trim());
+          }
+        }
+      }
+    } catch {
+      // Non-JSON value already added verbatim
+    }
+  }
   return secrets;
 }
 
@@ -382,8 +416,9 @@ function hasEnvKeyDefinition(content: string, key: string): boolean {
 /**
  * Strict atomic file write: writes to a unique temp file in the same directory,
  * flushes via fsync, and renames atomically. Cleans up temp files on any failure.
+ * Accepts string (UTF-8) or raw Buffer for byte-for-byte restoration.
  */
-export function writeFileAtomicallyStrict(filePath: string, content: string): void {
+export function writeFileAtomicallyStrict(filePath: string, content: string | Buffer): void {
   const dir = path.dirname(filePath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -392,7 +427,11 @@ export function writeFileAtomicallyStrict(filePath: string, content: string): vo
   let fd: number | null = null;
   try {
     fd = fs.openSync(tmpPath, 'wx', 0o600);
-    fs.writeFileSync(fd, content, 'utf-8');
+    if (Buffer.isBuffer(content)) {
+      fs.writeFileSync(fd, content);
+    } else {
+      fs.writeFileSync(fd, content, 'utf-8');
+    }
     fs.fsyncSync(fd);
     fs.closeSync(fd);
     fd = null;
@@ -416,13 +455,102 @@ export function writeFileAtomicallyStrict(filePath: string, content: string): vo
   }
 }
 
+/**
+ * Creates a byte-for-byte backup strictly via exclusive file creation (`wx`) so an
+ * existing backup file is NEVER overwritten.
+ * If write, fsync, or close fails after creating the new backup file, safely closes
+ * the descriptor without double-closing and removes only the partial backup file
+ * created by this operation (never deleting a pre-existing backup).
+ */
 export function defaultCreateFileBackup(filePath: string, backupPath: string): void {
   const rawContent = fs.readFileSync(filePath);
   const dir = path.dirname(backupPath);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  fs.writeFileSync(backupPath, rawContent, { mode: 0o600 });
+  let fd: number | null = null;
+  let createdByThisCall = false;
+  try {
+    fd = fs.openSync(backupPath, 'wx', 0o600);
+    createdByThisCall = true;
+    fs.writeFileSync(fd, rawContent);
+    fs.fsyncSync(fd);
+    const fdToClose = fd;
+    fd = null;
+    fs.closeSync(fdToClose);
+  } catch (err) {
+    let closeErr: unknown = null;
+    if (fd !== null) {
+      const fdToClose = fd;
+      fd = null;
+      try {
+        fs.closeSync(fdToClose);
+      } catch (cErr) {
+        closeErr = cErr;
+      }
+    }
+
+    if (!createdByThisCall) {
+      if ((err as NodeJS.ErrnoException)?.code === 'EEXIST') {
+        throw new Error(
+          `Backup file already exists at "${path.basename(backupPath)}"; refusing to overwrite existing backup.`
+        );
+      }
+      throw err;
+    }
+
+    let cleanupErr: unknown = null;
+    try {
+      fs.unlinkSync(backupPath);
+    } catch (uErr) {
+      if ((uErr as NodeJS.ErrnoException)?.code !== 'ENOENT') {
+        cleanupErr = uErr;
+      }
+    }
+
+    const originalMsg = err instanceof Error ? err.message : String(err);
+    const secondaryNotes: string[] = [];
+    if (closeErr !== null) {
+      secondaryNotes.push(
+        `file descriptor close failed: ${closeErr instanceof Error ? closeErr.message : String(closeErr)}`
+      );
+    }
+    if (cleanupErr !== null) {
+      secondaryNotes.push(
+        `partial backup cleanup failed for "${path.basename(backupPath)}": ${cleanupErr instanceof Error ? cleanupErr.message : String(cleanupErr)}`
+      );
+    }
+
+    if (secondaryNotes.length > 0) {
+      const combinedErr = new Error(
+        `${originalMsg} (Additionally, ${secondaryNotes.join('; ')})`
+      );
+      if (err instanceof Error && 'code' in err && (err as NodeJS.ErrnoException).code) {
+        (combinedErr as NodeJS.ErrnoException).code = (err as NodeJS.ErrnoException).code;
+      }
+      throw combinedErr;
+    }
+
+    throw err;
+  }
+}
+
+/**
+ * Restores a file atomically and byte-for-byte from its backup without deleting or
+ * modifying the backup file.
+ */
+export function defaultRestoreFileFromBackup(filePath: string, backupPath: string): void {
+  if (!fs.existsSync(backupPath)) {
+    throw new Error(`Backup file "${path.basename(backupPath)}" does not exist for rollback.`);
+  }
+  const originalBytes = fs.readFileSync(backupPath);
+  writeFileAtomicallyStrict(filePath, originalBytes);
+}
+
+function defaultRemoveCreatedFile(filePath: string): void {
+  if (fs.existsSync(filePath)) {
+    fs.unlinkSync(filePath);
+  }
 }
 
 function execFileReadOnly(
@@ -709,6 +837,9 @@ export async function runLocalDatabaseEnvRepair(
       : detectPersistentWindowsEnvOverrides);
   const createBackup = options.createBackup ?? defaultCreateFileBackup;
   const writeFileAtomically = options.writeFileAtomically ?? writeFileAtomicallyStrict;
+  const verifyRepairedFiles = options.verifyRepairedFiles ?? runDatabaseEnvironmentSetup;
+  const restoreFileFromBackup = options.restoreFileFromBackup ?? defaultRestoreFileFromBackup;
+  const removeCreatedFile = options.removeCreatedFile ?? defaultRemoveCreatedFile;
   const now = options.now ?? (() => new Date());
   const logger: RepairLogger = options.logger ?? {
     log: (m) => console.log(m),
@@ -1836,11 +1967,12 @@ export async function runLocalDatabaseEnvRepair(
     executed: boolean;
     fileVerificationPassed: boolean | null;
     verificationPassed: boolean | null;
+    rollback?: RepairRollbackSummary;
   }): LocalEnvRepairResult => ({
     exitCode: params.exitCode,
     mode,
     executed: params.executed,
-    blocked: isBlocked,
+    blocked: blockers.length > 0,
     docker: {
       ...docker,
       error: docker.error ? redact(docker.error) : undefined,
@@ -1868,6 +2000,18 @@ export async function runLocalDatabaseEnvRepair(
       params.verificationPassed === true && !persistentEnvScopesVerified
         ? null
         : params.verificationPassed,
+    ...(params.rollback
+      ? {
+          rollback: {
+            attempted: params.rollback.attempted,
+            succeeded: params.rollback.succeeded,
+            records: params.rollback.records.map((r) => ({
+              ...r,
+              error: r.error ? redact(r.error) : undefined,
+            })),
+          },
+        }
+      : {}),
   });
 
   // 9. Handle CHECK mode (strictly read-only)
@@ -2082,6 +2226,118 @@ export async function runLocalDatabaseEnvRepair(
     });
   }
 
+  // Shared atomic byte-for-byte rollback helper (reused by Phase B write failures and Phase C verification failures).
+  // Never deletes or overwrites backup files.
+  const rollbackCompletedWrites = (writesToUndo: readonly PendingFileWrite[]): RepairRollbackSummary => {
+    const records: FileRollbackRecord[] = [];
+    for (const done of [...writesToUndo].reverse()) {
+      if (done.existedBefore) {
+        if (!done.backupPath) {
+          const rbMsg = `No backup path recorded for ${done.label}; cannot restore original file.`;
+          records.push({
+            file: done.label,
+            action: 'RESTORE_FROM_BACKUP',
+            success: false,
+            error: rbMsg,
+          });
+          warnings.push(`Rollback of ${done.label} failed: ${rbMsg}`);
+          logger.error(`   - [ROLLBACK FAILED] ${done.label}: ${rbMsg}`);
+          continue;
+        }
+        try {
+          restoreFileFromBackup(done.filePath, done.backupPath);
+          records.push({
+            file: done.label,
+            action: 'RESTORE_FROM_BACKUP',
+            success: true,
+            backupPath: done.backupPath,
+          });
+          const modIdx = modifiedFiles.indexOf(done.label);
+          if (modIdx !== -1) modifiedFiles.splice(modIdx, 1);
+          logger.log(`   - Restored ${done.label} byte-for-byte from ${path.basename(done.backupPath)}`);
+        } catch (rbErr) {
+          const rbMsg = redact(rbErr instanceof Error ? rbErr.message : String(rbErr));
+          records.push({
+            file: done.label,
+            action: 'RESTORE_FROM_BACKUP',
+            success: false,
+            backupPath: done.backupPath,
+            error: rbMsg,
+          });
+          warnings.push(
+            `Rollback failed for ${done.label} (backup preserved at ${path.basename(done.backupPath)}): ${rbMsg}`
+          );
+          logger.error(
+            `   - [ROLLBACK FAILED] Could not restore ${done.label} from ${path.basename(done.backupPath)}: ${rbMsg}`
+          );
+        }
+      } else {
+        try {
+          removeCreatedFile(done.filePath);
+          records.push({
+            file: done.label,
+            action: 'REMOVE_CREATED_FILE',
+            success: true,
+          });
+          const createIdx = createdFiles.indexOf(done.label);
+          if (createIdx !== -1) createdFiles.splice(createIdx, 1);
+          logger.log(`   - Removed newly created ${done.label} during rollback`);
+        } catch (rbErr) {
+          const rbMsg = redact(rbErr instanceof Error ? rbErr.message : String(rbErr));
+          records.push({
+            file: done.label,
+            action: 'REMOVE_CREATED_FILE',
+            success: false,
+            error: rbMsg,
+          });
+          warnings.push(`Rollback failed to remove newly created ${done.label}: ${rbMsg}`);
+          logger.error(`   - [ROLLBACK FAILED] Could not remove newly created ${done.label}: ${rbMsg}`);
+        }
+      }
+    }
+
+    return {
+      attempted: true,
+      succeeded: records.every((r) => r.success),
+      records,
+    };
+  };
+
+  const recordRollbackOutcome = (reason: string, rollback: RepairRollbackSummary): void => {
+    const failedRecords = rollback.records.filter((r) => !r.success);
+    if (rollback.succeeded) {
+      logger.log(
+        `   - [ROLLBACK COMPLETE] ${reason}; all original files were restored and all backups remain intact.`
+      );
+      blockers.push(
+        `${reason}; all original files were restored from backups and any newly created files were removed.`
+      );
+      return;
+    }
+
+    const failedFileLabels = failedRecords.map((r) => r.file);
+    for (const failed of failedRecords) {
+      if (failed.action === 'RESTORE_FROM_BACKUP') {
+        const backupNote = failed.backupPath
+          ? ` (backup preserved at ${path.basename(failed.backupPath)})`
+          : '';
+        blockers.push(
+          `Rollback failed for ${failed.file}${backupNote}: ${failed.error || 'unknown error'}`
+        );
+      } else {
+        blockers.push(
+          `Rollback failed to remove newly created ${failed.file}: ${failed.error || 'unknown error'}`
+        );
+      }
+    }
+    blockers.push(
+      `${reason}; rollback was INCOMPLETE (could not roll back: ${failedFileLabels.join(', ')}). Preserved backups remain available for manual recovery.`
+    );
+    logger.error(
+      `   - [ROLLBACK INCOMPLETE] ${reason}; rollback failed for: ${failedFileLabels.join(', ')}. Preserved backups remain available for manual recovery.`
+    );
+  };
+
   // Phase B: Atomic writes with rollback on mid-flight failure
   logger.log('\n7. Applying Atomic File Repairs:');
   const completedWrites: PendingFileWrite[] = [];
@@ -2101,59 +2357,66 @@ export async function runLocalDatabaseEnvRepair(
     const errMsg = redact(err instanceof Error ? err.message : String(err));
     logger.error(`   - [WRITE FAILURE] Atomic write failed: ${errMsg}. Attempting rollback from backups...`);
 
-    // Best-effort rollback of any files written earlier in this batch
-    for (const done of completedWrites.reverse()) {
-      try {
-        if (done.existedBefore && done.backupPath && fs.existsSync(done.backupPath)) {
-          const originalBytes = fs.readFileSync(done.backupPath, 'utf-8');
-          writeFileAtomicallyStrict(done.filePath, originalBytes);
-          logger.log(`   - Rolled back ${done.label} from ${path.basename(done.backupPath)}`);
-        } else if (!done.existedBefore && fs.existsSync(done.filePath)) {
-          fs.unlinkSync(done.filePath);
-          logger.log(`   - Removed newly created ${done.label} during rollback`);
-        }
-      } catch (rbErr) {
-        const rbMsg = redact(rbErr instanceof Error ? rbErr.message : String(rbErr));
-        warnings.push(`Rollback of ${done.label} encountered an error: ${rbMsg}`);
-      }
-    }
-
-    modifiedFiles.length = 0;
-    createdFiles.length = 0;
+    const rollback = rollbackCompletedWrites(completedWrites);
     blockers.push(`Atomic write failed during repair: ${errMsg}`);
+    recordRollbackOutcome('Atomic write failed during repair', rollback);
+
     return finalizeResult({
       exitCode: 1,
       executed: false,
       fileVerificationPassed: false,
       verificationPassed: false,
+      rollback,
     });
   }
 
   // Phase C: Post-write file verification (re-read from disk and validate all 5 file targets)
   logger.log('\n8. Verifying Repaired Files on Disk:');
   const silentLogger: RepairLogger = { log: () => {}, warn: () => {}, error: () => {} };
-  const postVerify = await runDatabaseEnvironmentSetup({
-    projectRoot,
-    checkOnly: true,
-    shellEnv: {},
-    logger: silentLogger,
-    inspectDockerVolumes: async () =>
-      docker.available ? docker.volumes.map((v) => v.name) : null,
-  });
+  let postVerifyIssues: string[] = [];
+  let postVerifyFailed = false;
+  try {
+    const postVerify = await verifyRepairedFiles({
+      projectRoot,
+      checkOnly: true,
+      shellEnv: {},
+      logger: silentLogger,
+      inspectDockerVolumes: async () =>
+        docker.available ? docker.volumes.map((v) => v.name) : null,
+    });
+    if (postVerify.exitCode !== 0) {
+      postVerifyFailed = true;
+      postVerifyIssues =
+        postVerify.issues.length > 0
+          ? postVerify.issues
+          : ['Post-repair five-environment verification returned a non-zero exit code.'];
+    }
+  } catch (verifyErr) {
+    postVerifyFailed = true;
+    postVerifyIssues = [
+      `Post-repair verification threw an unexpected error: ${verifyErr instanceof Error ? verifyErr.message : String(verifyErr)}`,
+    ];
+  }
 
-  if (postVerify.exitCode !== 0) {
-    for (const issue of postVerify.issues) {
+  if (postVerifyFailed) {
+    for (const issue of postVerifyIssues) {
       blockers.push(`Post-repair verification issue: ${redact(issue)}`);
     }
     logger.error('   - [VERIFICATION FAILED] Resulting files failed five-environment validation:');
-    for (const issue of postVerify.issues) {
+    for (const issue of postVerifyIssues) {
       logger.error(`       * ${redact(issue)}`);
     }
+    logger.log('   - Attempting automatic rollback to pre-repair state (all backups will be preserved)...');
+
+    const rollback = rollbackCompletedWrites(completedWrites);
+    recordRollbackOutcome('Post-repair verification failed', rollback);
+
     return finalizeResult({
       exitCode: 1,
-      executed: true,
+      executed: false,
       fileVerificationPassed: false,
       verificationPassed: false,
+      rollback,
     });
   }
 
